@@ -226,10 +226,10 @@ mod tests {
     fn create_small_datablock() -> Datablock {
         Datablock {
             datablock_kind: DatablockKind::EventBatchItem(DatablockAggregateEventBatch {
-                event_batch_index: 1,
+                aggregate_version: 1,
                 events: vec![DatablockAggregateEvent {
-                    client_event_index: 1,
-                    event_index: 1,
+                    client_seq: 1,
+                    event_seq: 1,
                     event_id: None,
                     event_timestamp: 1000,
                     event_type_major: 1,
@@ -248,10 +248,10 @@ mod tests {
         let large_payload = vec![0u8; 1500];
         Datablock {
             datablock_kind: DatablockKind::EventBatchItem(DatablockAggregateEventBatch {
-                event_batch_index: 1,
+                aggregate_version: 1,
                 events: vec![DatablockAggregateEvent {
-                    client_event_index: 1,
-                    event_index: 1,
+                    client_seq: 1,
+                    event_seq: 1,
                     event_id: Some(12345),
                     event_timestamp: 1000,
                     event_type_major: 1,
@@ -276,10 +276,10 @@ mod tests {
         }
         Datablock {
             datablock_kind: DatablockKind::EventBatchItem(DatablockAggregateEventBatch {
-                event_batch_index: 1,
+                aggregate_version: 1,
                 events: vec![DatablockAggregateEvent {
-                    client_event_index: 1,
-                    event_index: 1,
+                    client_seq: 1,
+                    event_seq: 1,
                     event_id: Some(12345),
                     event_timestamp: 1000,
                     event_type_major: 1,
@@ -319,10 +319,10 @@ mod tests {
     fn assert_same_batch(a: &Datablock, b: &Datablock) {
         match (&a.datablock_kind, &b.datablock_kind) {
             (DatablockKind::EventBatchItem(x), DatablockKind::EventBatchItem(y)) => {
-                assert_eq!(x.event_batch_index, y.event_batch_index);
+                assert_eq!(x.aggregate_version, y.aggregate_version);
                 assert_eq!(x.events.len(), y.events.len());
                 if !x.events.is_empty() {
-                    assert_eq!(x.events[0].event_index, y.events[0].event_index);
+                    assert_eq!(x.events[0].event_seq, y.events[0].event_seq);
                 }
             }
             _ => panic!("Unexpected datablock kind"),

@@ -257,8 +257,8 @@ fn make_event(payload_size: usize) -> DatablockAggregateEvent {
     let mut payload = vec![0u8; payload_size];
     crate::fill_incompressible(&mut payload, seed);
     DatablockAggregateEvent {
-        client_event_index: 0,
-        event_index: 0,
+        client_seq: 0,
+        event_seq: 0,
         event_id: Some(1),
         event_timestamp: 0,
         event_type_major: 1,
@@ -282,7 +282,7 @@ fn make_create_request(flat_index: usize, client_id: u128) -> ClientRequest {
         SingleAggregateWrite {
             events,
             allow_create: true,
-            expected_event_batch_index: None,
+            expected_version: None,
             enforce_client_idempotency: false,
         },
     );
@@ -303,7 +303,7 @@ fn make_single_write_request(org_id: u128, type_id: u128, aggregate_id: u128, cl
         SingleAggregateWrite {
             events: vec![make_event(LARGE_PAYLOAD_SIZE)],
             allow_create: true,
-            expected_event_batch_index: None,
+            expected_version: None,
             enforce_client_idempotency: false,
         },
     );

@@ -1,10 +1,10 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeStatus {
-    Leader { lease_index: u64 },
-    Follower { leader_lease_index: u64 },
+    Leader { lease_epoch: u64 },
+    Follower { leader_lease_epoch: u64 },
     /// Runtime kick: follower is catching up from S3, rejects TCP replication.
     /// Transitions directly back to Follower when catchup completes.
-    FollowerCatchingUp { leader_lease_index: u64 },
+    FollowerCatchingUp { leader_lease_epoch: u64 },
     /// Boot-time S3 catchup, before election. TTL-exempt.
     BootCatchup,
     Fenced,
@@ -45,19 +45,19 @@ impl NodeStatus {
         matches!(self, NodeStatus::Follower { .. } | NodeStatus::FollowerCatchingUp { .. })
     }
 
-    pub fn lease_index(&self) -> Option<u64> {
+    pub fn lease_epoch(&self) -> Option<u64> {
         match self {
-            NodeStatus::Leader { lease_index } => Some(*lease_index),
+            NodeStatus::Leader { lease_epoch } => Some(*lease_epoch),
             NodeStatus::Standalone => Some(0),
             _ => None,
         }
     }
 
-    pub fn lease_index_for_logging(&self) -> u64 {
+    pub fn lease_epoch_for_logging(&self) -> u64 {
         match self {
-            NodeStatus::Leader { lease_index } => *lease_index,
-            NodeStatus::Follower { leader_lease_index }
-            | NodeStatus::FollowerCatchingUp { leader_lease_index } => *leader_lease_index,
+            NodeStatus::Leader { lease_epoch } => *lease_epoch,
+            NodeStatus::Follower { leader_lease_epoch }
+            | NodeStatus::FollowerCatchingUp { leader_lease_epoch } => *leader_lease_epoch,
             NodeStatus::Standalone | NodeStatus::Fenced | NodeStatus::BootCatchup => 0,
         }
     }
@@ -77,14 +77,14 @@ impl NodeStatus {
             // Standalone is initial state, can go to Leader or Follower
             (Standalone, Leader { .. }) | (Standalone, Follower { .. }) => true,
 
-            // Follower can update lease_index or enter catchup (runtime kick)
+            // Follower can update lease_epoch or enter catchup (runtime kick)
             (Follower { .. }, Follower { .. }) => true,
             (Follower { .. }, FollowerCatchingUp { .. }) => true,
 
             // Catchup completes directly back to Follower
             (FollowerCatchingUp { .. }, Follower { .. }) => true,
 
-            // Leader -> Leader: TTL refresh after S3 renewal (lease_index unchanged).
+            // Leader -> Leader: TTL refresh after S3 renewal (lease_epoch unchanged).
             // Leader -> Follower: lost S3 CAS during election.
             (Leader { .. }, Leader { .. }) | (Leader { .. }, Follower { .. }) => true,
 
@@ -100,33 +100,33 @@ mod tests {
 
     #[test]
     fn leader_helpers() {
-        let status = NodeStatus::Leader { lease_index: 5 };
+        let status = NodeStatus::Leader { lease_epoch: 5 };
         assert!(status.is_leader());
         assert!(!status.is_follower());
         assert!(!status.is_fenced());
         assert!(!status.is_catching_up());
-        assert_eq!(status.lease_index(), Some(5));
+        assert_eq!(status.lease_epoch(), Some(5));
     }
 
     #[test]
     fn follower_helpers() {
-        let status = NodeStatus::Follower { leader_lease_index: 3 };
+        let status = NodeStatus::Follower { leader_lease_epoch: 3 };
         assert!(!status.is_leader());
         assert!(status.is_follower());
         assert!(!status.is_fenced());
         assert!(!status.is_catching_up());
-        assert_eq!(status.lease_index(), None);
+        assert_eq!(status.lease_epoch(), None);
     }
 
     #[test]
     fn follower_catching_up_helpers() {
-        let status = NodeStatus::FollowerCatchingUp { leader_lease_index: 3 };
+        let status = NodeStatus::FollowerCatchingUp { leader_lease_epoch: 3 };
         assert!(!status.is_leader());
         assert!(!status.is_follower());
         assert!(!status.is_fenced());
         assert!(status.is_catching_up());
-        assert_eq!(status.lease_index(), None);
-        assert_eq!(status.lease_index_for_logging(), 3);
+        assert_eq!(status.lease_epoch(), None);
+        assert_eq!(status.lease_epoch_for_logging(), 3);
     }
 
     #[test]
@@ -136,8 +136,8 @@ mod tests {
         assert!(!status.is_follower());
         assert!(!status.is_fenced());
         assert!(status.is_catching_up());
-        assert_eq!(status.lease_index(), None);
-        assert_eq!(status.lease_index_for_logging(), 0);
+        assert_eq!(status.lease_epoch(), None);
+        assert_eq!(status.lease_epoch_for_logging(), 0);
     }
 
     #[test]
@@ -147,7 +147,7 @@ mod tests {
         assert!(!status.is_follower());
         assert!(status.is_fenced());
         assert!(!status.is_catching_up());
-        assert_eq!(status.lease_index(), None);
+        assert_eq!(status.lease_epoch(), None);
     }
 
     #[test]
@@ -157,14 +157,14 @@ mod tests {
         assert!(!status.is_follower());
         assert!(!status.is_fenced());
         assert!(!status.is_catching_up());
-        assert_eq!(status.lease_index(), Some(0));
+        assert_eq!(status.lease_epoch(), Some(0));
     }
 
     #[test]
     fn valid_transitions_from_standalone() {
         let standalone = NodeStatus::Standalone;
-        assert!(standalone.is_valid_transition_to(&NodeStatus::Leader { lease_index: 1 }));
-        assert!(standalone.is_valid_transition_to(&NodeStatus::Follower { leader_lease_index: 1 }));
+        assert!(standalone.is_valid_transition_to(&NodeStatus::Leader { lease_epoch: 1 }));
+        assert!(standalone.is_valid_transition_to(&NodeStatus::Follower { leader_lease_epoch: 1 }));
         assert!(standalone.is_valid_transition_to(&NodeStatus::Fenced));
         assert!(!standalone.is_valid_transition_to(&NodeStatus::Standalone));
         assert!(!standalone.is_valid_transition_to(&NodeStatus::BootCatchup));
@@ -172,37 +172,37 @@ mod tests {
 
     #[test]
     fn valid_transitions_from_leader() {
-        let leader = NodeStatus::Leader { lease_index: 5 };
-        assert!(leader.is_valid_transition_to(&NodeStatus::Leader { lease_index: 6 }));
-        assert!(leader.is_valid_transition_to(&NodeStatus::Follower { leader_lease_index: 6 }));
+        let leader = NodeStatus::Leader { lease_epoch: 5 };
+        assert!(leader.is_valid_transition_to(&NodeStatus::Leader { lease_epoch: 6 }));
+        assert!(leader.is_valid_transition_to(&NodeStatus::Follower { leader_lease_epoch: 6 }));
         assert!(leader.is_valid_transition_to(&NodeStatus::Fenced));
-        assert!(!leader.is_valid_transition_to(&NodeStatus::FollowerCatchingUp { leader_lease_index: 6 }));
+        assert!(!leader.is_valid_transition_to(&NodeStatus::FollowerCatchingUp { leader_lease_epoch: 6 }));
         assert!(!leader.is_valid_transition_to(&NodeStatus::Standalone));
     }
 
     #[test]
     fn valid_transitions_from_follower() {
-        let follower = NodeStatus::Follower { leader_lease_index: 3 };
-        assert!(follower.is_valid_transition_to(&NodeStatus::Follower { leader_lease_index: 4 }));
-        assert!(follower.is_valid_transition_to(&NodeStatus::FollowerCatchingUp { leader_lease_index: 3 }));
+        let follower = NodeStatus::Follower { leader_lease_epoch: 3 };
+        assert!(follower.is_valid_transition_to(&NodeStatus::Follower { leader_lease_epoch: 4 }));
+        assert!(follower.is_valid_transition_to(&NodeStatus::FollowerCatchingUp { leader_lease_epoch: 3 }));
         assert!(follower.is_valid_transition_to(&NodeStatus::Fenced));
-        assert!(!follower.is_valid_transition_to(&NodeStatus::Leader { lease_index: 5 }));
+        assert!(!follower.is_valid_transition_to(&NodeStatus::Leader { lease_epoch: 5 }));
         assert!(!follower.is_valid_transition_to(&NodeStatus::Standalone));
     }
 
     #[test]
     fn valid_transitions_from_follower_catching_up() {
-        let catching_up = NodeStatus::FollowerCatchingUp { leader_lease_index: 3 };
-        assert!(catching_up.is_valid_transition_to(&NodeStatus::Follower { leader_lease_index: 3 }));
+        let catching_up = NodeStatus::FollowerCatchingUp { leader_lease_epoch: 3 };
+        assert!(catching_up.is_valid_transition_to(&NodeStatus::Follower { leader_lease_epoch: 3 }));
         assert!(catching_up.is_valid_transition_to(&NodeStatus::Fenced));
-        assert!(!catching_up.is_valid_transition_to(&NodeStatus::Leader { lease_index: 5 }));
+        assert!(!catching_up.is_valid_transition_to(&NodeStatus::Leader { lease_epoch: 5 }));
     }
 
     #[test]
     fn valid_transitions_from_fenced() {
         let fenced = NodeStatus::Fenced;
-        assert!(fenced.is_valid_transition_to(&NodeStatus::Leader { lease_index: 1 }));
-        assert!(fenced.is_valid_transition_to(&NodeStatus::Follower { leader_lease_index: 1 }));
+        assert!(fenced.is_valid_transition_to(&NodeStatus::Leader { lease_epoch: 1 }));
+        assert!(fenced.is_valid_transition_to(&NodeStatus::Follower { leader_lease_epoch: 1 }));
         assert!(fenced.is_valid_transition_to(&NodeStatus::BootCatchup));
         assert!(fenced.is_valid_transition_to(&NodeStatus::Fenced));
         assert!(!fenced.is_valid_transition_to(&NodeStatus::Standalone));
@@ -211,30 +211,30 @@ mod tests {
     #[test]
     fn valid_transitions_from_boot_catchup() {
         let boot = NodeStatus::BootCatchup;
-        assert!(boot.is_valid_transition_to(&NodeStatus::Leader { lease_index: 1 }));
-        assert!(boot.is_valid_transition_to(&NodeStatus::Follower { leader_lease_index: 1 }));
+        assert!(boot.is_valid_transition_to(&NodeStatus::Leader { lease_epoch: 1 }));
+        assert!(boot.is_valid_transition_to(&NodeStatus::Follower { leader_lease_epoch: 1 }));
         assert!(boot.is_valid_transition_to(&NodeStatus::Fenced));
-        assert!(!boot.is_valid_transition_to(&NodeStatus::FollowerCatchingUp { leader_lease_index: 1 }));
+        assert!(!boot.is_valid_transition_to(&NodeStatus::FollowerCatchingUp { leader_lease_epoch: 1 }));
         assert!(!boot.is_valid_transition_to(&NodeStatus::Standalone));
     }
 
     #[test]
     fn any_follower_state() {
-        assert!(NodeStatus::Follower { leader_lease_index: 1 }.is_any_follower_state());
-        assert!(NodeStatus::FollowerCatchingUp { leader_lease_index: 1 }.is_any_follower_state());
-        assert!(!NodeStatus::Leader { lease_index: 1 }.is_any_follower_state());
+        assert!(NodeStatus::Follower { leader_lease_epoch: 1 }.is_any_follower_state());
+        assert!(NodeStatus::FollowerCatchingUp { leader_lease_epoch: 1 }.is_any_follower_state());
+        assert!(!NodeStatus::Leader { lease_epoch: 1 }.is_any_follower_state());
         assert!(!NodeStatus::Fenced.is_any_follower_state());
         assert!(!NodeStatus::Standalone.is_any_follower_state());
         assert!(!NodeStatus::BootCatchup.is_any_follower_state());
     }
 
     #[test]
-    fn lease_index_for_logging() {
-        assert_eq!(NodeStatus::Leader { lease_index: 42 }.lease_index_for_logging(), 42);
-        assert_eq!(NodeStatus::Follower { leader_lease_index: 17 }.lease_index_for_logging(), 17);
-        assert_eq!(NodeStatus::FollowerCatchingUp { leader_lease_index: 17 }.lease_index_for_logging(), 17);
-        assert_eq!(NodeStatus::Standalone.lease_index_for_logging(), 0);
-        assert_eq!(NodeStatus::Fenced.lease_index_for_logging(), 0);
-        assert_eq!(NodeStatus::BootCatchup.lease_index_for_logging(), 0);
+    fn lease_epoch_for_logging() {
+        assert_eq!(NodeStatus::Leader { lease_epoch: 42 }.lease_epoch_for_logging(), 42);
+        assert_eq!(NodeStatus::Follower { leader_lease_epoch: 17 }.lease_epoch_for_logging(), 17);
+        assert_eq!(NodeStatus::FollowerCatchingUp { leader_lease_epoch: 17 }.lease_epoch_for_logging(), 17);
+        assert_eq!(NodeStatus::Standalone.lease_epoch_for_logging(), 0);
+        assert_eq!(NodeStatus::Fenced.lease_epoch_for_logging(), 0);
+        assert_eq!(NodeStatus::BootCatchup.lease_epoch_for_logging(), 0);
     }
 }

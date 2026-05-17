@@ -266,7 +266,7 @@ async fn test_watch_receives_writes(
         SingleAggregateWrite {
             events: vec![event],
             allow_create: true,
-            expected_event_batch_index: None,
+            expected_version: None,
             enforce_client_idempotency: false,
         },
     );
@@ -349,7 +349,7 @@ async fn test_watch_with_aggregate_filter(
         SingleAggregateWrite {
             events: vec![event],
             allow_create: true,
-            expected_event_batch_index: None,
+            expected_version: None,
             enforce_client_idempotency: false,
         },
     );
@@ -373,7 +373,7 @@ async fn test_watch_with_aggregate_filter(
         SingleAggregateWrite {
             events: vec![event],
             allow_create: true,
-            expected_event_batch_index: None,
+            expected_version: None,
             enforce_client_idempotency: false,
         },
     );
@@ -515,7 +515,7 @@ async fn test_multiple_watchers(
         SingleAggregateWrite {
             events: vec![event],
             allow_create: true,
-            expected_event_batch_index: None,
+            expected_version: None,
             enforce_client_idempotency: false,
         },
     );
@@ -597,7 +597,7 @@ async fn test_write_then_watch_same_connection(
         SingleAggregateWrite {
             events: vec![event],
             allow_create: true,
-            expected_event_batch_index: None,
+            expected_version: None,
             enforce_client_idempotency: false,
         },
     );
@@ -653,7 +653,7 @@ async fn test_write_then_watch_same_connection(
         SingleAggregateWrite {
             events: vec![event2],
             allow_create: false, // Aggregate already exists
-            expected_event_batch_index: None,
+            expected_version: None,
             enforce_client_idempotency: false,
         },
     );
@@ -700,10 +700,10 @@ async fn test_write_then_watch_same_connection(
     Ok(())
 }
 
-fn create_event(client_event_index: u64, message: String) -> DatablockAggregateEvent {
+fn create_event(client_seq: u64, message: String) -> DatablockAggregateEvent {
     DatablockAggregateEvent {
-        client_event_index,
-        event_index: 0,
+        client_seq,
+        event_seq: 0,
         event_id: Some(rand::random()),
         event_timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

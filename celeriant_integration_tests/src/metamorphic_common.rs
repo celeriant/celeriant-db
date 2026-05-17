@@ -31,13 +31,13 @@ pub fn format_key(key: &AggregateKey) -> String {
 pub fn response_digest(batches: &[AggregateEventBatch]) -> u64 {
     let mut h = DefaultHasher::new();
     for b in batches {
-        b.event_batch_index.hash(&mut h);
+        b.aggregate_version.hash(&mut h);
         b.client_id.hash(&mut h);
         b.user_id.hash(&mut h);
         b.server_timestamp.hash(&mut h);
         for e in &b.events {
-            e.client_event_index.hash(&mut h);
-            e.event_index.hash(&mut h);
+            e.client_seq.hash(&mut h);
+            e.event_seq.hash(&mut h);
             e.event_id.hash(&mut h);
             e.event_timestamp.hash(&mut h);
             e.event_type_major.hash(&mut h);
@@ -69,60 +69,60 @@ pub fn diff_aggregate(
     }
 
     for (i, (ab, bb)) in a.iter().zip(b.iter()).enumerate() {
-        if ab.event_batch_index != bb.event_batch_index {
+        if ab.aggregate_version != bb.aggregate_version {
             return Err(format!(
-                "aggregate {} batch[{}]: event_batch_index mismatch (a={}, b={})",
-                k, i, ab.event_batch_index, bb.event_batch_index
+                "aggregate {} batch[{}]: aggregate_version mismatch (a={}, b={})",
+                k, i, ab.aggregate_version, bb.aggregate_version
             ));
         }
         if ab.client_id != bb.client_id {
             return Err(format!(
                 "aggregate {} batch[{}] (idx={}): client_id mismatch (a={}, b={})",
-                k, i, ab.event_batch_index, ab.client_id, bb.client_id
+                k, i, ab.aggregate_version, ab.client_id, bb.client_id
             ));
         }
         if ab.user_id != bb.user_id {
             return Err(format!(
                 "aggregate {} batch[{}] (idx={}): user_id mismatch (a={:?}, b={:?})",
-                k, i, ab.event_batch_index, ab.user_id, bb.user_id
+                k, i, ab.aggregate_version, ab.user_id, bb.user_id
             ));
         }
         if mode == DiffMode::SameRun && ab.server_timestamp != bb.server_timestamp {
             return Err(format!(
                 "aggregate {} batch[{}] (idx={}): server_timestamp mismatch (a={}, b={}) — leader-assigned, should propagate unchanged",
-                k, i, ab.event_batch_index, ab.server_timestamp, bb.server_timestamp
+                k, i, ab.aggregate_version, ab.server_timestamp, bb.server_timestamp
             ));
         }
         if ab.events.len() != bb.events.len() {
             return Err(format!(
                 "aggregate {} batch[{}] (idx={}): event count mismatch (a={}, b={})",
-                k, i, ab.event_batch_index, ab.events.len(), bb.events.len()
+                k, i, ab.aggregate_version, ab.events.len(), bb.events.len()
             ));
         }
         for (j, (ae, be)) in ab.events.iter().zip(bb.events.iter()).enumerate() {
-            let bidx = ab.event_batch_index;
-            if ae.client_event_index != be.client_event_index {
+            let bidx = ab.aggregate_version;
+            if ae.client_seq != be.client_seq {
                 return Err(format!(
-                    "aggregate {} batch[{}] (idx={}) event[{}]: client_event_index mismatch (a={}, b={})",
-                    k, i, bidx, j, ae.client_event_index, be.client_event_index
+                    "aggregate {} batch[{}] (idx={}) event[{}]: client_seq mismatch (a={}, b={})",
+                    k, i, bidx, j, ae.client_seq, be.client_seq
                 ));
             }
-            if ae.event_index != be.event_index {
+            if ae.event_seq != be.event_seq {
                 return Err(format!(
-                    "aggregate {} batch[{}] (idx={}) event[{}] (client_idx={}): event_index mismatch (a={}, b={})",
-                    k, i, bidx, j, ae.client_event_index, ae.event_index, be.event_index
+                    "aggregate {} batch[{}] (idx={}) event[{}] (client_idx={}): event_seq mismatch (a={}, b={})",
+                    k, i, bidx, j, ae.client_seq, ae.event_seq, be.event_seq
                 ));
             }
             if mode == DiffMode::SameRun && ae.event_id != be.event_id {
                 return Err(format!(
                     "aggregate {} batch[{}] (idx={}) event[{}] (client_idx={}): event_id mismatch (a={:?}, b={:?})",
-                    k, i, bidx, j, ae.client_event_index, ae.event_id, be.event_id
+                    k, i, bidx, j, ae.client_seq, ae.event_id, be.event_id
                 ));
             }
             if mode == DiffMode::SameRun && ae.event_timestamp != be.event_timestamp {
                 return Err(format!(
                     "aggregate {} batch[{}] (idx={}) event[{}] (client_idx={}): event_timestamp mismatch (a={}, b={})",
-                    k, i, bidx, j, ae.client_event_index, ae.event_timestamp, be.event_timestamp
+                    k, i, bidx, j, ae.client_seq, ae.event_timestamp, be.event_timestamp
                 ));
             }
             if ae.event_type_major != be.event_type_major
@@ -130,7 +130,7 @@ pub fn diff_aggregate(
             {
                 return Err(format!(
                     "aggregate {} batch[{}] (idx={}) event[{}] (client_idx={}): event_type mismatch (a={}.{}, b={}.{})",
-                    k, i, bidx, j, ae.client_event_index,
+                    k, i, bidx, j, ae.client_seq,
                     ae.event_type_major, ae.event_type_minor,
                     be.event_type_major, be.event_type_minor
                 ));
@@ -138,13 +138,13 @@ pub fn diff_aggregate(
             if ae.iv != be.iv {
                 return Err(format!(
                     "aggregate {} batch[{}] (idx={}) event[{}] (client_idx={}): iv mismatch",
-                    k, i, bidx, j, ae.client_event_index
+                    k, i, bidx, j, ae.client_seq
                 ));
             }
             if ae.event_value.as_slice() != be.event_value.as_slice() {
                 return Err(format!(
                     "aggregate {} batch[{}] (idx={}) event[{}] (client_idx={}): event_value bytes mismatch (a_len={}, b_len={})",
-                    k, i, bidx, j, ae.client_event_index,
+                    k, i, bidx, j, ae.client_seq,
                     ae.event_value.len(), be.event_value.len()
                 ));
             }

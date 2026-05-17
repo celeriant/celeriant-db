@@ -14,7 +14,7 @@ use crate::request::{read_filters::ReadFilters};
 pub struct ListOrgsRequest {
     pub correlation_id: Option<u128>,
     pub shard_id: u64,
-    /// WAL index to continue scanning from (exclusive). None starts from latest.
+    /// WAL sequence to continue scanning from (exclusive). None starts from latest.
     pub cursor: Option<u64>,
 }
 
@@ -24,7 +24,7 @@ pub struct ListAggregateTypesRequest {
     pub shard_id: u64,
     /// Optional filter by org_id
     pub org_id: Option<u128>,
-    /// WAL index to continue scanning from (exclusive). None starts from latest.
+    /// WAL sequence to continue scanning from (exclusive). None starts from latest.
     pub cursor: Option<u64>,
 }
 
@@ -36,7 +36,7 @@ pub struct ListAggregatesRequest {
     pub org_id: Option<u128>,
     /// Optional filter by aggregate_type_id (requires org_id if specified)
     pub aggregate_type_id: Option<u128>,
-    /// WAL index to continue scanning from (exclusive). None starts from latest.
+    /// WAL sequence to continue scanning from (exclusive). None starts from latest.
     pub cursor: Option<u64>,
 }
 
@@ -65,7 +65,7 @@ pub struct WriteRequest {
 pub struct SingleAggregateWrite {
     pub events: Vec<DatablockAggregateEvent>,
     pub allow_create: bool,
-    pub expected_event_batch_index: Option<u64>,
+    pub expected_version: Option<u64>,
     pub enforce_client_idempotency: bool,
 }
 
@@ -74,7 +74,7 @@ pub struct SingleAggregateWrite {
 pub struct TrimStartRequest {
     pub correlation_id: Option<u128>,
     pub aggregate_key: AggregateKey,
-    pub keep_from_event_batch_index: u64,
+    pub keep_from_aggregate_version: u64,
     pub client_id: u128,
     pub user_id: Option<u128>,
 }
@@ -90,8 +90,8 @@ pub struct DeleteRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct SingleAggregateDelete {
     pub allow_recreate: bool,
-    pub allow_index_continuation: bool,
-    pub expected_event_batch_index: Option<u64>,
+    pub allow_sequence_continuation: bool,
+    pub expected_version: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
@@ -122,9 +122,9 @@ pub struct ReplicationBatchRequest {
     pub shard_id: u64,
     /// Leader provides its current time to follower to catch clock drift
     pub leader_timestamp_ms: u64,
-    /// Leader's `read.wal_index` at send time. Follower uses this as the
-    /// promotion-batch upload floor (sets `last_received_replication_wal_index = this + 1`).
-    pub leader_confirmed_wal_index: u64,
+    /// Leader's `read.wal_seq` at send time. Follower uses this as the
+    /// promotion-batch upload floor (sets `last_received_replication_wal_seq = this + 1`).
+    pub leader_confirmed_wal_seq: u64,
     /// If there are batches to replicate, they are provided to the follower
     /// Otherwise it's just a heartbeat message
     pub batches: Vec<ReplicationBatchItem>,
@@ -150,7 +150,7 @@ pub struct HeartbeatRequest {
     pub correlation_id: Option<u128>,
     pub shard_id: u64,
     pub leader_timestamp_ms: u64,
-    pub lease_index: u64,
+    pub lease_epoch: u64,
 }
 
 

@@ -14,7 +14,7 @@ pub struct NodeSample {
     pub error: Option<String>,
     /// Sum of `celeriant_node_role` across all label sets. Expected 0 or 1.
     pub node_role: f64,
-    pub wal_index_max: u64,
+    pub wal_seq_max: u64,
     pub writes_total: u64,
     pub write_errors_total: u64,
     pub leader_elections_total: u64,
@@ -37,7 +37,7 @@ impl NodeSample {
             ok: false,
             error: Some(error),
             node_role: 0.0,
-            wal_index_max: 0,
+            wal_seq_max: 0,
             writes_total: 0,
             write_errors_total: 0,
             leader_elections_total: 0,
@@ -55,11 +55,11 @@ impl NodeSample {
 ///
 /// Only extracts the metrics the chaos runner cares about. All other lines
 /// are ignored. Series with labels collapse via `agg`: sum for counters,
-/// max for `wal_index`, sum for the `node_role` gauge.
+/// max for `wal_seq`, sum for the `node_role` gauge.
 pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
     let mut sums: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut node_role = 0.0_f64;
-    let mut wal_index_max: u64 = 0;
+    let mut wal_seq_max: u64 = 0;
     let mut client_connections_active: u64 = 0;
 
     const COUNTERS: &[&str] = &[
@@ -93,11 +93,11 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
             }
             continue;
         }
-        if name == "celeriant_wal_index" {
+        if name == "celeriant_wal_seq" {
             if let Ok(v) = value_str.parse::<f64>() {
                 let v = v as u64;
-                if v > wal_index_max {
-                    wal_index_max = v;
+                if v > wal_seq_max {
+                    wal_seq_max = v;
                 }
             }
             continue;
@@ -123,7 +123,7 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         ok: true,
         error: None,
         node_role,
-        wal_index_max,
+        wal_seq_max,
         writes_total: get("celeriant_writes_total"),
         write_errors_total: get("celeriant_write_errors_total"),
         leader_elections_total: get("celeriant_leader_elections_total"),

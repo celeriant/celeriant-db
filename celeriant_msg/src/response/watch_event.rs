@@ -9,7 +9,7 @@ pub struct WatchResponseEvent {
     pub aggregate_type_id: u128,
     pub aggregate_id: u128,
     pub operation: u8,
-    pub from_event_batch_index: Option<u64>,
-    pub to_event_batch_index: Option<u64>,
-    pub keep_from_event_batch_index: Option<u64>,
+    pub from_aggregate_version: Option<u64>,
+    pub to_aggregate_version: Option<u64>,
+    pub keep_from_aggregate_version: Option<u64>,
 }

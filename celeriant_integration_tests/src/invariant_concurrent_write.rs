@@ -78,8 +78,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             bar.wait().await;
             for seq in 0..writes_per_connection {
                 let event = DatablockAggregateEvent {
-                    client_event_index: seq,
-                    event_index: 0,
+                    client_seq: seq,
+                    event_seq: 0,
                     event_id: None,
                     event_timestamp: 1000 + seq,
                     event_type_major: 100,
@@ -95,7 +95,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     SingleAggregateWrite {
                         events: vec![event],
                         allow_create: false,
-                        expected_event_batch_index: None,
+                        expected_version: None,
                         enforce_client_idempotency: false,
                     },
                 );

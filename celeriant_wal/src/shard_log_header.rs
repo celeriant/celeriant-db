@@ -17,8 +17,8 @@ pub struct ShardLogHeader {
     /// so this position indicates the start of the most recently written batches
     pub datablocks_position: u64,
 
-    /// Shard-global WAL index representing the last written metablock
-    pub wal_index: u64,
+    /// Shard-global WAL sequence representing the last written metablock
+    pub wal_seq: u64,
 
     /// Blake3 hash of last metablock entry
     pub tip_hash: EntryHashBytes,
@@ -28,12 +28,12 @@ pub struct ShardLogHeader {
     /// A "definitely not in set" result means no metablocks for that aggregate exist.
     pub aggregate_bloom: Vec<u64>,
 
-    /// Promotion-batch floor: `leader_confirmed_wal_index + 1` from the highest-confirmed
+    /// Promotion-batch floor: `leader_confirmed_wal_seq + 1` from the highest-confirmed
     /// batch received via TCP replication while follower (monotonic max). On promotion to
     /// leader, entries from this index onward are uploaded to S3 so the old leader (which
     /// may have rolled back data above its confirmed point) can catch up. Zero means no
     /// pending promotion upload.
-    pub last_received_replication_wal_index: u64,
+    pub last_received_replication_wal_seq: u64,
 }
 
 impl ShardLogHeader {
@@ -42,40 +42,40 @@ impl ShardLogHeader {
 
     const WIRE_SIZE_METABLOCKS_POSITION: usize = 8;
     const WIRE_SIZE_DATABLOCKS_POSITION: usize = 8;
-    const WIRE_SIZE_WAL_INDEX: usize = 8;
+    const WIRE_SIZE_WAL_SEQ: usize = 8;
     const WIRE_SIZE_TIP_HASH: usize = 32;
     const WIRE_SIZE_AGGREGATE_BLOOM: usize = AGGREGATE_BLOOM_BYTES;
-    const WIRE_SIZE_LAST_RECEIVED_REPLICATION_WAL_INDEX: usize = 8;
+    const WIRE_SIZE_LAST_RECEIVED_REPLICATION_WAL_SEQ: usize = 8;
 
     pub const OFFSET_METABLOCKS_POSITION: usize = 0;
 
     pub const OFFSET_DATABLOCKS_POSITION: usize =
         Self::OFFSET_METABLOCKS_POSITION + Self::WIRE_SIZE_METABLOCKS_POSITION;
 
-    pub const OFFSET_WAL_INDEX: usize =
+    pub const OFFSET_WAL_SEQ: usize =
         Self::OFFSET_DATABLOCKS_POSITION + Self::WIRE_SIZE_DATABLOCKS_POSITION;
 
     pub const OFFSET_TIP_HASH: usize =
-        Self::OFFSET_WAL_INDEX + Self::WIRE_SIZE_WAL_INDEX;
+        Self::OFFSET_WAL_SEQ + Self::WIRE_SIZE_WAL_SEQ;
 
     pub const OFFSET_AGGREGATE_BLOOM: usize =
         Self::OFFSET_TIP_HASH + Self::WIRE_SIZE_TIP_HASH;
 
-    pub const OFFSET_LAST_RECEIVED_REPLICATION_WAL_INDEX: usize =
+    pub const OFFSET_LAST_RECEIVED_REPLICATION_WAL_SEQ: usize =
         Self::OFFSET_AGGREGATE_BLOOM + Self::WIRE_SIZE_AGGREGATE_BLOOM;
 
     /// Total wire size of ShardLogHeader
     pub const WIRE_SIZE_TOTAL: usize =
-        Self::OFFSET_LAST_RECEIVED_REPLICATION_WAL_INDEX + Self::WIRE_SIZE_LAST_RECEIVED_REPLICATION_WAL_INDEX;
+        Self::OFFSET_LAST_RECEIVED_REPLICATION_WAL_SEQ + Self::WIRE_SIZE_LAST_RECEIVED_REPLICATION_WAL_SEQ;
         
     pub fn new(file_len: u64) -> Self {
         Self {
             metablocks_position: HEADER_BLOCK_SIZE_BYTES as u64,
             datablocks_position: file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64),
-            wal_index: 0,
+            wal_seq: 0,
             tip_hash: GENESIS_HASH,
             aggregate_bloom: vec![],
-            last_received_replication_wal_index: 0,
+            last_received_replication_wal_seq: 0,
         }
     }
 
@@ -141,10 +141,10 @@ mod tests {
         let header = ShardLogHeader {
             metablocks_position: 1000,
             datablocks_position: 500,
-            wal_index: 0,
+            wal_seq: 0,
             tip_hash: GENESIS_HASH,
             aggregate_bloom: vec![],
-            last_received_replication_wal_index: 0,
+            last_received_replication_wal_seq: 0,
         };
 
         assert_eq!(header.available_space(), 0); // saturating_sub prevents underflow

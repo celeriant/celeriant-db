@@ -494,7 +494,7 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
 
     let previous_status = ctx.shard_wal.node_status.get();
     let is_currently_leader = previous_status.raw().is_leader();
-    let previous_lease_index = previous_status.raw().lease_index().unwrap_or(0);
+    let previous_lease_epoch = previous_status.raw().lease_epoch().unwrap_or(0);
 
     let outcome = retry_s3_operation(ctx.config.s3_retry_max_duration, "renew_s3_lease", || lease_manager.run_election_to_acquire_s3_lease()).await?;
 
@@ -514,15 +514,15 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
         ctx.intrashard_sender.clone()
     ).await;
 
-    let new_lease_index = outcome.status.raw().lease_index().unwrap_or(0);
-    // Same-leader renewals don't bump lease_index, so any increase means another
+    let new_lease_epoch = outcome.status.raw().lease_epoch().unwrap_or(0);
+    // Same-leader renewals don't bump lease_epoch, so any increase means another
     // node held the lease in between and may have uploaded S3 fallback batches.
-    let lease_changed_hands = new_lease_index > previous_lease_index;
+    let lease_changed_hands = new_lease_epoch > previous_lease_epoch;
     let became_leader = !is_currently_leader && outcome.status.is_leader();
 
     if outcome.status.is_leader() && (became_leader || lease_changed_hands) {
         if lease_changed_hands {
-            info!(previous_lease_index, new_lease_index, "Lease changed hands during partition — running S3 catchup");
+            info!(previous_lease_epoch, new_lease_epoch, "Lease changed hands during partition — running S3 catchup");
         } else {
             info!("Starting post-election S3 catchup");
         }
@@ -647,7 +647,7 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                 glommio::timer::sleep(ctx.config.heartbeat_interval_duration).await;
 
                 let unix_epoch_now_ms = validated_node_status::unix_epoch_now_ms();
-                let lease_index = ctx.shard_wal.node_status.get().raw().lease_index().unwrap_or(0);
+                let lease_epoch = ctx.shard_wal.node_status.get().raw().lease_epoch().unwrap_or(0);
                 let hb_start = std::time::Instant::now();
                 let shard_label = ctx.current_shard_id.to_string();
                 metrics::counter!("celeriant_heartbeat_attempts_total", &[("shard_id", shard_label.clone())]).increment(1);
@@ -686,7 +686,7 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                 let hb_hard_timed_out;
                 let result = match glommio::timer::timeout(hb_hard_timeout, async {
                     Ok::<_, glommio::GlommioError<()>>(
-                        ctx.shard_wal.replication_client.send_heartbeat(unix_epoch_now_ms, lease_index).await
+                        ctx.shard_wal.replication_client.send_heartbeat(unix_epoch_now_ms, lease_epoch).await
                     )
                 }).await {
                     Ok(inner) => { hb_hard_timed_out = false; inner },

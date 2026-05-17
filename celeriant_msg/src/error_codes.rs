@@ -14,7 +14,7 @@
 //  10xxx  Identity & authentication errors
 
 // --- Read errors: 1xxx ---
-pub const READ_UNAVAILABLE_BATCH_INDEX: u32 = 1000;
+pub const READ_UNAVAILABLE_VERSION: u32 = 1000;
 pub const READ_AGGREGATE_NOT_EXISTS: u32 = 1001;
 pub const READ_CACHE_LOAD_LOCK_TIMEOUT: u32 = 1002;
 pub const READ_CACHE_LOAD_FILE_SCAN: u32 = 1003;
@@ -74,7 +74,7 @@ pub const LIST_AGGREGATES_DISK_READ: u32 = 5002;
 // --- Replication batch errors: 6xxx ---
 pub const REPLICATION_BATCH_FSYNC: u32 = 6000;
 pub const REPLICATION_BATCH_SERIALISE_DATABLOCKS: u32 = 6001;
-pub const REPLICATION_BATCH_WAL_INDEX_GAP: u32 = 6002;
+pub const REPLICATION_BATCH_WAL_SEQ_GAP: u32 = 6002;
 
 // --- Exists / aggregate-details errors: 7xxx ---
 pub const EXISTS_CACHE_ERROR: u32 = 7000;

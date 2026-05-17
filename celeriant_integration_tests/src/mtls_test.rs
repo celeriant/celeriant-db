@@ -107,8 +107,8 @@ async fn test_mtls_client_server_roundtrip() -> Result<(), Box<dyn std::error::E
 
     let aggregate = AggregateKey::new(1, 1, 40001);
     let event = DatablockAggregateEvent {
-        client_event_index: 1,
-        event_index: 0,
+        client_seq: 1,
+        event_seq: 0,
         event_id: None,
         event_timestamp: 1_000_000,
         event_type_major: 1,
@@ -122,7 +122,7 @@ async fn test_mtls_client_server_roundtrip() -> Result<(), Box<dyn std::error::E
         SingleAggregateWrite {
             events: vec![event],
             allow_create: true,
-            expected_event_batch_index: None,
+            expected_version: None,
             enforce_client_idempotency: false,
         },
     );
@@ -466,8 +466,8 @@ async fn cross_shard_roundtrip(
         let aggregate = AggregateKey::new(1, 1, agg_id);
 
         let event = DatablockAggregateEvent {
-            client_event_index: 1,
-            event_index: 0,
+            client_seq: 1,
+            event_seq: 0,
             event_id: None,
             event_timestamp: 2_000_000 + shard as u64,
             event_type_major: 1,
@@ -481,7 +481,7 @@ async fn cross_shard_roundtrip(
             SingleAggregateWrite {
                 events: vec![event],
                 allow_create: true,
-                expected_event_batch_index: None,
+                expected_version: None,
                 enforce_client_idempotency: false,
             },
         );

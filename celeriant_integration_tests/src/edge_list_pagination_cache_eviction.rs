@@ -1,9 +1,9 @@
 //! Edge Case: List Pagination Across Cache Eviction
 //!
 //! Tests that paginated list operations return correct results even when the
-//! WAL index cache is evicted between page fetches.
+//! WAL sequence cache is evicted between page fetches.
 //!
-//! The `list_wal_index_cache_bytes` config controls an LRU that maps WAL index
+//! The `list_wal_seq_cache_bytes` config controls an LRU that maps WAL sequence
 //! positions to file offsets, avoiding full log scans on each page. With
 //! capacity=1 entry (24 bytes / 24 bytes per entry), every new page fetch evicts
 //! the previous cursor entry. The test verifies correctness (no gaps/duplicates)
@@ -11,7 +11,7 @@
 //!
 //! Scenario:
 //! 1. Start a standalone server with:
-//!    - list_wal_index_cache_bytes=24 (capacity=1 — every second fetch is a miss)
+//!    - list_wal_seq_cache_bytes=24 (capacity=1 — every second fetch is a miss)
 //!    - list_page_size=20 (small pages — forces many cursor hops)
 //!    - shard_log_preallocate_bytes=2MB (small log — forces rotation)
 //! 2. Create 200 aggregates (all in same shard via AggregateTypeId routing)
@@ -125,7 +125,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let shard_id: u64 = 0;
 
     // Between each page, write another large event to a scratch aggregate.
-    // This forces the server to update WAL index entries, potentially evicting
+    // This forces the server to update WAL sequence entries, potentially evicting
     // the cached cursor position from the 1-entry LRU.
     let scratch_key = AggregateKey::new(agg_type_id, category_id, num_aggregates + 2);
     write_event(&mut client, &scratch_key, 1, true).await?;

@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Default, Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct ReadFilters {
     /// Starting server ID to begin reading from (inclusive). Will error if not found in stream.
-    pub from_event_batch_index: u64,
+    pub from_aggregate_version: u64,
     /// End reading event batches at this server id (inclusive). Will error if reached end of stream before this ID.
-    pub to_event_batch_index: Option<u64>,
+    pub to_aggregate_version: Option<u64>,
     /// Optional whitelist of event types to include in results
     pub include_event_types: Option<Vec<u64>>,
     /// Skip events created by this client
@@ -23,34 +23,34 @@ pub struct ReadFilters {
     /// Optional timestamp filter, only include batches before this time (exclusive)
     pub max_server_timestamp: Option<u64>,
     /// Only include batches with max_local_index greater than or equal to this value
-    pub min_client_event_index: Option<u64>,
+    pub min_client_seq: Option<u64>,
     /// Only include batches with min_local_index less than or equal to this value
-    pub max_client_event_index: Option<u64>,
+    pub max_client_seq: Option<u64>,
     /// Only include batches with max_event_time greater than or equal to this value
     pub min_event_timestamp: Option<u64>,
     /// Only include batches with min_event_time less than or equal to this value
     pub max_event_timestamp: Option<u64>,
-    /// Only include batches with event_index greater than or equal to this value
-    pub min_event_index: Option<u64>,
-    /// Only include batches with event_index less than or equal to this value
-    pub max_event_index: Option<u64>,
+    /// Only include batches with event_seq greater than or equal to this value
+    pub min_event_seq: Option<u64>,
+    /// Only include batches with event_seq less than or equal to this value
+    pub max_event_seq: Option<u64>,
 }
 
 impl ReadFilters {
-    pub fn new(mut from_event_batch_index: u64) -> Self {
+    pub fn new(mut from_aggregate_version: u64) -> Self {
         // We never have batch '0' as we are 1 based
         // Still allow clients to use this as 'give me everything'
-        if from_event_batch_index == 0 {
-            from_event_batch_index = 1;
+        if from_aggregate_version == 0 {
+            from_aggregate_version = 1;
         }
         Self {
-            from_event_batch_index,
+            from_aggregate_version,
             ..Default::default()
         }
     }
 
-    pub fn to_event_batch_index(mut self, event_batch_index: u64) -> Self {
-        self.to_event_batch_index = Some(event_batch_index);
+    pub fn to_aggregate_version(mut self, aggregate_version: u64) -> Self {
+        self.to_aggregate_version = Some(aggregate_version);
         self
     }
 
@@ -96,19 +96,19 @@ impl ReadFilters {
         self
     }
 
-    pub fn min_client_event_index(mut self, index: u64) -> Self {
-        self.min_client_event_index = Some(index);
+    pub fn min_client_seq(mut self, index: u64) -> Self {
+        self.min_client_seq = Some(index);
         self
     }
 
-    pub fn max_client_event_index(mut self, index: u64) -> Self {
-        self.max_client_event_index = Some(index);
+    pub fn max_client_seq(mut self, index: u64) -> Self {
+        self.max_client_seq = Some(index);
         self
     }
 
-    pub fn client_event_index_range(mut self, min: u64, max: u64) -> Self {
-        self.min_client_event_index = Some(min);
-        self.max_client_event_index = Some(max);
+    pub fn client_seq_range(mut self, min: u64, max: u64) -> Self {
+        self.min_client_seq = Some(min);
+        self.max_client_seq = Some(max);
         self
     }
 
@@ -128,19 +128,19 @@ impl ReadFilters {
         self
     }
 
-    pub fn min_event_index(mut self, event_index: u64) -> Self {
-        self.min_event_index = Some(event_index);
+    pub fn min_event_seq(mut self, event_seq: u64) -> Self {
+        self.min_event_seq = Some(event_seq);
         self
     }
 
-    pub fn max_event_index(mut self, event_index: u64) -> Self {
-        self.max_event_index = Some(event_index);
+    pub fn max_event_seq(mut self, event_seq: u64) -> Self {
+        self.max_event_seq = Some(event_seq);
         self
     }
 
-    pub fn event_index_range(mut self, min_event_index: u64, max_event_index: u64) -> Self {
-        self.min_event_index = Some(min_event_index);
-        self.max_event_index = Some(max_event_index);
+    pub fn event_seq_range(mut self, min_event_seq: u64, max_event_seq: u64) -> Self {
+        self.min_event_seq = Some(min_event_seq);
+        self.max_event_seq = Some(max_event_seq);
         self
     }
 }

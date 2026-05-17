@@ -30,10 +30,10 @@ use celeriant_wal::{
 
 const PORT_BASE: u16 = 18500;
 
-fn create_event(client_event_index: u64, message: String) -> DatablockAggregateEvent {
+fn create_event(client_seq: u64, message: String) -> DatablockAggregateEvent {
     DatablockAggregateEvent {
-        client_event_index,
-        event_index: 0, // Server will assign
+        client_seq,
+        event_seq: 0, // Server will assign
         event_id: Some(rand::random()),
         event_timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -77,7 +77,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         SingleAggregateWrite {
             events: vec![event_a1],
             allow_create: true,
-            expected_event_batch_index: Some(0),
+            expected_version: Some(0),
             enforce_client_idempotency: true,
         },
     );
@@ -86,7 +86,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         SingleAggregateWrite {
             events: vec![event_b1],
             allow_create: true,
-            expected_event_batch_index: Some(0),
+            expected_version: Some(0),
             enforce_client_idempotency: true,
         },
     );
@@ -125,7 +125,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         SingleAggregateWrite {
             events: vec![event_b2],
             allow_create: false,
-            expected_event_batch_index: Some(1),
+            expected_version: Some(1),
             enforce_client_idempotency: true,
         },
     );
@@ -165,7 +165,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         SingleAggregateWrite {
             events: vec![event_a2],
             allow_create: false,
-            expected_event_batch_index: Some(1), // Expects version 1
+            expected_version: Some(1), // Expects version 1
             enforce_client_idempotency: true,
         },
     );
@@ -174,7 +174,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         SingleAggregateWrite {
             events: vec![event_b3],
             allow_create: false,
-            expected_event_batch_index: Some(1), // Stale! B is actually at version 2
+            expected_version: Some(1), // Stale! B is actually at version 2
             enforce_client_idempotency: true,
         },
     );

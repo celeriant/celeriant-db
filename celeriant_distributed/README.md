@@ -56,21 +56,21 @@ The runtime calls `effective_node_status()`, not `raw()`, to get the current sta
 ## Invariants
 
 - Leader is determined by S3 CAS on a single `cluster/lease.json` object. No Raft, no quorum.
-- `lease_index` is strictly monotonically increasing and never reused. A fresh cluster starts at `lease_index = 1`.
+- `lease_epoch` is strictly monotonically increasing and never reused. A fresh cluster starts at `lease_epoch = 1`.
 - A node seeing a valid (non-expired) lease from another node becomes follower unconditionally. No CAS attempt.
 - Membership is a fixed 2-slot array in S3. A third node cannot join.
 - The leader fences at `lease_expires_at_ms - max_clock_drift_ms`, which must always fire before the follower's TTL expires.
 - `FollowerCatchingUp` and `BootCatchup` states are TTL-exempt. They never decay to `Fenced`.
 - `FollowerCatchingUp` cannot transition directly to `Leader`. It must catch up and return to `Follower` first.
-- A newly elected leader runs S3 catchup before serving writes. Catchup also runs if the `lease_index` gap indicates the lease changed hands during a partition.
+- A newly elected leader runs S3 catchup before serving writes. Catchup also runs if the `lease_epoch` gap indicates the lease changed hands during a partition.
 
 ## NodeStatus
 
 ```rust
 pub enum NodeStatus {
-    Leader { lease_index: u64 },
-    Follower { leader_lease_index: u64 },
-    FollowerCatchingUp { leader_lease_index: u64 },
+    Leader { lease_epoch: u64 },
+    Follower { leader_lease_epoch: u64 },
+    FollowerCatchingUp { leader_lease_epoch: u64 },
     BootCatchup,
     Fenced,
     Standalone,
@@ -81,7 +81,7 @@ pub enum NodeStatus {
 
 - `is_leader()`, `is_follower()`, `is_fenced()`, `is_standalone()`, `is_catching_up()`
 - `is_any_follower_state()` matches both `Follower` and `FollowerCatchingUp` (used by heartbeat handler and watchdog)
-- `lease_index()` → `Some(u64)` for Leader and Standalone only
+- `lease_epoch()` → `Some(u64)` for Leader and Standalone only
 - `is_valid_transition_to()` validates state machine transitions
 
 ### State Machine
@@ -99,9 +99,9 @@ FollowerCatchingUp → Follower (catchup complete)
 | State | Description | TTL-exempt |
 |-------|-------------|-----------|
 | `Standalone` | Single-node, no replication | yes |
-| `Leader { lease_index }` | Holds S3 lease, accepts writes | no |
-| `Follower { leader_lease_index }` | Follows leader, accepts TCP replication | no |
-| `FollowerCatchingUp { leader_lease_index }` | Catching up from S3, rejects TCP replication | yes |
+| `Leader { lease_epoch }` | Holds S3 lease, accepts writes | no |
+| `Follower { leader_lease_epoch }` | Follows leader, accepts TCP replication | no |
+| `FollowerCatchingUp { leader_lease_epoch }` | Catching up from S3, rejects TCP replication | yes |
 | `BootCatchup` | Pre-election S3 catchup at boot | yes |
 | `Fenced` | Write-blocked; must re-run election to recover | yes |
 
@@ -133,7 +133,7 @@ pub enum LeaseStoreError {
 |----------|---------|
 | No lease | Race `put_lease_create_only`; winner → Leader, loser reads again → Follower |
 | Valid lease, other node | Follower unconditionally |
-| Valid lease, own node | CAS-extend; winner → Leader with incremented `lease_index` |
+| Valid lease, own node | CAS-extend; winner → Leader with incremented `lease_epoch` |
 | Expired lease | CAS race; winner → Leader, loser reads winner's lease → Follower |
 
 `run_election_to_acquire_s3_lease()` always calls `discover_peer()` after determining the election outcome, so `ElectionOutcome.peer_info` is populated when a peer exists in the membership object.

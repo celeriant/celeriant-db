@@ -303,7 +303,7 @@ pub fn all_tests() -> &'static [TestEntry] {
         },
         TestEntry {
             name: "s3_lease_monotonicity",
-            description: "Lease index strictly monotonically increasing across consecutive failovers",
+            description: "Lease epoch strictly monotonically increasing across consecutive failovers",
             estimated_secs: 24,
             categories: &[Election],
             distributed: true,
@@ -447,7 +447,7 @@ pub fn all_tests() -> &'static [TestEntry] {
         },
         TestEntry {
             name: "edge_s3_missing_batches",
-            description: "Missing S3 batch detection triggers fatal WalIndexGap error",
+            description: "Missing S3 batch detection triggers fatal WalSeqGap error",
             estimated_secs: 32,
             categories: &[Edge],
             distributed: true,
@@ -496,14 +496,14 @@ pub fn all_tests() -> &'static [TestEntry] {
         },
         TestEntry {
             name: "edge_s3_batch_boundary_contiguity",
-            description: "S3 fallback batch boundaries contiguous under load (WalIndexGap bug)",
+            description: "S3 fallback batch boundaries contiguous under load (WalSeqGap bug)",
             estimated_secs: 45,
             categories: &[Edge, Replication],
             distributed: true,
         },
         TestEntry {
             name: "edge_s3_catchup_after_partition",
-            description: "S3 catchup after partition + failover: no WalIndexGap on rejoin",
+            description: "S3 catchup after partition + failover: no WalSeqGap on rejoin",
             estimated_secs: 40,
             categories: &[Edge, Replication],
             distributed: true,
@@ -524,7 +524,7 @@ pub fn all_tests() -> &'static [TestEntry] {
         },
         TestEntry {
             name: "edge_list_pagination_cache_eviction",
-            description: "Paginated list returns correct results despite WAL index cache eviction",
+            description: "Paginated list returns correct results despite WAL sequence cache eviction",
             estimated_secs: 5,
             categories: &[Edge],
             distributed: false,

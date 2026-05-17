@@ -110,7 +110,7 @@ fn register_metric_descriptions() {
     describe_counter!("celeriant_cache_log_file_misses_total", "Log file LRU misses");
 
     // WAL and storage
-    describe_gauge!("celeriant_wal_index", "Current WAL index");
+    describe_gauge!("celeriant_wal_seq", "Current WAL sequence");
     describe_gauge!("celeriant_log_segments_total", "Active log segment count");
     describe_counter!("celeriant_log_rotations_total", "Log file rotations");
     describe_counter!("celeriant_log_segment_close_total", "Log segment file close events");

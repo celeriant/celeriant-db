@@ -9,7 +9,7 @@ description: Core architecture invariants for Celeriant. Memory bounds, WAL dura
 
 Celeriant supports millions of aggregates per shard. No data structure grows proportional to cardinality.
 
-All long-lived caches use `LruCache` with byte-based capacity derived from a per-shard memory budget. Total memory = `detected_memory * CELERIANT_MEMORY_CONSUMPTION_PERCENT / 100` (default 80%, respects cgroup limits). Divided equally across shards, then split into fixed ratios: recent_write 71.5%, aggregate_snapshots 9%, client_snapshots 9%, schema_cache 9%, WAL index 1.5%.
+All long-lived caches use `LruCache` with byte-based capacity derived from a per-shard memory budget. Total memory = `detected_memory * CELERIANT_MEMORY_CONSUMPTION_PERCENT / 100` (default 80%, respects cgroup limits). Divided equally across shards, then split into fixed ratios: recent_write 71.5%, aggregate_snapshots 9%, client_snapshots 9%, schema_cache 9%, WAL sequence 1.5%.
 
 Scan pollution prevention: entries from WAL scans insert at low priority, only into spare capacity, immediately demoted to LRU tail. A list operation can't flush the hot working set.
 
@@ -51,7 +51,7 @@ The `small-metablock` compile-time feature halves metablock size (1024 -> 512 by
 
 Two separate LRU caches: write snapshots (updated after fsync, used for OCC/idempotency) and read snapshots (updated after replication on leader, used by reads). On leader, writes are invisible to readers until replication completes.
 
-Recent write cache entries carry WAL index. Reads filter by `visible_wal_index`, excluding un-replicated data. The hot cache can hold speculative data without leaking it.
+Recent write cache entries carry WAL sequence. Reads filter by `visible_wal_seq`, excluding un-replicated data. The hot cache can hold speculative data without leaking it.
 
 Read operations are never rejected based on node status. A fenced or catching-up node serves stale reads silently.
 

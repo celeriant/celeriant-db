@@ -168,7 +168,7 @@ async fn test_read_write_key_allows_writes(
         SingleAggregateWrite {
             events: vec![event],
             allow_create: true,
-            expected_event_batch_index: Some(0),
+            expected_version: Some(0),
             enforce_client_idempotency: false,
         },
     );
@@ -245,7 +245,7 @@ async fn test_read_only_key_blocks_writes(
         SingleAggregateWrite {
             events: vec![event],
             allow_create: false,
-            expected_event_batch_index: None,
+            expected_version: None,
             enforce_client_idempotency: false,
         },
     );
@@ -392,7 +392,7 @@ async fn test_secondary_key_works(
         SingleAggregateWrite {
             events: vec![event],
             allow_create: true,
-            expected_event_batch_index: Some(0),
+            expected_version: Some(0),
             enforce_client_idempotency: false,
         },
     );
@@ -440,7 +440,7 @@ async fn test_no_api_keys_allows_all(
         SingleAggregateWrite {
             events: vec![event],
             allow_create: true,
-            expected_event_batch_index: Some(0),
+            expected_version: Some(0),
             enforce_client_idempotency: false,
         },
     );
@@ -472,8 +472,8 @@ async fn test_no_api_keys_allows_all(
 fn create_test_event(event_num: u64) -> DatablockAggregateEvent {
     use std::sync::Arc;
     DatablockAggregateEvent {
-        client_event_index: event_num,
-        event_index: 0,
+        client_seq: event_num,
+        event_seq: 0,
         event_id: None,
         event_timestamp: 1000 + event_num,
         event_type_major: 100,

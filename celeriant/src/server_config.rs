@@ -774,7 +774,7 @@ impl ServerConfig {
             list_page_size: self.list_page_size as usize,
             list_max_concurrent: self.list_max_concurrent,
             read_max_concurrent: self.read_max_concurrent,
-            list_wal_index_cache_bytes: memory_budget.list_wal_index_cache_bytes,
+            list_wal_seq_cache_bytes: memory_budget.list_wal_seq_cache_bytes,
             schema_cache_bytes: memory_budget.schema_cache_bytes,
             max_schema_size_bytes: self.max_schema_size_bytes,
             max_clock_drift_ms: self.max_clock_drift_ms,

@@ -114,7 +114,7 @@ async fn test_cross_shard_write_rejection(
         SingleAggregateWrite {
             events: vec![event_0],
             allow_create: true,
-            expected_event_batch_index: None,
+            expected_version: None,
             enforce_client_idempotency: false,
         },
     );
@@ -123,7 +123,7 @@ async fn test_cross_shard_write_rejection(
         SingleAggregateWrite {
             events: vec![event_1],
             allow_create: true,
-            expected_event_batch_index: None,
+            expected_version: None,
             enforce_client_idempotency: false,
         },
     );
@@ -186,7 +186,7 @@ async fn test_same_shard_write_success(
         SingleAggregateWrite {
             events: vec![event_a],
             allow_create: true,
-            expected_event_batch_index: None,
+            expected_version: None,
             enforce_client_idempotency: false,
         },
     );
@@ -195,7 +195,7 @@ async fn test_same_shard_write_success(
         SingleAggregateWrite {
             events: vec![event_b],
             allow_create: true,
-            expected_event_batch_index: None,
+            expected_version: None,
             enforce_client_idempotency: false,
         },
     );
@@ -282,7 +282,7 @@ async fn test_no_partial_writes(server_address: &str) -> Result<(), Box<dyn std:
         SingleAggregateWrite {
             events: vec![event_0],
             allow_create: true,
-            expected_event_batch_index: None,
+            expected_version: None,
             enforce_client_idempotency: false,
         },
     );
@@ -291,7 +291,7 @@ async fn test_no_partial_writes(server_address: &str) -> Result<(), Box<dyn std:
         SingleAggregateWrite {
             events: vec![event_1],
             allow_create: true,
-            expected_event_batch_index: None,
+            expected_version: None,
             enforce_client_idempotency: false,
         },
     );
@@ -344,10 +344,10 @@ async fn test_no_partial_writes(server_address: &str) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-fn create_event(client_event_index: u64, message: String) -> DatablockAggregateEvent {
+fn create_event(client_seq: u64, message: String) -> DatablockAggregateEvent {
     DatablockAggregateEvent {
-        client_event_index,
-        event_index: 0,
+        client_seq,
+        event_seq: 0,
         event_id: Some(rand::random()),
         event_timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

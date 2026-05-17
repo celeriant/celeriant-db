@@ -37,7 +37,7 @@ LogSegmentFileMetadata
 - Separate reader/writer DmaFile handles via `dup()`. Readers never block writers.
 - Dual cursors: `write` tracks in-progress writes, `read` tracks replicated/visible data. The reverse scanner uses `read` exclusively.
 - After rotation, the new file's `read` cursor is `None` until the first successful replication.
-- Log segment rotation carries `wal_index` and `tip_hash` from the old file's write cursor into the new file's header. Hash chain and WAL sequence are unbroken across file boundaries.
+- Log segment rotation carries `wal_seq` and `tip_hash` from the old file's write cursor into the new file's header. Hash chain and WAL sequence are unbroken across file boundaries.
 - Sealed segments produce a separate sidecar `.summary` file, never embedded in the WAL.
 - Log segments are preallocated at creation. Minimum valid size: 1.5MB (two 512KB headers + one usable block).
 - All lock acquisitions use 1-second timeout wrappers. Timeout returns `PotentialDeadlock`.
@@ -49,7 +49,7 @@ LogSegmentFileMetadata
 | `LogSegmentsCache` | Manages active + cached log files with LRU eviction |
 | `LogSegmentFile` | Single log file with reader/writer handles and metadata |
 | `LogSegmentFileMetadata` | In-memory state: dual cursors, file_len, carry-over bytes |
-| `LogSegmentCursor` | Snapshot of positions, wal_index, bloom filter, tip_hash |
+| `LogSegmentCursor` | Snapshot of positions, wal_seq, bloom filter, tip_hash |
 | `AggregateKeyBloom` | Per-segment bloom filter for aggregate key filtering |
 | `ReverseMetablockScanner` | Scans metablocks backwards across log files |
 | `OpenOrCreateError` | Errors opening or creating log files |
@@ -109,7 +109,7 @@ pub struct LogSegmentCursor {
     pub log_id: u64,
     pub metablocks_position: u64,   // End of last metablock (grows from header end)
     pub datablocks_position: u64,   // Start of most recent datablock (grows from rear)
-    pub wal_index: u64,             // Shard-global WAL index at this cursor
+    pub wal_seq: u64,             // Shard-global WAL sequence at this cursor
     pub aggregate_key_bloom: AggregateKeyBloom,
     pub tip_hash: EntryHashBytes,   // blake3 hash chain for distributed verification
 }
@@ -127,14 +127,14 @@ pub struct LogSegmentFile {
 }
 ```
 
-Metadata (cursors, bloom filter, wal_index) is stored in a separate `RefCell`, not inside the `RwLock` with the file handles. This enables a critical optimization:
+Metadata (cursors, bloom filter, wal_seq) is stored in a separate `RefCell`, not inside the `RwLock` with the file handles. This enables a critical optimization:
 
 ```rust
 // After fsync completes, update metadata without blocking readers:
 let mut metadata = log_segment_file.metadata.borrow_mut();
 metadata.write.metablocks_position = new_metablocks_position;
 metadata.write.datablocks_position = new_datablocks_position;
-metadata.write.wal_index = new_wal_index;
+metadata.write.wal_seq = new_wal_seq;
 // Readers can immediately see new data boundaries
 ```
 
@@ -142,17 +142,17 @@ metadata.write.wal_index = new_wal_index;
 
 **Single-threaded safety:** Celeriant uses glommio's thread-per-core model. Each shard runs on exactly one thread, so `RefCell` is safe. The `RwLock` on file handles exists for async coordination (multiple tasks on same thread), not thread safety.
 
-### Rotation carry-over: wal_index and tip_hash
+### Rotation carry-over: wal_seq and tip_hash
 
-When rotating to a new log file, `wal_index` and `tip_hash` are read from the current active file's `write` cursor and written into the new file's header:
+When rotating to a new log file, `wal_seq` and `tip_hash` are read from the current active file's `write` cursor and written into the new file's header:
 
 ```rust
 pub async fn rotate(&self, shard_dir: &PathBuf, preallocate_bytes: u64) -> Result<Self, OpenOrCreateError> {
-    let (new_log_id, wal_index, tip_hash) = {
+    let (new_log_id, wal_seq, tip_hash) = {
         let meta = self.metadata.borrow();
-        (meta.log_id + 1, meta.write.wal_index, meta.write.tip_hash)
+        (meta.log_id + 1, meta.write.wal_seq, meta.write.tip_hash)
     };
-    // ... create new file with wal_index and tip_hash ...
+    // ... create new file with wal_seq and tip_hash ...
 }
 ```
 
@@ -206,7 +206,7 @@ pub fn rollback_write_position(&self)
 If replication fails after writes have been fsynced, the write cursor must be reset to the last known replicated state. Two cases are handled:
 
 - **Read on active file**: Reset `write` to `read` directly.
-- **Read still on previous file** (just rotated): Reset active file's `write` cursor to an empty state (positions at header boundaries) carrying over `wal_index`, `tip_hash`, and bloom from the previous file's last known cursor. Also resets the previous file's `write` to its `read`.
+- **Read still on previous file** (just rotated): Reset active file's `write` cursor to an empty state (positions at header boundaries) carrying over `wal_seq`, `tip_hash`, and bloom from the previous file's last known cursor. Also resets the previous file's `write` to its `read`.
 
 ### Deadlock detection
 

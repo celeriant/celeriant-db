@@ -607,7 +607,7 @@ fn draw_aggregate_context(f: &mut Frame, app: &App, area: Rect) {
             ]));
             info_lines.push(Line::from(vec![
                 Span::styled("Max event index: ", Style::default().fg(DIM_COLOR)),
-                Span::raw(info.max_event_index.to_string()),
+                Span::raw(info.max_event_seq.to_string()),
             ]));
             if info.is_deleted {
                 info_lines.push(Line::from(Span::styled(
@@ -763,7 +763,7 @@ fn draw_trim_start(f: &mut Frame, app: &App, area: Rect) {
     };
     let is_active = app.input_mode == InputMode::Editing;
     let is_disabled = !has_info;
-    render_input_field(f, chunks[1], "Keep From Batch Index", value, placeholder, is_active, is_disabled);
+    render_input_field(f, chunks[1], "Keep From version", value, placeholder, is_active, is_disabled);
 
     // Help text or confirmation prompt
     let help_lines = if app.pending_action == Some(PendingAction::Trim) {
@@ -788,7 +788,7 @@ fn draw_trim_start(f: &mut Frame, app: &App, area: Rect) {
     } else {
         vec![
             Line::from(""),
-            Line::from("Press 'e' or 'i' to edit the batch index"),
+            Line::from("Press 'e' or 'i' to edit the aggregate version"),
             Line::from("Press 'x' to execute the trim"),
             Line::from("Press Esc or 'q' to go back"),
             Line::from(""),

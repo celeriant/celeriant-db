@@ -138,12 +138,12 @@ async fn check_aggregatedetails(client: &mut CeleriantClient, args: AggregateKey
     match &response {
         ClientResponse::AggregateDetails(res) => {
             println!("Aggregate details:");
-            println!("  Batch index range: {} - {}", res.min_event_batch_index, res.max_event_batch_index);
-            println!("  Max event index: {}", res.max_event_index);
+            println!("  Aggregate version range: {} - {}", res.min_aggregate_version, res.max_aggregate_version);
+            println!("  Max event index: {}", res.max_event_seq);
             println!("  Deleted: {}", res.is_deleted);
             if res.is_deleted {
                 println!("  Allow recreate: {}", res.allow_recreate);
-                println!("  Allow index continuation: {}", res.allow_index_continuation);
+                println!("  Allow index continuation: {}", res.allow_sequence_continuation);
             }
             println!("  Last server timestamp: {}", format_timestamp(res.last_server_timestamp));
             println!("  Last client ID: {}", format_u128_uuid(res.last_client_id));
@@ -168,7 +168,7 @@ async fn read_events(client: &mut CeleriantClient, args: ReadArgs) -> Result<()>
     let mut filters = ReadFilters::new(args.from);
 
     if let Some(to) = args.to {
-        filters = filters.to_event_batch_index(to);
+        filters = filters.to_aggregate_version(to);
     }
     if let Some(types) = args.event_types {
         filters = filters.include_event_types(types);
@@ -197,17 +197,17 @@ async fn read_events(client: &mut CeleriantClient, args: ReadArgs) -> Result<()>
     if let Some(ts) = args.max_event_timestamp {
         filters = filters.max_event_timestamp(ts);
     }
-    if let Some(idx) = args.min_event_index {
-        filters = filters.min_event_index(idx);
+    if let Some(idx) = args.min_event_seq {
+        filters = filters.min_event_seq(idx);
     }
-    if let Some(idx) = args.max_event_index {
-        filters = filters.max_event_index(idx);
+    if let Some(idx) = args.max_event_seq {
+        filters = filters.max_event_seq(idx);
     }
-    if let Some(idx) = args.min_client_event_index {
-        filters = filters.min_client_event_index(idx);
+    if let Some(idx) = args.min_client_seq {
+        filters = filters.min_client_seq(idx);
     }
-    if let Some(idx) = args.max_client_event_index {
-        filters = filters.max_client_event_index(idx);
+    if let Some(idx) = args.max_client_seq {
+        filters = filters.max_client_seq(idx);
     }
 
     let request = ClientRequest::Read(ReadRequest {
@@ -226,12 +226,12 @@ async fn read_events(client: &mut CeleriantClient, args: ReadArgs) -> Result<()>
                 }
                 OutputFormat::Table | OutputFormat::Compact => {
                     println!("Read {} event batches", res.event_batches.len());
-                    if let Some(next) = res.next_event_batch_index {
-                        println!("Next batch index: {}", next);
+                    if let Some(next) = res.next_aggregate_version {
+                        println!("Next aggregate version: {}", next);
                     }
                     println!();
                     for batch in &res.event_batches {
-                        println!("Batch {} ({})", batch.event_batch_index, format_timestamp(batch.server_timestamp));
+                        println!("Batch {} ({})", batch.aggregate_version, format_timestamp(batch.server_timestamp));
                         println!("  Client: {}, Events: {}", format_u128_uuid(batch.client_id), batch.events.len());
                         for event in &batch.events {
                             let data_preview: String = String::from_utf8_lossy(&event.event_value)
@@ -269,10 +269,10 @@ async fn write_event(client: &mut CeleriantClient, args: WriteArgs, identity_cli
 
     let event = DatablockAggregateEvent {
         event_type_major: args.event_type,
-        client_event_index: 0,
+        client_seq: 0,
         event_timestamp: chrono::Utc::now().timestamp_millis() as u64,
         event_value: std::sync::Arc::new(data),
-        event_index: 0,
+        event_seq: 0,
         event_id: None,
         event_type_minor: 0,
         iv: None,
@@ -282,7 +282,7 @@ async fn write_event(client: &mut CeleriantClient, args: WriteArgs, identity_cli
     writes.insert(key, SingleAggregateWrite {
         events: vec![event],
         allow_create: args.allow_create,
-        expected_event_batch_index: args.expected_index,
+        expected_version: args.expected_version,
         enforce_client_idempotency: args.enforce_idempotency,
     });
 
@@ -317,7 +317,7 @@ async fn trim_start(client: &mut CeleriantClient, args: TrimArgs, identity_clien
     let request = ClientRequest::TrimStart(TrimStartRequest {
         correlation_id: args.key.correlation_id,
         aggregate_key: key,
-        keep_from_event_batch_index: args.keep_from,
+        keep_from_aggregate_version: args.keep_from,
         client_id,
         user_id: args.user_id,
     });
@@ -349,8 +349,8 @@ async fn delete_aggregate(client: &mut CeleriantClient, args: DeleteArgs, identi
     let mut deletes = HashMap::new();
     deletes.insert(key, SingleAggregateDelete {
         allow_recreate: args.allow_recreate,
-        allow_index_continuation: args.allow_index_continuation,
-        expected_event_batch_index: args.expected_index,
+        allow_sequence_continuation: args.allow_sequence_continuation,
+        expected_version: args.expected_version,
     });
 
     let request = ClientRequest::Delete(DeleteRequest {
@@ -523,10 +523,10 @@ async fn list_aggregates(client: &mut CeleriantClient, args: ListAggregatesArgs)
                 "aggregate_id": format_u128_uuid(i.aggregate_id),
                 "is_deleted": i.is_deleted,
                 "event_batch_count": i.event_batch_count,
-                "min_event_batch_index": i.min_event_batch_index,
-                "max_event_batch_index": i.max_event_batch_index,
-                "min_event_index": i.min_event_index,
-                "max_event_index": i.max_event_index,
+                "min_aggregate_version": i.min_aggregate_version,
+                "max_aggregate_version": i.max_aggregate_version,
+                "min_event_seq": i.min_event_seq,
+                "max_event_seq": i.max_event_seq,
                 "compressed_size": i.compressed_size,
                 "uncompressed_size": i.uncompressed_size,
                 "min_server_timestamp": i.min_server_timestamp,
@@ -549,8 +549,8 @@ async fn list_aggregates(client: &mut CeleriantClient, args: ListAggregatesArgs)
                     } else {
                         "-".to_string()
                     };
-                    let events = if item.min_event_batch_index > 0 {
-                        format!("{}-{}", item.min_event_batch_index, item.max_event_batch_index)
+                    let events = if item.min_aggregate_version > 0 {
+                        format!("{}-{}", item.min_aggregate_version, item.max_aggregate_version)
                     } else {
                         "-".to_string()
                     };

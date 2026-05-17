@@ -36,7 +36,7 @@ use celeriant_wal::aggregate_client_key::AggregateClientKey;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::aggregate_type_key::AggregateTypeKey;
 use celeriant_wal::schema_key::SchemaKey;
-use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH};
+use celeriant_wal::constants::{FIRST_AGGREGATE_VERSION, FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH};
 use celeriant_wal::datablocks::datablock::Datablock;
 use celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
 use celeriant_wal::segment_summary::SegmentSummaryPayload;
@@ -295,7 +295,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             config.recent_write_cache_bytes,
             config.aggregate_snapshots_cache_bytes,
             config.aggregate_client_snapshots_cache_bytes,
-            config.list_wal_index_cache_bytes,
+            config.list_wal_seq_cache_bytes,
             config.schema_cache_bytes,
             config.internode_max_request_size,
         );
@@ -325,8 +325,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         Self::pre_warm_cache(&log_segments_cache, &shard_mem_cache, &config, &dict_codec).await?;
 
-        let recovered_wal_index = log_segments_cache.active().metadata.borrow().write.wal_index;
-        metrics::gauge!("celeriant_wal_index", &metrics_shard_label).set(recovered_wal_index as f64);
+        let recovered_wal_seq = log_segments_cache.active().metadata.borrow().write.wal_seq;
+        metrics::gauge!("celeriant_wal_seq", &metrics_shard_label).set(recovered_wal_seq as f64);
 
         Ok(Self {
             dict_codec,
@@ -409,10 +409,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                                 soft_delete.aggregate_key,
                                 log_id,
                                 metablock_absolute_pos,
-                                soft_delete.event_index,
-                                soft_delete.event_batch_index,
+                                soft_delete.event_seq,
+                                soft_delete.aggregate_version,
                                 soft_delete.allow_recreate,
-                                soft_delete.allow_index_continuation,
+                                soft_delete.allow_sequence_continuation,
                                 CachePath::Write,
                             );
                             warmup_agg_count += 1;
@@ -437,9 +437,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                             let snapshot = MemSnapshotAggregate::found(
                                 log_id,
                                 metablock_absolute_pos,
-                                soft_trim.event_index,
-                                soft_trim.event_batch_index,
-                                soft_trim.keep_from_event_batch_index,
+                                soft_trim.event_seq,
+                                soft_trim.aggregate_version,
+                                soft_trim.keep_from_aggregate_version,
                             );
                             cache.put_aggregate_snapshot_only(soft_trim.aggregate_key, snapshot, false, CachePath::Write);
                             warmup_agg_count += 1;
@@ -481,13 +481,13 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     let snapshot = MemSnapshotAggregate::found(
                         log_id,
                         metablock_absolute_pos,
-                        metablock_bytes::read_event_batch_max_event_index(metablock_bytes),
-                        metablock_bytes::read_event_batch_event_batch_index(metablock_bytes),
-                        metablock_bytes::read_event_batch_min_event_batch_index(metablock_bytes),
+                        metablock_bytes::read_event_batch_max_event_seq(metablock_bytes),
+                        metablock_bytes::read_event_batch_aggregate_version(metablock_bytes),
+                        metablock_bytes::read_event_batch_min_aggregate_version(metablock_bytes),
                     );
                     let client_id = metablock_bytes::read_event_batch_client_id(metablock_bytes);
-                    let last_client_event_index = metablock_bytes::read_event_batch_max_client_event_index(metablock_bytes);
-                    cache.put_aggregate_into_cache(aggregate_key, snapshot, client_id, last_client_event_index, false, CachePath::Write);
+                    let last_client_seq = metablock_bytes::read_event_batch_max_client_seq(metablock_bytes);
+                    cache.put_aggregate_into_cache(aggregate_key, snapshot, client_id, last_client_seq, false, CachePath::Write);
                     warmup_agg_count += 1;
                     agg_cache_full = cache.is_aggregate_snapshot_cache_full(CachePath::Write);
                     client_cache_full = cache.is_aggregate_client_cache_full();
@@ -495,8 +495,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     let client_id = metablock_bytes::read_event_batch_client_id(metablock_bytes);
                     let client_key = AggregateClientKey::new(aggregate_key, client_id);
                     if !cache.is_aggregate_client_cache_full_or_contains(&client_key) {
-                        let last_client_event_index = metablock_bytes::read_event_batch_max_client_event_index(metablock_bytes);
-                        cache.put_aggregate_client_into_cache(client_key, last_client_event_index, false);
+                        let last_client_seq = metablock_bytes::read_event_batch_max_client_seq(metablock_bytes);
+                        cache.put_aggregate_client_into_cache(client_key, last_client_seq, false);
                         warmup_client_count += 1;
                         client_cache_full = cache.is_aggregate_client_cache_full();
                     }
@@ -760,8 +760,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         struct AccumulatedStats {
             is_deleted: bool,
             event_batch_count: u64,
-            min_event_batch_index: u64,
-            max_event_batch_index: u64,
+            min_aggregate_version: u64,
+            max_aggregate_version: u64,
             max_server_timestamp: u64,
             compressed_size: u64,
             uncompressed_size: u64,
@@ -783,10 +783,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                         event_batch_count: stats.event_batch_count,
                         min_event_timestamp: 0,
                         max_event_timestamp: 0,
-                        min_event_batch_index: if stats.min_event_batch_index == u64::MAX { 0 } else { stats.min_event_batch_index },
-                        max_event_batch_index: stats.max_event_batch_index,
-                        min_event_index: 0,
-                        max_event_index: 0,
+                        min_aggregate_version: if stats.min_aggregate_version == u64::MAX { 0 } else { stats.min_aggregate_version },
+                        max_aggregate_version: stats.max_aggregate_version,
+                        min_event_seq: 0,
+                        max_event_seq: 0,
                         min_server_timestamp: 0,
                         max_server_timestamp: stats.max_server_timestamp,
                         compressed_size: stats.compressed_size,
@@ -800,7 +800,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         fn process_aggregate_entry(
             org_id: u128, aggregate_type_id: u128, aggregate_id: u128,
             is_deleted: bool, event_batch_count: u64,
-            min_event_batch_index: u64, last_event_batch_index: u64,
+            min_aggregate_version: u64, last_aggregate_version: u64,
             last_server_timestamp: u64, compressed_size: u64, uncompressed_size: u64,
             filter_org_id: Option<u128>, filter_aggregate_type_id: Option<u128>,
             seen: &mut HashMap<AggregateKey, AccumulatedStats>,
@@ -819,7 +819,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 if !seen.contains_key(&key) {
                     seen.insert(key.clone(), AccumulatedStats {
                         is_deleted: true, event_batch_count: 0,
-                        min_event_batch_index: u64::MAX, max_event_batch_index: 0,
+                        min_aggregate_version: u64::MAX, max_aggregate_version: 0,
                         max_server_timestamp: 0, compressed_size: 0, uncompressed_size: 0,
                     });
                     result_order.push(key);
@@ -831,8 +831,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             if let Some(stats) = seen.get_mut(&key) {
                 if !stats.is_deleted {
                     stats.event_batch_count += event_batch_count;
-                    stats.min_event_batch_index = stats.min_event_batch_index.min(min_event_batch_index);
-                    stats.max_event_batch_index = stats.max_event_batch_index.max(last_event_batch_index);
+                    stats.min_aggregate_version = stats.min_aggregate_version.min(min_aggregate_version);
+                    stats.max_aggregate_version = stats.max_aggregate_version.max(last_aggregate_version);
                     stats.max_server_timestamp = stats.max_server_timestamp.max(last_server_timestamp);
                     stats.compressed_size += compressed_size;
                     stats.uncompressed_size += uncompressed_size;
@@ -841,8 +841,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 seen.insert(key.clone(), AccumulatedStats {
                     is_deleted: false,
                     event_batch_count,
-                    min_event_batch_index,
-                    max_event_batch_index: last_event_batch_index,
+                    min_aggregate_version,
+                    max_aggregate_version: last_aggregate_version,
                     max_server_timestamp: last_server_timestamp,
                     compressed_size,
                     uncompressed_size,
@@ -874,7 +874,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 for (key, entry) in &summary {
                     process!(key.org_id, key.aggregate_type_id, key.aggregate_id,
                         entry.is_deleted, entry.event_batch_count,
-                        entry.min_event_batch_index, entry.last_event_batch_index,
+                        entry.min_aggregate_version, entry.last_aggregate_version,
                         entry.last_server_timestamp, entry.compressed_size, entry.uncompressed_size);
                 }
                 active_log_id.saturating_sub(1)
@@ -897,7 +897,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     for entry in &payload.aggregates {
                         process!(entry.org_id, entry.aggregate_type_id, entry.aggregate_id,
                             entry.is_deleted, entry.event_batch_count,
-                            entry.min_event_batch_index, entry.last_event_batch_index,
+                            entry.min_aggregate_version, entry.last_aggregate_version,
                             entry.last_server_timestamp, entry.compressed_size, entry.uncompressed_size);
                     }
                 }
@@ -921,7 +921,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                         }
 
                         let ak = metablock_bytes::read_event_batch_aggregate_key(bytes);
-                        let ebi = metablock_bytes::read_event_batch_event_batch_index(bytes);
+                        let ebi = metablock_bytes::read_event_batch_aggregate_version(bytes);
                         let ts = metablock_bytes::read_server_timestamp(bytes);
                         let csz = metablock_bytes::read_compressed_size(bytes);
                         let usz = metablock_bytes::read_uncompressed_size(bytes);
@@ -960,12 +960,12 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         Ok(AggregateDetailsResponse {
             correlation_id: exists_request.correlation_id,
-            min_event_batch_index: snapshot.min_event_batch_index,
-            max_event_batch_index: snapshot.event_batch_index,
-            max_event_index: snapshot.event_index,
+            min_aggregate_version: snapshot.min_aggregate_version,
+            max_aggregate_version: snapshot.aggregate_version,
+            max_event_seq: snapshot.event_seq,
             is_deleted,
             allow_recreate: snapshot.allow_recreate,
-            allow_index_continuation: snapshot.allow_index_continuation,
+            allow_sequence_continuation: snapshot.allow_sequence_continuation,
             last_server_timestamp,
             last_client_id,
             last_user_id,
@@ -1012,8 +1012,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
     pub async fn trim_start(&self, trim_request: TrimStartRequest) -> Result<SuccessResponse, ShardTrimError> {
         
-        let lease_index = match self.node_status.get().effective_node_status() {
-            NodeStatus::Leader { lease_index } => lease_index,
+        let lease_epoch = match self.node_status.get().effective_node_status() {
+            NodeStatus::Leader { lease_epoch } => lease_epoch,
             NodeStatus::Standalone => 0,
             _ => return Err(ShardTrimError::ShardCannotAcceptWrites { leader_address: self.leader_client_address.borrow().clone() }),
         };
@@ -1025,20 +1025,20 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             return Err(ShardTrimError::AggregateNotExists);
         }
 
-        let current_indexes = self.shard_mem_cache.borrow_mut().get_write_event_indexes(aggregate_key);
+        let current_indexes = self.shard_mem_cache.borrow_mut().get_write_event_seqes(aggregate_key);
 
         // Validate trim index is within valid range
-        if trim_request.keep_from_event_batch_index <= current_indexes.min_event_batch_index {
+        if trim_request.keep_from_aggregate_version <= current_indexes.min_aggregate_version {
             // Already trimmed to this point or beyond, nothing to do
             return Ok(SuccessResponse {
                 correlation_id: trim_request.correlation_id,
             });
         }
 
-        if trim_request.keep_from_event_batch_index > current_indexes.event_batch_index {
+        if trim_request.keep_from_aggregate_version > current_indexes.aggregate_version {
             return Err(ShardTrimError::TrimIndexOutOfRange {
-                requested: trim_request.keep_from_event_batch_index,
-                max_event_batch_index: current_indexes.event_batch_index,
+                requested: trim_request.keep_from_aggregate_version,
+                max_aggregate_version: current_indexes.aggregate_version,
             });
         }
 
@@ -1046,17 +1046,17 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         let metablock_soft_trim = MetablockSoftTrim {
             aggregate_key: aggregate_key.clone(),
-            keep_from_event_batch_index: trim_request.keep_from_event_batch_index,
-            event_batch_index: current_indexes.event_batch_index,
-            event_index: current_indexes.event_index,
+            keep_from_aggregate_version: trim_request.keep_from_aggregate_version,
+            aggregate_version: current_indexes.aggregate_version,
+            event_seq: current_indexes.event_seq,
             client_id: trim_request.client_id,
             user_id: trim_request.user_id,
         };
 
         let metablock = Metablock {
-            wal_index: 0,
+            wal_seq: 0,
             server_timestamp,
-            lease_index,
+            lease_epoch,
             node_id: self.config.node_id,
             compressed_size: 0,
             uncompressed_size: 0,
@@ -1075,7 +1075,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
             shard_mem_cache.add_pending_trim_to_queue(
                 aggregate_key,
-                trim_request.keep_from_event_batch_index,
+                trim_request.keep_from_aggregate_version,
                 shard_log_queue_item,
             );
         }
@@ -1094,8 +1094,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     
     pub async fn delete(&self, delete_request: DeleteRequest) -> Result<SuccessResponse, ShardDeleteError> {
         
-        let lease_index = match self.node_status.get().effective_node_status() {
-            NodeStatus::Leader { lease_index } => lease_index,
+        let lease_epoch = match self.node_status.get().effective_node_status() {
+            NodeStatus::Leader { lease_epoch } => lease_epoch,
             NodeStatus::Standalone => 0,
             _ => return Err(ShardDeleteError::ShardCannotAcceptWrites { leader_address: self.leader_client_address.borrow().clone() }),
         };
@@ -1112,14 +1112,14 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 return Err(ShardDeleteError::AggregateNotExists);
             }
 
-            let aggregate_current_indexes = self.shard_mem_cache.borrow_mut().get_write_event_indexes(aggregate_key);
+            let aggregate_current_indexes = self.shard_mem_cache.borrow_mut().get_write_event_seqes(aggregate_key);
 
             // Validate optimistic concurrency
-            if let Some(expected) = single_delete.expected_event_batch_index {
-                if expected != aggregate_current_indexes.event_batch_index {
+            if let Some(expected) = single_delete.expected_version {
+                if expected != aggregate_current_indexes.aggregate_version {
                     return Err(ShardDeleteError::OptimisticConcurrencyViolation {
-                        expected_event_batch_index: expected,
-                        current_event_batch_index: aggregate_current_indexes.event_batch_index,
+                        expected_version: expected,
+                        current_aggregate_version: aggregate_current_indexes.aggregate_version,
                     });
                 }
             }
@@ -1128,17 +1128,17 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
             let metablock_soft_delete = MetablockSoftDelete {
                 aggregate_key: aggregate_key.clone(),
-                event_batch_index: aggregate_current_indexes.event_batch_index,
-                event_index: aggregate_current_indexes.event_index,
+                aggregate_version: aggregate_current_indexes.aggregate_version,
+                event_seq: aggregate_current_indexes.event_seq,
                 client_id: delete_request.client_id,
                 user_id: delete_request.user_id,
                 allow_recreate: single_delete.allow_recreate,
-                allow_index_continuation: single_delete.allow_index_continuation,
+                allow_sequence_continuation: single_delete.allow_sequence_continuation,
             };
             let metablock = Metablock {
-                wal_index: 0,
+                wal_seq: 0,
                 server_timestamp,
-                lease_index,
+                lease_epoch,
                 node_id: self.config.node_id,
                 compressed_size: 0,
                 uncompressed_size: 0,
@@ -1160,10 +1160,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             for (aggregate_key, soft_delete, shard_log_queue_item) in prepared_deletes {
                 shard_mem_cache.add_pending_delete_to_queue(
                     &aggregate_key,
-                    soft_delete.event_index,
-                    soft_delete.event_batch_index,
+                    soft_delete.event_seq,
+                    soft_delete.aggregate_version,
                     soft_delete.allow_recreate,
-                    soft_delete.allow_index_continuation,
+                    soft_delete.allow_sequence_continuation,
                     shard_log_queue_item,
                 );
             }
@@ -1192,8 +1192,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     pub async fn write(&self, write_request: WriteRequest) -> Result<SuccessResponse, ShardWriteError> {
         
         let status = self.node_status.get();
-        let lease_index = match status.effective_node_status() {
-            NodeStatus::Leader { lease_index } => lease_index,
+        let lease_epoch = match status.effective_node_status() {
+            NodeStatus::Leader { lease_epoch } => lease_epoch,
             NodeStatus::Standalone => 0,
             other => {
                 debug!(effective = ?other, raw = ?status.raw(), expires_at_ms = status.lease_expires_at_ms(), now_ms = validated_node_status::unix_epoch_now_ms(), "Write rejected: not Leader/Standalone");
@@ -1281,7 +1281,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             // Validate that no event uses the sentinel 0 event type
             if let Some(ev) = single_write.events.iter().find(|e| e.event_type_major == 0) {
                 return Err(ShardWriteError::ZeroEventType {
-                    client_event_index: ev.client_event_index,
+                    client_seq: ev.client_seq,
                 });
             }
 
@@ -1294,7 +1294,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 // Check if it was deleted with allow_recreate = false
                 let (is_loaded, status) = self.shard_mem_cache.borrow_mut().aggregate_load_status(&aggregate_key, CachePath::Write);
                 if is_loaded && status == AggregateStatus::Deleted {
-                    let indexes = self.shard_mem_cache.borrow_mut().get_write_event_indexes(&aggregate_key);
+                    let indexes = self.shard_mem_cache.borrow_mut().get_write_event_seqes(&aggregate_key);
                     if !indexes.allow_recreate {
                         return Err(ShardWriteError::AggregateRecreateNotAllowed);
                     }
@@ -1318,7 +1318,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
             // Validate and prepare - reads from memcache but does not mutate
             let prepared = self.validate_and_prepare_write(
-                lease_index,
+                lease_epoch,
                 &aggregate_key,
                 write_request.client_id,
                 write_request.user_id,
@@ -1379,11 +1379,11 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         // 1. Ensure aggregate exists and is cached
         if !self.aggregate_exists_and_cache(aggregate_key, CachePath::Read).await? {
-            let visible_wal_index = self.log_segments_cache.get_latest_read_cursor().wal_index;
+            let visible_wal_seq = self.log_segments_cache.get_latest_read_cursor().wal_seq;
             debug!(
                 shard_id = self.config.shard_id,
                 aggregate_key = %aggregate_key,
-                visible_wal_index,
+                visible_wal_seq,
                 "Read: aggregate not found after disk scan"
             );
             return Err(ShardReadError::AggregateNotExists);
@@ -1392,10 +1392,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let last_known = self.shard_mem_cache.borrow_mut().get_aggregate_last_metablock_pos(aggregate_key, CachePath::Read);
 
         // 2. Validate requested range is available (not trimmed)
-        if filters.from_event_batch_index < last_known.min_event_batch_index {
+        if filters.from_aggregate_version < last_known.min_aggregate_version {
             return Err(ShardReadError::UnavailableBatchIndex {
-                minimum_available: last_known.min_event_batch_index,
-                requested: filters.from_event_batch_index,
+                minimum_available: last_known.min_aggregate_version,
+                requested: filters.from_aggregate_version,
             });
         }
 
@@ -1415,7 +1415,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         Ok(ReadResponse {
             correlation_id: request.correlation_id,
             event_batches,
-            next_event_batch_index: collection.next_event_batch_index,
+            next_aggregate_version: collection.next_aggregate_version,
         })
     }
 
@@ -1541,9 +1541,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     return Ok(None);
                 }
 
-                let last_client_event_index = metablock_bytes::read_event_batch_max_client_event_index(metablock_bytes);
+                let last_client_seq = metablock_bytes::read_event_batch_max_client_seq(metablock_bytes);
 
-                shard_mem_cache.put_aggregate_client_into_cache(target_aggregate_client_key, last_client_event_index, low_priority);
+                shard_mem_cache.put_aggregate_client_into_cache(target_aggregate_client_key, last_client_seq, low_priority);
 
                 if low_priority {
                     Ok(None) //Haven't found aggregate client yet
@@ -1717,10 +1717,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                             searching_for_aggregate_key.clone(),
                             log_id,
                             metablock_absolute_pos,
-                            soft_delete.event_index,
-                            soft_delete.event_batch_index,
+                            soft_delete.event_seq,
+                            soft_delete.aggregate_version,
                             soft_delete.allow_recreate,
-                            soft_delete.allow_index_continuation,
+                            soft_delete.allow_sequence_continuation,
                             cache_path,
                         );
                     }
@@ -1735,9 +1735,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                         let snapshot = MemSnapshotAggregate::found(
                             log_id,
                             metablock_absolute_pos,
-                            soft_trim.event_index,
-                            soft_trim.event_batch_index,
-                            soft_trim.keep_from_event_batch_index,
+                            soft_trim.event_seq,
+                            soft_trim.aggregate_version,
+                            soft_trim.keep_from_aggregate_version,
                         );
                         let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
                         shard_mem_cache.put_aggregate_snapshot_only(
@@ -1764,20 +1764,20 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     return Ok(None);
                 }
 
-                let min_event_batch_index = metablock_bytes::read_event_batch_min_event_batch_index(metablock_bytes);
+                let min_aggregate_version = metablock_bytes::read_event_batch_min_aggregate_version(metablock_bytes);
 
                 let snapshot = MemSnapshotAggregate::found(
                     log_id,
                     metablock_absolute_pos,
-                    metablock_bytes::read_event_batch_max_event_index(metablock_bytes),
-                    metablock_bytes::read_event_batch_event_batch_index(metablock_bytes),
-                    min_event_batch_index,
+                    metablock_bytes::read_event_batch_max_event_seq(metablock_bytes),
+                    metablock_bytes::read_event_batch_aggregate_version(metablock_bytes),
+                    min_aggregate_version,
                 );
 
                 let client_id = metablock_bytes::read_event_batch_client_id(metablock_bytes);
-                let last_client_event_index = metablock_bytes::read_event_batch_max_client_event_index(metablock_bytes);
+                let last_client_seq = metablock_bytes::read_event_batch_max_client_seq(metablock_bytes);
 
-                shard_mem_cache.put_aggregate_into_cache(current_aggregate_key, snapshot, client_id, last_client_event_index, low_priority, cache_path);
+                shard_mem_cache.put_aggregate_into_cache(current_aggregate_key, snapshot, client_id, last_client_seq, low_priority, cache_path);
 
                 if low_priority {
                     Ok(None) //Haven't found aggregate yet
@@ -1809,7 +1809,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     /// This performs read-only access to shard_mem_cache and can fail.
     fn validate_and_prepare_write(
         &self,
-        lease_index: u64,
+        lease_epoch: u64,
         aggregate_key: &AggregateKey,
         client_id: u128,
         user_id: Option<u128>,
@@ -1817,7 +1817,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     ) -> Result<PreparedWrite, ShardWriteError> {
         let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
 
-        let aggregate_current_indexes = shard_mem_cache.get_write_event_indexes(aggregate_key);
+        let aggregate_current_indexes = shard_mem_cache.get_write_event_seqes(aggregate_key);
 
         // There is a soft delete entry in the queue that hasn't been committed yet
         if aggregate_current_indexes.pending_delete_or_deleted && !aggregate_current_indexes.allow_recreate {
@@ -1825,38 +1825,38 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         }
 
         // Validate optimistic concurrency (only for existing aggregates, not recreates)
-        if let Some(expected) = write_request.expected_event_batch_index {
-            if expected != aggregate_current_indexes.event_batch_index {
+        if let Some(expected) = write_request.expected_version {
+            if expected != aggregate_current_indexes.aggregate_version {
                 debug!(
                     shard_id = self.config.shard_id,
                     aggregate_key = %aggregate_key,
-                    expected_event_batch_index = expected,
-                    current_event_batch_index = aggregate_current_indexes.event_batch_index,
+                    expected_version = expected,
+                    current_aggregate_version = aggregate_current_indexes.aggregate_version,
                     "Write rejected: optimistic concurrency violation"
                 );
                 return Err(ShardWriteError::OptimisticConcurrencyViolation {
-                    expected_event_batch_index: expected,
-                    current_event_batch_index: aggregate_current_indexes.event_batch_index,
+                    expected_version: expected,
+                    current_aggregate_version: aggregate_current_indexes.aggregate_version,
                 });
             }
         }
 
         // Validate client idempotency
         if write_request.enforce_client_idempotency {
-            if let Some(last_client_event_index) = shard_mem_cache.get_client_event_index(aggregate_key, client_id) {
-                let attempted_client_event_index = write_request.events.iter().map(|e| e.client_event_index).min().unwrap_or(0);
-                if attempted_client_event_index <= last_client_event_index {
+            if let Some(last_client_seq) = shard_mem_cache.get_client_seq(aggregate_key, client_id) {
+                let attempted_client_seq = write_request.events.iter().map(|e| e.client_seq).min().unwrap_or(0);
+                if attempted_client_seq <= last_client_seq {
                     debug!(
                         shard_id = self.config.shard_id,
                         aggregate_key = %aggregate_key,
                         client_id = %celeriant_wal::format_uuid(client_id),
-                        last_client_event_index,
-                        attempted_client_event_index,
+                        last_client_seq,
+                        attempted_client_seq,
                         "Write rejected: client idempotency violation"
                     );
                     return Err(ShardWriteError::ClientIdempotencyViolation {
-                        last_client_event_index,
-                        attempted_client_event_index,
+                        last_client_seq,
+                        attempted_client_seq,
                     });
                 }
             }
@@ -1879,7 +1879,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                         ShardWriteError::SchemaValidationFailed {
                             event_type_major: event.event_type_major,
                             event_type_minor: event.event_type_minor,
-                            client_event_index: event.client_event_index,
+                            client_seq: event.client_seq,
                             validation_error: e,
                         }
                     })?;
@@ -1888,7 +1888,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     return Err(ShardWriteError::SchemaCompilationFailed {
                         event_type_major: event.event_type_major,
                         event_type_minor: event.event_type_minor,
-                        client_event_index: event.client_event_index,
+                        client_seq: event.client_seq,
                         compilation_error: err.clone(),
                     });
                 }
@@ -1901,37 +1901,37 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         // Determine starting indexes based on whether this is a recreate with index continuation
         let is_recreate = aggregate_current_indexes.pending_delete_or_deleted 
-            || aggregate_current_indexes.event_batch_index == 0;
+            || aggregate_current_indexes.aggregate_version == 0;
         
-        let (mut event_index, event_batch_index, mut min_event_batch_index) = if is_recreate && aggregate_current_indexes.allow_index_continuation {
+        let (mut event_seq, aggregate_version, mut min_aggregate_version) = if is_recreate && aggregate_current_indexes.allow_sequence_continuation {
             // Continue from pre-deletion indexes
             (
-                aggregate_current_indexes.event_index,
-                aggregate_current_indexes.event_batch_index.saturating_add(1),
-                aggregate_current_indexes.min_event_batch_index,
+                aggregate_current_indexes.event_seq,
+                aggregate_current_indexes.aggregate_version.saturating_add(1),
+                aggregate_current_indexes.min_aggregate_version,
             )
         } else if is_recreate {
             // Fresh start
-            (0, FIRST_EVENT_BATCH_INDEX, FIRST_EVENT_BATCH_INDEX)
+            (0, FIRST_AGGREGATE_VERSION, FIRST_AGGREGATE_VERSION)
         } else {
             // Normal append to existing aggregate
             (
-                aggregate_current_indexes.event_index,
-                aggregate_current_indexes.event_batch_index.saturating_add(1),
-                aggregate_current_indexes.min_event_batch_index,
+                aggregate_current_indexes.event_seq,
+                aggregate_current_indexes.aggregate_version.saturating_add(1),
+                aggregate_current_indexes.min_aggregate_version,
             )
         };
 
-        if min_event_batch_index == 0 {
-            min_event_batch_index = FIRST_EVENT_BATCH_INDEX;
+        if min_aggregate_version == 0 {
+            min_aggregate_version = FIRST_AGGREGATE_VERSION;
         }
 
         // Prepare event data
         let mut events_in_batch = std::mem::take(&mut write_request.events);
 
         for e in events_in_batch.iter_mut() {
-            event_index = event_index.saturating_add(1);
-            e.event_index = event_index;
+            event_seq = event_seq.saturating_add(1);
+            e.event_seq = event_seq;
         }
 
         let event_type_extraction = extract_unique_event_types(&events_in_batch);
@@ -1946,7 +1946,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let has_encrypted_events = events_in_batch.iter().any(|e| e.iv.is_some());
 
         let datablock_aggregate_event_batch = DatablockAggregateEventBatch {
-            event_batch_index,
+            aggregate_version,
             events: events_in_batch,
         };
 
@@ -1954,11 +1954,11 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             client_id,
             user_id,
             aggregate_key.clone(),
-            min_event_batch_index,
+            min_aggregate_version,
             &datablock_aggregate_event_batch,
             event_types_data,
         );
-        let latest_client_event_index = metablock_event_batch.max_client_event_index;
+        let latest_client_seq = metablock_event_batch.max_client_seq;
 
         let datablock = Datablock {
             datablock_kind: DatablockKind::EventBatchItem(datablock_aggregate_event_batch),
@@ -1973,9 +1973,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let server_timestamp = self.config.timestamp_config.now();
 
         let metablock = Metablock {
-            wal_index: 0,
+            wal_seq: 0,
             server_timestamp,
-            lease_index,
+            lease_epoch,
             node_id: self.config.node_id,
             uncompressed_size: serialized_datablock.uncompressed_size,
             compressed_size: serialized_datablock.compressed_size,
@@ -1992,11 +1992,11 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         Ok(PreparedWrite {
             aggregate_key: aggregate_key.clone(),
             client_id,
-            event_index,
-            event_batch_index,
-            latest_client_event_index,
+            event_seq,
+            aggregate_version,
+            latest_client_seq,
             shard_log_queue_item,
-            min_event_batch_index,
+            min_aggregate_version,
         })
     }
 
@@ -2008,11 +2008,11 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         for prepared in prepared_writes {
             shard_mem_cache.add_to_pending_append_queue(
                 &prepared.aggregate_key,
-                prepared.event_index,
-                prepared.event_batch_index,
-                prepared.min_event_batch_index,
+                prepared.event_seq,
+                prepared.aggregate_version,
+                prepared.min_aggregate_version,
                 prepared.client_id,
-                prepared.latest_client_event_index,
+                prepared.latest_client_seq,
                 prepared.shard_log_queue_item,
             );
         }
@@ -2156,7 +2156,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 let reason = match r {
                     FollowerRejection::NotAFollower => "not_follower",
                     FollowerRejection::TimeDriftTooHigh { .. } => "time_drift",
-                    FollowerRejection::WalIndexMismatch { .. } => "wal_index_mismatch",
+                    FollowerRejection::WalSeqMismatch { .. } => "wal_seq_mismatch",
                     FollowerRejection::TipHashMismatch { .. } => "tip_hash_mismatch",
                     FollowerRejection::EmptyBatch => "empty_batch",
                     FollowerRejection::MissingDatablock => "missing_datablock",
@@ -2174,8 +2174,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             }
         };
 
-        let leader_lease_index = match self.node_status.get().effective_node_status() {
-            NodeStatus::Follower { leader_lease_index } => leader_lease_index,
+        let leader_lease_epoch = match self.node_status.get().effective_node_status() {
+            NodeStatus::Follower { leader_lease_epoch } => leader_lease_epoch,
             _ => return Ok(response(ReplicationResult::Rejected(FollowerRejection::NotAFollower))),
         };
 
@@ -2191,11 +2191,11 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             return Ok(response(ReplicationResult::Rejected(FollowerRejection::EmptyBatch)));
         }
 
-        let batch_lease_index = request.batches[0].metablock.lease_index;
-        if batch_lease_index < leader_lease_index {
+        let batch_lease_epoch = request.batches[0].metablock.lease_epoch;
+        if batch_lease_epoch < leader_lease_epoch {
             return Ok(response(ReplicationResult::Rejected(FollowerRejection::StaleLease {
-                follower_lease_index: leader_lease_index,
-                received_lease_index: batch_lease_index,
+                follower_lease_epoch: leader_lease_epoch,
+                received_lease_epoch: batch_lease_epoch,
             })));
         }
 
@@ -2204,33 +2204,33 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             &self.log_segments_cache, &self.shard_mem_cache, &request.batches, &self.dict_codec,
         ) {
             Ok(()) => {}
-            Err(ApplyBatchError::WalIndexMismatch { current, batch_first }) => {
+            Err(ApplyBatchError::WalSeqMismatch { current, batch_first }) => {
                 tracing::warn!(
                     shard_id,
                     follower_wal = current,
                     batch_first_wal = batch_first,
-                    batch_lease = batch_lease_index,
-                    "Replication batch rejected: WalIndexMismatch"
+                    batch_lease = batch_lease_epoch,
+                    "Replication batch rejected: WalSeqMismatch"
                 );
-                return Ok(response(ReplicationResult::Rejected(FollowerRejection::WalIndexMismatch {
-                    max_follower_wal_index: current,
+                return Ok(response(ReplicationResult::Rejected(FollowerRejection::WalSeqMismatch {
+                    max_follower_wal_seq: current,
                 })));
             }
-            Err(ApplyBatchError::TipHashMismatch { current, current_wal_index, batch, batch_wal_index }) => {
+            Err(ApplyBatchError::TipHashMismatch { current, current_wal_seq, batch, batch_wal_seq }) => {
                 tracing::warn!(
                     shard_id,
-                    follower_wal = current_wal_index,
+                    follower_wal = current_wal_seq,
                     follower_tip = ?current,
-                    batch_first_wal = batch_wal_index,
+                    batch_first_wal = batch_wal_seq,
                     batch_first_prev = ?batch,
-                    batch_lease = batch_lease_index,
+                    batch_lease = batch_lease_epoch,
                     "Replication batch rejected: TipHashMismatch (follower's tip at follower_wal != batch's prev_hash)"
                 );
                 return Ok(response(ReplicationResult::Rejected(FollowerRejection::TipHashMismatch {
                     follower: current,
-                    follower_wal_index: current_wal_index,
+                    follower_wal_seq: current_wal_seq,
                     leader: batch,
-                    leader_wal_index: batch_wal_index,
+                    leader_wal_seq: batch_wal_seq,
                 })));
             }
             Err(ApplyBatchError::MissingDatablock) => {
@@ -2242,19 +2242,19 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             Err(ApplyBatchError::BlockBecameInline) => {
                 return Err(FollowerReplicationWriteError::BlockBecameInline);
             }
-            Err(ApplyBatchError::BatchWalIndexGap { index, expected, actual }) => {
-                return Err(FollowerReplicationWriteError::BatchWalIndexGap { index, expected, actual });
+            Err(ApplyBatchError::BatchWalSeqGap { index, expected, actual }) => {
+                return Err(FollowerReplicationWriteError::BatchWalSeqGap { index, expected, actual });
             }
         }
 
         // Promotion-batch floor: bounds the range we'd upload if we became leader.
         // Monotonic max guards against retries / out-of-order arrival.
         {
-            let new_floor = request.leader_confirmed_wal_index.saturating_add(1);
+            let new_floor = request.leader_confirmed_wal_seq.saturating_add(1);
             let active = self.log_segments_cache.active();
             let mut meta = active.metadata.borrow_mut();
-            if new_floor > meta.last_received_replication_wal_index {
-                meta.last_received_replication_wal_index = new_floor;
+            if new_floor > meta.last_received_replication_wal_seq {
+                meta.last_received_replication_wal_seq = new_floor;
             }
         }
 
@@ -2277,13 +2277,13 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     /// after failing to get our ACK (partition). We kept the batch. On promotion,
     /// upload it to S3 so the old leader can catch up without a gap.
     pub async fn upload_s3_promotion_batch(&self) -> Result<(), crate::error::replication_to_s3_error::ReplicateToS3Error> {
-        let (start_wal_index, current_wal_index) = {
+        let (start_wal_seq, current_wal_seq) = {
             let active = self.log_segments_cache.active();
             let metadata = active.metadata.borrow();
-            (metadata.last_received_replication_wal_index, metadata.write.wal_index)
+            (metadata.last_received_replication_wal_seq, metadata.write.wal_seq)
         };
 
-        if start_wal_index == 0 || start_wal_index > current_wal_index {
+        if start_wal_seq == 0 || start_wal_seq > current_wal_seq {
             return Ok(());
         }
 
@@ -2292,12 +2292,12 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let max_bytes = self.config.max_promotion_batch_bytes;
 
         let mut items = match scan_for_promotion_batch(
-            &self.log_segments_cache, start_wal_index, max_bytes, read_max_chunk_size,
+            &self.log_segments_cache, start_wal_seq, max_bytes, read_max_chunk_size,
         ).await? {
             PromotionBatchScan::Collected(items) => items,
             PromotionBatchScan::BudgetExceeded => {
                 tracing::warn!(
-                    shard_id, start_wal_index, current_wal_index, max_bytes = ?max_bytes,
+                    shard_id, start_wal_seq, current_wal_seq, max_bytes = ?max_bytes,
                     "Promotion batch exceeds max_promotion_batch_bytes — skipping upload; demoted peer must catch up via leader-side S3 fallback"
                 );
                 metrics::counter!(
@@ -2306,7 +2306,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 ).increment(1);
                 // Clear so we don't re-scan the same unbridgeable range next role change.
                 let active = self.log_segments_cache.active();
-                active.metadata.borrow_mut().last_received_replication_wal_index = 0;
+                active.metadata.borrow_mut().last_received_replication_wal_seq = 0;
                 return Ok(());
             }
         };
@@ -2332,14 +2332,14 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             .collect();
 
         let batch_count = batch_items.len();
-        info!(shard_id, batch_count, start_wal_index, current_wal_index, "Uploading promotion batch to S3");
+        info!(shard_id, batch_count, start_wal_seq, current_wal_seq, "Uploading promotion batch to S3");
 
         self.replication_client.replicate_to_s3(batch_items).await?;
 
         // Clear the field now that S3 has the data
         {
             let active = self.log_segments_cache.active();
-            active.metadata.borrow_mut().last_received_replication_wal_index = 0;
+            active.metadata.borrow_mut().last_received_replication_wal_seq = 0;
         }
 
         Ok(())
@@ -2350,19 +2350,19 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 struct PreparedWrite {
     aggregate_key: AggregateKey,
     client_id: u128,
-    event_index: u64,
-    event_batch_index: u64,
-    min_event_batch_index: u64,
-    latest_client_event_index: u64,
+    event_seq: u64,
+    aggregate_version: u64,
+    min_aggregate_version: u64,
+    latest_client_seq: u64,
     shard_log_queue_item: ShardLogQueueItem,
 }
 
 /// Result of size-bounded metablock collection
 struct MetablockCollection {
-    /// Metablocks that fit within max_bytes, sorted by batch index ascending
+    /// Metablocks that fit within max_bytes, sorted by aggregate version ascending
     kept_metablocks: Vec<EventBatchFromLogSegmentFile>,
-    /// If we hit the size limit, this is the next batch index to continue from
-    next_event_batch_index: Option<u64>,
+    /// If we hit the size limit, this is the next aggregate version to continue from
+    next_aggregate_version: Option<u64>,
 }
 
 /// Outcome of `scan_for_promotion_batch`.
@@ -2371,12 +2371,12 @@ enum PromotionBatchScan {
     BudgetExceeded,
 }
 
-/// Scan the active segment backwards for metablocks at or above `start_wal_index`,
+/// Scan the active segment backwards for metablocks at or above `start_wal_seq`,
 /// tallying `uncompressed_size`. Returns `BudgetExceeded` if the running sum overshoots
 /// `max_bytes`. Items are in reverse-WAL order; caller must `.reverse()` before use.
 async fn scan_for_promotion_batch(
     log_segments_cache: &LogSegmentsCache,
-    start_wal_index: u64,
+    start_wal_seq: u64,
     max_bytes: Option<u64>,
     read_max_chunk_size: u64,
 ) -> Result<PromotionBatchScan, crate::error::replication_to_s3_error::ReplicateToS3Error> {
@@ -2390,8 +2390,8 @@ async fn scan_for_promotion_batch(
     let mut budget_exceeded = false;
     scanner
         .scan(|log_id, _pos, bytes| {
-            let wal_index = metablock_bytes::read_wal_index(bytes);
-            if wal_index < start_wal_index {
+            let wal_seq = metablock_bytes::read_wal_seq(bytes);
+            if wal_seq < start_wal_seq {
                 return Ok(Some(()));
             }
             let metablock = deserialise_metablock(bytes)?;
@@ -2418,9 +2418,9 @@ async fn scan_for_promotion_batch(
 }
 
 impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
-    fn get_batch_index(metablock: &Metablock) -> u64 {
+    fn get_aggregate_version(metablock: &Metablock) -> u64 {
         match &metablock.wal_metablock_type {
-            MetablockKind::EventBatchMetadata(m) => m.event_batch_index,
+            MetablockKind::EventBatchMetadata(m) => m.aggregate_version,
             _ => 0,
         }
     }
@@ -2434,42 +2434,42 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     ) -> Result<MetablockCollection, ScanError<DiskFormatError>> {
         let mut kept: Vec<EventBatchFromLogSegmentFile> = Vec::new();
         let mut cumulative_size: u64 = 0;
-        let mut evicted_batch_index: Option<u64> = None;
+        let mut evicted_version: Option<u64> = None;
 
-        // Try cache first (iterates forward from from_event_batch_index)
+        // Try cache first (iterates forward from from_aggregate_version)
         self.collect_from_cache_bounded(
             aggregate_key,
             filters,
             max_bytes,
             &mut kept,
             &mut cumulative_size,
-            &mut evicted_batch_index,
+            &mut evicted_version,
         );
 
-        // Check if we need disk (cache doesn't cover from_event_batch_index)
-        let cache_min_batch = kept.first().map(|k| Self::get_batch_index(&k.metablock));
-        let need_disk = cache_min_batch.map(|min| min > filters.from_event_batch_index).unwrap_or(true);
+        // Check if we need disk (cache doesn't cover from_aggregate_version)
+        let cache_min_batch = kept.first().map(|k| Self::get_aggregate_version(&k.metablock));
+        let need_disk = cache_min_batch.map(|min| min > filters.from_aggregate_version).unwrap_or(true);
 
         if need_disk && last_known.metablock_absolute_pos > 0 {
             let disk_to = cache_min_batch.map(|min| min.saturating_sub(1));
 
             self.collect_from_disk_bounded(
                 aggregate_key,
-                filters.from_event_batch_index,
-                disk_to.or(filters.to_event_batch_index),
+                filters.from_aggregate_version,
+                disk_to.or(filters.to_aggregate_version),
                 last_known,
                 filters,
                 max_bytes,
                 &mut kept,
                 &mut cumulative_size,
-                &mut evicted_batch_index,
+                &mut evicted_version,
             )
             .await?;
         }
 
         Ok(MetablockCollection {
             kept_metablocks: kept,
-            next_event_batch_index: evicted_batch_index,
+            next_aggregate_version: evicted_version,
         })
     }
 
@@ -2480,16 +2480,16 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         max_bytes: u64,
         kept: &mut Vec<EventBatchFromLogSegmentFile>,
         cumulative_size: &mut u64,
-        evicted_batch_index: &mut Option<u64>,
+        evicted_version: &mut Option<u64>,
     ) {
         let shard_mem_cache = self.shard_mem_cache.borrow();
         let log_segments_cache = self.log_segments_cache.get_latest_read_cursor();
         let kept_before = kept.len();
 
-        // Cache iterates forward (ascending batch index) from from_event_batch_index
-        for (batch_idx, write) in shard_mem_cache.get_cached_writes_from(aggregate_key, filters.from_event_batch_index, log_segments_cache.wal_index) {
+        // Cache iterates forward (ascending aggregate version) from from_aggregate_version
+        for (batch_idx, write) in shard_mem_cache.get_cached_writes_from(aggregate_key, filters.from_aggregate_version, log_segments_cache.wal_seq) {
             // Stop if past upper bound
-            if filters.to_event_batch_index.map_or(false, |to| batch_idx > to) {
+            if filters.to_aggregate_version.map_or(false, |to| batch_idx > to) {
                 break;
             }
 
@@ -2503,7 +2503,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             // Check if adding this batch would exceed budget
             // (allow at least one batch even if over budget)
             if *cumulative_size + batch_size > max_bytes && !kept.is_empty() {
-                *evicted_batch_index = Some(batch_idx);
+                *evicted_version = Some(batch_idx);
                 break;
             }
 
@@ -2533,7 +2533,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         max_bytes: u64,
         kept: &mut Vec<EventBatchFromLogSegmentFile>,
         cumulative_size: &mut u64,
-        evicted_batch_index: &mut Option<u64>,
+        evicted_version: &mut Option<u64>,
     ) -> Result<(), ScanError<DiskFormatError>> {
         // Use a VecDeque for efficient eviction from the "newest" end
         let mut disk_kept: VecDeque<EventBatchFromLogSegmentFile> = VecDeque::new();
@@ -2556,15 +2556,15 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     return Ok(None); // Continue - different aggregate
                 }
 
-                let batch_index = metablock_bytes::read_event_batch_event_batch_index(bytes);
+                let aggregate_version = metablock_bytes::read_event_batch_aggregate_version(bytes);
 
                 // Stop when we've gone past our requested range
-                if batch_index < from_batch {
+                if aggregate_version < from_batch {
                     return Ok(Some(())); // Stop - past our range
                 }
 
                 // Skip if above the range we need (cache already has newer)
-                if to_batch.map_or(false, |to| batch_index > to) {
+                if to_batch.map_or(false, |to| aggregate_version > to) {
                     return Ok(None); // Continue - will be served from cache
                 }
 
@@ -2587,14 +2587,14 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 while disk_cumulative > budget_for_disk && disk_kept.len() > 1 {
                     if let Some(evicted) = disk_kept.pop_front() {
                         disk_cumulative -= evicted.metablock.uncompressed_size;
-                        let evicted_idx = Self::get_batch_index(&evicted.metablock);
+                        let evicted_idx = Self::get_aggregate_version(&evicted.metablock);
                         // Track lowest evicted as continuation point
-                        match evicted_batch_index {
+                        match evicted_version {
                             Some(existing) if evicted_idx < *existing => {
-                                *evicted_batch_index = Some(evicted_idx);
+                                *evicted_version = Some(evicted_idx);
                             }
                             None => {
-                                *evicted_batch_index = Some(evicted_idx);
+                                *evicted_version = Some(evicted_idx);
                             }
                             _ => {}
                         }
@@ -2647,9 +2647,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     pub async fn enter_s3_catchup(&self) -> Result<S3CatchupResult, S3CatchupError> {
 
         let catchup_status = match self.node_status.get().raw() {
-            NodeStatus::Follower { leader_lease_index }
-            | NodeStatus::FollowerCatchingUp { leader_lease_index } => {
-                NodeStatus::FollowerCatchingUp { leader_lease_index }
+            NodeStatus::Follower { leader_lease_epoch }
+            | NodeStatus::FollowerCatchingUp { leader_lease_epoch } => {
+                NodeStatus::FollowerCatchingUp { leader_lease_epoch }
             }
             NodeStatus::BootCatchup => NodeStatus::BootCatchup,
             _ => NodeStatus::BootCatchup,
@@ -2678,8 +2678,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let max_schema_size = self.config.max_schema_size_bytes as usize;
 
         // Validate we can accept writes
-        let lease_index = match self.node_status.get().effective_node_status() {
-            NodeStatus::Leader { lease_index } => lease_index,
+        let lease_epoch = match self.node_status.get().effective_node_status() {
+            NodeStatus::Leader { lease_epoch } => lease_epoch,
             NodeStatus::Standalone => 0,
             _ => return Err(ShardSchemaError::ShardCannotAcceptWrites {
                 leader_address: self.leader_client_address.borrow().clone(),
@@ -2747,9 +2747,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         })?;
 
         let metablock = Metablock {
-            wal_index: 0,
+            wal_seq: 0,
             server_timestamp,
-            lease_index,
+            lease_epoch,
             node_id: self.config.node_id,
             uncompressed_size: serialized_datablock.uncompressed_size,
             compressed_size: serialized_datablock.compressed_size,
@@ -2865,7 +2865,7 @@ mod tests {
             list_page_size: 100,
             list_max_concurrent: 16,
             list_max_duration: Duration::from_secs(2),
-            list_wal_index_cache_bytes: 1024 * 1024,
+            list_wal_seq_cache_bytes: 1024 * 1024,
             schema_cache_bytes: 4 * 1024 * 1024,
             max_schema_size_bytes: 16384,
             max_catchup_gap_bytes: Some(100 * 1024 * 1024),
@@ -2888,7 +2888,7 @@ mod tests {
     fn events(count: usize) -> Vec<DatablockAggregateEvent> {
         (1..=count as u64)
             .map(|i| DatablockAggregateEvent {
-                client_event_index: i,
+                client_seq: i,
                 event_type_major: 1,
                 event_value: Arc::new(vec![i as u8; 8]),
                 ..Default::default()
@@ -2914,7 +2914,7 @@ mod tests {
             SingleAggregateWrite {
                 events: evts,
                 allow_create,
-                expected_event_batch_index: expected_batch,
+                expected_version: expected_batch,
                 enforce_client_idempotency: enforce_idempotency,
             },
         );
@@ -2956,7 +2956,7 @@ mod tests {
     fn delete_req_full(
         agg: AggregateKey,
         allow_recreate: bool,
-        allow_index_continuation: bool,
+        allow_sequence_continuation: bool,
         expected: Option<u64>,
     ) -> ClientRequest {
         let mut deletes = HashMap::new();
@@ -2964,8 +2964,8 @@ mod tests {
             agg,
             SingleAggregateDelete {
                 allow_recreate,
-                allow_index_continuation,
-                expected_event_batch_index: expected,
+                allow_sequence_continuation: allow_sequence_continuation,
+                expected_version: expected,
             },
         );
         ClientRequest::Delete(DeleteRequest {
@@ -2980,7 +2980,7 @@ mod tests {
         ClientRequest::TrimStart(TrimStartRequest {
             correlation_id: None,
             aggregate_key: agg,
-            keep_from_event_batch_index: keep_from,
+            keep_from_aggregate_version: keep_from,
             client_id: 1,
             user_id: None,
         })
@@ -3042,7 +3042,7 @@ mod tests {
             SingleAggregateWrite {
                 events: evts,
                 allow_create: true,
-                expected_event_batch_index: None,
+                expected_version: None,
                 enforce_client_idempotency: false,
             },
         );
@@ -3111,7 +3111,7 @@ mod tests {
             let read = unwrap_read(process(&shard, read_req(agg)).await);
             assert_eq!(read.event_batches.len(), 1);
             assert_eq!(read.event_batches[0].events.len(), 3);
-            assert_eq!(read.event_batches[0].event_batch_index, 1);
+            assert_eq!(read.event_batches[0].aggregate_version, 1);
 
             shard.close().await;
         });
@@ -3126,7 +3126,7 @@ mod tests {
 
             for batch_num in 1u64..=5 {
                 let evts = vec![DatablockAggregateEvent {
-                    client_event_index: batch_num,
+                    client_seq: batch_num,
                     event_type_major: 1,
                     event_value: Arc::new(vec![batch_num as u8]),
                     ..Default::default()
@@ -3137,7 +3137,7 @@ mod tests {
             let read = unwrap_read(process(&shard, read_req(agg)).await);
             assert_eq!(read.event_batches.len(), 5);
             for (i, batch) in read.event_batches.iter().enumerate() {
-                assert_eq!(batch.event_batch_index, (i + 1) as u64);
+                assert_eq!(batch.aggregate_version, (i + 1) as u64);
             }
 
             shard.close().await;
@@ -3206,9 +3206,9 @@ mod tests {
             write_ok(&shard, write_req(agg.clone(), events(1))).await;
 
             let resp = unwrap_exists(process(&shard, exists_req(agg)).await);
-            assert_eq!(resp.min_event_batch_index, FIRST_EVENT_BATCH_INDEX);
-            assert_eq!(resp.max_event_batch_index, FIRST_EVENT_BATCH_INDEX);
-            assert_eq!(resp.max_event_index, 1);
+            assert_eq!(resp.min_aggregate_version, FIRST_AGGREGATE_VERSION);
+            assert_eq!(resp.max_aggregate_version, FIRST_AGGREGATE_VERSION);
+            assert_eq!(resp.max_event_seq, 1);
             assert!(!resp.is_deleted);
             assert!(resp.last_server_timestamp > 0);
             assert_eq!(resp.last_client_id, 1);
@@ -3308,7 +3308,7 @@ mod tests {
             let shard = open_shard(&dir).await;
 
             let evts = vec![DatablockAggregateEvent {
-                client_event_index: 1,
+                client_seq: 1,
                 event_type_major: 0,
                 event_value: Arc::new(vec![1]),
                 ..Default::default()
@@ -3382,16 +3382,16 @@ mod tests {
             let shard = open_shard(&dir).await;
             let agg = key(1, 1, 1);
 
-            // Write with client_id=1, client_event_index=1 (batch index becomes 1)
+            // Write with client_id=1, client_seq=1 (aggregate version becomes 1)
             let req = write_req_full(agg.clone(), events(1), true, None, 1, true);
             write_ok(&shard, req).await;
 
-            // Write with client_id=2 to advance batch index to 2
+            // Write with client_id=2 to advance aggregate version to 2
             let req = write_req_full(agg.clone(), events(1), true, Some(1), 2, false);
             write_ok(&shard, req).await;
 
-            // Write with client_id=1, client_event_index=1 (idempotency violation)
-            // AND stale expected_event_batch_index=1 (OCC violation, current is 2)
+            // Write with client_id=1, client_seq=1 (idempotency violation)
+            // AND stale expected_version=1 (OCC violation, current is 2)
             // OCC should fire first
             let req = write_req_full(agg, events(1), true, Some(1), 1, true);
             let result = process(&shard, req).await;
@@ -3461,7 +3461,7 @@ mod tests {
 
             let read = unwrap_read(process(&shard, read_req(agg)).await);
             assert_eq!(read.event_batches.len(), 1);
-            assert_eq!(read.event_batches[0].event_batch_index, FIRST_EVENT_BATCH_INDEX);
+            assert_eq!(read.event_batches[0].aggregate_version, FIRST_AGGREGATE_VERSION);
 
             shard.close().await;
         });
@@ -3485,7 +3485,7 @@ mod tests {
 
             let read = unwrap_read(process(&shard, read_req_from(agg, 4)).await);
             assert_eq!(read.event_batches.len(), 1);
-            assert_eq!(read.event_batches[0].event_batch_index, 4);
+            assert_eq!(read.event_batches[0].aggregate_version, 4);
 
             shard.close().await;
         });
@@ -3694,8 +3694,8 @@ mod tests {
             let _ = process(&shard, trim_req(agg.clone(), 3)).await.unwrap();
 
             let resp = unwrap_exists(process(&shard, exists_req(agg)).await);
-            assert_eq!(resp.min_event_batch_index, 3);
-            assert_eq!(resp.max_event_batch_index, FIRST_EVENT_BATCH_INDEX + 4);
+            assert_eq!(resp.min_aggregate_version, 3);
+            assert_eq!(resp.max_aggregate_version, FIRST_AGGREGATE_VERSION + 4);
             assert!(!resp.is_deleted);
 
             shard.close().await;
@@ -3725,7 +3725,7 @@ mod tests {
         fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
         fn reset_heartbeat_state(&self) {}
 
-        async fn replicate_to_follower(&self, _batches: Vec<celeriant_msg::request::requests::ReplicationBatchItem>, _leader_confirmed_wal_index: u64) -> Result<(), ReplicateToFollowerError> {
+        async fn replicate_to_follower(&self, _batches: Vec<celeriant_msg::request::requests::ReplicationBatchItem>, _leader_confirmed_wal_seq: u64) -> Result<(), ReplicateToFollowerError> {
             let remaining = self.follower_failures_remaining.get();
             if remaining > 0 {
                 self.follower_failures_remaining.set(remaining - 1);
@@ -3745,7 +3745,7 @@ mod tests {
 
         fn set_follower_address(&self, _address: Option<String>) {}
 
-        async fn send_heartbeat(&self, unix_epoch_now_ms: u64, _lease_index: u64) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
+        async fn send_heartbeat(&self, unix_epoch_now_ms: u64, _lease_epoch: u64) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
             glommio::timer::sleep(std::time::Duration::from_millis(10)).await;
             Ok(celeriant_msg::response::responses::HeartbeatResult::Ack { follower_timestamp_ms: unix_epoch_now_ms + 10, follower_can_accept_tcp_replication: true })
         }
@@ -3754,7 +3754,7 @@ mod tests {
     }
 
     async fn open_leader_shard(dir: &std::path::Path, client: FailThenSucceedReplicationClient) -> ShardWal<FailThenSucceedReplicationClient, StubS3Downloader> {
-        ShardWal::open(test_config(dir), ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_index: 0 }, 500, now_ms() + 10_000), client, StubS3Downloader)
+        ShardWal::open(test_config(dir), ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 0 }, 500, now_ms() + 10_000), client, StubS3Downloader)
             .await
             .unwrap()
     }
@@ -3815,7 +3815,7 @@ mod tests {
             let client = SwitchableReplicationClient::new();
             let shard = ShardWal::open(
                 config,
-                ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_index: 0 }, 500, now_ms() + 30_000),
+                ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 0 }, 500, now_ms() + 30_000),
                 client,
                 StubS3Downloader,
             ).await.unwrap();
@@ -3910,7 +3910,7 @@ mod tests {
     // ── Replication (handle_replication_batch) ──
 
     async fn open_follower_shard(dir: &std::path::Path) -> ShardWal<StubReplicationClient, StubS3Downloader> {
-        ShardWal::open(test_config(dir), ValidatedNodeStatus::create_custom_status(NodeStatus::Follower { leader_lease_index: 0 }, 500, now_ms() + 10_000), StubReplicationClient, StubS3Downloader)
+        ShardWal::open(test_config(dir), ValidatedNodeStatus::create_custom_status(NodeStatus::Follower { leader_lease_epoch: 0 }, 500, now_ms() + 10_000), StubReplicationClient, StubS3Downloader)
             .await
             .unwrap()
     }
@@ -3919,29 +3919,29 @@ mod tests {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
     }
 
-    fn test_metablock(wal_index: u64, previous_tip_hash: [u8; 32]) -> Metablock {
+    fn test_metablock(wal_seq: u64, previous_tip_hash: [u8; 32]) -> Metablock {
         let mut mb = Metablock::default_inline_event_batch_metadata(AggregateKey::new(1, 1, 1));
-        mb.wal_index = wal_index;
+        mb.wal_seq = wal_seq;
         mb.previous_tip_hash = previous_tip_hash;
         mb
     }
 
     fn replication_batch_req(batches: Vec<ReplicationBatchItem>) -> ReplicationBatchRequest {
-        let leader_confirmed_wal_index = batches.first()
-            .map(|b| b.metablock.wal_index.saturating_sub(1))
+        let leader_confirmed_wal_seq = batches.first()
+            .map(|b| b.metablock.wal_seq.saturating_sub(1))
             .unwrap_or(0);
-        replication_batch_req_with_leader_confirmed(batches, leader_confirmed_wal_index)
+        replication_batch_req_with_leader_confirmed(batches, leader_confirmed_wal_seq)
     }
 
     fn replication_batch_req_with_leader_confirmed(
         batches: Vec<ReplicationBatchItem>,
-        leader_confirmed_wal_index: u64,
+        leader_confirmed_wal_seq: u64,
     ) -> ReplicationBatchRequest {
         ReplicationBatchRequest {
             correlation_id: None,
             shard_id: 0,
             leader_timestamp_ms: now_ms(),
-            leader_confirmed_wal_index,
+            leader_confirmed_wal_seq,
             batches,
         }
     }
@@ -3950,9 +3950,9 @@ mod tests {
         result.expect("replication should not error")
     }
 
-    fn replication_item(wal_index: u64, tip_hash: [u8; 32]) -> ReplicationBatchItem {
+    fn replication_item(wal_seq: u64, tip_hash: [u8; 32]) -> ReplicationBatchItem {
         ReplicationBatchItem {
-            metablock: test_metablock(wal_index, tip_hash),
+            metablock: test_metablock(wal_seq, tip_hash),
             datablock: None,
         }
     }
@@ -4001,20 +4001,20 @@ mod tests {
     }
 
     #[test]
-    fn replication_rejects_wal_index_gap() {
+    fn replication_rejects_wal_seq_gap() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let shard = open_follower_shard(&dir).await;
 
-            // Follower at wal_index=0, batch starts at 5 (expects 1)
+            // Follower at wal_seq=0, batch starts at 5 (expects 1)
             let resp = unwrap_replication(
                 shard.handle_replication_batch(replication_batch_req(vec![replication_item(5, GENESIS_HASH)])).await,
             );
             match resp.result {
-                ReplicationResult::Rejected(FollowerRejection::WalIndexMismatch { max_follower_wal_index }) => {
-                    assert_eq!(max_follower_wal_index, 0);
+                ReplicationResult::Rejected(FollowerRejection::WalSeqMismatch { max_follower_wal_seq }) => {
+                    assert_eq!(max_follower_wal_seq, 0);
                 }
-                other => panic!("expected WalIndexMismatch, got {other:?}"),
+                other => panic!("expected WalSeqMismatch, got {other:?}"),
             }
 
             shard.close().await;
@@ -4027,7 +4027,7 @@ mod tests {
             let (_tmp, dir) = test_dir();
             let shard = open_follower_shard(&dir).await;
 
-            // Correct wal_index but wrong tip hash
+            // Correct wal_seq but wrong tip hash
             let resp = unwrap_replication(
                 shard.handle_replication_batch(replication_batch_req(vec![replication_item(1, [0xFF; 32])])).await,
             );
@@ -4059,9 +4059,9 @@ mod tests {
             );
             assert!(matches!(resp.result, ReplicationResult::Success { .. }));
 
-            // Verify WAL index advanced
-            let final_wal_index = shard.log_segments_cache.active().metadata.borrow().write.wal_index;
-            assert_eq!(final_wal_index, 2);
+            // Verify WAL sequence advanced
+            let final_wal_seq = shard.log_segments_cache.active().metadata.borrow().write.wal_seq;
+            assert_eq!(final_wal_seq, 2);
 
             shard.close().await;
         });
@@ -4077,7 +4077,7 @@ mod tests {
                 correlation_id: None,
                 shard_id: 0,
                 leader_timestamp_ms: 1000, // ancient timestamp
-                leader_confirmed_wal_index: 0,
+                leader_confirmed_wal_seq: 0,
                 batches: vec![replication_item(1, GENESIS_HASH)],
             };
             let resp = unwrap_replication(shard.handle_replication_batch(stale_request).await);
@@ -4106,19 +4106,19 @@ mod tests {
         fn current_heartbeat_started_at_unix_ms(&self) -> Option<u64> { None }
         fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
         fn reset_heartbeat_state(&self) {}
-        async fn replicate_to_follower(&self, _batches: Vec<ReplicationBatchItem>, _leader_confirmed_wal_index: u64) -> Result<(), ReplicateToFollowerError> { Ok(()) }
+        async fn replicate_to_follower(&self, _batches: Vec<ReplicationBatchItem>, _leader_confirmed_wal_seq: u64) -> Result<(), ReplicateToFollowerError> { Ok(()) }
         async fn replicate_to_s3(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error> {
             self.s3_uploads.borrow_mut().push(batches);
             Ok(())
         }
-        async fn send_heartbeat(&self, unix_epoch_now_ms: u64, _lease_index: u64) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
+        async fn send_heartbeat(&self, unix_epoch_now_ms: u64, _lease_epoch: u64) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
             Ok(celeriant_msg::response::responses::HeartbeatResult::Ack { follower_timestamp_ms: unix_epoch_now_ms + 10, follower_can_accept_tcp_replication: true })
         }
         async fn send_kick(&self) -> Result<bool, crate::error::send_heartbeat_error::SendHeartbeatError> { Ok(true) }
     }
 
     async fn open_follower_shard_capturing(dir: &std::path::Path, client: CapturingReplicationClient) -> ShardWal<CapturingReplicationClient, StubS3Downloader> {
-        ShardWal::open(test_config(dir), ValidatedNodeStatus::create_custom_status(NodeStatus::Follower { leader_lease_index: 0 }, 500, now_ms() + 10_000), client, StubS3Downloader)
+        ShardWal::open(test_config(dir), ValidatedNodeStatus::create_custom_status(NodeStatus::Follower { leader_lease_epoch: 0 }, 500, now_ms() + 10_000), client, StubS3Downloader)
             .await
             .unwrap()
     }
@@ -4128,33 +4128,33 @@ mod tests {
     ) -> ShardWal<CapturingReplicationClient, StubS3Downloader> {
         let mut cfg = test_config(dir);
         cfg.max_promotion_batch_bytes = Some(cap_bytes);
-        ShardWal::open(cfg, ValidatedNodeStatus::create_custom_status(NodeStatus::Follower { leader_lease_index: 0 }, 500, now_ms() + 10_000), client, StubS3Downloader)
+        ShardWal::open(cfg, ValidatedNodeStatus::create_custom_status(NodeStatus::Follower { leader_lease_epoch: 0 }, 500, now_ms() + 10_000), client, StubS3Downloader)
             .await
             .unwrap()
     }
 
     /// Metablock with no datablock — avoids deserialization failures in promotion upload tests
-    fn test_metablock_no_datablock(wal_index: u64, previous_tip_hash: [u8; 32]) -> Metablock {
-        let mut mb = test_metablock(wal_index, previous_tip_hash);
+    fn test_metablock_no_datablock(wal_seq: u64, previous_tip_hash: [u8; 32]) -> Metablock {
+        let mut mb = test_metablock(wal_seq, previous_tip_hash);
         mb.datablock = DatablockStorageKind::None;
         mb
     }
 
-    fn replication_item_no_datablock(wal_index: u64, tip_hash: [u8; 32]) -> ReplicationBatchItem {
+    fn replication_item_no_datablock(wal_seq: u64, tip_hash: [u8; 32]) -> ReplicationBatchItem {
         ReplicationBatchItem {
-            metablock: test_metablock_no_datablock(wal_index, tip_hash),
+            metablock: test_metablock_no_datablock(wal_seq, tip_hash),
             datablock: None,
         }
     }
 
-    fn replication_item_with_size(wal_index: u64, tip_hash: [u8; 32], uncompressed_size: u64) -> ReplicationBatchItem {
-        let mut mb = test_metablock_no_datablock(wal_index, tip_hash);
+    fn replication_item_with_size(wal_seq: u64, tip_hash: [u8; 32], uncompressed_size: u64) -> ReplicationBatchItem {
+        let mut mb = test_metablock_no_datablock(wal_seq, tip_hash);
         mb.uncompressed_size = uncompressed_size;
         ReplicationBatchItem { metablock: mb, datablock: None }
     }
 
     #[test]
-    fn replication_sets_last_received_wal_index() {
+    fn replication_sets_last_received_wal_seq() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let shard = open_follower_shard(&dir).await;
@@ -4164,15 +4164,15 @@ mod tests {
             );
             assert!(matches!(resp.result, ReplicationResult::Success { .. }));
 
-            let idx = shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_index;
-            assert_eq!(idx, 1, "should track wal_index of replicated batch");
+            let idx = shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_seq;
+            assert_eq!(idx, 1, "should track wal_seq of replicated batch");
 
             shard.close().await;
         });
     }
 
     #[test]
-    fn replication_advances_last_received_wal_index_on_subsequent_batch() {
+    fn replication_advances_last_received_wal_seq_on_subsequent_batch() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let shard = open_follower_shard(&dir).await;
@@ -4188,14 +4188,14 @@ mod tests {
             );
             assert!(matches!(resp.result, ReplicationResult::Success { .. }));
 
-            let idx = shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_index;
+            let idx = shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_seq;
             assert_eq!(idx, 2, "subsequent batch should advance floor");
 
             shard.close().await;
         });
     }
 
-    /// Floor is `leader_confirmed + 1`, not `batch[0].wal_index`. They coincide
+    /// Floor is `leader_confirmed + 1`, not `batch[0].wal_seq`. They coincide
     /// on contiguous replication and diverge when the leader's confirmed range
     /// runs ahead of what this single batch covers.
     #[test]
@@ -4219,14 +4219,14 @@ mod tests {
             );
             assert!(matches!(resp.result, ReplicationResult::Success { .. }));
 
-            let idx = shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_index;
-            assert_eq!(idx, 101, "floor = leader_confirmed_wal_index + 1, not batch[0].wal_index");
+            let idx = shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_seq;
+            assert_eq!(idx, 101, "floor = leader_confirmed_wal_seq + 1, not batch[0].wal_seq");
 
             shard.close().await;
         });
     }
 
-    /// Floor is monotonic max. A later batch with a lower `leader_confirmed_wal_index`
+    /// Floor is monotonic max. A later batch with a lower `leader_confirmed_wal_seq`
     /// (stale message, retry from before a leader rollback, etc.) must NOT regress
     /// the floor — that would shrink the promotion-batch upload range and risk
     /// dropping in-flight history the demoted peer still needs.
@@ -4243,7 +4243,7 @@ mod tests {
             );
             assert!(matches!(resp.result, ReplicationResult::Success { .. }));
             assert_eq!(
-                shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_index,
+                shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_seq,
                 101,
             );
 
@@ -4255,7 +4255,7 @@ mod tests {
             );
             assert!(matches!(resp.result, ReplicationResult::Success { .. }));
 
-            let idx = shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_index;
+            let idx = shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_seq;
             assert_eq!(idx, 101, "monotonic guard must hold floor at previous high-water mark");
 
             shard.close().await;
@@ -4295,11 +4295,11 @@ mod tests {
             let uploads = shard.replication_client.s3_uploads.borrow();
             assert_eq!(uploads.len(), 1, "should upload exactly one batch");
             assert_eq!(uploads[0].len(), 1, "batch should contain one item");
-            assert_eq!(uploads[0][0].metablock.wal_index, 1);
+            assert_eq!(uploads[0][0].metablock.wal_seq, 1);
             drop(uploads);
 
             // Field should be cleared
-            let idx = shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_index;
+            let idx = shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_seq;
             assert_eq!(idx, 0, "field should be cleared after upload");
 
             // Second call should be a noop
@@ -4330,13 +4330,13 @@ mod tests {
             );
             assert!(matches!(resp.result, ReplicationResult::Success { .. }));
 
-            // Upload should contain only entries from wal_index 2 onward (last batch)
+            // Upload should contain only entries from wal_seq 2 onward (last batch)
             shard.upload_s3_promotion_batch().await.unwrap();
 
             let uploads = shard.replication_client.s3_uploads.borrow();
             assert_eq!(uploads.len(), 1);
             assert_eq!(uploads[0].len(), 1, "should only upload from last_received index");
-            assert_eq!(uploads[0][0].metablock.wal_index, 2);
+            assert_eq!(uploads[0][0].metablock.wal_seq, 2);
 
             shard.close().await;
         });
@@ -4368,7 +4368,7 @@ mod tests {
             assert!(matches!(resp.result, ReplicationResult::Success { .. }));
 
             // Pin the floor at 1 so the scan covers all three metablocks.
-            shard.log_segments_cache.active().metadata.borrow_mut().last_received_replication_wal_index = 1;
+            shard.log_segments_cache.active().metadata.borrow_mut().last_received_replication_wal_seq = 1;
 
             shard.upload_s3_promotion_batch().await.unwrap();
 
@@ -4377,7 +4377,7 @@ mod tests {
                 "no S3 upload when scan exceeds max_promotion_batch_bytes",
             );
             assert_eq!(
-                shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_index,
+                shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_seq,
                 0,
                 "floor must be cleared so subsequent role changes don't re-scan the same range",
             );
@@ -4396,7 +4396,7 @@ mod tests {
                 SingleAggregateWrite {
                     events: evts,
                     allow_create: true,
-                    expected_event_batch_index: expected,
+                    expected_version: expected,
                     enforce_client_idempotency: false,
                 },
             );
@@ -4453,7 +4453,7 @@ mod tests {
             }
 
             let read = unwrap_read(process(&shard, read_req(agg)).await);
-            let indices: Vec<u64> = read.event_batches.iter().map(|b| b.event_batch_index).collect();
+            let indices: Vec<u64> = read.event_batches.iter().map(|b| b.aggregate_version).collect();
             assert_eq!(indices, vec![1, 2, 3, 4, 5]);
 
             shard.close().await;
@@ -4546,7 +4546,7 @@ mod tests {
 
     fn json_events(payloads: &[&[u8]], major: u64, minor: u64) -> Vec<DatablockAggregateEvent> {
         payloads.iter().enumerate().map(|(i, payload)| DatablockAggregateEvent {
-            client_event_index: (i + 1) as u64,
+            client_seq: (i + 1) as u64,
             event_type_major: major,
             event_type_minor: minor,
             event_value: Arc::new(payload.to_vec()),
@@ -4666,7 +4666,7 @@ mod tests {
 
     fn avro_events(payloads: &[&[u8]], major: u64, minor: u64) -> Vec<DatablockAggregateEvent> {
         payloads.iter().enumerate().map(|(i, payload)| DatablockAggregateEvent {
-            client_event_index: (i + 1) as u64,
+            client_seq: (i + 1) as u64,
             event_type_major: major,
             event_type_minor: minor,
             event_value: Arc::new(payload.to_vec()),
@@ -4718,7 +4718,7 @@ mod tests {
 
             // Encrypted event with garbage payload — should pass because iv.is_some() skips validation
             let evts = vec![DatablockAggregateEvent {
-                client_event_index: 1,
+                client_seq: 1,
                 event_type_major: 1,
                 event_type_minor: 0,
                 event_value: Arc::new(b"not valid json at all".to_vec()),
@@ -4978,7 +4978,7 @@ mod tests {
             *slot = h as u8;
         }
         vec![DatablockAggregateEvent {
-            client_event_index: index,
+            client_seq: index,
             event_type_major: 1,
             event_value: Arc::new(bytes),
             ..Default::default()
@@ -5099,7 +5099,7 @@ mod tests {
             // Reading from batch 31 should succeed.
             let read = unwrap_read(process(&shard, read_req_from(agg.clone(), 31)).await);
             assert!(!read.event_batches.is_empty());
-            assert!(read.event_batches.iter().all(|b| b.event_batch_index >= 31));
+            assert!(read.event_batches.iter().all(|b| b.aggregate_version >= 31));
 
             shard.close().await;
         });
@@ -5327,7 +5327,7 @@ mod tests {
             // B readable (only batches 9+).
             let read_b = unwrap_read(process(&shard, read_req_from(agg_b.clone(), 9)).await);
             assert!(!read_b.event_batches.is_empty());
-            assert!(read_b.event_batches.iter().all(|b| b.event_batch_index >= 9));
+            assert!(read_b.event_batches.iter().all(|b| b.aggregate_version >= 9));
 
             // B's early batches unavailable.
             let result = process(&shard, read_req_from(agg_b.clone(), 1)).await;
@@ -5591,7 +5591,7 @@ mod tests {
         });
     }
 
-    // ── Additional compaction tests: list operations, restart, datablock positions, WAL index gaps ──
+    // ── Additional compaction tests: list operations, restart, datablock positions, WAL sequence gaps ──
 
     fn list_aggs_req_with_cursor(org: Option<u128>, atype: Option<u128>, cursor: Option<u64>) -> ClientRequest {
         ClientRequest::ListAggregates(ListAggregatesRequest {
@@ -5829,20 +5829,20 @@ mod tests {
                         // datablock_position must be after the metablock region.
                         assert!(
                             mb.datablock_position >= metablocks_end,
-                            "datablock_position ({}) must be >= metablocks_end ({}) for wal_index {}",
-                            mb.datablock_position, metablocks_end, mb.wal_index
+                            "datablock_position ({}) must be >= metablocks_end ({}) for wal_seq {}",
+                            mb.datablock_position, metablocks_end, mb.wal_seq
                         );
 
                         // datablock_position + compressed_size must be <= tail header start.
                         assert!(
                             mb.datablock_position + mb.compressed_size <= tail_header_start,
-                            "datablock at {} + {} = {} exceeds tail header start {} for wal_index {}",
+                            "datablock at {} + {} = {} exceeds tail header start {} for wal_seq {}",
                             mb.datablock_position, mb.compressed_size,
                             mb.datablock_position + mb.compressed_size,
-                            tail_header_start, mb.wal_index
+                            tail_header_start, mb.wal_seq
                         );
 
-                        datablock_refs.push((mb.datablock_position, mb.compressed_size, mb.wal_index));
+                        datablock_refs.push((mb.datablock_position, mb.compressed_size, mb.wal_seq));
                     }
 
                     Ok::<bool, String>(false)
@@ -5864,15 +5864,15 @@ mod tests {
 
             for (pos, size, wal_idx) in &datablock_refs {
                 let buf = dma_file.read_at(*pos, *size as usize).await
-                    .unwrap_or_else(|e| panic!("failed to read datablock at pos={pos} size={size} wal_index={wal_idx}: {e:?}"));
+                    .unwrap_or_else(|e| panic!("failed to read datablock at pos={pos} size={size} wal_seq={wal_idx}: {e:?}"));
                 assert_eq!(
                     buf.len(), *size as usize,
-                    "read {} bytes but expected {} for wal_index={wal_idx} at pos={pos}",
+                    "read {} bytes but expected {} for wal_seq={wal_idx} at pos={pos}",
                     buf.len(), size
                 );
                 assert!(
                     !buf.iter().all(|&b| b == 0),
-                    "datablock at pos={pos} size={size} wal_index={wal_idx} is all zeros — compaction did not write payload"
+                    "datablock at pos={pos} size={size} wal_seq={wal_idx} is all zeros — compaction did not write payload"
                 );
             }
 
@@ -5883,7 +5883,7 @@ mod tests {
                 let (cur_pos, _, cur_idx) = datablock_refs[i];
                 assert!(
                     prev_pos + prev_size <= cur_pos,
-                    "datablocks overlap: [{prev_pos}, {}) and [{cur_pos}, ...) for wal_indices {prev_idx} and {cur_idx}",
+                    "datablocks overlap: [{prev_pos}, {}) and [{cur_pos}, ...) for wal_seqs {prev_idx} and {cur_idx}",
                     prev_pos + prev_size
                 );
             }
@@ -5897,17 +5897,17 @@ mod tests {
     }
 
     #[test]
-    fn compact_wal_index_gaps_transparent_to_reads() {
+    fn compact_wal_seq_gaps_transparent_to_reads() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let shard = open_compact_shard(&dir).await;
 
             let agg_a = key(1, 1, 1); // 5 sequential batches — all kept
-            let filler = key(1, 1, 99); // fat data — deleted, creates WAL index gaps
+            let filler = key(1, 1, 99); // fat data — deleted, creates WAL sequence gaps
 
             // Write 5 batches to A first, then bulk filler so filler is interleaved or after.
             // The key is that after compaction, A's 5 metablocks remain but filler's are gone,
-            // leaving wal_index gaps in the compacted file.
+            // leaving wal_seq gaps in the compacted file.
             write_ok(&shard, write_req(agg_a.clone(), events(2))).await; // batch 1
             write_ok(&shard, write_req(agg_a.clone(), events(2))).await; // batch 2
             write_fat(&shard, &filler, 10).await;                        // filler interleaved
@@ -5916,7 +5916,7 @@ mod tests {
             write_fat(&shard, &filler, 20).await;                        // more filler
             write_ok(&shard, write_req(agg_a.clone(), events(2))).await; // batch 5
 
-            // Delete filler — creates wal_index gaps when filler's metablocks are removed.
+            // Delete filler — creates wal_seq gaps when filler's metablocks are removed.
             let result = process(&shard, delete_req(filler.clone())).await;
             assert!(matches!(result, Ok(ClientResponse::Delete(_))));
 
@@ -5927,19 +5927,19 @@ mod tests {
             assert_eq!(cr.log_id, 1);
             assert!(cr.compacted_size < cr.original_size);
 
-            // Walk the compacted segment and prove wal_index values have gaps.
+            // Walk the compacted segment and prove wal_seq values have gaps.
             // agg_a's metablocks and filler's SoftDelete tombstone survive; filler's
-            // EventBatchMetadata entries are removed, leaving wal_index gaps.
+            // EventBatchMetadata entries are removed, leaving wal_seq gaps.
             {
                 let seg = shard.log_segments_cache.get(cr.log_id).await.unwrap();
                 let (metablocks_start, metablocks_end) = {
                     let meta = seg.metadata.borrow();
                     (HEADER_BLOCK_SIZE_BYTES as u64, meta.readable_metablocks_end())
                 };
-                let guard = seg.lock_reader("test_wal_index_gaps").await.unwrap();
+                let guard = seg.lock_reader("test_wal_seq_gaps").await.unwrap();
                 let dma_file = guard.as_ref().unwrap();
 
-                let mut wal_indices: Vec<u64> = Vec::new();
+                let mut wal_seqs: Vec<u64> = Vec::new();
                 let scan = read_fixed_records_visit_const::<FIXED_BLOCK_SIZE_BYTES, String>(
                     dma_file,
                     false,
@@ -5948,7 +5948,7 @@ mod tests {
                     SCAN_CHUNK_SIZE,
                     |_pos, block| {
                         let mb = deserialise_metablock(block).map_err(|e| format!("deser error: {e:?}"))?;
-                        wal_indices.push(mb.wal_index);
+                        wal_seqs.push(mb.wal_seq);
                         Ok::<bool, String>(false)
                     },
                 )
@@ -5956,33 +5956,33 @@ mod tests {
                 match scan {
                     Ok(_) => {}
                     Err(ReadVisitError::Visitor(e)) => {
-                        panic!("wal_index scan failed: {e}");
+                        panic!("wal_seq scan failed: {e}");
                     }
                     Err(ReadVisitError::Io(e)) => {
-                        panic!("io error during wal_index scan: {e:?}");
+                        panic!("io error during wal_seq scan: {e:?}");
                     }
                 }
 
                 // Indices must be strictly ascending.
                 assert!(
-                    wal_indices.windows(2).all(|w| w[1] > w[0]),
-                    "wal_indices in compacted file are not strictly ascending: {wal_indices:?}"
+                    wal_seqs.windows(2).all(|w| w[1] > w[0]),
+                    "wal_seqs in compacted file are not strictly ascending: {wal_seqs:?}"
                 );
 
                 // There must be at least one gap (filler metablocks were removed).
-                let has_gap = wal_indices.windows(2).any(|w| w[1] != w[0] + 1);
+                let has_gap = wal_seqs.windows(2).any(|w| w[1] != w[0] + 1);
                 assert!(
                     has_gap,
-                    "compacted file should have wal_index gaps but indices are contiguous: {wal_indices:?}"
+                    "compacted file should have wal_seq gaps but indices are contiguous: {wal_seqs:?}"
                 );
             }
 
             // Read A from batch 0 — should return all 5 batches.
             let read_all = unwrap_read(process(&shard, read_req_from(agg_a.clone(), 0)).await);
             assert_eq!(read_all.event_batches.len(), 5, "expected all 5 batches; got {:?}",
-                read_all.event_batches.iter().map(|b| b.event_batch_index).collect::<Vec<_>>());
+                read_all.event_batches.iter().map(|b| b.aggregate_version).collect::<Vec<_>>());
             for (i, batch) in read_all.event_batches.iter().enumerate() {
-                assert_eq!(batch.event_batch_index, (i + 1) as u64,
+                assert_eq!(batch.aggregate_version, (i + 1) as u64,
                     "batch {} should have index {}", i, i + 1);
                 assert_eq!(batch.events.len(), 2, "batch {} should have 2 events", i + 1);
             }
@@ -5991,8 +5991,8 @@ mod tests {
             let read_from_3 = unwrap_read(process(&shard, read_req_from(agg_a.clone(), 3)).await);
             assert_eq!(read_from_3.event_batches.len(), 3,
                 "expected batches 3, 4, 5; got {:?}",
-                read_from_3.event_batches.iter().map(|b| b.event_batch_index).collect::<Vec<_>>());
-            assert!(read_from_3.event_batches.iter().all(|b| b.event_batch_index >= 3),
+                read_from_3.event_batches.iter().map(|b| b.aggregate_version).collect::<Vec<_>>());
+            assert!(read_from_3.event_batches.iter().all(|b| b.aggregate_version >= 3),
                 "all returned batches should have index >= 3");
 
             shard.close().await;
@@ -6000,10 +6000,10 @@ mod tests {
     }
 
     #[test]
-    fn compact_wal_index_gaps_list_pagination() {
+    fn compact_wal_seq_gaps_list_pagination() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
-            // Use a small page size (3) to force pagination across WAL index gaps.
+            // Use a small page size (3) to force pagination across WAL sequence gaps.
             let config = compact_config_small_page(&dir, 3);
             let shard = ShardWal::open(config, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader)
                 .await
@@ -6015,7 +6015,7 @@ mod tests {
                 write_ok(&shard, write_req(agg.clone(), events(1))).await;
             }
 
-            // Interleave fat filler aggregates that will be deleted (creates wal_index gaps).
+            // Interleave fat filler aggregates that will be deleted (creates wal_seq gaps).
             let filler_a = key(1, 2, 1);
             let filler_b = key(1, 2, 2);
             write_fat(&shard, &filler_a, 15).await;
@@ -6059,7 +6059,7 @@ mod tests {
             all_found.sort_unstable();
             let expected: Vec<u128> = (1..=10).collect();
             assert_eq!(all_found, expected,
-                "pagination should find all 10 live aggregates across WAL index gaps; found {all_found:?}");
+                "pagination should find all 10 live aggregates across WAL sequence gaps; found {all_found:?}");
 
             shard.close().await;
         });
@@ -6118,7 +6118,7 @@ mod tests {
                 // A's post-recreation events (in seg 2, untouched) are still accessible.
                 let read_a = unwrap_read(process(&shard, read_req(agg_a.clone())).await);
                 assert!(read_a.event_batches.len() > 1);
-                assert!(read_a.event_batches[0].event_batch_index > 1); //continuation of indexing
+                assert!(read_a.event_batches[0].aggregate_version > 1); //continuation of indexing
                 assert_eq!(read_a.event_batches[0].events.len(), 3);
 
                 shard.close().await;
@@ -6132,7 +6132,7 @@ mod tests {
 
                 let read_a = unwrap_read(process(&shard, read_req(agg_a.clone())).await);
                 assert!(read_a.event_batches.len() > 1);
-                assert!(read_a.event_batches[0].event_batch_index > 1);
+                assert!(read_a.event_batches[0].aggregate_version > 1);
                 assert_eq!(read_a.event_batches[0].events.len(), 3);
 
                 shard.close().await;
@@ -6179,7 +6179,7 @@ mod tests {
                 // First delete+recreate for A and B.
                 let r = process(&shard, delete_req_full(agg_a.clone(), true, true, None)).await;
                 assert!(matches!(r, Ok(ClientResponse::Delete(_))));
-                write_ok(&shard, write_req(agg_a.clone(), events(2))).await; // A life 2, batch index continues
+                write_ok(&shard, write_req(agg_a.clone(), events(2))).await; // A life 2, aggregate version continues
 
                 let r = process(&shard, delete_req_full(agg_b.clone(), true, true, None)).await;
                 assert!(matches!(r, Ok(ClientResponse::Delete(_))));
@@ -6232,12 +6232,12 @@ mod tests {
                 // Verify A: only life-3 data visible; index must be > 1 (continuation).
                 let read_a = unwrap_read(process(&shard, read_req(agg_a.clone())).await);
                 assert_eq!(read_a.event_batches[0].events.len(), 5, "A life-3 batch should have 5 events");
-                assert!(read_a.event_batches[0].event_batch_index > 1, "A index must continue past earlier lives");
+                assert!(read_a.event_batches[0].aggregate_version > 1, "A index must continue past earlier lives");
 
                 // Verify B: only life-3 data visible; index must be > 1 (continuation).
                 let read_b = unwrap_read(process(&shard, read_req(agg_b.clone())).await);
                 assert_eq!(read_b.event_batches[0].events.len(), 7, "B life-3 batch should have 7 events");
-                assert!(read_b.event_batches[0].event_batch_index > 1, "B index must continue past earlier lives");
+                assert!(read_b.event_batches[0].aggregate_version > 1, "B index must continue past earlier lives");
 
                 shard.close().await;
             }
@@ -6251,11 +6251,11 @@ mod tests {
 
                 let read_a = unwrap_read(process(&shard, read_req(agg_a.clone())).await);
                 assert_eq!(read_a.event_batches[0].events.len(), 5);
-                assert!(read_a.event_batches[0].event_batch_index > 1);
+                assert!(read_a.event_batches[0].aggregate_version > 1);
 
                 let read_b = unwrap_read(process(&shard, read_req(agg_b.clone())).await);
                 assert_eq!(read_b.event_batches[0].events.len(), 7);
-                assert!(read_b.event_batches[0].event_batch_index > 1);
+                assert!(read_b.event_batches[0].aggregate_version > 1);
 
                 shard.close().await;
             }
@@ -6387,7 +6387,7 @@ mod tests {
                     .map(|i| (i.wrapping_mul(2654435761) >> 16) as u8)
                     .collect();
                 write_ok(&shard, write_req(agg_a.clone(), vec![DatablockAggregateEvent {
-                    client_event_index: 1,
+                    client_seq: 1,
                     event_type_major: 1,
                     event_value: Arc::new(payload),
                     ..Default::default()
@@ -6445,14 +6445,14 @@ mod tests {
             assert_eq!(status, AggregateStatus::Found);
 
             let snap = cache.get_aggregate_snapshot(&agg, CachePath::Write).unwrap();
-            assert_eq!(snap.event_index, 3);
-            assert_eq!(snap.event_batch_index, 1);
+            assert_eq!(snap.event_seq, 3);
+            assert_eq!(snap.aggregate_version, 1);
 
             // Client cache should also be populated from the EventBatch
             let client_key = AggregateClientKey::new(agg.clone(), 1);
-            let (client_in_cache, client_event_index) = cache.aggregate_client_load_status(&agg, &client_key);
+            let (client_in_cache, client_seq) = cache.aggregate_client_load_status(&agg, &client_key);
             assert!(client_in_cache, "client cache should be populated from EventBatch warmup");
-            assert_eq!(client_event_index, Some(3));
+            assert_eq!(client_seq, Some(3));
 
             drop(cache);
             shard.close().await;
@@ -6506,15 +6506,15 @@ mod tests {
             assert_eq!(status, AggregateStatus::Found);
 
             let snap = cache.get_aggregate_snapshot(&agg, CachePath::Write).unwrap();
-            assert_eq!(snap.min_event_batch_index, 2, "trim boundary must be reflected in cached snapshot");
-            assert_eq!(snap.event_batch_index, 3);
-            assert_eq!(snap.event_index, 6);
+            assert_eq!(snap.min_aggregate_version, 2, "trim boundary must be reflected in cached snapshot");
+            assert_eq!(snap.aggregate_version, 3);
+            assert_eq!(snap.event_seq, 6);
 
             // Client cache is populated from the EventBatch (not the SoftTrim itself)
             let client_key = AggregateClientKey::new(agg.clone(), 1);
-            let (client_in_cache, client_event_index) = cache.aggregate_client_load_status(&agg, &client_key);
+            let (client_in_cache, client_seq) = cache.aggregate_client_load_status(&agg, &client_key);
             assert!(client_in_cache, "client cache should be populated from EventBatch after SoftTrim");
-            assert_eq!(client_event_index, Some(2));
+            assert_eq!(client_seq, Some(2));
 
             drop(cache);
             shard.close().await;

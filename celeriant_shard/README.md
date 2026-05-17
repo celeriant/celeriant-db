@@ -44,14 +44,14 @@ Shard-level write-ahead log orchestrator. Coordinates validation, queue manageme
 
 - Client ACK is withheld until local `fdatasync()` succeeds AND replication succeeds (TCP or S3 fallback). Both must complete before the response is sent.
 - OCC validation runs before client idempotency checks. A concurrent writer with a stale read receives `OccConflict`, not `ClientIdempotencyViolation`.
-- S3 replication uploads a single file per batch. Splitting into sub-batches is prohibited, it creates WAL index gaps on the consumer.
+- S3 replication uploads a single file per batch. Splitting into sub-batches is prohibited, it creates WAL sequence gaps on the consumer.
 - Pending replication entries are never silently dropped. If rollback fails, entries are requeued for the next replication cycle.
 - The rollback lock (`sync_gate` write-lock) blocks all concurrent writes. Any in-flight fsync completes before the lock is granted.
 - Rollback is durable: dual headers are rewritten and `fdatasync()` completes before the lock is released.
 - The coordinator's Phase 1 (capture snapshot) runs before Phase 2 (clear queue), preventing a race where a new leader finds an empty queue.
 - A kick is always attempted after S3 fallback replication succeeds, regardless of TCP reachability state.
 - On promotion, the new leader uploads a "promotion batch" to S3 covering the last TCP-replicated batch.
-- S3 catchup handles mid-batch resume: entries at or before the current WAL index are skipped.
+- S3 catchup handles mid-batch resume: entries at or before the current WAL sequence are skipped.
 - Hash computation excludes `datablock_position` so leader and follower produce identical hashes despite different on-disk layouts.
 - `RefCell` borrows must NEVER be held across `.await` points. Snapshot into owned data, drop borrow, await, re-borrow to commit.
 
@@ -115,7 +115,7 @@ Client Write Request
 │  Phase 4: Replication (Coordinator::request_sync_two_phase)       │
 │  • Capture: take pending_replication snapshot                     │
 │  • Paginate batches across TCP (max_request_size chunks)          │
-│  • If follower rejects (WalIndexMismatch):                        │
+│  • If follower rejects (WalSeqMismatch):                        │
 │      → Fetch older entries from local disk (catchup)              │
 │      → If too far behind: fallback to S3                          │
 │  • If follower offline / queue pressure > high water mark:         │
@@ -188,7 +188,7 @@ capture_replication_snapshot()
         ▼ (paginate across TCP, max_request_size chunks)
 replicate_to_follower(batch)
   ├── Ok → drain batch, continue
-  └── Rejected(WalIndexMismatch) → fetch_catchup_entries from disk
+  └── Rejected(WalSeqMismatch) → fetch_catchup_entries from disk
         ├── entries within max_catchup_gap_bytes → prepend + retry
         └── too far behind → fallback to S3
         │
@@ -267,13 +267,13 @@ enter_s3_catchup()
         ▼
 catchup_from_s3() loop (up to s3_download_max_rounds rounds):
   1. list_objects(shard prefix)
-  2. parse and sort FallbackBatchRef by start_wal_index
-  3. validate no WAL index gaps between consecutive batches
+  2. parse and sort FallbackBatchRef by start_wal_seq
+  3. validate no WAL sequence gaps between consecutive batches
   4. for each batch in order:
      a. download(path)
      b. skip already-applied entries (partial overlap)
      c. apply_external_batch()
-        → validate wal_index continuity + tip hash
+        → validate wal_seq continuity + tip hash
         → queue entries via add_to_pending_queue
      d. sync_applied_batch()
         → coordinator captures + commits fsync (standalone mode)
@@ -318,4 +318,4 @@ Every metablock includes `previous_tip_hash`, forming a blake3 chain over the WA
 tip_hash[n] = blake3(tip_hash[n-1] || metablock_bytes_excluding_datablock_position)
 ```
 
-`apply_external_batch` validates both `wal_index` continuity and `previous_tip_hash` before queuing replicated entries.
+`apply_external_batch` validates both `wal_seq` continuity and `previous_tip_hash` before queuing replicated entries.

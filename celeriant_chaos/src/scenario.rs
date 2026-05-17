@@ -378,7 +378,7 @@ pub async fn run_follower_graceful_stop(
         // Under load the cluster can legitimately hand off leadership when
         // the original leader's S3 lease renewal contends with its own
         // S3 fallback uploads (during the follower-down gap). The
-        // CAS on lease_index prevents real split-brain; gauge-level
+        // CAS on lease_epoch prevents real split-brain; gauge-level
         // overlap during the transition shows up as a few "split-brain
         // ticks". Both are bounded recovery noise, not faults.
         max_role_flips: 4,
@@ -482,7 +482,7 @@ pub async fn run_follower_sigkill(
         max_bench_errors: 60_000,
         // Same recovery-thrash tolerance as follower_graceful_stop: under
         // load the leader's S3 lease renewal may briefly lose to a freshly-
-        // restarted follower's CAS attempt. CAS on lease_index keeps
+        // restarted follower's CAS attempt. CAS on lease_epoch keeps
         // correctness; the metric overlap during transition is bounded.
         max_role_flips: 4,
         max_split_brain_ticks: 4,
@@ -599,7 +599,7 @@ pub async fn run_leader_graceful_stop(
         // this scenario is that leadership changes hands cleanly.
         require_leader_retained: false,
         // But the post-stop leader MUST actually serve writes. Catches the
-        // "promoted but frozen" failure mode that `WalIndexAdvanced` and
+        // "promoted but frozen" failure mode that `WalSeqAdvanced` and
         // `EventualConvergence` both miss (they can be satisfied by
         // matching-but-dead values when the restarted old leader happens
         // to disk-read to the same tip as the frozen new leader).
@@ -1743,7 +1743,7 @@ pub async fn run_partition_then_kill_minio(
         // branches. Each catchup-driven `set_node_role_via_s3` call counts
         // (boot/post-catchup/challenge/proactive paths). On slow infra this
         // can stack up while the apply path holds the executor; correctness
-        // is preserved via the lease_index CAS. 80 covers the observed
+        // is preserved via the lease_epoch CAS. 80 covers the observed
         // 30-50 range with margin.
         max_leader_elections: 80,
         // cs1 will attempt S3 fallback while it still thinks it has a
@@ -1763,7 +1763,7 @@ pub async fn run_partition_then_kill_minio(
         // divergent branches, the apply path on shard 0 transiently
         // delays heartbeat acks. The follower's TTL expires, it
         // challenges via S3 CAS, fails (current leader has higher
-        // lease_index), reverts to follower. Each round-trip = 1 role
+        // lease_epoch), reverts to follower. Each round-trip = 1 role
         // flip per node. Observed 14 in worst case; 20 is generous.
         max_role_flips: 20,
         // Significant split-brain tolerance: during the fencing window
@@ -1952,12 +1952,12 @@ pub async fn run_rolling_restart(
 /// starts serving writes. When the old leader is SIGCONT'd, it wakes
 /// up and SHOULD discover via its next heartbeat attempt (or its next
 /// S3 lease check) that its lease has been taken by a higher
-/// lease_index, and demote itself to follower WITHOUT split-brain.
+/// lease_epoch, and demote itself to follower WITHOUT split-brain.
 ///
 /// This is the test of the "zombie leader wakes up after lease
 /// expiry" invariant. If the old leader resumes and continues
 /// committing writes without checking S3, it would double-commit at
-/// the same `wal_index`, break the hash chain, and potentially lose
+/// the same `wal_seq`, break the hash chain, and potentially lose
 /// acked data.
 ///
 /// Timeline: bring up → bench (90s) → +15s SIGSTOP leader →
@@ -2053,7 +2053,7 @@ pub async fn run_sigstop_leader(
         // which transiently delays heartbeats and produces extra lease
         // challenges (each `set_node_role_via_s3` increments). Bumped
         // to absorb the new recovery thrash pattern; correctness is
-        // preserved via lease_index CAS.
+        // preserved via lease_epoch CAS.
         max_leader_elections: 80,
         // S3 fallback fires while the follower is reaching for the
         // lease and the paused leader can't commit anything.
@@ -2368,7 +2368,7 @@ pub async fn run_follower_disk_full(
         // Empirically at 8k load with the optimised catchup, post-recovery
         // S3 CAS retries can stack to 70+ as the follower's restart-then-
         // catchup pulls heavily on MinIO. Bumped from 40 → 100 for
-        // headroom. Correctness is preserved by lease_index CAS regardless.
+        // headroom. Correctness is preserved by lease_epoch CAS regardless.
         max_leader_elections: 100,
         // If the follower's fsync fails, the leader falls back to S3
         // for every commit during the outage window.

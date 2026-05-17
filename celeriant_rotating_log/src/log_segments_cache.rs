@@ -65,7 +65,7 @@ impl LogSegmentsCache {
                 log_id: metadata.log_id,
                 metablocks_position: HEADER_BLOCK_SIZE_BYTES as u64,
                 datablocks_position: metadata.file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64),
-                wal_index: prev_cursor.as_ref().map_or(0, |c| c.wal_index),
+                wal_seq: prev_cursor.as_ref().map_or(0, |c| c.wal_seq),
                 aggregate_key_bloom: prev_cursor.as_ref().map_or_else(Default::default, |c| c.aggregate_key_bloom.clone()),
                 tip_hash: prev_cursor.as_ref().map_or(Default::default(), |c| c.tip_hash),
             };
@@ -110,7 +110,7 @@ impl LogSegmentsCache {
 
     pub async fn rotate_to_next_log(&self) -> Result<(), OpenOrCreateError> {
         let current_log_id = self.active_log_id();
-        let wal_index_at_rotation = self.active().metadata.borrow().write.wal_index;
+        let wal_seq_at_rotation = self.active().metadata.borrow().write.wal_seq;
         let new_log_segment_file = Rc::new(self.active().rotate(&self.shard_dir, self.preallocate_bytes).await?);
         let new_log_id = new_log_segment_file.metadata.borrow().log_id;
 
@@ -121,7 +121,7 @@ impl LogSegmentsCache {
 
         metrics::counter!("celeriant_log_rotations_total", &self.shard_label).increment(1);
         metrics::gauge!("celeriant_log_segments_total", &self.shard_label).set((1 + self.lru_cache.borrow().len()) as f64);
-        tracing::info!(shard_id = %self.shard_label[0].1, old_log_id = current_log_id, new_log_id, wal_index_at_rotation, "Log segment rotated");
+        tracing::info!(shard_id = %self.shard_label[0].1, old_log_id = current_log_id, new_log_id, wal_seq_at_rotation, "Log segment rotated");
 
         Ok(())
     }

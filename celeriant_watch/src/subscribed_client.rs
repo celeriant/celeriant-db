@@ -132,8 +132,8 @@ mod test_subscribed_client {
                         aggregate_key: AggregateKey::new(1, 2, 4),
                         operation:
                             crate::aggregate_watch_event::AggregateWatchEventOperation::Read {
-                                from_event_batch_index: 44,
-                                to_event_batch_index: Some(46),
+                                from_aggregate_version: 44,
+                                to_aggregate_version: Some(46),
                             },
                     });
 
@@ -160,13 +160,13 @@ mod test_subscribed_client {
                     let delete = watch_response.events.iter()
                         .find(|e| e.aggregate_id == 3 && e.operation == AggregateWatchEvent::DELETE)
                         .expect("expected delete event");
-                    assert!(delete.from_event_batch_index.is_none());
+                    assert!(delete.from_aggregate_version.is_none());
 
                     let read = watch_response.events.iter()
                         .find(|e| e.aggregate_id == 4 && e.operation == AggregateWatchEvent::READ)
                         .expect("expected read event");
-                    assert_eq!(read.from_event_batch_index, Some(44));
-                    assert_eq!(read.to_event_batch_index, Some(46));
+                    assert_eq!(read.from_aggregate_version, Some(44));
+                    assert_eq!(read.to_aggregate_version, Some(46));
                 })
                 .unwrap();
 

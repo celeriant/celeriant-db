@@ -14,8 +14,8 @@ pub fn json_event<T: Serialize>(
 ) -> Result<DatablockAggregateEvent, serde_json::Error> {
     let bytes = serde_json::to_vec(value)?;
     Ok(DatablockAggregateEvent {
-        client_event_index: 0,
-        event_index: 0,
+        client_seq: 0,
+        event_seq: 0,
         event_id: None,
         event_timestamp: 0,
         event_type_major: event_type,

@@ -4,34 +4,34 @@ use crate::recent_write::RecentWrite;
 
 
 /// Contiguous cache of recent writes for a single aggregate.
-/// Batch indexes are monotonic with no gaps, so we use a VecDeque
+/// Aggregate versions are monotonic with no gaps, so we use a VecDeque
 /// with a tracked starting index for O(1) access.
 pub struct AggregateRecentWrites {
-    pub first_batch_index: u64,
+    pub first_version: u64,
     pub writes: VecDeque<RecentWrite>,
 }
 
 impl AggregateRecentWrites {
-    pub fn new(first_batch_index: u64) -> Self {
+    pub fn new(first_version: u64) -> Self {
         Self {
-            first_batch_index,
+            first_version,
             writes: VecDeque::new(),
         }
     }
 
-    /// Get a write by batch index
-    pub fn get(&self, batch_index: u64) -> Option<&RecentWrite> {
-        if batch_index < self.first_batch_index {
+    /// Get a write by version
+    pub fn get(&self, aggregate_version: u64) -> Option<&RecentWrite> {
+        if aggregate_version < self.first_version {
             return None;
         }
-        let offset = (batch_index - self.first_batch_index) as usize;
+        let offset = (aggregate_version - self.first_version) as usize;
         self.writes.get(offset)
     }
 
-    /// Iterate from a starting batch index, yielding (batch_index, &RecentWrite)
-    pub fn iter_from(&self, from_batch_index: u64) -> impl Iterator<Item = (u64, &RecentWrite)> {
-        let start = from_batch_index.max(self.first_batch_index);
-        let skip = (start - self.first_batch_index) as usize;
+    /// Iterate from a starting aggregate version, yielding (aggregate_version, &RecentWrite)
+    pub fn iter_from(&self, from_version: u64) -> impl Iterator<Item = (u64, &RecentWrite)> {
+        let start = from_version.max(self.first_version);
+        let skip = (start - self.first_version) as usize;
         let base_index = start;
         
         self.writes
@@ -44,7 +44,7 @@ impl AggregateRecentWrites {
     /// Remove the oldest entry, returns true if something was removed
     pub fn pop_front(&mut self) -> bool {
         if self.writes.pop_front().is_some() {
-            self.first_batch_index += 1;
+            self.first_version += 1;
             true
         } else {
             false

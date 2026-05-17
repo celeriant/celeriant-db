@@ -57,8 +57,8 @@ impl<S: LeaseStore> S3LeaseManager<S> {
     }
 
     /// Determine this node's role via S3 lease. No lease? Try create with self as leader.
-    /// Own lease (any expiry)? Renew via CAS, keeping the same lease_index.
-    /// Other node's expired lease? Promote via CAS, bumping lease_index.
+    /// Own lease (any expiry)? Renew via CAS, keeping the same lease_epoch.
+    /// Other node's expired lease? Promote via CAS, bumping lease_epoch.
     /// Other node still leader? Become follower, no lease.bin update.
     pub async fn run_election_to_acquire_s3_lease(&self) -> Result<ElectionOutcome, LeaseStoreError> {
         let now = validated_node_status::unix_epoch_now_ms();
@@ -89,7 +89,7 @@ impl<S: LeaseStore> S3LeaseManager<S> {
                 && lwe.lease.leader_node_id != self.config.node_id =>
             {
                 debug!(
-                    observed_lease_index = lwe.lease.lease_index,
+                    observed_lease_epoch = lwe.lease.lease_epoch,
                     leader_node_id = lwe.lease.leader_node_id,
                     "Election: valid lease held by another node — becoming follower"
                 );
@@ -97,7 +97,7 @@ impl<S: LeaseStore> S3LeaseManager<S> {
             }
             Some(lwe) => {
                 debug!(
-                    observed_lease_index = lwe.lease.lease_index,
+                    observed_lease_epoch = lwe.lease.lease_epoch,
                     leader_node_id = lwe.lease.leader_node_id,
                     expired = lwe.lease.is_expired(now),
                     "Election: existing lease found — racing CAS"
@@ -137,7 +137,7 @@ impl<S: LeaseStore> S3LeaseManager<S> {
         let peer_info = self.discover_peer().await.ok().flatten();
         Ok(ElectionOutcome {
             status: ValidatedNodeStatus::create_custom_status(
-                NodeStatus::Follower { leader_lease_index: lease.lease_index },
+                NodeStatus::Follower { leader_lease_epoch: lease.lease_epoch },
                 self.config.max_clock_drift.as_millis() as u64,
                 lease.expires_at_ms,
             ),
@@ -149,7 +149,7 @@ impl<S: LeaseStore> S3LeaseManager<S> {
         let peer_info = self.discover_peer().await.ok().flatten();
         Ok(ElectionOutcome {
             status: ValidatedNodeStatus::create_custom_status(
-                NodeStatus::Leader { lease_index: lease.lease_index },
+                NodeStatus::Leader { lease_epoch: lease.lease_epoch },
                 self.config.max_clock_drift.as_millis() as u64,
                 lease.expires_at_ms,
             ),
@@ -283,14 +283,14 @@ mod tests {
 
     fn make_lease_with_etag(
         node_id: u128,
-        lease_index: u64,
+        lease_epoch: u64,
         now_ms: u64,
         duration_ms: u64,
     ) -> LeaseWithEtag {
         LeaseWithEtag {
             lease: Lease {
                 leader_node_id: node_id,
-                lease_index,
+                lease_epoch,
                 acquired_at_ms: now_ms,
                 expires_at_ms: now_ms + duration_ms,
             },
@@ -327,7 +327,7 @@ mod tests {
 
         assert!(matches!(
             outcome.status.raw(),
-            NodeStatus::Leader { lease_index: 1 }
+            NodeStatus::Leader { lease_epoch: 1 }
         ));
         assert!(outcome.peer_info.is_none());
     }
@@ -348,7 +348,7 @@ mod tests {
         assert!(matches!(
             outcome.status.raw(),
             NodeStatus::Follower {
-                leader_lease_index: 1
+                leader_lease_epoch: 1
             }
         ));
         assert_eq!(outcome.peer_info.as_ref().unwrap().node_id, 2);
@@ -368,7 +368,7 @@ mod tests {
 
         assert!(matches!(
             outcome.status.raw(),
-            NodeStatus::Leader { lease_index: 3 }
+            NodeStatus::Leader { lease_epoch: 3 }
         ));
     }
 
@@ -386,7 +386,7 @@ mod tests {
         assert!(matches!(
             outcome.status.raw(),
             NodeStatus::Follower {
-                leader_lease_index: 5
+                leader_lease_epoch: 5
             }
         ));
         assert_eq!(outcome.peer_info.as_ref().unwrap().node_id, 2);
@@ -406,7 +406,7 @@ mod tests {
 
         assert!(matches!(
             outcome.status.raw(),
-            NodeStatus::Leader { lease_index: 4 }
+            NodeStatus::Leader { lease_epoch: 4 }
         ));
         assert_eq!(outcome.peer_info.as_ref().unwrap().node_id, 2);
     }
@@ -425,7 +425,7 @@ mod tests {
 
         assert!(matches!(
             outcome.status.raw(),
-            NodeStatus::Leader { lease_index: 2 }
+            NodeStatus::Leader { lease_epoch: 2 }
         ));
     }
 
@@ -445,7 +445,7 @@ mod tests {
         assert!(matches!(
             outcome.status.raw(),
             NodeStatus::Follower {
-                leader_lease_index: 4
+                leader_lease_epoch: 4
             }
         ));
         assert_eq!(outcome.peer_info.as_ref().unwrap().node_id, 2);

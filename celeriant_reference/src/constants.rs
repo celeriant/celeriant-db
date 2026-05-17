@@ -17,7 +17,7 @@ pub static ORG_ID: LazyLock<u128> = LazyLock::new(|| deterministic_id("DemoOrg")
 pub static ACCOUNT_TYPE_ID: LazyLock<u128> = LazyLock::new(|| deterministic_id("Account"));
 
 /// Single service-owned ClientId. All API instances share this identity.
-/// ClientEventIndex is per (AggregateKey, ClientId) — OCC serialises concurrent writes.
+/// ClientSeq is per (AggregateKey, ClientId) — OCC serialises concurrent writes.
 pub static SERVICE_CLIENT_ID: LazyLock<u128> =
     LazyLock::new(|| deterministic_id("ReferenceApiService"));
 

@@ -61,7 +61,7 @@ impl SidecarS3Uploader {
                     match store_kind {
                         StoreErrorKind::AlreadyExists => {
                             // Invariant #8: AlreadyExists is not an error
-                            // Same WAL index = same data (crash-restart scenario)
+                            // Same WAL sequence = same data (crash-restart scenario)
                             tracing::warn!("S3 batch already exists (likely crash-restart): {}", path);
                             Ok(())
                         }

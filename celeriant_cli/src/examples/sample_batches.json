@@ -1,15 +1,15 @@
 [
     {
-        "event_batch_index": 1,
+        "aggregate_version": 1,
         "client_id": 1,
         "user_id": null,
         "server_timestamp": 1705312200000,
-        "start_event_index": 0,
+        "start_event_seq": 0,
         "compression_type": 0,
         "events": [
             {
                 "event_type": 1,
-                "client_event_index": 0,
+                "client_seq": 0,
                 "event_timestamp": 1705312200000,
                 "data": [123, 34, 116, 121, 112, 101, 34, 58, 34, 105, 110, 105, 116, 34, 125]
             }

@@ -249,7 +249,7 @@ async fn test_mixed_operations(server_address: &str) -> Result<(), Box<dyn std::
         SingleAggregateWrite {
             events: vec![event],
             allow_create: true,
-            expected_event_batch_index: None, // Don't enforce version
+            expected_version: None, // Don't enforce version
             enforce_client_idempotency: false,
         },
     );
@@ -371,7 +371,7 @@ async fn test_shard_affinity(server_address: &str) -> Result<(), Box<dyn std::er
             SingleAggregateWrite {
                 events: vec![event],
                 allow_create: true,
-                expected_event_batch_index: None,
+                expected_version: None,
                 enforce_client_idempotency: false,
             },
         );
@@ -438,10 +438,10 @@ async fn test_long_lived_connection(
     Ok(())
 }
 
-fn create_event(client_event_index: u64, message: String) -> DatablockAggregateEvent {
+fn create_event(client_seq: u64, message: String) -> DatablockAggregateEvent {
     DatablockAggregateEvent {
-        client_event_index,
-        event_index: 0, // Server will assign
+        client_seq,
+        event_seq: 0, // Server will assign
         event_id: Some(rand::random()),
         event_timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -46,7 +46,7 @@ pub fn format_timestamp(timestamp_ms: u64) -> String {
 pub fn format_response(response: &ClientResponse) -> String {
     match response {
         ClientResponse::AggregateDetails(r) => format!("Exists: batches from {}",
-            r.min_event_batch_index),
+            r.min_aggregate_version),
         ClientResponse::Read(r) => format!("Read: {} batches", r.event_batches.len()),
         ClientResponse::Write(_) => "Write: success".to_string(),
         ClientResponse::TrimStart(_) => "TrimStart: success".to_string(),

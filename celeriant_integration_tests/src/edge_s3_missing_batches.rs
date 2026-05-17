@@ -153,7 +153,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         objects.len()
     );
 
-    // Sort by path — lexicographic order matches WAL index order for zero-padded names.
+    // Sort by path — lexicographic order matches WAL sequence order for zero-padded names.
     objects.sort();
 
     // Delete multiple consecutive batches from the middle to create a multi-batch gap.

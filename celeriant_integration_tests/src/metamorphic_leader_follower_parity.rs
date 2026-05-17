@@ -3,7 +3,7 @@
 //! Writes N events across M aggregates to the leader, then immediately reads
 //! every aggregate's full event list from BOTH leader and follower via the
 //! client API. Fails if any aggregate's batches differ in any field exposed by
-//! the read response (batch index, client/user id, server timestamp, or any
+//! the read response (aggregate version, client/user id, server timestamp, or any
 //! per-event field including the raw payload bytes).
 //!
 //! No quiesce wait is required: `invariants.md` guarantees that by the time a

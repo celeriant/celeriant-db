@@ -321,10 +321,10 @@ pub struct AggregateStats {
     pub max_event_timestamp: u64,
     pub min_server_timestamp: u64,
     pub max_server_timestamp: u64,
-    pub min_event_batch_index: u64,
-    pub max_event_batch_index: u64,
-    pub min_event_index: u64,
-    pub max_event_index: u64,
+    pub min_aggregate_version: u64,
+    pub max_aggregate_version: u64,
+    pub min_event_seq: u64,
+    pub max_event_seq: u64,
     pub compressed_size: u64,
     pub uncompressed_size: u64,
 }
@@ -341,10 +341,10 @@ impl AggregateStats {
             max_event_timestamp: item.max_event_timestamp,
             min_server_timestamp: item.min_server_timestamp,
             max_server_timestamp: item.max_server_timestamp,
-            min_event_batch_index: item.min_event_batch_index,
-            max_event_batch_index: item.max_event_batch_index,
-            min_event_index: item.min_event_index,
-            max_event_index: item.max_event_index,
+            min_aggregate_version: item.min_aggregate_version,
+            max_aggregate_version: item.max_aggregate_version,
+            min_event_seq: item.min_event_seq,
+            max_event_seq: item.max_event_seq,
             compressed_size: item.compressed_size,
             uncompressed_size: item.uncompressed_size,
         }
@@ -367,24 +367,24 @@ impl AggregateStats {
                 self.min_server_timestamp.min(item.min_server_timestamp)
             };
         }
-        if item.min_event_batch_index > 0 {
-            self.min_event_batch_index = if self.min_event_batch_index == 0 {
-                item.min_event_batch_index
+        if item.min_aggregate_version > 0 {
+            self.min_aggregate_version = if self.min_aggregate_version == 0 {
+                item.min_aggregate_version
             } else {
-                self.min_event_batch_index.min(item.min_event_batch_index)
+                self.min_aggregate_version.min(item.min_aggregate_version)
             };
         }
-        if item.min_event_index > 0 {
-            self.min_event_index = if self.min_event_index == 0 {
-                item.min_event_index
+        if item.min_event_seq > 0 {
+            self.min_event_seq = if self.min_event_seq == 0 {
+                item.min_event_seq
             } else {
-                self.min_event_index.min(item.min_event_index)
+                self.min_event_seq.min(item.min_event_seq)
             };
         }
         self.max_event_timestamp = self.max_event_timestamp.max(item.max_event_timestamp);
         self.max_server_timestamp = self.max_server_timestamp.max(item.max_server_timestamp);
-        self.max_event_batch_index = self.max_event_batch_index.max(item.max_event_batch_index);
-        self.max_event_index = self.max_event_index.max(item.max_event_index);
+        self.max_aggregate_version = self.max_aggregate_version.max(item.max_aggregate_version);
+        self.max_event_seq = self.max_event_seq.max(item.max_event_seq);
         self.compressed_size += item.compressed_size;
         self.uncompressed_size += item.uncompressed_size;
     }

@@ -57,7 +57,7 @@ async fn read_aggregate(
                     .iter()
                     .map(|b| b.events.len())
                     .sum::<usize>();
-                match read_resp.next_event_batch_index {
+                match read_resp.next_aggregate_version {
                     Some(next) => from_batch = next,
                     None => return Ok(total_events),
                 }

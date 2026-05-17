@@ -79,7 +79,7 @@ fn create_config(shard_dir: PathBuf) -> InternalShardConfig {
         list_page_size: 20000,
         list_max_concurrent: 16,
         read_max_concurrent: 64,
-        list_wal_index_cache_bytes: 12 * 1024 * 1024,
+        list_wal_seq_cache_bytes: 12 * 1024 * 1024,
         schema_cache_bytes: 4 * 1024 * 1024,
         max_schema_size_bytes: 16384,
         max_catchup_gap_bytes: Some(104_857_600),
@@ -98,8 +98,8 @@ fn create_config(shard_dir: PathBuf) -> InternalShardConfig {
 fn create_events(count: usize, size: usize, base_index: u64) -> Vec<DatablockAggregateEvent> {
     (0..count)
         .map(|i| DatablockAggregateEvent {
-            client_event_index: base_index + i as u64,
-            event_index: 0,
+            client_seq: base_index + i as u64,
+            event_seq: 0,
             event_id: None,
             event_timestamp: 1_700_000_000_000 + i as u64,
             event_type_major: 1,
@@ -121,7 +121,7 @@ fn create_write_request(
         SingleAggregateWrite {
             events,
             allow_create: true,
-            expected_event_batch_index: None,
+            expected_version: None,
             enforce_client_idempotency: false,
         },
     );

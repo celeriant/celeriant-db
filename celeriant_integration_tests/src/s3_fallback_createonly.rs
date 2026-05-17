@@ -82,8 +82,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let garbage_content = b"GARBAGE_CONTENT_DO_NOT_OVERWRITE_THIS_987654321";
     let mut seeded_paths = Vec::new();
 
-    for wal_index in 4..=10 {
-        let path = format!("cluster/fallback/shard_{:03}/batch_{:09}_{:09}.bin", expected_shard, wal_index, wal_index);
+    for wal_seq in 4..=10 {
+        let path = format!("cluster/fallback/shard_{:03}/batch_{:09}_{:09}.bin", expected_shard, wal_seq, wal_seq);
         println!("  Pre-seeding: {}", path);
         minio.put_object(&path, garbage_content.to_vec()).await?;
         seeded_paths.push(path);

@@ -14,10 +14,10 @@ use crate::error::replication_error::ReplicationError;
 use crate::error::replication_to_follower_error::ReplicateToFollowerError;
 use crate::fetch_catchup_entries::fetch_catchup_entries;
 use crate::replication_client::ReplicationClient;
-use crate::shard_wal_replicate::current_leader_confirmed_wal_index;
+use crate::shard_wal_replicate::current_leader_confirmed_wal_seq;
 
 pub(crate) enum CatchupOutcome {
-    /// Follower is now caught up to (but not including) `leader_wal_index`.
+    /// Follower is now caught up to (but not including) `leader_wal_seq`.
     /// The caller can retry the original send.
     Caught,
     /// Catchup itself failed in a way that means TCP can't deliver. The caller
@@ -30,8 +30,8 @@ pub(crate) async fn replicate_follower_catchup<R: ReplicationClient + 'static>(
     replication_client: &Rc<R>,
     log_segments_cache: &Rc<LogSegmentsCache>,
     node_status: &Rc<Cell<ValidatedNodeStatus>>,
-    follower_wal_index: u64,
-    leader_wal_index: u64,
+    follower_wal_seq: u64,
+    leader_wal_seq: u64,
     max_catchup_gap_bytes: Option<u64>,
     max_request_size: u64,
     read_max_chunk_size: u64,
@@ -39,7 +39,7 @@ pub(crate) async fn replicate_follower_catchup<R: ReplicationClient + 'static>(
     dict_codec: &DictCodec,
 ) -> Result<CatchupOutcome, ReplicationError> {
     let entries = match fetch_catchup_entries(
-        log_segments_cache, follower_wal_index, leader_wal_index,
+        log_segments_cache, follower_wal_seq, leader_wal_seq,
         max_catchup_gap_bytes, read_max_chunk_size, dict_codec,
     ).await {
         Ok(entries) => entries,
@@ -60,7 +60,7 @@ pub(crate) async fn replicate_follower_catchup<R: ReplicationClient + 'static>(
         .map(|e| ReplicationBatchItem { metablock: e.metablock, datablock: e.datablock })
         .collect();
 
-    debug!(shard_id, follower_wal_index, leader_wal_index, count = items.len(), "Catchup entries fetched");
+    debug!(shard_id, follower_wal_seq, leader_wal_seq, count = items.len(), "Catchup entries fetched");
 
     let mut sent: usize = 0;
     while sent < items.len() {
@@ -79,8 +79,8 @@ pub(crate) async fn replicate_follower_catchup<R: ReplicationClient + 'static>(
         };
 
         let chunk = items[sent..sent + end_idx].to_vec();
-        let leader_confirmed_wal_index = current_leader_confirmed_wal_index(log_segments_cache);
-        let send_result = with_budget(budget, replication_client.replicate_to_follower(chunk, leader_confirmed_wal_index))
+        let leader_confirmed_wal_seq = current_leader_confirmed_wal_seq(log_segments_cache);
+        let send_result = with_budget(budget, replication_client.replicate_to_follower(chunk, leader_confirmed_wal_seq))
             .await
             .ok_or_else(|| {
                 metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "catchup".to_string()), ("shard_id", shard_id.to_string())]).increment(1);

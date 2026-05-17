@@ -27,8 +27,8 @@ async fn delete_aggregate(
         key.clone(),
         SingleAggregateDelete {
             allow_recreate,
-            allow_index_continuation: false,
-            expected_event_batch_index: None,
+            allow_sequence_continuation: false,
+            expected_version: None,
         },
     );
 
@@ -57,7 +57,7 @@ async fn trim_aggregate(
     let req = TrimStartRequest {
         correlation_id: Some(2),
         aggregate_key: key.clone(),
-        keep_from_event_batch_index: keep_from,
+        keep_from_aggregate_version: keep_from,
         client_id: 999,
         user_id: Some(888),
     };
@@ -168,8 +168,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     delete_aggregate(&mut leader_client, &key_recreate, true).await?;
 
-    // Recreate with new events — use allow_create but don't assert batch index 0
-    // since the aggregate's batch index continues from before deletion.
+    // Recreate with new events — use allow_create but don't assert aggregate version 0
+    // since the aggregate's aggregate version continues from before deletion.
     for i in 1..=2 {
         write_event(&mut leader_client, &key_recreate, 100 + i, i == 1).await?;
     }

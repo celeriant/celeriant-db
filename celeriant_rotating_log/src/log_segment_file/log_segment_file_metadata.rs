@@ -15,10 +15,10 @@ pub struct LogSegmentFileMetadata {
     pub read: Option<LogSegmentCursor>,
     /// Used in write path as datablock file writes are not Direct I/O aligned
     pub datablocks_carry_over: Option<Vec<u8>>,
-    /// Promotion-batch floor: `leader_confirmed_wal_index + 1` from the highest-confirmed
+    /// Promotion-batch floor: `leader_confirmed_wal_seq + 1` from the highest-confirmed
     /// batch received via TCP replication while follower (monotonic max). On promotion to
     /// leader, entries from this index onward are uploaded to S3.
-    pub last_received_replication_wal_index: u64,
+    pub last_received_replication_wal_seq: u64,
 }
 
 impl LogSegmentFileMetadata {
@@ -33,13 +33,13 @@ impl LogSegmentFileMetadata {
             write: LogSegmentCursor::from_shard_log_header(log_id, shard_log_header),
             read: if advance_read { Some(LogSegmentCursor::from_shard_log_header(log_id, shard_log_header)) } else { None },
             datablocks_carry_over,
-            last_received_replication_wal_index: shard_log_header.last_received_replication_wal_index,
+            last_received_replication_wal_seq: shard_log_header.last_received_replication_wal_seq,
         }
     }
 
     #[must_use]
     pub fn to_shard_log_header(&self) -> ShardLogHeader {
-        self.write.to_shard_log_header(self.last_received_replication_wal_index)
+        self.write.to_shard_log_header(self.last_received_replication_wal_seq)
     }
 
     /// Advance visible position after successful replication (write -> read)
@@ -49,7 +49,7 @@ impl LogSegmentFileMetadata {
 
     /// Returns true if write cursor is ahead of read cursor (pending replication)
     pub fn is_pending_advance(&self) -> bool {
-        self.read.is_none() || self.write.wal_index > self.read.as_ref().unwrap().wal_index
+        self.read.is_none() || self.write.wal_seq > self.read.as_ref().unwrap().wal_seq
     }
 
     /// Returns the end of the readable metablock region.
@@ -73,10 +73,10 @@ mod tests {
         ShardLogHeader {
             metablocks_position: meta_pos,
             datablocks_position: data_pos,
-            wal_index: wal_idx,
+            wal_seq: wal_idx,
             tip_hash: [0u8; 32],
             aggregate_bloom: AggregateKeyBloom::new().to_bytes(),
-            last_received_replication_wal_index: 0,
+            last_received_replication_wal_seq: 0,
         }
     }
 
@@ -98,22 +98,22 @@ mod tests {
         assert_eq!(meta.log_id, 5);
         assert_eq!(meta.file_len, 2000);
         assert!(meta.read.is_none());
-        assert_eq!(meta.write.wal_index, 10);
+        assert_eq!(meta.write.wal_seq, 10);
     }
 
     #[test]
     fn new_with_advance_read() {
         let meta = LogSegmentFileMetadata::new(5, 2000, None, &make_header(50, 1950, 10), true);
         assert!(meta.read.is_some());
-        assert_eq!(meta.read.unwrap().wal_index, 10);
+        assert_eq!(meta.read.unwrap().wal_seq, 10);
     }
 
     #[test]
     fn advance_visible_position_copies_write() {
         let mut meta = LogSegmentFileMetadata::new(1, 1000, None, &make_header(100, 900, 5), false);
-        meta.write.wal_index = 15;
+        meta.write.wal_seq = 15;
         meta.advance_visible_position();
-        assert_eq!(meta.read.unwrap().wal_index, 15);
+        assert_eq!(meta.read.unwrap().wal_seq, 15);
     }
 
     #[test]
@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn is_pending_when_write_ahead() {
         let mut meta = LogSegmentFileMetadata::new(1, 1000, None, &make_header(100, 900, 5), true);
-        meta.write.wal_index = 10;
+        meta.write.wal_seq = 10;
         assert!(meta.is_pending_advance());
     }
 

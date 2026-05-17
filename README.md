@@ -31,7 +31,7 @@ Each aggregate is an independent, totally-ordered stream. Writes are acknowledge
 **You get:**
 
 - Per-aggregate total ordering (no gaps, no reordering)
-- Optimistic concurrency control (expected batch index)
+- Optimistic concurrency control (expected version)
 - Dynamic consistency boundaries - conditionally, atomically write events to multiple aggregates
 - Exactly-once writes (client idempotency, duplicate writes rejected)
 - Infinite cardinality (millions of aggregates, no tuning, bounded memory)

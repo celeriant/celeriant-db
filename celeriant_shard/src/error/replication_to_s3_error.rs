@@ -12,8 +12,8 @@ pub enum ReplicateToS3Error {
     SerializationFailed(String),
     BatchNotContiguous {
         at_index: usize,
-        expected_wal_index: u64,
-        actual_wal_index: u64,
+        expected_wal_seq: u64,
+        actual_wal_seq: u64,
     },
     LeaseIndexInconsistent {
         at_index: usize,

@@ -11,11 +11,11 @@ use crate::{aggregate_key::AggregateKey, constants::{EntryHashBytes, FIXED_BLOCK
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, DeepSizeOf)]
 pub struct Metablock {
     /// WAL global index of this metablock
-    pub wal_index: u64,
+    pub wal_seq: u64,
     /// Server timestamp when batch was processed
     pub server_timestamp: u64,
-    /// Lease index at time of write
-    pub lease_index: u64,
+    /// Lease epoch at time of write
+    pub lease_epoch: u64,
     /// ID of the node that wrote this batch
     pub node_id: u128,
     /// Size of the uncompressed event batch data in bytes
@@ -41,7 +41,7 @@ impl Metablock {
     // Wire format layout (bincode fixed-int encoding)
     // Update these if field order or types change!
 
-    const WIRE_SIZE_WAL_INDEX: usize = 8;
+    const WIRE_SIZE_WAL_SEQ: usize = 8;
     const WIRE_SIZE_SERVER_TIMESTAMP: usize = 8;
     const WIRE_SIZE_LEASE_INDEX: usize = 8;
     const WIRE_SIZE_NODE_ID: usize = 16;
@@ -52,10 +52,10 @@ impl Metablock {
     const WIRE_SIZE_PREVIOUS_TIP_HASH: usize = 32;
     pub const WIRE_SIZE_DATABLOCK_POSITION: usize = 8;
 
-    pub const OFFSET_WAL_INDEX: usize = 0;
+    pub const OFFSET_WAL_SEQ: usize = 0;
 
     pub const OFFSET_SERVER_TIMESTAMP: usize =
-        Self::OFFSET_WAL_INDEX + Self::WIRE_SIZE_WAL_INDEX;
+        Self::OFFSET_WAL_SEQ + Self::WIRE_SIZE_WAL_SEQ;
 
     pub const OFFSET_LEASE_INDEX: usize =
         Self::OFFSET_SERVER_TIMESTAMP + Self::WIRE_SIZE_SERVER_TIMESTAMP;
@@ -86,9 +86,9 @@ impl Metablock {
 
     pub fn default_inline_event_batch_metadata(aggregate_key: AggregateKey) -> Self {
         Self {
-            wal_index: 0,
+            wal_seq: 0,
             server_timestamp: 0,
-            lease_index: 0,
+            lease_epoch: 0,
             node_id: 0,
             uncompressed_size: 0,
             compressed_size: 0,
@@ -98,14 +98,14 @@ impl Metablock {
             datablock_position: 0,
             wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
                 aggregate_key,
-                event_batch_index: 0,
-                min_event_batch_index: 0,
-                min_client_event_index: 0,
-                max_client_event_index: 0,
+                aggregate_version: 0,
+                trimmed_below_version: 0,
+                min_client_seq: 0,
+                max_client_seq: 0,
                 min_event_timestamp: 0,
                 max_event_timestamp: 0,
-                min_event_index: 0,
-                max_event_index: 0,
+                min_event_seq: 0,
+                max_event_seq: 0,
                 client_id: 0,
                 user_id: None,
                 event_types_data: EventTypesKind::Direct([0u64; 4]),

@@ -29,7 +29,7 @@ Open http://localhost:5000.
 ## What it demonstrates
 
 - Writing events with `CeleriantPool` and `json_event`
-- Optimistic concurrency control (`expected_event_batch_index`)
+- Optimistic concurrency control (`expected_version`)
 - Atomic multi-aggregate writes (transfers across two accounts)
 - Watch API with SSE broadcast to the browser
 

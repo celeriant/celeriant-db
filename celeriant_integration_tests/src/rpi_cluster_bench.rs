@@ -107,8 +107,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         let key = AggregateKey::new(99, 99, 99);
         let event = DatablockAggregateEvent {
-            client_event_index: 0,
-            event_index: 0,
+            client_seq: 0,
+            event_seq: 0,
             event_id: None,
             event_timestamp: 0,
             event_type_major: 1,
@@ -121,7 +121,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         writes.insert(key, SingleAggregateWrite {
             events: vec![event],
             allow_create: true,
-            expected_event_batch_index: None,
+            expected_version: None,
             enforce_client_idempotency: false,
         });
 
@@ -306,8 +306,8 @@ async fn run_connection(
 
     while Instant::now() < deadline {
         let event = DatablockAggregateEvent {
-            client_event_index: 0,
-            event_index: 0,
+            client_seq: 0,
+            event_seq: 0,
             event_id: None,
             event_timestamp: 0,
             event_type_major: 1,
@@ -325,7 +325,7 @@ async fn run_connection(
             SingleAggregateWrite {
                 events: vec![event],
                 allow_create: true,
-                expected_event_batch_index: None,
+                expected_version: None,
                 enforce_client_idempotency: false,
             },
         );

@@ -35,8 +35,8 @@ Open http://localhost:5001.
 ## What it demonstrates
 
 - **Lazy catch-up projection** Postgres read model rebuilt on-demand from Celeriant, no background projection service
-- **Exactly-once writes** `client_event_index` derived from catch-up + `enforce_client_idempotency` on the server
-- **OCC retry loops** re-derive state on conflict, retry with fresh `expected_event_batch_index`
+- **Exactly-once writes** `client_seq` derived from catch-up + `enforce_client_idempotency` on the server
+- **OCC retry loops** re-derive state on conflict, retry with fresh `expected_version`
 - **Atomic multi-aggregate transfers** debit and credit written in a single `WriteRequest` with OCC on both
 - **HTTP idempotency cache** duplicate POST protection via `Idempotency-Key` header
 - **Self-healing Postgres projection** stale values auto-corrected by catch-up replay

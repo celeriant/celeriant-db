@@ -6,7 +6,7 @@ use serde::{Serialize, Deserialize};
 pub struct Lease {
     #[serde(with = "super::serde_uuid")]
     pub leader_node_id: u128,
-    pub lease_index: u64,
+    pub lease_epoch: u64,
     pub acquired_at_ms: u64,
     pub expires_at_ms: u64,
 }
@@ -19,7 +19,7 @@ impl Lease {
     ) -> Self {
         Self {
             leader_node_id,
-            lease_index: 1,
+            lease_epoch: 1,
             acquired_at_ms: now_millis,
             expires_at_ms: now_millis + duration_millis,
         }
@@ -33,7 +33,7 @@ impl Lease {
     ) -> Self {
         Self {
             leader_node_id: new_leader_node_id,
-            lease_index: self.lease_index + 1,
+            lease_epoch: self.lease_epoch + 1,
             acquired_at_ms: now_millis,
             expires_at_ms: now_millis + duration_millis,
         }
@@ -42,7 +42,7 @@ impl Lease {
     pub fn renew(&self, now_millis: u64, duration_millis: u64) -> Self {
         Self {
             leader_node_id: self.leader_node_id,
-            lease_index: self.lease_index,
+            lease_epoch: self.lease_epoch,
             acquired_at_ms: now_millis,
             expires_at_ms: now_millis + duration_millis,
         }
@@ -58,8 +58,8 @@ impl Lease {
     }
 
     /// Check if this lease supersedes another lease held by a specific node.
-    pub fn supersedes(&self, our_lease_index: u64, our_node_id: u128) -> bool {
-        self.lease_index > our_lease_index && self.leader_node_id != our_node_id
+    pub fn supersedes(&self, our_lease_epoch: u64, our_node_id: u128) -> bool {
+        self.lease_epoch > our_lease_epoch && self.leader_node_id != our_node_id
     }
 }
 
@@ -71,13 +71,13 @@ mod tests {
     fn test_lease_lifecycle() {
         let lease = Lease::new_initial(42, 1000, 5000);
 
-        assert_eq!(lease.lease_index, 1);
+        assert_eq!(lease.lease_epoch, 1);
         assert!(!lease.is_expired(3000));
         assert!(lease.is_expired(6001));
         assert_eq!(lease.remaining_millis(3000), 3000);
 
         let promoted = lease.promote(99, 7000, 5000);
-        assert_eq!(promoted.lease_index, 2);
+        assert_eq!(promoted.lease_epoch, 2);
         assert_eq!(promoted.leader_node_id, 99);
     }
 
@@ -114,7 +114,7 @@ mod tests {
     }
 
     #[test]
-    fn test_supersedes_zero_lease_index() {
+    fn test_supersedes_zero_lease_epoch() {
         let lease = Lease::new_initial(99, 1000, 5000);
         assert!(lease.supersedes(0, 42));
     }

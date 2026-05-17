@@ -6,7 +6,7 @@ pub enum ShardTrimError {
     AggregateExistsAndCacheError(ShardCacheLoadError),
     ReplicationError(ReplicationError),
     ShardFsyncError(ShardFsyncError),
-    TrimIndexOutOfRange { requested: u64, max_event_batch_index: u64 },
+    TrimIndexOutOfRange { requested: u64, max_aggregate_version: u64 },
     ShardCannotAcceptWrites { leader_address: Option<String> },
 }
 

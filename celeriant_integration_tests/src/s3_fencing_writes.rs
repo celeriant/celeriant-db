@@ -6,7 +6,7 @@
 //! Scenario:
 //! Part A: Follower rejects writes across all shards, returns NotLeader with leader address
 //! Part B: Writes rejected during failover transition (kill leader, immediate write fails)
-//! Part C: Former follower becomes leader, lease_index incremented, writes succeed
+//! Part C: Former follower becomes leader, lease_epoch incremented, writes succeed
 //!
 //! Invariants tested: 3 (write gating), 4 (asymmetric fencing)
 
@@ -164,13 +164,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let initial_lease = deserialise_lease(&initial_lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
 
-    println!("  Initial lease: leader_node_id={:x}, lease_index={}",
-        initial_lease.leader_node_id, initial_lease.lease_index);
+    println!("  Initial lease: leader_node_id={:x}, lease_epoch={}",
+        initial_lease.leader_node_id, initial_lease.lease_epoch);
 
     let initial_leader_node_id = initial_lease.leader_node_id;
-    let initial_lease_index = initial_lease.lease_index;
+    let initial_lease_epoch = initial_lease.lease_epoch;
 
-    println!("  ✓ Initial lease_index is {}", initial_lease_index);
+    println!("  ✓ Initial lease_epoch is {}", initial_lease_epoch);
 
     // ========================================
     // PHASE 4: Writes rejected during failover transition
@@ -206,24 +206,24 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  ✓ Node B now accepts writes (became leader after S3 race)");
 
     // ========================================
-    // PHASE 6: Verify lease_index incremented after failover
+    // PHASE 6: Verify lease_epoch incremented after failover
     // ========================================
-    println!("\nPHASE 6: Verify lease_index incremented after failover");
+    println!("\nPHASE 6: Verify lease_epoch incremented after failover");
     println!("------------------------------------------------------");
 
     let new_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let new_lease = deserialise_lease(&new_lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
 
-    println!("  New lease: leader_node_id={:x}, lease_index={}",
-        new_lease.leader_node_id, new_lease.lease_index);
+    println!("  New lease: leader_node_id={:x}, lease_epoch={}",
+        new_lease.leader_node_id, new_lease.lease_epoch);
 
     assert!(
-        new_lease.lease_index > initial_lease_index,
-        "lease_index should have increased after failover: was {}, now {}",
-        initial_lease_index, new_lease.lease_index
+        new_lease.lease_epoch > initial_lease_epoch,
+        "lease_epoch should have increased after failover: was {}, now {}",
+        initial_lease_epoch, new_lease.lease_epoch
     );
-    println!("  ✓ lease_index increased: {} → {}", initial_lease_index, new_lease.lease_index);
+    println!("  ✓ lease_epoch increased: {} → {}", initial_lease_epoch, new_lease.lease_epoch);
 
     assert_ne!(
         new_lease.leader_node_id, initial_leader_node_id,

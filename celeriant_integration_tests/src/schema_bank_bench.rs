@@ -340,8 +340,8 @@ async fn setup_schema_and_accounts(
             account_id, account_id
         );
         let event = DatablockAggregateEvent {
-            client_event_index: 0,
-            event_index: 0,
+            client_seq: 0,
+            event_seq: 0,
             event_id: Some(rand::random()),
             event_timestamp: 0,
             event_type_major: BANK_EVENT_TYPE_MAJOR,
@@ -356,7 +356,7 @@ async fn setup_schema_and_accounts(
             SingleAggregateWrite {
                 events: vec![event],
                 allow_create: true,
-                expected_event_batch_index: None,
+                expected_version: None,
                 enforce_client_idempotency: false,
             },
         );
@@ -390,8 +390,8 @@ fn build_prebuilt_requests(connection_id: usize, client_id: u128) -> Vec<ClientR
         let event_value = Arc::new(payload.into_bytes());
 
         let debit_event = DatablockAggregateEvent {
-            client_event_index: 0,
-            event_index: 0,
+            client_seq: 0,
+            event_seq: 0,
             event_id: Some(rand::random()),
             event_timestamp: 0,
             event_type_major: BANK_EVENT_TYPE_MAJOR,
@@ -401,8 +401,8 @@ fn build_prebuilt_requests(connection_id: usize, client_id: u128) -> Vec<ClientR
         };
 
         let credit_event = DatablockAggregateEvent {
-            client_event_index: 1,
-            event_index: 0,
+            client_seq: 1,
+            event_seq: 0,
             event_id: Some(rand::random()),
             event_timestamp: 0,
             event_type_major: BANK_EVENT_TYPE_MAJOR,
@@ -417,7 +417,7 @@ fn build_prebuilt_requests(connection_id: usize, client_id: u128) -> Vec<ClientR
             SingleAggregateWrite {
                 events: vec![debit_event],
                 allow_create: false,
-                expected_event_batch_index: None,
+                expected_version: None,
                 enforce_client_idempotency: false,
             },
         );
@@ -426,7 +426,7 @@ fn build_prebuilt_requests(connection_id: usize, client_id: u128) -> Vec<ClientR
             SingleAggregateWrite {
                 events: vec![credit_event],
                 allow_create: false,
-                expected_event_batch_index: None,
+                expected_version: None,
                 enforce_client_idempotency: false,
             },
         );

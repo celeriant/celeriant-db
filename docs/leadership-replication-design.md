@@ -14,7 +14,7 @@ write is ever acknowledged until it exists on two storage systems.
 
 Celeriant does not use Raft or Paxos. Leader election and coordination run
 entirely through S3 conditional writes (CAS on a single `cluster/lease.json`
-object using etag-based preconditions). A monotonically increasing `lease_index`
+object using etag-based preconditions). A monotonically increasing `lease_epoch`
 prevents ABA races. Nodes self-fence via asymmetric TTLs: the leader fences
 early (at `expires_at - max_clock_drift`), the follower challenges late (at full
 `expires_at`), guaranteeing the leader stops writing before the follower can win
@@ -62,14 +62,14 @@ conditional PUT (CAS) on this object using its etag.
 ```mermaid
 flowchart TD
     A[run_election_to_acquire_s3_lease] --> B{Lease exists?}
-    B -->|No| C[Create lease: lease_index=1, self as leader]
+    B -->|No| C[Create lease: lease_epoch=1, self as leader]
     C --> D{put_lease_create_only}
     D -->|Success| E[Become Leader]
     D -->|AlreadyExists| F[Fetch lease, Become Follower]
 
     B -->|Yes| G{Expired or held by self?}
     G -->|Valid, other node| H[Become Follower unconditionally]
-    G -->|Expired or self| I[Promote: lease_index+1, self as leader]
+    G -->|Expired or self| I[Promote: lease_epoch+1, self as leader]
     I --> J{put_lease_conditional etag}
     J -->|Success| E
     J -->|PreconditionFailed| K[Fetch new lease, Become Follower]
@@ -78,7 +78,7 @@ flowchart TD
 **Key property:** A node seeing a valid unexpired lease from another node becomes
 follower without attempting CAS. Only expired or self-held leases trigger a race.
 
-`lease_index` is strictly monotonic and never reused.
+`lease_epoch` is strictly monotonic and never reused.
 
 **Election return value:** `ElectionOutcome { status: ValidatedNodeStatus, peer_info: Option<NodeInfo> }`.
 The status is `Leader` or `Follower` with TTL set from the S3 lease. `peer_info`
@@ -104,7 +104,7 @@ cluster/
 ```
 
 **Lease object** (`cluster/lease.json`): JSON-serialized.
-Fields: `leader_node_id` (u128), `lease_index` (u64), `acquired_at_ms` (u64),
+Fields: `leader_node_id` (u128), `lease_epoch` (u64), `acquired_at_ms` (u64),
 `expires_at_ms` (u64).
 
 **Membership object** (`cluster/membership.json`): JSON-serialized.
@@ -114,7 +114,7 @@ Each `NodeInfo` contains: `node_id` (u128), `client_address` (String),
 
 **Fallback batch objects**: Bincode-serialized with 8-byte header
 (`[CRC32C 4B LE] [Version 4B LE]`, version = 1). Filename encodes shard ID
-(3-digit zero-padded), WAL index range (9-digit zero-padded), and uploader
+(3-digit zero-padded), WAL sequence range (9-digit zero-padded), and uploader
 node ID (UUID format). Zero-padding ensures lexicographic ordering matches
 temporal ordering.
 
@@ -132,7 +132,7 @@ sequenceDiagram
     participant F as Follower (shard 0)
 
     loop Every 500ms
-        L->>F: Heartbeat(timestamp, lease_index)
+        L->>F: Heartbeat(timestamp, lease_epoch)
         F->>F: Validate state (must be follower/fenced)
         F->>F: Check clock drift
         F->>F: Extend TTL = max(current, leader_ts + 1500ms)
@@ -394,13 +394,13 @@ to readers. Steps in order:
 2. **Update caches per-item:** For each metablock in the batch:
    - `EventBatchMetadata`: update segment summary, commit position to read snapshot,
      cache recent write with metablock and datablock data
-   - `SoftTrim`: update aggregate min event batch index on both write and read paths
+   - `SoftTrim`: update aggregate min aggregate version on both write and read paths
    - `SoftDelete`: mark aggregate as deleted in read snapshot cache
    - `SchemaRegistration`: follower compiles and caches the schema on fsync
      (leader caches at write time). Both nodes have schemas available for reads.
 
 3. **Finalize sealed segments:** If a non-active log segment is now fully replicated
-   (`read.wal_index == write.wal_index`), extract its sealed segment summary from
+   (`read.wal_seq == write.wal_seq`), extract its sealed segment summary from
    memcache for sidecar file write. This is best-effort (errors logged, not fatal).
 
 4. **Broadcast watch events:** Events are collected during step 2 and broadcast
@@ -428,13 +428,13 @@ sequenceDiagram
         L->>F: ReplicationBatch(items)
 
         alt Success
-            F->>F: apply_external_batch (WAL index + hash check)
+            F->>F: apply_external_batch (WAL sequence + hash check)
             F->>F: sync_durable (fsync as Standalone)
             F-->>L: Success
             L->>L: Drain sent items from workset
 
-        else WalIndexMismatch (follower behind)
-            F-->>L: Rejected(WalIndexMismatch { max_follower_wal_index })
+        else WalSeqMismatch (follower behind)
+            F-->>L: Rejected(WalSeqMismatch { max_follower_wal_seq })
             L->>L: fetch_catchup_entries from local WAL
             alt Entries found (within max_catchup_gap_bytes)
                 L->>L: Prepend catchup entries to workset
@@ -461,17 +461,17 @@ committing with an expired lease (which would be silent ACK forgery if a new lea
 has already taken over).
 
 **Follower validation on receive:**
-1. WAL index continuity: `current + 1 == batch[0].wal_index`
+1. WAL sequence continuity: `current + 1 == batch[0].wal_seq`
 2. Hash chain: `current_tip_hash == batch[0].previous_tip_hash`
-3. Batch internal contiguity: each item's WAL index is previous + 1
-4. Lease index: `batch.lease_index >= follower.leader_lease_index`
+3. Batch internal contiguity: each item's WAL sequence is previous + 1
+4. Lease epoch: `batch.lease_epoch >= follower.leader_lease_epoch`
 
-**After successful TCP receive, the follower records `last_received_replication_wal_index`
+**After successful TCP receive, the follower records `last_received_replication_wal_seq`
 in the log segment header.** This survives crashes and is used during promotion to
 upload the batch to S3 (see Promotion Batch Upload below).
 
 **Authentication:** mTLS on the replication port (always required, hardcoded).
-Per-request `lease_index` validation prevents stale leaders from overwriting data.
+Per-request `lease_epoch` validation prevents stale leaders from overwriting data.
 No separate API key or token for replication.
 
 ---
@@ -500,8 +500,8 @@ during follower outages, which could starve shard 0's S3 lease renewal and cause
 leadership loss.
 
 **FallbackBatch structure:**
-- `fallback_index` (u64): first WAL index in the batch
-- `end_wal_index` (u64): last WAL index in the batch
+- `fallback_index` (u64): first WAL sequence in the batch
+- `end_wal_seq` (u64): last WAL sequence in the batch
 - `shard_id` (u32)
 - `uploaded_by_node_id` (u128)
 - `items`: Vec of (metablock, optional datablock) pairs
@@ -526,10 +526,10 @@ sequenceDiagram
     F->>S3: Download and apply batches
     F->>F: Delete consumed batches from S3
 
-    alt Kicked by live leader (has leader_lease_index)
+    alt Kicked by live leader (has leader_lease_epoch)
         F->>F: Resume as Follower (skip S3 election)
         Note over F: Leader proved alive by kicking us
-    else Boot catchup (no leader_lease_index)
+    else Boot catchup (no leader_lease_epoch)
         F->>S3: run_election_to_acquire_s3_lease
         F->>F: Become Leader or Follower
     end
@@ -544,7 +544,7 @@ A non-follower node rejects with `acknowledged: false`.
 | Aspect | BootCatchup | FollowerCatchingUp |
 |--------|-------------|-------------------|
 | When set | Process start | Leader sends kick |
-| Carries leader_lease_index | No | Yes |
+| Carries leader_lease_epoch | No | Yes |
 | Post-catchup action | S3 election | Resume as Follower |
 | TTL behavior | Exempt | Exempt |
 | Heartbeat Ack `follower_can_accept_tcp_replication` | `false` | `false` |
@@ -559,7 +559,7 @@ straight to S3 fallback without attempting TCP replication that would be rejecte
 3. Validate inter-batch contiguity: `batch[i].end + 1 == batch[i+1].start`
 4. For each batch: download, skip already-applied entries, apply, fsync, delete from S3
 5. On `TipHashMismatch`: find divergence point, truncate local WAL, retry
-6. On `WalIndexMismatch` (batch starts ahead): defer to TCP replication
+6. On `WalSeqMismatch` (batch starts ahead): defer to TCP replication
 
 ---
 
@@ -611,12 +611,12 @@ follower but was rolled back by the leader and never uploaded to S3.
 8. Old leader rejoins, enters S3 catchup: gap at X
 
 **Fix:** On promotion to leader, upload the last TCP-received batch to S3 before
-accepting writes. The field `last_received_replication_wal_index` tracks which
+accepting writes. The field `last_received_replication_wal_seq` tracks which
 batch needs uploading.
 
 **Limitation:** Only fires on leadership change. If the original leader stays
 leader, the gap between TCP-replicated and S3-uploaded entries is not backfilled.
-The follower handles this via `WalIndexMismatch` deferral to TCP replication.
+The follower handles this via `WalSeqMismatch` deferral to TCP replication.
 
 ---
 
@@ -643,7 +643,7 @@ independent of S3 round-trip time and avoids MinIO cost under normal load.
 ```
 loop {
     sleep(heartbeat_interval)                           // 500ms default
-    send_heartbeat(timestamp, lease_index)              // hard timeout: 2s default
+    send_heartbeat(timestamp, lease_epoch)              // hard timeout: 2s default
 
     if Ack { follower_can_accept_tcp_replication }:
         has_peer = true
@@ -812,10 +812,10 @@ sequenceDiagram
     Note over L: Leader cable restored
     L->>L: Heartbeat send fails (peer unreachable during partition)
     L->>S3: S3 lease renewal attempt
-    L->>L: Discover higher lease_index → step down to Follower
+    L->>L: Discover higher lease_epoch → step down to Follower
 
     F->>L: Heartbeat (new leader → old leader)
-    L->>L: Accept heartbeat (higher lease_index)
+    L->>L: Accept heartbeat (higher lease_epoch)
     L->>L: Leader → Follower
 ```
 
@@ -823,7 +823,7 @@ sequenceDiagram
 
 ## Edge Cases for Gap Analysis
 
-These are the scenarios where a WAL index gap can form between a follower's local
+These are the scenarios where a WAL sequence gap can form between a follower's local
 WAL and the S3 fallback batches:
 
 ### 1. TCP-only entries before S3 transition
@@ -896,7 +896,7 @@ at an inconsistent position relative to what S3 has. On next clean startup, S3
 batches don't align with the truncated WAL.
 
 **Gap?** Possible. The truncation + crash leaves the WAL at a position that
-doesn't match any S3 batch boundary. Mitigation: `WalIndexMismatch` deferral
+doesn't match any S3 batch boundary. Mitigation: `WalSeqMismatch` deferral
 to TCP replication.
 
 ---
@@ -926,16 +926,16 @@ fences at `expires_at - max_clock_drift` (default: 500ms early). The follower wa
 for the full `expires_at` before challenging. This creates a guaranteed window where
 the leader has stopped writing before the follower can win an election.
 
-**2. Monotonic `lease_index` on every batch:**
-Every metablock carries the leader's `lease_index`. A stale leader (whose lease
-expired and was superseded) cannot produce a `lease_index` >= the new leader's.
+**2. Monotonic `lease_epoch` on every batch:**
+Every metablock carries the leader's `lease_epoch`. A stale leader (whose lease
+expired and was superseded) cannot produce a `lease_epoch` >= the new leader's.
 The follower rejects `StaleLease` on both TCP replication and S3 catchup paths.
 
 **3. Write gating per-shard:**
 Every write path checks `effective_node_status()` synchronously before entering
 the pipeline. Once fenced, new writes are immediately rejected with
 `ShardCannotAcceptWrites`. In-flight writes that already passed the gate but
-haven't replicated yet will be rejected by the follower's `lease_index` check.
+haven't replicated yet will be rejected by the follower's `lease_epoch` check.
 
 **Historical failure mode (fixed):** S3 fallback upload storms during follower
 outages saturated MinIO, preventing shard 0 from renewing the S3 lease. The leader's
@@ -946,7 +946,7 @@ the heartbeat task.
 
 **Remaining risk:** If clock drift exceeds `max_clock_drift_ms`, the asymmetric
 fencing window closes and both nodes could believe they are leader simultaneously.
-The `lease_index` check on the follower is the last line of defence in this case.
+The `lease_epoch` check on the follower is the last line of defence in this case.
 
 ---
 

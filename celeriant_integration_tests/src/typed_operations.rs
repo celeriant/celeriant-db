@@ -37,10 +37,10 @@ struct UserEvent {
     score: f64,
 }
 
-fn make_event(client_event_index: u64, payload: &str) -> DatablockAggregateEvent {
+fn make_event(client_seq: u64, payload: &str) -> DatablockAggregateEvent {
     DatablockAggregateEvent {
-        client_event_index,
-        event_index: 0,
+        client_seq,
+        event_seq: 0,
         event_id: Some(rand::random()),
         event_timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -71,7 +71,7 @@ async fn test_typed_write(client: &mut CeleriantClient) {
         SingleAggregateWrite {
             events: vec![make_event(0, "typed write")],
             allow_create: true,
-            expected_event_batch_index: Some(0),
+            expected_version: Some(0),
             enforce_client_idempotency: false,
         },
     );
@@ -94,7 +94,7 @@ async fn test_typed_read(client: &mut CeleriantClient) {
         SingleAggregateWrite {
             events: vec![make_event(0, "read me back")],
             allow_create: true,
-            expected_event_batch_index: Some(0),
+            expected_version: Some(0),
             enforce_client_idempotency: false,
         },
     );
@@ -135,7 +135,7 @@ async fn test_write_events_with_no_create(client: &mut CeleriantClient) {
     let options = WriteEventsOptions {
         client_id: 1,
         allow_create: false,
-        expected_event_batch_index: None,
+        expected_version: None,
         enforce_client_idempotency: false,
     };
     let events = vec![make_event(0, "should fail — no create")];
@@ -166,7 +166,7 @@ async fn test_json_event_roundtrip(client: &mut CeleriantClient) {
         SingleAggregateWrite {
             events: vec![event],
             allow_create: true,
-            expected_event_batch_index: Some(0),
+            expected_version: Some(0),
             enforce_client_idempotency: false,
         },
     );
@@ -207,8 +207,8 @@ async fn test_typed_delete(client: &mut CeleriantClient) {
     let mut deletes = HashMap::new();
     deletes.insert(agg.clone(), SingleAggregateDelete {
         allow_recreate: false,
-        allow_index_continuation: false,
-        expected_event_batch_index: None,
+        allow_sequence_continuation: false,
+        expected_version: None,
     });
     let req = DeleteRequest { correlation_id: None, client_id: 1, user_id: None, deletes };
 
@@ -243,7 +243,7 @@ async fn test_trim_start(client: &mut CeleriantClient) {
         let opts = WriteEventsOptions {
             client_id: 1,
             allow_create: i == 0,
-            expected_event_batch_index: Some(i),
+            expected_version: Some(i),
             enforce_client_idempotency: false,
         };
         let events = vec![make_event(i, &format!("batch {}", i))];
@@ -253,11 +253,11 @@ async fn test_trim_start(client: &mut CeleriantClient) {
         }
     }
 
-    // Trim: keep from batch index 2
+    // Trim: keep from version 2
     let req = TrimStartRequest {
         correlation_id: None,
         aggregate_key: agg.clone(),
-        keep_from_event_batch_index: 2,
+        keep_from_aggregate_version: 2,
         client_id: 1,
         user_id: None,
     };
@@ -277,7 +277,7 @@ async fn test_trim_start(client: &mut CeleriantClient) {
                 })) => pass("trim_start()"),
                 Ok(resp) => {
                     // If server returns batches, the minimum should be >= 2
-                    let all_trimmed = resp.event_batches.iter().all(|b| b.event_batch_index >= 2);
+                    let all_trimmed = resp.event_batches.iter().all(|b| b.aggregate_version >= 2);
                     if all_trimmed {
                         pass("trim_start()");
                     } else {
@@ -301,7 +301,7 @@ async fn test_aggregate_details(client: &mut CeleriantClient) {
         let opts = WriteEventsOptions {
             client_id: 1,
             allow_create: i == 0,
-            expected_event_batch_index: Some(i),
+            expected_version: Some(i),
             enforce_client_idempotency: false,
         };
         let _ = client.write_events_with(agg.clone(), vec![make_event(i, "detail event")], opts).await;
@@ -310,7 +310,7 @@ async fn test_aggregate_details(client: &mut CeleriantClient) {
     let req = AggregateDetailsRequest { correlation_id: None, aggregate_key: agg };
     match client.aggregate_details(req).await {
         Ok(details) => {
-            if details.max_event_batch_index >= 1 && !details.is_deleted {
+            if details.max_aggregate_version >= 1 && !details.is_deleted {
                 pass("aggregate_details()");
             } else {
                 fail("aggregate_details() — unexpected values", details);
@@ -351,7 +351,7 @@ async fn test_read_all_iterator(client: &mut CeleriantClient) {
         let opts = WriteEventsOptions {
             client_id: 1,
             allow_create: i == 0,
-            expected_event_batch_index: Some(i),
+            expected_version: Some(i),
             enforce_client_idempotency: false,
         };
         let events = vec![make_event(i, &format!("iterator batch {}", i))];
@@ -365,12 +365,12 @@ async fn test_read_all_iterator(client: &mut CeleriantClient) {
     match iter.collect().await {
         Ok(batches) => {
             if batches.len() == 5 {
-                // Verify ordering: each batch index should be >= previous
-                let ordered = batches.windows(2).all(|w| w[0].event_batch_index <= w[1].event_batch_index);
+                // Verify ordering: each aggregate version should be >= previous
+                let ordered = batches.windows(2).all(|w| w[0].aggregate_version <= w[1].aggregate_version);
                 if ordered {
                     pass("ReadAllIterator — pagination and ordering");
                 } else {
-                    fail("ReadAllIterator — batches out of order", batches.iter().map(|b| b.event_batch_index).collect::<Vec<_>>());
+                    fail("ReadAllIterator — batches out of order", batches.iter().map(|b| b.aggregate_version).collect::<Vec<_>>());
                 }
             } else {
                 fail("ReadAllIterator — expected 5 batches", batches.len());
@@ -391,7 +391,7 @@ async fn test_auto_compression(client: &mut CeleriantClient) {
     let opts = WriteEventsOptions {
         client_id: 1,
         allow_create: true,
-        expected_event_batch_index: Some(0),
+        expected_version: Some(0),
         enforce_client_idempotency: false,
     };
     match client.write_events_with(agg, events, opts).await {
@@ -423,27 +423,27 @@ async fn test_write_error_optimistic_concurrency(client: &mut CeleriantClient) {
     // Write first batch to create the aggregate at index 1
     let _ = client.write_events(agg.clone(), vec![make_event(0, "initial")]).await;
 
-    // Now write with wrong expected_event_batch_index (0 instead of 1)
+    // Now write with wrong expected_version (0 instead of 1)
     let opts = WriteEventsOptions {
         client_id: 1,
         allow_create: false,
-        expected_event_batch_index: Some(0),
+        expected_version: Some(0),
         enforce_client_idempotency: false,
     };
     match client.write_events_with(agg, vec![make_event(1, "wrong index")], opts).await {
         Err(ClientError::Server(ServerError::Write {
             kind: WriteError::OptimisticConcurrencyViolation {
-                expected_event_batch_index,
-                current_event_batch_index,
+                expected_version,
+                current_aggregate_version,
             },
             ..
         })) => {
             // expected is what we sent (0), current is what server has (1)
-            if expected_event_batch_index == Some(0) && current_event_batch_index == Some(1) {
+            if expected_version == Some(0) && current_aggregate_version == Some(1) {
                 pass("WriteError::OptimisticConcurrencyViolation — fields parsed correctly");
             } else {
                 println!("  PASS: WriteError::OptimisticConcurrencyViolation (expected={:?}, current={:?})",
-                    expected_event_batch_index, current_event_batch_index);
+                    expected_version, current_aggregate_version);
             }
         }
         Err(e) => fail("WriteError::OptimisticConcurrencyViolation — wrong error", e),
@@ -458,7 +458,7 @@ async fn test_write_error_empty_events(client: &mut CeleriantClient) {
     let opts = WriteEventsOptions {
         client_id: 1,
         allow_create: true,
-        expected_event_batch_index: None,
+        expected_version: None,
         enforce_client_idempotency: false,
     };
     match client.write_events_with(agg, vec![], opts).await {
@@ -478,8 +478,8 @@ async fn test_delete_error_aggregate_not_exists(client: &mut CeleriantClient) {
     let mut deletes = HashMap::new();
     deletes.insert(agg, SingleAggregateDelete {
         allow_recreate: false,
-        allow_index_continuation: false,
-        expected_event_batch_index: None,
+        allow_sequence_continuation: false,
+        expected_version: None,
     });
     let req = DeleteRequest { correlation_id: None, client_id: 1, user_id: None, deletes };
     match client.delete(req).await {

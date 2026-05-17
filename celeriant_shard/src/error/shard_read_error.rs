@@ -18,7 +18,7 @@ pub enum ShardReadError {
 impl ShardReadError {
     pub fn error_code(&self) -> &'static str {
         match self {
-            Self::UnavailableBatchIndex { .. } => "unavailable_batch_index",
+            Self::UnavailableBatchIndex { .. } => "unavailable_version",
             Self::AggregateNotExists => "aggregate_not_exists",
             Self::ShardCacheLoadError(_) => "cache_load_error",
             Self::FetchDatablocksError(_) => "fetch_datablocks_error",

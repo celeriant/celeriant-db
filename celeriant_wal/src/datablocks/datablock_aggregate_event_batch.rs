@@ -10,7 +10,7 @@ use crate::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, DeepSizeOf, Default)]
 pub struct DatablockAggregateEventBatch {
     /// Unique, incremented integer assigned to each event batch when persisted on the server
-    pub event_batch_index: u64,
+    pub aggregate_version: u64,
 
     /// Events present in this batch, all from the same client / user
     pub events: Vec<DatablockAggregateEvent>,

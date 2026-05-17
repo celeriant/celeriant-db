@@ -21,7 +21,7 @@ impl SegmentSummaryPayload {
 }
 
 /// On-disk segment summary, written as a sidecar file at rotation time.
-/// Not a WAL entry — no wal_index, no hash chain participation.
+/// Not a WAL entry — no wal_seq, no hash chain participation.
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct SegmentSummaryBlock {
     pub payload: SegmentSummaryPayload,
@@ -34,8 +34,8 @@ pub struct SegmentAggregateEntry {
     pub aggregate_id: u128,
     pub is_deleted: bool,
     pub event_batch_count: u64,
-    pub last_event_batch_index: u64,
-    pub min_event_batch_index: u64,
+    pub last_aggregate_version: u64,
+    pub min_aggregate_version: u64,
     pub last_server_timestamp: u64,
     pub compressed_size: u64,
     pub uncompressed_size: u64,
@@ -52,8 +52,8 @@ impl SegmentAggregateEntry {
             aggregate_id,
             is_deleted: false,
             event_batch_count: 0,
-            last_event_batch_index: 0,
-            min_event_batch_index: 0,
+            last_aggregate_version: 0,
+            min_aggregate_version: 0,
             last_server_timestamp: 0,
             compressed_size: 0,
             uncompressed_size: 0,
@@ -73,8 +73,8 @@ mod tests {
             aggregate_id: aid,
             is_deleted: false,
             event_batch_count: 5,
-            last_event_batch_index: 10,
-            min_event_batch_index: 1,
+            last_aggregate_version: 10,
+            min_aggregate_version: 1,
             last_server_timestamp: 999,
             compressed_size: 512,
             uncompressed_size: 1024,

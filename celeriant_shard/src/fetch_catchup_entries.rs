@@ -14,8 +14,8 @@ use crate::error::fetch_catchup_entries_error::FetchCatchupEntriesError;
 /// Reverse-scan the WAL for metablocks that are to be sent to the follower
 pub(crate) async fn fetch_catchup_entries(
     log_segments_cache: &Rc<LogSegmentsCache>,
-    follower_wal_index: u64,
-    leader_wal_index: u64,
+    follower_wal_seq: u64,
+    leader_wal_seq: u64,
     max_size_bytes: Option<u64>,
     read_max_chunk_size: u64,
     dict_codec: &DictCodec,
@@ -28,15 +28,15 @@ pub(crate) async fn fetch_catchup_entries(
 
     let _scan_result = scanner
         .scan(|log_id, _pos, bytes| {
-            let wal_index = metablock_bytes::read_wal_index(bytes);
+            let wal_seq = metablock_bytes::read_wal_seq(bytes);
 
             // Stop if we've gone too far back
-            if wal_index <= follower_wal_index {
+            if wal_seq <= follower_wal_seq {
                 return Ok(Some(()));
             }
 
             // Include if in range
-            if wal_index < leader_wal_index {
+            if wal_seq < leader_wal_seq {
                 let metablock = deserialise_metablock(bytes)?;
 
                 // Estimate size (metablock + potential datablock)
@@ -117,9 +117,9 @@ mod tests {
     /// Build a metablock with `DatablockStorageKind::None` so the datablock-fetch step is a
     /// no-op. `uncompressed_size` controls how much budget the entry consumes during the
     /// budget-exhaustion test.
-    fn metablock_at(wal_index: u64, uncompressed_size: u64) -> Metablock {
+    fn metablock_at(wal_seq: u64, uncompressed_size: u64) -> Metablock {
         let mut mb = Metablock::default_inline_event_batch_metadata(AggregateKey::default());
-        mb.wal_index = wal_index;
+        mb.wal_seq = wal_seq;
         mb.uncompressed_size = uncompressed_size;
         mb.datablock = DatablockStorageKind::None;
         mb
@@ -158,12 +158,12 @@ mod tests {
         // `read.metablocks_position` as its upper bound; without `read = Some(..)` it skips
         // the segment entirely.
         let metablocks_end = HEADER_BLOCK_SIZE_BYTES as u64 + metablocks_bytes as u64;
-        let last_wal = metablocks.last().map(|m| m.wal_index).unwrap_or(0);
+        let last_wal = metablocks.last().map(|m| m.wal_seq).unwrap_or(0);
         let cursor = LogSegmentCursor {
             log_id: lsc.active_log_id(),
             metablocks_position: metablocks_end,
             datablocks_position: FILE_SIZE.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64),
-            wal_index: last_wal,
+            wal_seq: last_wal,
             aggregate_key_bloom: Default::default(),
             tip_hash: [0u8; 32],
         };
@@ -190,8 +190,8 @@ mod tests {
 
             let entries = fetch_catchup_entries(&lsc, 2, 5, Some(1024 * 1024), 64 * 1024, &test_codec()).await.unwrap();
 
-            let wal_indexes: Vec<u64> = entries.iter().map(|e| e.metablock.wal_index).collect();
-            assert_eq!(wal_indexes, vec![3, 4], "should return (follower, leader) exclusive on both ends");
+            let wal_seqs: Vec<u64> = entries.iter().map(|e| e.metablock.wal_seq).collect();
+            assert_eq!(wal_seqs, vec![3, 4], "should return (follower, leader) exclusive on both ends");
 
             lsc.close().await;
         });
@@ -261,7 +261,7 @@ mod tests {
     /// NOT appear in the result. Wal=follower is the entry the follower already has;
     /// wal=leader is the one that triggered the catchup and is sent on the next attempt.
     #[test]
-    fn excludes_boundary_wal_indexes() {
+    fn excludes_boundary_wal_seqs() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let lsc = Rc::new(LogSegmentsCache::ready_up(dir, FILE_SIZE, 4, 0).await.unwrap());
@@ -270,8 +270,8 @@ mod tests {
             write_metablocks_and_set_read_cursor(&lsc, &blocks).await;
 
             let entries = fetch_catchup_entries(&lsc, 1, 4, Some(1024 * 1024), 64 * 1024, &test_codec()).await.unwrap();
-            let wal_indexes: Vec<u64> = entries.iter().map(|e| e.metablock.wal_index).collect();
-            assert_eq!(wal_indexes, vec![2, 3], "wal=1 (follower) and wal=4 (leader) excluded");
+            let wal_seqs: Vec<u64> = entries.iter().map(|e| e.metablock.wal_seq).collect();
+            assert_eq!(wal_seqs, vec![2, 3], "wal=1 (follower) and wal=4 (leader) excluded");
 
             lsc.close().await;
         });

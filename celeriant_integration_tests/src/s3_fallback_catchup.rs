@@ -134,12 +134,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         !fallback_batch.items.is_empty(),
         "FallbackBatch should contain items"
     );
-    let first_wal_index = fallback_batch.items[0].metablock.wal_index;
+    let first_wal_seq = fallback_batch.items[0].metablock.wal_seq;
     assert_eq!(
-        fallback_batch.fallback_index, first_wal_index,
-        "fallback_index should match first item's WAL index"
+        fallback_batch.fallback_index, first_wal_seq,
+        "fallback_index should match first item's WAL sequence"
     );
-    println!("  Batch content verified: shard_id, item count, WAL index alignment");
+    println!("  Batch content verified: shard_id, item count, WAL sequence alignment");
 
     // ========================================
     // Phase 4: Follower restarts — boot catchup reads S3 fallback batches

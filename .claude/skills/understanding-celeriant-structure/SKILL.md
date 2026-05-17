@@ -36,7 +36,7 @@ S3/HTTP runs in a separate tokio sidecar runtime. io_uring and tokio are incompa
 
 ## Read Path
 
-1. Check recent write cache (filtered by `visible_wal_index`)
+1. Check recent write cache (filtered by `visible_wal_seq`)
 2. Reverse scan via `ReverseMetablockScanner`
 3. Bloom filter skips entire log segments
 4. Metablock-level filters (timestamps, batch indices, event type bloom)

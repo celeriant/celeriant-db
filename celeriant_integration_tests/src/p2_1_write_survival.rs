@@ -94,7 +94,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("PHASE 2: Write {} events and track acknowledged writes", NUM_EVENTS);
     println!("--------------------------------------------------------");
 
-    // Track which client_event_index values were acked
+    // Track which client_seq values were acked
     let mut acked_events: Vec<u64> = Vec::new();
 
     for i in 1..=NUM_EVENTS {
@@ -154,9 +154,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
         assert_eq!(
-            event.client_event_index, *client_event_idx,
-            "Event client_event_index mismatch: expected {}, got {}",
-            client_event_idx, event.client_event_index
+            event.client_seq, *client_event_idx,
+            "Event client_seq mismatch: expected {}, got {}",
+            client_event_idx, event.client_seq
         );
 
         // Verify data integrity
@@ -187,12 +187,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Read a specific event by its client_event_index.
-/// Scans all events until the matching client_event_index is found.
+/// Read a specific event by its client_seq.
+/// Scans all events until the matching client_seq is found.
 async fn read_event_by_client_index(
     client: &mut CeleriantClient,
     aggregate_key: &AggregateKey,
-    target_client_event_index: u64,
+    target_client_seq: u64,
 ) -> Result<DatablockAggregateEvent, Box<dyn std::error::Error>> {
     let mut from_batch = 1u64;
 
@@ -211,17 +211,17 @@ async fn read_event_by_client_index(
             ClientResponse::Read(read_resp) => {
                 for batch in read_resp.event_batches {
                     for event in batch.events {
-                        if event.client_event_index == target_client_event_index {
+                        if event.client_seq == target_client_seq {
                             return Ok(event);
                         }
                     }
                 }
-                match read_resp.next_event_batch_index {
+                match read_resp.next_aggregate_version {
                     Some(next) => from_batch = next,
                     None => {
                         return Err(format!(
-                            "Event with client_event_index {} not found",
-                            target_client_event_index
+                            "Event with client_seq {} not found",
+                            target_client_seq
                         )
                         .into())
                     }
@@ -258,7 +258,7 @@ async fn count_events_all(
                     .iter()
                     .map(|b| b.events.len())
                     .sum::<usize>();
-                match read_resp.next_event_batch_index {
+                match read_resp.next_aggregate_version {
                     Some(next) => from_batch = next,
                     None => return Ok(total),
                 }

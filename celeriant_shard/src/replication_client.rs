@@ -31,9 +31,9 @@ pub trait ReplicationClient {
     fn reset_heartbeat_state(&self);
     fn try_acquire_kick(&self) -> bool { true }
     fn release_kick(&self) {}
-    async fn replicate_to_follower(&self, batches: Vec<ReplicationBatchItem>, leader_confirmed_wal_index: u64) -> Result<(), ReplicateToFollowerError>;
+    async fn replicate_to_follower(&self, batches: Vec<ReplicationBatchItem>, leader_confirmed_wal_seq: u64) -> Result<(), ReplicateToFollowerError>;
     async fn replicate_to_s3(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error>;
-    async fn send_heartbeat(&self, unix_epoch_now_ms: u64, lease_index: u64) -> Result<HeartbeatResult, SendHeartbeatError>;
+    async fn send_heartbeat(&self, unix_epoch_now_ms: u64, lease_epoch: u64) -> Result<HeartbeatResult, SendHeartbeatError>;
     async fn send_kick(&self) -> Result<bool, SendHeartbeatError>;
 }
 
@@ -47,7 +47,7 @@ impl ReplicationClient for StubReplicationClient {
     fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
     fn reset_heartbeat_state(&self) {}
 
-    async fn replicate_to_follower(&self, _batches: Vec<ReplicationBatchItem>, _leader_confirmed_wal_index: u64) -> Result<(), ReplicateToFollowerError> {
+    async fn replicate_to_follower(&self, _batches: Vec<ReplicationBatchItem>, _leader_confirmed_wal_seq: u64) -> Result<(), ReplicateToFollowerError> {
         glommio::timer::sleep(std::time::Duration::from_millis(30)).await;
         Ok(())
     }
@@ -57,7 +57,7 @@ impl ReplicationClient for StubReplicationClient {
         Ok(())
     }
 
-    async fn send_heartbeat(&self, unix_epoch_now_ms: u64, _lease_index: u64) -> Result<HeartbeatResult, SendHeartbeatError> {
+    async fn send_heartbeat(&self, unix_epoch_now_ms: u64, _lease_epoch: u64) -> Result<HeartbeatResult, SendHeartbeatError> {
         glommio::timer::sleep(std::time::Duration::from_millis(100)).await;
         Ok(HeartbeatResult::Ack { follower_timestamp_ms: unix_epoch_now_ms + 100, follower_can_accept_tcp_replication: true })
     }
@@ -226,7 +226,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
         self.kick_in_flight.set(false);
     }
 
-    async fn replicate_to_follower(&self, batches: Vec<ReplicationBatchItem>, leader_confirmed_wal_index: u64) -> Result<(), ReplicateToFollowerError> {
+    async fn replicate_to_follower(&self, batches: Vec<ReplicationBatchItem>, leader_confirmed_wal_seq: u64) -> Result<(), ReplicateToFollowerError> {
         if batches.is_empty() {
             return Ok(());
         }
@@ -243,7 +243,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
             correlation_id: None,
             shard_id,
             leader_timestamp_ms: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
-            leader_confirmed_wal_index,
+            leader_confirmed_wal_seq,
             batches,
         });
 
@@ -272,26 +272,26 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
             return Ok(());
         }
 
-        // Refuse to upload a batch with internal wal_index gaps. A gap here means
+        // Refuse to upload a batch with internal wal_seq gaps. A gap here means
         // upstream code produced items from two chain generations in one workset —
         // a latent bug that would plant an unrecoverable file in S3 and panic any
         // follower that consumes it. Fail loudly at the source instead.
-        if let Some((i, w)) = batches.windows(2).enumerate().find(|(_, w)| w[0].metablock.wal_index + 1 != w[1].metablock.wal_index) {
-            let expected = w[0].metablock.wal_index + 1;
-            let actual = w[1].metablock.wal_index;
-            tracing::error!(shard_id = self.shard_id, at_index = i + 1, expected, actual, "refusing S3 upload: batch has internal wal_index gap");
-            return Err(ReplicateToS3Error::BatchNotContiguous { at_index: i + 1, expected_wal_index: expected, actual_wal_index: actual });
+        if let Some((i, w)) = batches.windows(2).enumerate().find(|(_, w)| w[0].metablock.wal_seq + 1 != w[1].metablock.wal_seq) {
+            let expected = w[0].metablock.wal_seq + 1;
+            let actual = w[1].metablock.wal_seq;
+            tracing::error!(shard_id = self.shard_id, at_index = i + 1, expected, actual, "refusing S3 upload: batch has internal wal_seq gap");
+            return Err(ReplicateToS3Error::BatchNotContiguous { at_index: i + 1, expected_wal_seq: expected, actual_wal_seq: actual });
         }
 
         let s3_uploader = self.s3_uploader.as_ref()
             .ok_or(ReplicateToS3Error::S3NotConfigured)?;
 
-        let fallback_index = batches[0].metablock.wal_index;
-        let end_wal_index = batches.last().unwrap().metablock.wal_index;
-        let lease_index = batches[0].metablock.lease_index;
-        if let Some((i, b)) = batches.iter().enumerate().skip(1).find(|(_, b)| b.metablock.lease_index != lease_index) {
-            tracing::error!(shard_id = self.shard_id, at_index = i, first = lease_index, found = b.metablock.lease_index, "refusing S3 upload: batch spans multiple lease_indexes");
-            return Err(ReplicateToS3Error::LeaseIndexInconsistent { at_index: i, first: lease_index, found: b.metablock.lease_index });
+        let fallback_index = batches[0].metablock.wal_seq;
+        let end_wal_seq = batches.last().unwrap().metablock.wal_seq;
+        let lease_epoch = batches[0].metablock.lease_epoch;
+        if let Some((i, b)) = batches.iter().enumerate().skip(1).find(|(_, b)| b.metablock.lease_epoch != lease_epoch) {
+            tracing::error!(shard_id = self.shard_id, at_index = i, first = lease_epoch, found = b.metablock.lease_epoch, "refusing S3 upload: batch spans multiple lease_epochs");
+            return Err(ReplicateToS3Error::LeaseIndexInconsistent { at_index: i, first: lease_epoch, found: b.metablock.lease_epoch });
         }
         let shard_id = self.shard_id as u32;
 
@@ -307,12 +307,12 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
 
         let fallback_batch = FallbackBatch {
             fallback_index,
-            end_wal_index,
+            end_wal_seq,
             shard_id,
             uploaded_by_node_id: self.node_id,
             items,
             upload_sequence: seq,
-            lease_index,
+            lease_epoch,
         };
 
         let batch_count = fallback_batch.items.len();
@@ -322,18 +322,18 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
         ).map_err(|e| ReplicateToS3Error::SerializationFailed(e.to_string()))?;
 
         let total_bytes = serialized.len();
-        let path = fallback_batch_path(shard_id, fallback_index, end_wal_index, self.node_id);
+        let path = fallback_batch_path(shard_id, fallback_index, end_wal_seq, self.node_id);
 
         debug!(
-            shard_id, batch_count, total_bytes, fallback_index, end_wal_index,
-            lease_index, upload_seq = seq, path = %path,
+            shard_id, batch_count, total_bytes, fallback_index, end_wal_seq,
+            lease_epoch, upload_seq = seq, path = %path,
             "S3 fallback upload"
         );
 
         s3_uploader.upload(path, Bytes::from(serialized)).await
     }
 
-    async fn send_heartbeat(&self, unix_epoch_now_ms: u64, lease_index: u64) -> Result<HeartbeatResult, SendHeartbeatError> {
+    async fn send_heartbeat(&self, unix_epoch_now_ms: u64, lease_epoch: u64) -> Result<HeartbeatResult, SendHeartbeatError> {
         let mut guard = write_with_timeout(&self.heartbeat_conn, "send_heartbeat").await
             .map_err(|_| SendHeartbeatError::LockTimeout)?;
 
@@ -349,7 +349,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
             correlation_id: None,
             shard_id: self.shard_id,
             leader_timestamp_ms: unix_epoch_now_ms,
-            lease_index,
+            lease_epoch,
         });
 
         let response = guard.client.as_mut().unwrap().send_cluster_request(&request).await?;
@@ -434,12 +434,12 @@ mod tests {
         }
     }
 
-    fn create_test_metablock(wal_index: u64) -> Metablock {
+    fn create_test_metablock(wal_seq: u64) -> Metablock {
         let aggregate_key = AggregateKey::new(1, 2, 3);
         Metablock {
-            wal_index,
+            wal_seq,
             server_timestamp: 1000,
-            lease_index: 5,
+            lease_epoch: 5,
             node_id: 999,
             uncompressed_size: 1024,
             compressed_size: 512,
@@ -449,14 +449,14 @@ mod tests {
             datablock_position: 0,
             wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
                 aggregate_key,
-                event_batch_index: 10,
-                min_event_batch_index: 1,
-                min_client_event_index: 1,
-                max_client_event_index: 5,
+                aggregate_version: 10,
+                trimmed_below_version: 1,
+                min_client_seq: 1,
+                max_client_seq: 5,
                 min_event_timestamp: 100,
                 max_event_timestamp: 500,
-                min_event_index: 1,
-                max_event_index: 5,
+                min_event_seq: 1,
+                max_event_seq: 5,
                 client_id: 123,
                 user_id: None,
                 event_types_data: celeriant_wal::metablocks::metablock_event_batch::EventTypesKind::Direct([7, 0, 0, 0]),
@@ -468,7 +468,7 @@ mod tests {
     fn create_test_datablock() -> Datablock {
         Datablock {
             datablock_kind: DatablockKind::EventBatchItem(DatablockAggregateEventBatch {
-                event_batch_index: 10,
+                aggregate_version: 10,
                 events: vec![],
             }),
         }
@@ -576,13 +576,13 @@ mod tests {
             assert_eq!(deserialized.shard_id, 7);
             assert_eq!(deserialized.uploaded_by_node_id, 42);
             assert_eq!(deserialized.fallback_index, 42);
-            assert_eq!(deserialized.end_wal_index, 43);
+            assert_eq!(deserialized.end_wal_seq, 43);
             assert_eq!(deserialized.items.len(), 2);
         });
     }
 
     #[test]
-    fn fallback_index_is_first_wal_index() {
+    fn fallback_index_is_first_wal_seq() {
         LocalExecutor::default().run(async {
             let (mock_uploader, calls) = MockS3Uploader::new();
 
@@ -630,10 +630,10 @@ mod tests {
                 .expect("should deserialize");
             assert_eq!(deserialized.fallback_index, 100);
             assert_eq!(deserialized.uploaded_by_node_id, 1);
-            assert_eq!(deserialized.end_wal_index, 102);
-            assert_eq!(deserialized.items[0].metablock.wal_index, 100);
-            assert_eq!(deserialized.items[1].metablock.wal_index, 101);
-            assert_eq!(deserialized.items[2].metablock.wal_index, 102);
+            assert_eq!(deserialized.end_wal_seq, 102);
+            assert_eq!(deserialized.items[0].metablock.wal_seq, 100);
+            assert_eq!(deserialized.items[1].metablock.wal_seq, 101);
+            assert_eq!(deserialized.items[2].metablock.wal_seq, 102);
         });
     }
 
@@ -655,9 +655,9 @@ mod tests {
             );
 
             let mut mb_a = create_test_metablock(42);
-            mb_a.lease_index = 5;
+            mb_a.lease_epoch = 5;
             let mut mb_b = create_test_metablock(43);
-            mb_b.lease_index = 6;
+            mb_b.lease_epoch = 6;
 
             let batches = vec![
                 ReplicationBatchItem { metablock: mb_a, datablock: None },

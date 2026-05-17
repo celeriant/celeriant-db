@@ -11,16 +11,16 @@ pub fn apply_event_filters(event_batch: &mut DatablockAggregateEventBatch, read_
     }
 
     // Final filtering for local_index
-    if let Some(min_event_index) = read_filters.min_event_index {
+    if let Some(min_event_seq) = read_filters.min_event_seq {
         event_batch
             .events
-            .retain(|event| event.event_index >= min_event_index);
+            .retain(|event| event.event_seq >= min_event_seq);
     }
 
-    if let Some(max_event_index) = read_filters.max_event_index {
+    if let Some(max_event_seq) = read_filters.max_event_seq {
         event_batch
             .events
-            .retain(|event| event.event_index <= max_event_index);
+            .retain(|event| event.event_seq <= max_event_seq);
     }
 
     // Final filtering for event_time
@@ -37,16 +37,16 @@ pub fn apply_event_filters(event_batch: &mut DatablockAggregateEventBatch, read_
     }
 
     // Final filtering for event index
-    if let Some(min_client_event_index) = read_filters.min_client_event_index {
+    if let Some(min_client_seq) = read_filters.min_client_seq {
         event_batch
             .events
-            .retain(|event| event.client_event_index >= min_client_event_index);
+            .retain(|event| event.client_seq >= min_client_seq);
     }
 
-    if let Some(max_client_event_index) = read_filters.max_client_event_index {
+    if let Some(max_client_seq) = read_filters.max_client_seq {
         event_batch
             .events
-            .retain(|event| event.client_event_index <= max_client_event_index);
+            .retain(|event| event.client_seq <= max_client_seq);
     }
 }
 
@@ -56,12 +56,12 @@ pub fn is_include_batch(metablock: &Metablock, filters: &ReadFilters) -> bool {
         _ => return false, // Not an EventBatch metablock
     };
 
-    if metadata.event_batch_index < filters.from_event_batch_index {
+    if metadata.aggregate_version < filters.from_aggregate_version {
         return false;
     }
 
-    if filters.to_event_batch_index.map_or(false, |to_event_batch_index| {
-        metadata.event_batch_index > to_event_batch_index
+    if filters.to_aggregate_version.map_or(false, |to_aggregate_version| {
+        metadata.aggregate_version > to_aggregate_version
     }) {
         return false;
     }
@@ -116,14 +116,14 @@ pub fn is_include_batch(metablock: &Metablock, filters: &ReadFilters) -> bool {
         return false;
     }
 
-    if filters.min_client_event_index.map_or(false, |min_index| {
-        metadata.max_client_event_index < min_index
+    if filters.min_client_seq.map_or(false, |min_index| {
+        metadata.max_client_seq < min_index
     }) {
         return false;
     }
 
-    if filters.max_client_event_index.map_or(false, |max_index| {
-        metadata.min_client_event_index > max_index
+    if filters.max_client_seq.map_or(false, |max_index| {
+        metadata.min_client_seq > max_index
     }) {
         return false;
     }
@@ -143,15 +143,15 @@ pub fn is_include_batch(metablock: &Metablock, filters: &ReadFilters) -> bool {
     }
 
     if filters
-        .min_event_index
-        .map_or(false, |min_index| metadata.max_event_index < min_index)
+        .min_event_seq
+        .map_or(false, |min_index| metadata.max_event_seq < min_index)
     {
         return false;
     }
 
     if filters
-        .max_event_index
-        .map_or(false, |max_index| metadata.min_event_index > max_index)
+        .max_event_seq
+        .map_or(false, |max_index| metadata.min_event_seq > max_index)
     {
         return false;
     }
@@ -219,7 +219,7 @@ pub fn trim_end_if_exceeds_max_bytes(
     let mut cumulative_size: u64 = 0;
     let mut cut_index: Option<usize> = None;
 
-    // Batches are sorted by event_batch_index (ascending)
+    // Batches are sorted by aggregate_version (ascending)
     for (index, batch) in metablocks.iter().enumerate() {
         cumulative_size += batch.uncompressed_size;
 
@@ -232,10 +232,10 @@ pub fn trim_end_if_exceeds_max_bytes(
 
     // If we need to trim
     if let Some(index) = cut_index {
-        // Get the event_batch_index of the first batch we're trimming
-        let next_event_batch_index = if index < metablocks.len() {
+        // Get the aggregate_version of the first batch we're trimming
+        let next_aggregate_version = if index < metablocks.len() {
             match &metablocks[index].wal_metablock_type {
-                MetablockKind::EventBatchMetadata(m) => Some(m.event_batch_index),
+                MetablockKind::EventBatchMetadata(m) => Some(m.aggregate_version),
                 _ => None,
             }
         } else {
@@ -245,7 +245,7 @@ pub fn trim_end_if_exceeds_max_bytes(
         // Keep only the batches that fit within the max_bytes limit
         metablocks.truncate(index);
 
-        next_event_batch_index
+        next_aggregate_version
     } else {
         // No trimming needed, all batches fit within the limit
         None
@@ -259,7 +259,7 @@ mod tests {
     use super::*;
 
     fn mk_metadata(
-        event_batch_index: u64,
+        aggregate_version: u64,
         server_timestamp: u64,
         client_id: u128,
         user_id: u128,
@@ -273,9 +273,9 @@ mod tests {
         event_types: &[u64; 4],
     ) -> Metablock {
         Metablock {
-            wal_index: 0,
+            wal_seq: 0,
             server_timestamp,
-            lease_index: 0,
+            lease_epoch: 0,
             node_id: 0,
             uncompressed_size,
             compressed_size: 0,
@@ -288,23 +288,23 @@ mod tests {
             wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
                 aggregate_key: AggregateKey::new(1, 1, 1),
                 event_types_data: EventTypesKind::Direct(*event_types),
-                event_batch_index,
-                min_event_batch_index: 0,
+                aggregate_version,
+                trimmed_below_version: 0,
                 client_id,
                 user_id: Some(user_id),
-                min_client_event_index: min_cidx,
-                max_client_event_index: max_cidx,
+                min_client_seq: min_cidx,
+                max_client_seq: max_cidx,
                 min_event_timestamp: min_ts,
                 max_event_timestamp: max_ts,
-                min_event_index: min_eidx,
-                max_event_index: max_eidx,
+                min_event_seq: min_eidx,
+                max_event_seq: max_eidx,
             }),
             previous_tip_hash: GENESIS_HASH,
         }
     }
 
     fn mk_metadata_bloom(
-        event_batch_index: u64,
+        aggregate_version: u64,
         server_timestamp: u64,
         client_id: u128,
         user_id: u128,
@@ -328,9 +328,9 @@ mod tests {
         let bloom_bytes: [u64; BLOOM_BYTES / 8] = bloom.as_slice().try_into().unwrap();
 
         Metablock {
-            wal_index: 0,
+            wal_seq: 0,
             server_timestamp,
-            lease_index: 0,
+            lease_epoch: 0,
             node_id: 0,
             uncompressed_size,
             compressed_size: 0,
@@ -343,16 +343,16 @@ mod tests {
             wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
                 aggregate_key: AggregateKey::new(1, 1, 1),
                 event_types_data: EventTypesKind::Bloom(bloom_bytes),
-                event_batch_index,
-                min_event_batch_index: 0,
+                aggregate_version,
+                trimmed_below_version: 0,
                 client_id,
                 user_id: Some(user_id),
-                min_client_event_index: min_cidx,
-                max_client_event_index: max_cidx,
+                min_client_seq: min_cidx,
+                max_client_seq: max_cidx,
                 min_event_timestamp: min_ts,
                 max_event_timestamp: max_ts,
-                min_event_index: min_eidx,
-                max_event_index: max_eidx,
+                min_event_seq: min_eidx,
+                max_event_seq: max_eidx,
             }),
             previous_tip_hash: GENESIS_HASH,
         }
@@ -360,21 +360,21 @@ mod tests {
 
     fn mk_event(
         event_type_major: u64,
-        event_index: u64,
-        client_event_index: u64,
+        event_seq: u64,
+        client_seq: u64,
         event_timestamp: u64,
     ) -> DatablockAggregateEvent {
         DatablockAggregateEvent {
             event_type_major,
-            event_index,
-            client_event_index,
+            event_seq: event_seq,
+            client_seq,
             event_timestamp,
             ..Default::default()
         }
     }
 
     #[test]
-    fn is_include_batch_inclusive_batch_index_bounds() {
+    fn is_include_batch_inclusive_aggregate_version_bounds() {
         let meta = mk_metadata(
             10, // bx
             1000,
@@ -399,11 +399,11 @@ mod tests {
         assert!(!is_include_batch(&meta, &filters));
 
         // to >= bx included (inclusive upper bound)
-        let filters = ReadFilters::new(1).to_event_batch_index(10);
+        let filters = ReadFilters::new(1).to_aggregate_version(10);
         assert!(is_include_batch(&meta, &filters));
 
         // to < bx excluded
-        let filters = ReadFilters::new(1).to_event_batch_index(9);
+        let filters = ReadFilters::new(1).to_aggregate_version(9);
         assert!(!is_include_batch(&meta, &filters));
     }
 
@@ -454,23 +454,23 @@ mod tests {
     }
 
     #[test]
-    fn is_include_batch_inclusive_ranges_for_client_index_event_time_and_event_index() {
+    fn is_include_batch_inclusive_ranges_for_client_index_event_time_and_event_seq() {
         // Batch with ranges:
-        // client_event_index: [10, 20]
+        // client_seq: [10, 20]
         // event_timestamp: [1_000, 2_000]
-        // event_index: [100, 200]
+        // event_seq: [100, 200]
         let meta = mk_metadata(1, 0, 0, 0, 10, 20, 1000, 2000, 100, 200, 1, &[0, 0, 0, 0]);
 
-        // min_client_event_index: keep when max >= min (inclusive)
-        let filters = ReadFilters::new(1).min_client_event_index(20);
+        // min_client_seq: keep when max >= min (inclusive)
+        let filters = ReadFilters::new(1).min_client_seq(20);
         assert!(is_include_batch(&meta, &filters)); // edge ok
-        let filters = ReadFilters::new(1).min_client_event_index(21);
+        let filters = ReadFilters::new(1).min_client_seq(21);
         assert!(!is_include_batch(&meta, &filters)); // 20 < 21 -> no overlap
 
-        // max_client_event_index: keep when min <= max (inclusive)
-        let filters = ReadFilters::new(1).max_client_event_index(10);
+        // max_client_seq: keep when min <= max (inclusive)
+        let filters = ReadFilters::new(1).max_client_seq(10);
         assert!(is_include_batch(&meta, &filters));
-        let filters = ReadFilters::new(1).max_client_event_index(9);
+        let filters = ReadFilters::new(1).max_client_seq(9);
         assert!(!is_include_batch(&meta, &filters));
 
         // min_event_timestamp: keep when batch.max_event_timestamp >= min (inclusive)
@@ -485,16 +485,16 @@ mod tests {
         let filters = ReadFilters::new(1).max_event_timestamp(999);
         assert!(!is_include_batch(&meta, &filters));
 
-        // min_event_index: keep when batch.max_event_index >= min (inclusive)
-        let filters = ReadFilters::new(1).min_event_index(200);
+        // min_event_seq: keep when batch.max_event_seq >= min (inclusive)
+        let filters = ReadFilters::new(1).min_event_seq(200);
         assert!(is_include_batch(&meta, &filters));
-        let filters = ReadFilters::new(1).min_event_index(201);
+        let filters = ReadFilters::new(1).min_event_seq(201);
         assert!(!is_include_batch(&meta, &filters));
 
-        // max_event_index: keep when batch.min_event_index <= max (inclusive)
-        let filters = ReadFilters::new(1).max_event_index(100);
+        // max_event_seq: keep when batch.min_event_seq <= max (inclusive)
+        let filters = ReadFilters::new(1).max_event_seq(100);
         assert!(is_include_batch(&meta, &filters));
-        let filters = ReadFilters::new(1).max_event_index(99);
+        let filters = ReadFilters::new(1).max_event_seq(99);
         assert!(!is_include_batch(&meta, &filters));
     }
 
@@ -530,11 +530,11 @@ mod tests {
     fn apply_event_filters_keeps_only_matching_events_all_fields_inclusive() {
         // Build a batch with varied events
         // Types: 1, 2, 3
-        // event_index: 9, 10, 11, 12
-        // client_event_index: 99, 100, 101, 102
+        // event_seq: 9, 10, 11, 12
+        // client_seq: 99, 100, 101, 102
         // event_timestamp: 999, 1000, 1001, 1002
         let mut batch = DatablockAggregateEventBatch {
-            event_batch_index: 1,
+            aggregate_version: 1,
             events: vec![
                 mk_event(1, 9, 99, 999),
                 mk_event(2, 10, 100, 1000),
@@ -545,12 +545,12 @@ mod tests {
 
         let filters = ReadFilters::new(1)
             .include_event_types(vec![2, 3])
-            .min_event_index(10)
-            .max_event_index(12)
+            .min_event_seq(10)
+            .max_event_seq(12)
             .min_event_timestamp(1000)
             .max_event_timestamp(1002)
-            .min_client_event_index(100)
-            .max_client_event_index(102);
+            .min_client_seq(100)
+            .max_client_seq(102);
 
         apply_event_filters(&mut batch, &filters);
 
@@ -559,7 +559,7 @@ mod tests {
         let kept: Vec<(u64, u64, u64, u64)> = batch
             .events
             .iter()
-            .map(|e| (e.event_type_major, e.event_index, e.client_event_index, e.event_timestamp))
+            .map(|e| (e.event_type_major, e.event_seq, e.client_seq, e.event_timestamp))
             .collect();
 
         assert_eq!(
@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn apply_event_filters_type_whitelist_only() {
         let mut batch = DatablockAggregateEventBatch {
-            event_batch_index: 1,
+            aggregate_version: 1,
             events: vec![mk_event(1, 1, 1, 1), mk_event(2, 2, 2, 2), mk_event(3, 3, 3, 3)],
         };
 
@@ -582,7 +582,7 @@ mod tests {
         assert_eq!(kept_types, vec![2]);
     }
 
-    fn get_event_batch_index(meta: &Metablock) -> &MetablockEventBatch {
+    fn get_aggregate_version(meta: &Metablock) -> &MetablockEventBatch {
         match &meta.wal_metablock_type {
             MetablockKind::EventBatchMetadata(m) => m,
             _ => panic!("Expected EventBatchMetadata"),
@@ -605,7 +605,7 @@ mod tests {
         let next = trim_end_if_exceeds_max_bytes(&mut v, &filters, Some(250));
         assert_eq!(next, Some(11));
         assert_eq!(v.len(), 1);
-        assert_eq!(get_event_batch_index(&v[0]).event_batch_index, 10);
+        assert_eq!(get_aggregate_version(&v[0]).aggregate_version, 10);
     }
 
     #[test]
@@ -640,7 +640,7 @@ mod tests {
         assert!(is_include_batch(&meta, &filters));
 
         let mut batch = DatablockAggregateEventBatch {
-            event_batch_index: 1,
+            aggregate_version: 1,
             events: vec![mk_event(1, 1, 1, 1), mk_event(2, 2, 2, 2)],
         };
         apply_event_filters(&mut batch, &filters);

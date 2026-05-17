@@ -18,7 +18,7 @@ use crate::client_error::ClientError;
 pub struct WriteEventsOptions {
     pub client_id: u128,
     pub allow_create: bool,
-    pub expected_event_batch_index: Option<u64>,
+    pub expected_version: Option<u64>,
     pub enforce_client_idempotency: bool,
 }
 
@@ -27,7 +27,7 @@ impl Default for WriteEventsOptions {
         Self {
             client_id: 0,
             allow_create: true,
-            expected_event_batch_index: None,
+            expected_version: None,
             enforce_client_idempotency: false,
         }
     }
@@ -92,7 +92,7 @@ impl CeleriantClient {
         writes.insert(aggregate_key, SingleAggregateWrite {
             events,
             allow_create: options.allow_create,
-            expected_event_batch_index: options.expected_event_batch_index,
+            expected_version: options.expected_version,
             enforce_client_idempotency: options.enforce_client_idempotency,
         });
         self.write(WriteRequest {

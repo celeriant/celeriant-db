@@ -40,7 +40,7 @@ Read Path:
            │
            ▼
 ┌───────────────────────┐
-│ get_cached_writes_    │─── Filter by visible_wal_index (replication boundary)
+│ get_cached_writes_    │─── Filter by visible_wal_seq (replication boundary)
 │ from                  │
 └───────────────────────┘
            │
@@ -68,7 +68,7 @@ Read Path:
 | `MetablockPosition` | Log file position for an aggregate |
 | `AggregateStatus` | `Found` / `NotFound` / `Deleted` |
 | `EventIndexes` | Latest indexes from queue or write snapshot |
-| `WalIndexPosition` | Cached WAL index → log file position mapping |
+| `WalSeqPosition` | Cached WAL sequence → log file position mapping |
 | `Validate` | Trait for schema validators used by `ShardMemCache<V>` |
 | `CachedSchema<V>` | `Validated(CachedValidator<V>)` or `CompilationFailed(String)` |
 | `CachedValidator<V>` | Wraps an `Rc<V>` validator with size estimate |
@@ -78,7 +78,7 @@ Read Path:
 
 - Two separate LRU caches exist: `aggregate_write_snapshots` (updated after fsync, used for OCC/idempotency) and `aggregate_read_snapshots` (updated after replication on leader, used by reads).
 - OCC checks use the write-ahead snapshot, not the read snapshot. A concurrent write fsynced but not yet replicated still triggers an OCC conflict.
-- The recent-write cache filters by `visible_wal_index`. Entries with `wal_index > visible_wal_index` are excluded from reads.
+- The recent-write cache filters by `visible_wal_seq`. Entries with `wal_seq > visible_wal_seq` are excluded from reads.
 - Rollback flags (`fsync_rollback_occurred`, `replication_rollback_occurred`) are one-time-consumption. The next capture phase reads and resets the flag.
 - Replication rollback is a superset of fsync rollback: it also wipes write snapshots because those positions are not yet visible to readers.
 - Low-priority LRU inserts (scan-driven) only populate spare capacity and immediately demote to LRU tail. Scans must not evict hot entries.
@@ -139,7 +139,7 @@ pub struct ShardMemCache<V: Validate> {
 }
 ```
 
-Recent writes are evicted FIFO when the size limit is exceeded. Each entry tracks its byte size for accurate accounting. Eviction happens before insertion to ensure space. When a trim commits on the read path, `update_aggregate_min_event_batch_index` also proactively evicts now-trimmed entries.
+Recent writes are evicted FIFO when the size limit is exceeded. Each entry tracks its byte size for accurate accounting. Eviction happens before insertion to ensure space. When a trim commits on the read path, `update_aggregate_min_aggregate_version` also proactively evicts now-trimmed entries.
 
 ### LRU with priority insertion
 
@@ -184,42 +184,42 @@ Replication rollback is a superset of fsync rollback: it also wipes the write sn
 
 ```rust
 // 0 is sentinel for "checked disk, client never wrote"
-if client_event_index == 0 { None } else { Some(client_event_index) }
+if client_seq == 0 { None } else { Some(client_seq) }
 ```
 
-Client event indexes are cached with a sentinel to distinguish "never wrote" from "not in cache". Enables idempotency checks without repeated disk scans. Client cache is only populated from the write path, `put_aggregate_into_cache` with `CachePath::Write` updates client tracking; `CachePath::Read` does not.
+Client event sequences are cached with a sentinel to distinguish "never wrote" from "not in cache". Enables idempotency checks without repeated disk scans. Client cache is only populated from the write path, `put_aggregate_into_cache` with `CachePath::Write` updates client tracking; `CachePath::Read` does not.
 
-### WAL index position cache for list pagination
+### WAL sequence position cache for list pagination
 
 ```rust
-wal_index_positions: LruCache<u64, WalIndexPosition>
+wal_seq_positions: LruCache<u64, WalSeqPosition>
 ```
 
-Caches WAL index → file position mappings. `find_nearest_wal_index_position` finds the closest cached position at or below the target, enabling list pagination to skip ahead rather than scanning from the beginning of the log. The scan is O(n) over the bounded LRU, which is acceptable given the small cache size.
+Caches WAL sequence → file position mappings. `find_nearest_wal_seq_position` finds the closest cached position at or below the target, enabling list pagination to skip ahead rather than scanning from the beginning of the log. The scan is O(n) over the bounded LRU, which is acceptable given the small cache size.
 
-### Contiguous batch index optimization
+### Contiguous aggregate version optimization
 
 ```rust
 pub struct AggregateRecentWrites {
-    pub first_batch_index: u64,
+    pub first_version: u64,
     pub writes: VecDeque<RecentWrite>,
 }
 ```
 
-Batch indexes are monotonic with no gaps. VecDeque with tracked starting index enables O(1) lookup by batch index instead of HashMap overhead.
+Aggregate versions are monotonic with no gaps. VecDeque with tracked starting index enables O(1) lookup by version instead of HashMap overhead.
 
-### `visible_wal_index` filtering in recent write reads
+### `visible_wal_seq` filtering in recent write reads
 
 ```rust
 pub fn get_cached_writes_from(
     &self,
     aggregate_key: &AggregateKey,
-    from_batch_index: u64,
-    visible_wal_index: u64,
+    from_version: u64,
+    visible_wal_seq: u64,
 ) -> impl Iterator<Item = (u64, &RecentWrite)>
 ```
 
-Each `RecentWrite` carries the `wal_index` of the write that produced it. The reader supplies the highest `wal_index` that is safe to serve (i.e. confirmed replicated). Writes beyond that boundary are silently excluded, ensuring readers never see data ahead of the replication frontier even if it is already cached in memory.
+Each `RecentWrite` carries the `wal_seq` of the write that produced it. The reader supplies the highest `wal_seq` that is safe to serve (i.e. confirmed replicated). Writes beyond that boundary are silently excluded, ensuring readers never see data ahead of the replication frontier even if it is already cached in memory.
 
 ### Schema validation caching
 

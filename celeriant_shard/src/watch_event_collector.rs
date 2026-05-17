@@ -20,27 +20,27 @@ impl WatchEventCollector {
         Self::default()
     }
 
-    /// Records a write event, extending the batch index range if the aggregate already has a write event.
+    /// Records a write event, extending the aggregate version range if the aggregate already has a write event.
     pub fn add_write_event(&mut self, metablock_event_batch: &MetablockEventBatch) {
         self.write_events
             .entry(metablock_event_batch.aggregate_key.clone())
             .and_modify(|event| {
                 if let AggregateWatchEventOperation::Write {
-                    from_event_batch_index,
-                    to_event_batch_index,
+                    from_aggregate_version,
+                    to_aggregate_version,
                 } = event
                 {
-                    if metablock_event_batch.event_batch_index < *from_event_batch_index {
-                        *from_event_batch_index = metablock_event_batch.event_batch_index;
+                    if metablock_event_batch.aggregate_version < *from_aggregate_version {
+                        *from_aggregate_version = metablock_event_batch.aggregate_version;
                     }
-                    if metablock_event_batch.event_batch_index > *to_event_batch_index {
-                        *to_event_batch_index = metablock_event_batch.event_batch_index;
+                    if metablock_event_batch.aggregate_version > *to_aggregate_version {
+                        *to_aggregate_version = metablock_event_batch.aggregate_version;
                     }
                 }
             })
             .or_insert(AggregateWatchEventOperation::Write {
-                from_event_batch_index: metablock_event_batch.event_batch_index,
-                to_event_batch_index: metablock_event_batch.event_batch_index,
+                from_aggregate_version: metablock_event_batch.aggregate_version,
+                to_aggregate_version: metablock_event_batch.aggregate_version,
             });
     }
 
@@ -55,10 +55,10 @@ impl WatchEventCollector {
     }
 
     /// Records a trim event for an aggregate.
-    pub fn add_trim_event(&mut self, aggregate_key: AggregateKey, keep_from_event_batch_index: u64) {
+    pub fn add_trim_event(&mut self, aggregate_key: AggregateKey, keep_from_aggregate_version: u64) {
         self.trim_events
             .entry(aggregate_key)
-            .or_insert(AggregateWatchEventOperation::TrimStart { keep_from_event_batch_index });
+            .or_insert(AggregateWatchEventOperation::TrimStart { keep_from_aggregate_version });
     }
 
     /// Broadcasts all collected events to watchers in the correct order.
@@ -96,19 +96,19 @@ mod tests {
         AggregateKey::new(org, agg_type, agg_id)
     }
 
-    fn make_event_batch(aggregate_key: AggregateKey, event_batch_index: u64) -> MetablockEventBatch {
+    fn make_event_batch(aggregate_key: AggregateKey, aggregate_version: u64) -> MetablockEventBatch {
         MetablockEventBatch {
             client_id: 1,
             user_id: None,
             aggregate_key,
-            event_batch_index,
-            min_event_batch_index: 1,
-            min_event_index: 1,
-            max_event_index: 1,
+            aggregate_version,
+            trimmed_below_version: 1,
+            min_event_seq: 1,
+            max_event_seq: 1,
             min_event_timestamp: 0,
             max_event_timestamp: 0,
-            min_client_event_index: 1,
-            max_client_event_index: 1,
+            min_client_seq: 1,
+            max_client_seq: 1,
             event_types_data: EventTypesKind::Direct([0u64; BLOOM_BYTES / 8]),
         }
     }
@@ -123,11 +123,11 @@ mod tests {
 
         match collector.write_events.get(&key) {
             Some(AggregateWatchEventOperation::Write {
-                from_event_batch_index,
-                to_event_batch_index,
+                from_aggregate_version,
+                to_aggregate_version,
             }) => {
-                assert_eq!(*from_event_batch_index, 5);
-                assert_eq!(*to_event_batch_index, 5);
+                assert_eq!(*from_aggregate_version, 5);
+                assert_eq!(*to_aggregate_version, 5);
             }
             _ => panic!("Expected Write event"),
         }
@@ -143,11 +143,11 @@ mod tests {
 
         match collector.write_events.get(&key) {
             Some(AggregateWatchEventOperation::Write {
-                from_event_batch_index,
-                to_event_batch_index,
+                from_aggregate_version,
+                to_aggregate_version,
             }) => {
-                assert_eq!(*from_event_batch_index, 5);
-                assert_eq!(*to_event_batch_index, 10);
+                assert_eq!(*from_aggregate_version, 5);
+                assert_eq!(*to_aggregate_version, 10);
             }
             _ => panic!("Expected Write event"),
         }
@@ -163,11 +163,11 @@ mod tests {
 
         match collector.write_events.get(&key) {
             Some(AggregateWatchEventOperation::Write {
-                from_event_batch_index,
-                to_event_batch_index,
+                from_aggregate_version,
+                to_aggregate_version,
             }) => {
-                assert_eq!(*from_event_batch_index, 5);
-                assert_eq!(*to_event_batch_index, 15);
+                assert_eq!(*from_aggregate_version, 5);
+                assert_eq!(*to_aggregate_version, 15);
             }
             _ => panic!("Expected Write event"),
         }
@@ -187,22 +187,22 @@ mod tests {
 
         match collector.write_events.get(&key1) {
             Some(AggregateWatchEventOperation::Write {
-                from_event_batch_index,
-                to_event_batch_index,
+                from_aggregate_version,
+                to_aggregate_version,
             }) => {
-                assert_eq!(*from_event_batch_index, 5);
-                assert_eq!(*to_event_batch_index, 7);
+                assert_eq!(*from_aggregate_version, 5);
+                assert_eq!(*to_aggregate_version, 7);
             }
             _ => panic!("Expected Write event for key1"),
         }
 
         match collector.write_events.get(&key2) {
             Some(AggregateWatchEventOperation::Write {
-                from_event_batch_index,
-                to_event_batch_index,
+                from_aggregate_version,
+                to_aggregate_version,
             }) => {
-                assert_eq!(*from_event_batch_index, 10);
-                assert_eq!(*to_event_batch_index, 10);
+                assert_eq!(*from_aggregate_version, 10);
+                assert_eq!(*to_aggregate_version, 10);
             }
             _ => panic!("Expected Write event for key2"),
         }
@@ -276,8 +276,8 @@ mod tests {
 
         assert_eq!(collector.trim_events.len(), 1);
         match collector.trim_events.get(&key) {
-            Some(AggregateWatchEventOperation::TrimStart { keep_from_event_batch_index }) => {
-                assert_eq!(*keep_from_event_batch_index, 5);
+            Some(AggregateWatchEventOperation::TrimStart { keep_from_aggregate_version }) => {
+                assert_eq!(*keep_from_aggregate_version, 5);
             }
             _ => panic!("Expected TrimStart event"),
         }
@@ -324,8 +324,8 @@ mod tests {
                 assert!(matches!(
                     event2.operation,
                     AggregateWatchEventOperation::Write {
-                        from_event_batch_index: 5,
-                        to_event_batch_index: 5
+                        from_aggregate_version: 5,
+                        to_aggregate_version: 5
                     }
                 ));
 
@@ -338,7 +338,7 @@ mod tests {
                 assert!(matches!(
                     event4.operation,
                     AggregateWatchEventOperation::TrimStart {
-                        keep_from_event_batch_index: 10
+                        keep_from_aggregate_version: 10
                     }
                 ));
 

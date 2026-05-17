@@ -7,7 +7,7 @@ pub enum FollowerReplicationWriteError {
     ShardFSyncError(ShardFsyncError),
     FailedToSerialiseDatablocks(CodecError),
     BlockBecameInline,
-    BatchWalIndexGap { index: usize, expected: u64, actual: u64 },
+    BatchWalSeqGap { index: usize, expected: u64, actual: u64 },
 }
 
 impl FollowerReplicationWriteError {
@@ -16,7 +16,7 @@ impl FollowerReplicationWriteError {
             Self::ShardFSyncError(_) => "fsync_error",
             Self::FailedToSerialiseDatablocks(_) => "serialise_datablocks_failed",
             Self::BlockBecameInline => "block_became_inline",
-            Self::BatchWalIndexGap { .. } => "batch_wal_index_gap",
+            Self::BatchWalSeqGap { .. } => "batch_wal_seq_gap",
         }
     }
 }

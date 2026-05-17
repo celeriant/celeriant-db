@@ -15,7 +15,7 @@
 //! With the fix (s3_lease_duration/3 backoff): ~2-3 renewals in 15s
 //!
 //! The test asserts the count of distinct `acquired_at_ms` values is ≤ 5.
-//! Same-leader renewal does not bump `lease_index`, so the only authoritative
+//! Same-leader renewal does not bump `lease_epoch`, so the only authoritative
 //! signal of "a renewal happened" is the `acquired_at_ms` timestamp changing.
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
@@ -103,8 +103,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let pre_lease = deserialise_lease(&pre_lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
     println!(
-        "  Pre-block lease_index={}, acquired_at_ms={}",
-        pre_lease.lease_index, pre_lease.acquired_at_ms
+        "  Pre-block lease_epoch={}, acquired_at_ms={}",
+        pre_lease.lease_epoch, pre_lease.acquired_at_ms
     );
 
     proxy.block();

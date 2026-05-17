@@ -1,7 +1,7 @@
 //! P1-6: Per-Aggregate Strict Total Ordering Verification
 //!
 //! Tests that concurrent writes to a single aggregate produce a contiguous,
-//! monotonically increasing sequence of event_batch_index values.
+//! monotonically increasing sequence of aggregate_version values.
 //!
 //! This test READS BACK the events and verifies ordering, not just count.
 //! A bug that stored events out of order but with correct count would pass
@@ -81,8 +81,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         tasks.push(tokio::spawn(async move {
             bar.wait().await;
             let event = DatablockAggregateEvent {
-                client_event_index: writer_id as u64,
-                event_index: 0,
+                client_seq: writer_id as u64,
+                event_seq: 0,
                 event_id: None,
                 event_timestamp: 1000 + writer_id as u64,
                 event_type_major: 100,
@@ -96,7 +96,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 SingleAggregateWrite {
                     events: vec![event],
                     allow_create: false,
-                    expected_event_batch_index: None,
+                    expected_version: None,
                     enforce_client_idempotency: false,
                 },
             );
@@ -139,7 +139,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let total_batches = all_batches.len();
     println!("  Read {} event batches", total_batches);
 
-    println!("\nVerifying event_batch_index ordering...");
+    println!("\nVerifying aggregate_version ordering...");
     let expected_count = 1 + successful;
     assert_eq!(
         total_batches as u64, expected_count,
@@ -147,19 +147,19 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         expected_count, successful, total_batches
     );
 
-    let mut batch_indices: Vec<u64> = all_batches.iter().map(|b| b.event_batch_index).collect();
+    let mut batch_indices: Vec<u64> = all_batches.iter().map(|b| b.aggregate_version).collect();
     batch_indices.sort_unstable();
 
-    for (i, &batch_index) in batch_indices.iter().enumerate() {
+    for (i, &aggregate_version) in batch_indices.iter().enumerate() {
         let expected = (i + 1) as u64;
         assert_eq!(
-            batch_index, expected,
-            "Gap or duplicate detected: expected event_batch_index={}, got {}",
-            expected, batch_index
+            aggregate_version, expected,
+            "Gap or duplicate detected: expected aggregate_version={}, got {}",
+            expected, aggregate_version
         );
     }
 
-    println!("  Verified: event_batch_index values are 1, 2, 3, ..., {}", total_batches);
+    println!("  Verified: aggregate_version values are 1, 2, 3, ..., {}", total_batches);
     println!("  No gaps, no duplicates");
 
     println!("\n=== All Tests Passed ===");
@@ -173,8 +173,8 @@ async fn write_event(
     allow_create: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let event = DatablockAggregateEvent {
-        client_event_index: event_num,
-        event_index: 0,
+        client_seq: event_num,
+        event_seq: 0,
         event_id: None,
         event_timestamp: 1000 + event_num,
         event_type_major: 100,
@@ -189,7 +189,7 @@ async fn write_event(
         SingleAggregateWrite {
             events: vec![event],
             allow_create,
-            expected_event_batch_index: if allow_create { Some(0) } else { None },
+            expected_version: if allow_create { Some(0) } else { None },
             enforce_client_idempotency: false,
         },
     );
@@ -233,7 +233,7 @@ async fn read_all_batches(
         match response {
             Ok(ClientResponse::Read(read_resp)) => {
                 all_batches.extend(read_resp.event_batches);
-                match read_resp.next_event_batch_index {
+                match read_resp.next_aggregate_version {
                     Some(next) => from_batch = next,
                     None => return Ok(all_batches),
                 }

@@ -8,7 +8,7 @@ pub enum S3CatchupError {
     S3GetFailed { path: String, message: String },
     S3DeleteFailed { path: String, message: String },
     DeserializationFailed { path: String, source: celeriant_wire::disk::disk_format_error::DiskFormatError },
-    WalIndexGap { expected: u64, got: u64 },
+    WalSeqGap { expected: u64, got: u64 },
     ApplyFailed(ApplyBatchError),
     FsyncFailed(ShardFsyncError),
     TruncationFailed(ShardFsyncError),

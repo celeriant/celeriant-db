@@ -12,10 +12,10 @@ use crate::serde::serde_option_fixed_u8_array_bytes;
 #[derive(Default, Debug, Clone, Serialize, Deserialize, Encode, Decode, DeepSizeOf)]
 pub struct DatablockAggregateEvent {
     /// Client derived incremented index position used to prevent client from writing the same event twice
-    pub client_event_index: u64,
+    pub client_seq: u64,
 
     /// A server-side incremented index for each event
-    pub event_index: u64,
+    pub event_seq: u64,
 
     /// Optional unique identifier for the event assigned by the client
     pub event_id: Option<u128>,

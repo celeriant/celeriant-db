@@ -8,12 +8,12 @@
 //! 1. Start two-node cluster with TcpProxy, verify replication through proxy
 //! 2. Block proxy (simulate network partition)
 //! 3. Wait for both nodes to fence and race to S3
-//! 4. Verify lease_index monotonically increased (S3 CAS safety)
+//! 4. Verify lease_epoch monotonically increased (S3 CAS safety)
 //! 5. Unblock proxy — nodes reconverge
 //! 6. Poll until exactly one leader emerges
 //! 7. Verify final state: one leader accepts writes, one follower rejects
 //!
-//! Invariants tested: 1 (single leader), 2 (monotonic lease_index),
+//! Invariants tested: 1 (single leader), 2 (monotonic lease_epoch),
 //!   3 (write gating), 17 (membership CAS)
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
@@ -125,10 +125,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let initial_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let initial_lease = deserialise_lease(&initial_lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
-    let initial_lease_index = initial_lease.lease_index;
+    let initial_lease_epoch = initial_lease.lease_epoch;
     let initial_leader_node_id = initial_lease.leader_node_id;
-    println!("  Initial lease_index={}, leader_node_id={:x}",
-        initial_lease_index, initial_leader_node_id);
+    println!("  Initial lease_epoch={}, leader_node_id={:x}",
+        initial_lease_epoch, initial_leader_node_id);
 
     proxy.block();
     println!("  Proxy blocked - nodes partitioned\n");
@@ -142,29 +142,29 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Waiting for heartbeat timeout + fencing + S3 races...");
     tokio::time::sleep(Duration::from_secs(8)).await;
 
-    // Verify lease_index monotonicity (from s3_network_partition)
+    // Verify lease_epoch monotonicity (from s3_network_partition)
     let post_race_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let post_race_lease = deserialise_lease(&post_race_lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
-    let post_race_lease_index = post_race_lease.lease_index;
+    let post_race_lease_epoch = post_race_lease.lease_epoch;
     let post_race_leader_node_id = post_race_lease.leader_node_id;
 
-    println!("  Post-race lease: leader_node_id={:x}, lease_index={}",
-        post_race_leader_node_id, post_race_lease_index);
+    println!("  Post-race lease: leader_node_id={:x}, lease_epoch={}",
+        post_race_leader_node_id, post_race_lease_epoch);
 
     assert!(
-        post_race_lease_index >= initial_lease_index,
-        "lease_index should not regress after S3 races: was {}, now {}",
-        initial_lease_index, post_race_lease_index
+        post_race_lease_epoch >= initial_lease_epoch,
+        "lease_epoch should not regress after S3 races: was {}, now {}",
+        initial_lease_epoch, post_race_lease_epoch
     );
     assert!(
-        post_race_lease_index <= initial_lease_index + 10,
-        "lease_index should not have jumped unreasonably: was {}, now {}",
-        initial_lease_index, post_race_lease_index
+        post_race_lease_epoch <= initial_lease_epoch + 10,
+        "lease_epoch should not have jumped unreasonably: was {}, now {}",
+        initial_lease_epoch, post_race_lease_epoch
     );
-    let lease_increments = post_race_lease_index - initial_lease_index;
-    println!("  S3 CAS resolved: lease_index {} -> {} ({} cross-node bumps)\n",
-        initial_lease_index, post_race_lease_index, lease_increments);
+    let lease_increments = post_race_lease_epoch - initial_lease_epoch;
+    println!("  S3 CAS resolved: lease_epoch {} -> {} ({} cross-node bumps)\n",
+        initial_lease_epoch, post_race_lease_epoch, lease_increments);
 
     // ========================================
     // PHASE 4: Unblock proxy, poll for reconvergence
@@ -233,10 +233,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let final_lease = deserialise_lease(&final_lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
     assert!(
-        final_lease.lease_index >= post_race_lease_index,
-        "Final lease_index should not decrease"
+        final_lease.lease_epoch >= post_race_lease_epoch,
+        "Final lease_epoch should not decrease"
     );
-    println!("  Final lease_index={} (monotonic)", final_lease.lease_index);
+    println!("  Final lease_epoch={} (monotonic)", final_lease.lease_epoch);
 
     println!("\n=== All Tests Passed ===");
     println!("Concurrent CAS + partition + reconvergence validated:");

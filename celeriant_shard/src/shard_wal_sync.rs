@@ -16,7 +16,7 @@ use celeriant_memcache::sync_positions_snapshot::SyncPositionsSnapshot;
 use celeriant_rotating_log::log_segment_file::log_segment_file::{LogSegmentFile, write_dual_shard_log_header};
 use celeriant_rotating_log::log_segment_file::log_segment_file_metadata::LogSegmentFileMetadata;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
-use celeriant_wal::constants::{self, EntryHashBytes, FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, MIN_WRITE_ALIGNMENT, WIRE_VERSION_SEGMENT_SUMMARY_BLOCK, WIRE_VERSION_WAL_METABLOCK};
+use celeriant_wal::constants::{self, EntryHashBytes, FIRST_AGGREGATE_VERSION, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, MIN_WRITE_ALIGNMENT, WIRE_VERSION_SEGMENT_SUMMARY_BLOCK, WIRE_VERSION_WAL_METABLOCK};
 use celeriant_wire::codec::compression::DictCodec;
 use celeriant_wal::segment_summary::{SegmentSummaryBlock, SegmentSummaryPayload};
 
@@ -115,7 +115,7 @@ pub(crate) async fn commit_fsync_with_rollback(
 
     match sync(active_log_segment.clone(), &mut captured.sync_positions_snapshot).await {
         Ok(updated_log_segment_file_metadata) => {
-            let wal_index = updated_log_segment_file_metadata.write.wal_index;
+            let wal_seq = updated_log_segment_file_metadata.write.wal_seq;
             commit_sync(
                 node_status,
                 shard_mem_cache,
@@ -127,7 +127,7 @@ pub(crate) async fn commit_fsync_with_rollback(
             );
             metrics::histogram!("celeriant_fsync_duration_seconds", &shard_label).record(start.elapsed().as_secs_f64());
             metrics::histogram!("celeriant_fsync_batch_size", &shard_label).record(batch_size as f64);
-            metrics::gauge!("celeriant_wal_index", &shard_label).set(wal_index as f64);
+            metrics::gauge!("celeriant_wal_seq", &shard_label).set(wal_seq as f64);
             Ok(())
         }
         Err(e) => {
@@ -198,7 +198,7 @@ fn commit_sync(
                 if !node_status.is_leader() {
                     event_collector.add_write_event(event_batch_metadata);
 
-                    if event_batch_metadata.event_batch_index == FIRST_EVENT_BATCH_INDEX {
+                    if event_batch_metadata.aggregate_version == FIRST_AGGREGATE_VERSION {
                         event_collector.add_create_event(event_batch_metadata.aggregate_key.clone());
                     }
 
@@ -215,7 +215,7 @@ fn commit_sync(
                     let size_bytes = queue_item.size_bytes();
                     shard_mem_cache.cache_recent_write(
                         event_batch_metadata.aggregate_key.clone(),
-                        event_batch_metadata.event_batch_index,
+                        event_batch_metadata.aggregate_version,
                         queue_item.metablock,
                         queue_item.datablock,
                         size_bytes,
@@ -225,19 +225,19 @@ fn commit_sync(
                 }
             }
             MetablockKind::SoftTrim(soft_trim) => {
-                shard_mem_cache.update_aggregate_min_event_batch_index(
+                shard_mem_cache.update_aggregate_min_aggregate_version(
                     &soft_trim.aggregate_key,
-                    soft_trim.keep_from_event_batch_index,
+                    soft_trim.keep_from_aggregate_version,
                     CachePath::Write,
                 );
 
                 if !node_status.is_leader() {
-                    shard_mem_cache.update_aggregate_min_event_batch_index(
+                    shard_mem_cache.update_aggregate_min_aggregate_version(
                         &soft_trim.aggregate_key,
-                        soft_trim.keep_from_event_batch_index,
+                        soft_trim.keep_from_aggregate_version,
                         CachePath::Read,
                     );
-                    event_collector.add_trim_event(soft_trim.aggregate_key.clone(), soft_trim.keep_from_event_batch_index);
+                    event_collector.add_trim_event(soft_trim.aggregate_key.clone(), soft_trim.keep_from_aggregate_version);
                 } else {
                     pending_commit_data.pending_queue.push(PendingCacheItem::new(queue_item));
                 }
@@ -252,10 +252,10 @@ fn commit_sync(
                 shard_mem_cache.put_aggregate_into_cache_as_deleted(
                     soft_delete.aggregate_key.clone(),
                     del_log_id, del_pos,
-                    soft_delete.event_index,
-                    soft_delete.event_batch_index,
+                    soft_delete.event_seq,
+                    soft_delete.aggregate_version,
                     soft_delete.allow_recreate,
-                    soft_delete.allow_index_continuation,
+                    soft_delete.allow_sequence_continuation,
                     CachePath::Write,
                 );
 
@@ -263,10 +263,10 @@ fn commit_sync(
                     shard_mem_cache.put_aggregate_into_cache_as_deleted(
                         soft_delete.aggregate_key.clone(),
                         del_log_id, del_pos,
-                        soft_delete.event_index,
-                        soft_delete.event_batch_index,
+                        soft_delete.event_seq,
+                        soft_delete.aggregate_version,
                         soft_delete.allow_recreate,
-                        soft_delete.allow_index_continuation,
+                        soft_delete.allow_sequence_continuation,
                         CachePath::Read,
                     );
                     event_collector.add_delete_event(soft_delete.aggregate_key.clone());
@@ -398,8 +398,8 @@ pub(crate) async fn sync(
             index += 1;
         }
 
-        log_segment_file_metadata.write.wal_index = log_segment_file_metadata.write.wal_index.saturating_add(1);
-        item.metablock.wal_index = log_segment_file_metadata.write.wal_index;
+        log_segment_file_metadata.write.wal_seq = log_segment_file_metadata.write.wal_seq.saturating_add(1);
+        item.metablock.wal_seq = log_segment_file_metadata.write.wal_seq;
 
         // Track the absolute position where this metablock is written
         let metablock_absolute_pos = log_segment_file_metadata.write.metablocks_position + position as u64;
@@ -561,11 +561,11 @@ mod tests {
         (tmp, dir)
     }
 
-    fn event_batch_metablock(aggregate_key: AggregateKey, event_batch_index: u64, max_event_index: u64) -> Metablock {
+    fn event_batch_metablock(aggregate_key: AggregateKey, aggregate_version: u64, max_event_seq: u64) -> Metablock {
         Metablock {
-            wal_index: 0,
+            wal_seq: 0,
             server_timestamp: 1000,
-            lease_index: 1,
+            lease_epoch: 1,
             node_id: 1,
             uncompressed_size: 128,
             compressed_size: 64,
@@ -575,14 +575,14 @@ mod tests {
             datablock_position: 0,
             wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
                 aggregate_key,
-                event_batch_index,
-                min_event_batch_index: 1,
-                min_client_event_index: 1,
-                max_client_event_index: max_event_index,
+                aggregate_version,
+                trimmed_below_version: 1,
+                min_client_seq: 1,
+                max_client_seq: max_event_seq,
                 min_event_timestamp: 100,
                 max_event_timestamp: 200,
-                min_event_index: 1,
-                max_event_index,
+                min_event_seq: 1,
+                max_event_seq,
                 client_id: 1,
                 user_id: None,
                 event_types_data: EventTypesKind::Direct([1, 0, 0, 0]),
@@ -593,11 +593,11 @@ mod tests {
         }
     }
 
-    fn soft_delete_metablock(aggregate_key: AggregateKey, event_batch_index: u64, event_index: u64) -> Metablock {
+    fn soft_delete_metablock(aggregate_key: AggregateKey, aggregate_version: u64, event_seq: u64) -> Metablock {
         Metablock {
-            wal_index: 0,
+            wal_seq: 0,
             server_timestamp: 1000,
-            lease_index: 1,
+            lease_epoch: 1,
             node_id: 1,
             uncompressed_size: 0,
             compressed_size: 0,
@@ -608,9 +608,9 @@ mod tests {
             wal_metablock_type: MetablockKind::SoftDelete(MetablockSoftDelete {
                 aggregate_key,
                 allow_recreate: false,
-                allow_index_continuation: false,
-                event_batch_index,
-                event_index,
+                allow_sequence_continuation: false,
+                aggregate_version,
+                event_seq,
                 client_id: 1,
                 user_id: None,
             }),
@@ -622,9 +622,9 @@ mod tests {
 
     fn soft_trim_metablock(aggregate_key: AggregateKey, keep_from: u64) -> Metablock {
         Metablock {
-            wal_index: 0,
+            wal_seq: 0,
             server_timestamp: 1000,
-            lease_index: 1,
+            lease_epoch: 1,
             node_id: 1,
             uncompressed_size: 0,
             compressed_size: 0,
@@ -634,9 +634,9 @@ mod tests {
             datablock_position: 0,
             wal_metablock_type: MetablockKind::SoftTrim(MetablockSoftTrim {
                 aggregate_key,
-                keep_from_event_batch_index: keep_from,
-                event_batch_index: 0,
-                event_index: 0,
+                keep_from_aggregate_version: keep_from,
+                aggregate_version: 0,
+                event_seq: 0,
                 client_id: 1,
                 user_id: None,
             }),
@@ -671,7 +671,7 @@ mod tests {
     }
 
     fn non_leader_statuses() -> [NodeStatus; 2] {
-        [NodeStatus::Follower { leader_lease_index: 1 }, NodeStatus::Standalone]
+        [NodeStatus::Follower { leader_lease_epoch: 1 }, NodeStatus::Standalone]
     }
 
     #[test]
@@ -702,8 +702,8 @@ mod tests {
                 assert_eq!(status, celeriant_memcache::mem_snapshot_aggregate::AggregateStatus::Found);
 
                 let pos = smc.borrow_mut().get_aggregate_last_metablock_pos(&k, CachePath::Read);
-                assert_eq!(pos.event_batch_index, 2, "should have latest event_batch_index");
-                assert_eq!(pos.event_index, 10, "should have latest event_index");
+                assert_eq!(pos.aggregate_version, 2, "should have latest aggregate_version");
+                assert_eq!(pos.event_seq, 10, "should have latest event_seq");
 
                 let (loaded, status) = smc.borrow_mut().aggregate_load_status(&k, CachePath::Write);
                 assert!(loaded, "{:?} write snapshot should be populated after commit_sync", node_status);
@@ -760,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn non_leader_soft_trim_via_pending_queue_updates_min_batch_index() {
+    fn non_leader_soft_trim_via_pending_queue_updates_trimmed_below_version() {
         glommio_test!({
             for node_status in non_leader_statuses() {
                 let (_tmp, dir) = test_dir();
@@ -789,8 +789,8 @@ mod tests {
 
                 for path in [CachePath::Read, CachePath::Write] {
                     let pos = smc.borrow_mut().get_aggregate_last_metablock_pos(&k, path);
-                    assert_eq!(pos.min_event_batch_index, 2,
-                        "{:?} min_event_batch_index should be 2 on {:?}", node_status, path);
+                    assert_eq!(pos.min_aggregate_version, 2,
+                        "{:?} min_aggregate_version should be 2 on {:?}", node_status, path);
                 }
 
                 lsc.close().await;
@@ -806,7 +806,7 @@ mod tests {
         let sync_positions_snapshot = shard_mem_cache.borrow_mut().take_sync_positions_snapshot();
         let new_metadata = log_segment_file.metadata.borrow().clone();
         commit_sync(
-            NodeStatus::Leader { lease_index: 1 },
+            NodeStatus::Leader { lease_epoch: 1 },
             shard_mem_cache.clone(),
             watched_aggregates.clone(),
             sync_positions_snapshot,

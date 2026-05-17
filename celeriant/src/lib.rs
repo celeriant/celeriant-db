@@ -242,7 +242,7 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
     info!("  aggregate_snapshots:         {:4} MB  (9.0%)", memory_budget.aggregate_snapshots_cache_bytes / (1024 * 1024));
     info!("  client_idempotency_snapshots:{:4} MB  (9.0%)", memory_budget.aggregate_client_snapshots_cache_bytes / (1024 * 1024));
     info!("  schema_cache:                {:4} MB  (9.0%)", memory_budget.schema_cache_bytes / (1024 * 1024));
-    info!("  wal_index_positions:         {:4} MB  (1.5%)", memory_budget.list_wal_index_cache_bytes / (1024 * 1024));
+    info!("  wal_seq_positions:         {:4} MB  (1.5%)", memory_budget.list_wal_seq_cache_bytes / (1024 * 1024));
 
     // Build TLS config if enabled, and verify kernel kTLS support.
     let tls_config = match server_config.build_tls_config() {

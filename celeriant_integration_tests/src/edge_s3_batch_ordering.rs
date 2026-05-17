@@ -1,11 +1,11 @@
 //! Edge Case: S3 Batch Ordering During Catchup
 //!
 //! Validates the S3 fallback → catchup → data-integrity pipeline, with explicit
-//! verification that batch naming produces correct WAL index ordering.
+//! verification that batch naming produces correct WAL sequence ordering.
 //!
 //! Limitation: MinIO returns objects in lexicographic order, which coincides
-//! with WAL index order for zero-padded batch names (`batch_XXXXXXXXX_XXXXXXXXX.bin`).
-//! The `sort_by_key(|b| b.start_wal_index)` in catchup code is never exercised
+//! with WAL sequence order for zero-padded batch names (`batch_XXXXXXXXX_XXXXXXXXX.bin`).
+//! The `sort_by_key(|b| b.start_wal_seq)` in catchup code is never exercised
 //! with genuinely out-of-order data at the integration level. Testing that would
 //! require either a mock S3 or a unit test on the catchup sort logic.
 //!
@@ -149,9 +149,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // ========================================
-    // Phase 3: Inspect S3 batches and verify WAL index ordering
+    // Phase 3: Inspect S3 batches and verify WAL sequence ordering
     // ========================================
-    println!("PHASE 3: Inspect S3 batches and verify WAL index ordering");
+    println!("PHASE 3: Inspect S3 batches and verify WAL sequence ordering");
     println!("-----------------------------------------------------------");
 
     let expected_shard = (agg_type_id % num_shards as u128) as u32;
@@ -168,7 +168,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         objects_before_restart.len()
     );
 
-    // Parse batch names and verify monotonic WAL index ordering.
+    // Parse batch names and verify monotonic WAL sequence ordering.
     // Format: cluster/fallback/shard_XXX/batch_XXXXXXXXX_XXXXXXXXX_UUID.bin
     let mut parsed_batches: Vec<(u64, u64)> = Vec::new();
     for obj in &objects_before_restart {
@@ -199,13 +199,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             prev_end, next_start
         );
     }
-    println!("  WAL index ordering verified: {} batches with monotonic start indices", parsed_batches.len());
+    println!("  WAL sequence ordering verified: {} batches with monotonic start indices", parsed_batches.len());
     println!();
 
     // ========================================
     // Phase 4: Restart follower — catchup applies S3 batches in order
     // ========================================
-    println!("PHASE 4: Restart follower — S3 catchup in WAL index order");
+    println!("PHASE 4: Restart follower — S3 catchup in WAL sequence order");
     println!("-------------------------------------------------------------");
 
     println!("  Restarting follower...");

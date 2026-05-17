@@ -451,9 +451,9 @@ mod tests {
                 aggregate_type_id: (i + 1) as u128,
                 aggregate_id: (i + 2) as u128,
                 operation: 1,
-                from_event_batch_index: Some(i),
-                to_event_batch_index: Some(i + 10),
-                keep_from_event_batch_index: None,
+                from_aggregate_version: Some(i),
+                to_aggregate_version: Some(i + 10),
+                keep_from_aggregate_version: None,
             }).collect(),
         };
 

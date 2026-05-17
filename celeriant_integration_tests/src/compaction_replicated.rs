@@ -38,8 +38,8 @@ async fn delete_aggregate(
         key.clone(),
         SingleAggregateDelete {
             allow_recreate: false,
-            allow_index_continuation: false,
-            expected_event_batch_index: None,
+            allow_sequence_continuation: false,
+            expected_version: None,
         },
     );
     let request = ClientRequest::Delete(DeleteRequest {

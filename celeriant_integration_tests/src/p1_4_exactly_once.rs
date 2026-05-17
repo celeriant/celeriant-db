@@ -5,7 +5,7 @@
 //! Scenario:
 //! 1. Client sends a write with enforce_client_idempotency: true
 //! 2. Connection is dropped after sending but before receiving response (uncertain ack)
-//! 3. Client reconnects and retries with same client_id and client_event_index
+//! 3. Client reconnects and retries with same client_id and client_seq
 //! 4. Verify: exactly one event exists (original write succeeded, retry rejected with error 2002)
 //!
 //! Run with: cargo run --bin p1_4_exactly_once_main
@@ -73,7 +73,7 @@ async fn test_basic_idempotency(
         SingleAggregateWrite {
             events: vec![event.clone()],
             allow_create: true,
-            expected_event_batch_index: None, // Don't use OCC for this test
+            expected_version: None, // Don't use OCC for this test
             enforce_client_idempotency: true,
         },
     );
@@ -93,7 +93,7 @@ async fn test_basic_idempotency(
         other => panic!("Expected Write response, got {:?}", other),
     }
 
-    // Retry same write (same client_id, same client_event_index)
+    // Retry same write (same client_id, same client_seq)
     // Note: We can't reuse the exact same request object because WriteRequest takes ownership
     // So we create a new request with the same parameters
     let retry_request = ClientRequest::Write(WriteRequest {
@@ -107,14 +107,14 @@ async fn test_basic_idempotency(
     match client.send_request(&retry_request).await {
         Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Write {
             kind: celeriant_client_tokio::server_error::WriteError::ClientIdempotencyViolation {
-                last_client_event_index,
-                attempted_client_event_index,
+                last_client_seq,
+                attempted_client_seq,
             }, ..
         })) => {
-            assert_eq!(last_client_event_index, Some(1), "last_client_event_index should be 1");
-            assert_eq!(attempted_client_event_index, Some(1), "attempted_client_event_index should be 1");
+            assert_eq!(last_client_seq, Some(1), "last_client_seq should be 1");
+            assert_eq!(attempted_client_seq, Some(1), "attempted_client_seq should be 1");
             println!("  Retry: REJECTED with ClientIdempotencyViolation (last={}, attempted={}) - CORRECT",
-                last_client_event_index.unwrap(), attempted_client_event_index.unwrap());
+                last_client_seq.unwrap(), attempted_client_seq.unwrap());
         }
         other => panic!("Expected ClientIdempotencyViolation, got {:?}", other),
     }
@@ -139,7 +139,7 @@ async fn test_uncertain_ack(
         SingleAggregateWrite {
             events: vec![event.clone()],
             allow_create: false,
-            expected_event_batch_index: None, // Don't use OCC - rely on idempotency
+            expected_version: None, // Don't use OCC - rely on idempotency
             enforce_client_idempotency: true,
         },
     );
@@ -177,14 +177,14 @@ async fn test_uncertain_ack(
     match client2.send_request(&retry_request).await {
         Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Write {
             kind: celeriant_client_tokio::server_error::WriteError::ClientIdempotencyViolation {
-                last_client_event_index,
-                attempted_client_event_index,
+                last_client_seq,
+                attempted_client_seq,
             }, ..
         })) => {
-            assert_eq!(last_client_event_index, Some(2), "last_client_event_index should be 2");
-            assert_eq!(attempted_client_event_index, Some(2), "attempted_client_event_index should be 2");
+            assert_eq!(last_client_seq, Some(2), "last_client_seq should be 2");
+            assert_eq!(attempted_client_seq, Some(2), "attempted_client_seq should be 2");
             println!("  Retry: REJECTED with ClientIdempotencyViolation (last={}, attempted={}) - CORRECT",
-                last_client_event_index.unwrap(), attempted_client_event_index.unwrap());
+                last_client_seq.unwrap(), attempted_client_seq.unwrap());
         }
         Ok(ClientResponse::Write(_)) => {
             println!("  Retry: SUCCESS (original didn't reach server) - ACCEPTABLE");
@@ -193,10 +193,10 @@ async fn test_uncertain_ack(
         other => panic!("Expected ClientIdempotencyViolation or Write response, got {:?}", other),
     }
 
-    // Read back and verify exactly one event exists for this client_event_index
+    // Read back and verify exactly one event exists for this client_seq
     verify_event_count(&mut client2, aggregate, 2, 2).await?;
 
-    // Additional verification: read all events and check client_event_index values
+    // Additional verification: read all events and check client_seq values
     verify_client_event_indices(&mut client2, aggregate).await?;
 
     Ok(())
@@ -256,7 +256,7 @@ async fn verify_client_event_indices(
             let mut client_event_indices = Vec::new();
             for batch in &r.event_batches {
                 for event in &batch.events {
-                    client_event_indices.push(event.client_event_index);
+                    client_event_indices.push(event.client_seq);
                 }
             }
             client_event_indices.sort();
@@ -268,15 +268,15 @@ async fn verify_client_event_indices(
                 assert_ne!(
                     client_event_indices[i - 1],
                     client_event_indices[i],
-                    "Duplicate client_event_index found: {}",
+                    "Duplicate client_seq found: {}",
                     client_event_indices[i]
                 );
             }
 
             // Check for expected indices (1 and 2)
             assert_eq!(client_event_indices.len(), 2, "Expected 2 events");
-            assert_eq!(client_event_indices[0], 1, "Expected client_event_index 1");
-            assert_eq!(client_event_indices[1], 2, "Expected client_event_index 2");
+            assert_eq!(client_event_indices[0], 1, "Expected client_seq 1");
+            assert_eq!(client_event_indices[1], 2, "Expected client_seq 2");
 
             println!("  Client event indices verification: PASSED (no duplicates)");
             Ok(())
@@ -285,10 +285,10 @@ async fn verify_client_event_indices(
     }
 }
 
-fn create_event(client_event_index: u64, message: String) -> DatablockAggregateEvent {
+fn create_event(client_seq: u64, message: String) -> DatablockAggregateEvent {
     DatablockAggregateEvent {
-        client_event_index,
-        event_index: 0, // Server will assign
+        client_seq,
+        event_seq: 0, // Server will assign
         event_id: Some(rand::random()),
         event_timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

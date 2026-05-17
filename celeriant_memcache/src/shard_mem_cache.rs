@@ -34,10 +34,10 @@ pub struct ShardMemCache<V: Validate> {
     /// Current size of the recent write cache in bytes
     cache_current_bytes: u64,
 
-    /// Eviction queue: (aggregate_key, batch_index, size_bytes) in insertion order
+    /// Eviction queue: (aggregate_key, aggregate_version, size_bytes) in insertion order
     cache_eviction_queue: VecDeque<(AggregateKey, u64, u64)>,
 
-    /// LRU cache of aggregate positions committed to file (batch and event indexes)
+    /// LRU cache of aggregate positions committed to file (batch and event sequences)
     /// Updated after fsync - used by write path (OCC, idempotency)
     aggregate_write_snapshots: LruCache<AggregateKey, MemSnapshotAggregate>,
 
@@ -45,7 +45,7 @@ pub struct ShardMemCache<V: Validate> {
     /// Updated after replication - used by read path
     aggregate_read_snapshots: LruCache<AggregateKey, MemSnapshotAggregate>,
 
-    /// LRU cache of client event indexes committed to file
+    /// LRU cache of client event sequences committed to file
     /// Missing here does not mean client hasn't written to aggregate, just not in cache
     aggregate_write_client_snapshots: LruCache<AggregateClientKey, u64>,
 
@@ -58,9 +58,9 @@ pub struct ShardMemCache<V: Validate> {
     /// This is unbounded as we expect quick flush to disk
     pending_append_queue: Vec<ShardLogQueueItem>,
 
-    /// LRU cache mapping wal_index -> position in log files
+    /// LRU cache mapping wal_seq -> position in log files
     /// Used to optimize list pagination by avoiding full scans
-    wal_index_positions: LruCache<u64, WalIndexPosition>,
+    wal_seq_positions: LruCache<u64, WalSeqPosition>,
 
     /// LRU cache of compiled schemas (Validated/CompilationFailed only).
     schema_cache: LruCache<SchemaKey, CachedSchema<V>>,
@@ -122,21 +122,21 @@ pub struct SealedSegmentSummary {
 }
 
 impl<V: Validate> ShardMemCache<V> {
-    /// Returns (is_loaded, last_client_event_index)
+    /// Returns (is_loaded, last_client_seq)
     /// - is_loaded: true if we've already checked disk for this aggregate+client
-    /// - last_client_event_index: Some(idx) if client has written, None if not found
+    /// - last_client_seq: Some(idx) if client has written, None if not found
     pub fn aggregate_client_load_status(&mut self, aggregate_key: &AggregateKey, aggregate_client_key: &AggregateClientKey) -> (bool, Option<u64>) {
         // Check queue first
         if let Some(queue_pos) = self.aggregate_queue_positions.get(aggregate_key) {
-            if let Some(&idx) = queue_pos.client_event_indexes.get(&aggregate_client_key.client_id) {
+            if let Some(&idx) = queue_pos.client_seqes.get(&aggregate_client_key.client_id) {
                 return (true, Some(idx));
             }
         }
 
         // Check LRU cache
-        if let Some(&client_event_index) = self.aggregate_write_client_snapshots.get(&aggregate_client_key) {
+        if let Some(&client_seq) = self.aggregate_write_client_snapshots.get(&aggregate_client_key) {
             // 0 is sentinel for "checked but client never wrote"
-            let result = if client_event_index == 0 { None } else { Some(client_event_index) };
+            let result = if client_seq == 0 { None } else { Some(client_seq) };
             return (true, result);
         }
 
@@ -151,7 +151,7 @@ impl<V: Validate> ShardMemCache<V> {
         self.aggregate_recent_writes.clear();
         self.cache_eviction_queue.clear();
         self.cache_current_bytes = 0;
-        self.wal_index_positions.clear();
+        self.wal_seq_positions.clear();
     }
 
     /// Returns (is_loaded, status)
@@ -187,7 +187,7 @@ impl<V: Validate> ShardMemCache<V> {
     pub fn cache_recent_write(
         &mut self,
         aggregate_key: AggregateKey,
-        batch_index: u64,
+        aggregate_version: u64,
         metablock: Metablock,
         datablock: Option<Datablock>,
         size_bytes: u64,
@@ -208,7 +208,7 @@ impl<V: Validate> ShardMemCache<V> {
         let aggregate_writes = self
             .aggregate_recent_writes
             .entry(aggregate_key.clone())
-            .or_insert_with(|| AggregateRecentWrites::new(batch_index));
+            .or_insert_with(|| AggregateRecentWrites::new(aggregate_version));
 
         aggregate_writes.push(RecentWrite {
             metablock,
@@ -217,12 +217,12 @@ impl<V: Validate> ShardMemCache<V> {
         });
 
         self.cache_current_bytes = self.cache_current_bytes.saturating_add(size_bytes);
-        self.cache_eviction_queue.push_back((aggregate_key, batch_index, size_bytes));
+        self.cache_eviction_queue.push_back((aggregate_key, aggregate_version, size_bytes));
         metrics::gauge!("celeriant_cache_recent_write_bytes").set(self.cache_current_bytes as f64);
     }
 
     fn evict_oldest_cache_entry(&mut self) -> bool {
-        let Some((aggregate_key, _batch_index, size_bytes)) = self.cache_eviction_queue.pop_front() else {
+        let Some((aggregate_key, _aggregate_version, size_bytes)) = self.cache_eviction_queue.pop_front() else {
             return false;
         };
 
@@ -250,7 +250,7 @@ impl<V: Validate> ShardMemCache<V> {
     pub fn add_pending_trim_to_queue(
         &mut self,
         aggregate_key: &AggregateKey,
-        keep_from_event_batch_index: u64,
+        keep_from_aggregate_version: u64,
         shard_log_queue_item: ShardLogQueueItem,
     ) {
         let aggregate = self
@@ -258,31 +258,31 @@ impl<V: Validate> ShardMemCache<V> {
             .entry(aggregate_key.clone())
             .or_insert_with(|| QueueAggregatePositions::default());
 
-        // Update min_event_batch_index if the new trim is higher
-        if keep_from_event_batch_index > aggregate.min_event_batch_index {
-            aggregate.min_event_batch_index = keep_from_event_batch_index;
+        // Update min_aggregate_version if the new trim is higher
+        if keep_from_aggregate_version > aggregate.min_aggregate_version {
+            aggregate.min_aggregate_version = keep_from_aggregate_version;
         }
 
         self.pending_append_bytes = self.pending_append_bytes.saturating_add(shard_log_queue_item.size_bytes());
         self.pending_append_queue.push(shard_log_queue_item);
     }
 
-    /// Update min_event_batch_index in the aggregate snapshot cache
-    pub fn update_aggregate_min_event_batch_index(&mut self, aggregate_key: &AggregateKey, min_event_batch_index: u64, cache_path: CachePath) {
+    /// Update min_aggregate_version in the aggregate snapshot cache
+    pub fn update_aggregate_min_aggregate_version(&mut self, aggregate_key: &AggregateKey, min_aggregate_version: u64, cache_path: CachePath) {
         let cache = match cache_path {
             CachePath::Read => &mut self.aggregate_read_snapshots,
             CachePath::Write => &mut self.aggregate_write_snapshots,
         };
         if let Some(snapshot) = cache.get_mut(aggregate_key) {
-            if min_event_batch_index > snapshot.min_event_batch_index {
-                snapshot.min_event_batch_index = min_event_batch_index;
+            if min_aggregate_version > snapshot.min_aggregate_version {
+                snapshot.min_aggregate_version = min_aggregate_version;
             }
         }
 
         if cache_path == CachePath::Read {
             // Also evict any cached writes that are now trimmed
             if let Some(writes) = self.aggregate_recent_writes.get_mut(aggregate_key) {
-                while writes.first_batch_index < min_event_batch_index && !writes.is_empty() {
+                while writes.first_version < min_aggregate_version && !writes.is_empty() {
                     if let Some(front) = writes.writes.front() {
                         self.cache_current_bytes = self.cache_current_bytes.saturating_sub(front.size_bytes);
                     }
@@ -295,20 +295,20 @@ impl<V: Validate> ShardMemCache<V> {
 
             // Clean up eviction queue for trimmed entries
             self.cache_eviction_queue
-                .retain(|(k, batch_idx, _)| k != aggregate_key || *batch_idx >= min_event_batch_index);
+                .retain(|(k, batch_idx, _)| k != aggregate_key || *batch_idx >= min_aggregate_version);
         }
     }
 
-    /// Get cached writes for an aggregate from a starting batch index.
-    /// Returns writes in batch order as (batch_index, &RecentWrite).
-    /// Writes with `wal_index > visible_wal_index` are excluded.
+    /// Get cached writes for an aggregate from a starting aggregate version.
+    /// Returns writes in batch order as (aggregate_version, &RecentWrite).
+    /// Writes with `wal_seq > visible_wal_seq` are excluded.
     /// Returns None if aggregate not in cache.
-    pub fn get_cached_writes_from(&self, aggregate_key: &AggregateKey, from_batch_index: u64, visible_wal_index: u64) -> impl Iterator<Item = (u64, &RecentWrite)> {
+    pub fn get_cached_writes_from(&self, aggregate_key: &AggregateKey, from_version: u64, visible_wal_seq: u64) -> impl Iterator<Item = (u64, &RecentWrite)> {
         self.aggregate_recent_writes
             .get(aggregate_key)
             .into_iter()
-            .flat_map(move |aggregate_writes| aggregate_writes.iter_from(from_batch_index))
-            .filter(move |(_batch_idx, write)| write.metablock.wal_index <= visible_wal_index)
+            .flat_map(move |aggregate_writes| aggregate_writes.iter_from(from_version))
+            .filter(move |(_batch_idx, write)| write.metablock.wal_seq <= visible_wal_seq)
     }
 
     pub fn pending_append_queue_is_empty(&self) -> bool {
@@ -327,10 +327,10 @@ impl<V: Validate> ShardMemCache<V> {
     pub fn add_pending_delete_to_queue(
         &mut self,
         aggregate_key: &AggregateKey,
-        event_index: u64,
-        event_batch_index: u64,
+        event_seq: u64,
+        aggregate_version: u64,
         allow_recreate: bool,
-        allow_index_continuation: bool,
+        allow_sequence_continuation: bool,
         shard_log_queue_item: ShardLogQueueItem,
     ) {
         let aggregate = self
@@ -340,9 +340,9 @@ impl<V: Validate> ShardMemCache<V> {
 
         aggregate.pending_delete = true;
         aggregate.allow_recreate = allow_recreate;
-        aggregate.allow_index_continuation = allow_index_continuation;
-        aggregate.event_batch_index = event_batch_index;
-        aggregate.event_index = event_index;
+        aggregate.allow_sequence_continuation = allow_sequence_continuation;
+        aggregate.aggregate_version = aggregate_version;
+        aggregate.event_seq = event_seq;
 
         self.pending_append_bytes = self.pending_append_bytes.saturating_add(shard_log_queue_item.size_bytes());
         self.pending_append_queue.push(shard_log_queue_item);
@@ -355,11 +355,11 @@ impl<V: Validate> ShardMemCache<V> {
     pub fn add_to_pending_append_queue(
         &mut self,
         aggregate_key: &AggregateKey,
-        event_index: u64,
-        event_batch_index: u64,
-        min_event_batch_index: u64,
+        event_seq: u64,
+        aggregate_version: u64,
+        min_aggregate_version: u64,
         client_id: u128,
-        client_event_index: u64,
+        client_seq: u64,
         shard_log_queue_item: ShardLogQueueItem,
     ) {
         let aggregate = self
@@ -367,25 +367,25 @@ impl<V: Validate> ShardMemCache<V> {
             .entry(aggregate_key.clone())
             .or_insert_with(|| QueueAggregatePositions::default());
 
-        if event_batch_index > aggregate.event_batch_index {
-            aggregate.event_batch_index = event_batch_index;
+        if aggregate_version > aggregate.aggregate_version {
+            aggregate.aggregate_version = aggregate_version;
         }
-        if event_index > aggregate.event_index {
-            aggregate.event_index = event_index;
+        if event_seq > aggregate.event_seq {
+            aggregate.event_seq = event_seq;
         }
 
-        aggregate.min_event_batch_index = min_event_batch_index;
+        aggregate.min_aggregate_version = min_aggregate_version;
         aggregate.pending_delete = false;
 
         aggregate
-            .client_event_indexes
+            .client_seqes
             .entry(client_id)
             .and_modify(|existing| {
-                if client_event_index > *existing {
-                    *existing = client_event_index;
+                if client_seq > *existing {
+                    *existing = client_seq;
                 }
             })
-            .or_insert(client_event_index);
+            .or_insert(client_seq);
 
         self.pending_append_bytes = self.pending_append_bytes.saturating_add(shard_log_queue_item.size_bytes());
         self.pending_append_queue.push(shard_log_queue_item);
@@ -488,11 +488,11 @@ impl<V: Validate> ShardMemCache<V> {
         put_with_priority(cache, aggregate_key, snapshot, false);
     }
 
-    pub fn put_aggregate_client_into_cache(&mut self, aggregate_client_key: AggregateClientKey, last_client_event_index: u64, low_priority: bool) {
+    pub fn put_aggregate_client_into_cache(&mut self, aggregate_client_key: AggregateClientKey, last_client_seq: u64, low_priority: bool) {
         put_with_priority(
             &mut self.aggregate_write_client_snapshots,
             aggregate_client_key,
-            last_client_event_index,
+            last_client_seq,
             low_priority,
         );
     }
@@ -502,13 +502,13 @@ impl<V: Validate> ShardMemCache<V> {
         aggregate_key: AggregateKey,
         log_id: u64,
         metablock_absolute_pos: u64,
-        event_index: u64,
-        event_batch_index: u64,
+        event_seq: u64,
+        aggregate_version: u64,
         allow_recreate: bool,
-        allow_index_continuation: bool,
+        allow_sequence_continuation: bool,
         cache_path: CachePath,
     ) {
-        let snapshot = MemSnapshotAggregate::deleted(log_id, metablock_absolute_pos, event_index, event_batch_index, allow_recreate, allow_index_continuation);
+        let snapshot = MemSnapshotAggregate::deleted(log_id, metablock_absolute_pos, event_seq, aggregate_version, allow_recreate, allow_sequence_continuation);
         let cache = match cache_path {
             CachePath::Read => &mut self.aggregate_read_snapshots,
             CachePath::Write => &mut self.aggregate_write_snapshots,
@@ -554,7 +554,7 @@ impl<V: Validate> ShardMemCache<V> {
         aggregate_key: AggregateKey,
         snapshot: MemSnapshotAggregate,
         client_id: u128,
-        last_client_event_index: u64,
+        last_client_seq: u64,
         low_priority: bool,
         cache_path: CachePath,
     ) {
@@ -566,7 +566,7 @@ impl<V: Validate> ShardMemCache<V> {
 
         if cache_path == CachePath::Write {
             let client_key = AggregateClientKey::new(aggregate_key, client_id);
-            put_with_priority(&mut self.aggregate_write_client_snapshots, client_key, last_client_event_index, low_priority);
+            put_with_priority(&mut self.aggregate_write_client_snapshots, client_key, last_client_seq, low_priority);
         }
     }
 
@@ -578,11 +578,11 @@ impl<V: Validate> ShardMemCache<V> {
         if let Some(existing) = cache.get_mut(&event_batch.aggregate_key)
             && existing.status != AggregateStatus::NotFound {
             existing.status = AggregateStatus::Found;
-            if event_batch.event_batch_index > existing.event_batch_index {
-                existing.event_batch_index = event_batch.event_batch_index;
+            if event_batch.aggregate_version > existing.aggregate_version {
+                existing.aggregate_version = event_batch.aggregate_version;
             }
-            if event_batch.max_event_index > existing.event_index {
-                existing.event_index = event_batch.max_event_index;
+            if event_batch.max_event_seq > existing.event_seq {
+                existing.event_seq = event_batch.max_event_seq;
             }
             existing.log_id = log_id;
             existing.metablock_absolute_pos = metablock_absolute_pos;
@@ -590,11 +590,11 @@ impl<V: Validate> ShardMemCache<V> {
             cache.put(event_batch.aggregate_key.clone(), MemSnapshotAggregate {
                 log_id,
                 metablock_absolute_pos,
-                event_index: event_batch.max_event_index,
-                event_batch_index: event_batch.event_batch_index,
-                min_event_batch_index: 0,
+                event_seq: event_batch.max_event_seq,
+                aggregate_version: event_batch.aggregate_version,
+                min_aggregate_version: 0,
                 status: AggregateStatus::Found,
-                allow_index_continuation: false,
+                allow_sequence_continuation: false,
                 allow_recreate: false,
             });
         }
@@ -610,17 +610,17 @@ impl<V: Validate> ShardMemCache<V> {
 
             // Only update disk position when this batch had an EventBatch write.
             // Trim-only batches have default log_id=0 which would corrupt the position.
-            let has_event_batch = queue_positions.event_batch_index > 0;
+            let has_event_batch = queue_positions.aggregate_version > 0;
 
             // Always update write cache
             if let Some(existing) = self.aggregate_write_snapshots.get_mut(&key)
             && existing.status != AggregateStatus::NotFound {
                 existing.status = AggregateStatus::Found;
-                if queue_positions.event_batch_index > existing.event_batch_index {
-                    existing.event_batch_index = queue_positions.event_batch_index;
+                if queue_positions.aggregate_version > existing.aggregate_version {
+                    existing.aggregate_version = queue_positions.aggregate_version;
                 }
-                if queue_positions.event_index > existing.event_index {
-                    existing.event_index = queue_positions.event_index;
+                if queue_positions.event_seq > existing.event_seq {
+                    existing.event_seq = queue_positions.event_seq;
                 }
                 if has_event_batch {
                     existing.log_id = queue_positions.log_id;
@@ -630,11 +630,11 @@ impl<V: Validate> ShardMemCache<V> {
                 let snapshot = MemSnapshotAggregate {
                     log_id: queue_positions.log_id,
                     metablock_absolute_pos: queue_positions.metablock_absolute_pos,
-                    event_index: queue_positions.event_index,
-                    event_batch_index: queue_positions.event_batch_index,
-                    min_event_batch_index: queue_positions.min_event_batch_index,
+                    event_seq: queue_positions.event_seq,
+                    aggregate_version: queue_positions.aggregate_version,
+                    min_aggregate_version: queue_positions.min_aggregate_version,
                     status: AggregateStatus::Found,
-                    allow_index_continuation: false,
+                    allow_sequence_continuation: false,
                     allow_recreate: false,
                 };
                 self.aggregate_write_snapshots.put(key.clone(), snapshot);
@@ -646,11 +646,11 @@ impl<V: Validate> ShardMemCache<V> {
                 if let Some(existing) = self.aggregate_read_snapshots.get_mut(&key)
                 && existing.status != AggregateStatus::NotFound {
                     existing.status = AggregateStatus::Found;
-                    if queue_positions.event_batch_index > existing.event_batch_index {
-                        existing.event_batch_index = queue_positions.event_batch_index;
+                    if queue_positions.aggregate_version > existing.aggregate_version {
+                        existing.aggregate_version = queue_positions.aggregate_version;
                     }
-                    if queue_positions.event_index > existing.event_index {
-                        existing.event_index = queue_positions.event_index;
+                    if queue_positions.event_seq > existing.event_seq {
+                        existing.event_seq = queue_positions.event_seq;
                     }
                     if has_event_batch {
                         existing.log_id = queue_positions.log_id;
@@ -660,32 +660,32 @@ impl<V: Validate> ShardMemCache<V> {
                     self.aggregate_read_snapshots.put(key.clone(), MemSnapshotAggregate {
                         log_id: queue_positions.log_id,
                         metablock_absolute_pos: queue_positions.metablock_absolute_pos,
-                        event_index: queue_positions.event_index,
-                        event_batch_index: queue_positions.event_batch_index,
-                        min_event_batch_index: queue_positions.min_event_batch_index,
+                        event_seq: queue_positions.event_seq,
+                        aggregate_version: queue_positions.aggregate_version,
+                        min_aggregate_version: queue_positions.min_aggregate_version,
                         status: AggregateStatus::Found,
-                        allow_index_continuation: false,
+                        allow_sequence_continuation: false,
                         allow_recreate: false,
                     });
                 }
             }
 
-            // Update client event indexes LRU
-            for (client_id, client_event_index) in queue_positions.client_event_indexes {
+            // Update client event sequences LRU
+            for (client_id, client_seq) in queue_positions.client_seqes {
                 let client_key = AggregateClientKey::new(key.clone(), client_id);
                 if let Some(existing) = self.aggregate_write_client_snapshots.get_mut(&client_key) {
-                    if client_event_index > *existing {
-                        *existing = client_event_index;
+                    if client_seq > *existing {
+                        *existing = client_seq;
                     }
                 } else {
-                    self.aggregate_write_client_snapshots.put(client_key, client_event_index);
+                    self.aggregate_write_client_snapshots.put(client_key, client_seq);
                 }
             }
 
             // Clean up queue entry only if it hasn't been updated by a newer write.
             // If a new write came in during sync, the queue will have higher indexes.
             if let Some(current_queue_pos) = self.aggregate_queue_positions.get(&key) {
-                if current_queue_pos.event_batch_index == queue_positions.event_batch_index {
+                if current_queue_pos.aggregate_version == queue_positions.aggregate_version {
                     self.aggregate_queue_positions.remove(&key);
                 }
             }
@@ -699,10 +699,10 @@ impl<V: Validate> ShardMemCache<V> {
 
     /// Get the latest event index for a client within an aggregate
     /// Preference the queue first, then fallback to file if no queued items for client
-    pub fn get_client_event_index(&mut self, aggregate_key: &AggregateKey, client_id: u128) -> Option<u64> {
+    pub fn get_client_seq(&mut self, aggregate_key: &AggregateKey, client_id: u128) -> Option<u64> {
         // Check queue first
         if let Some(queue_pos) = self.aggregate_queue_positions.get(aggregate_key) {
-            if let Some(&idx) = queue_pos.client_event_indexes.get(&client_id) {
+            if let Some(&idx) = queue_pos.client_seqes.get(&client_id) {
                 return Some(idx);
             }
         }
@@ -722,33 +722,33 @@ impl<V: Validate> ShardMemCache<V> {
             return MetablockPosition {
                 log_id: file_pos.log_id,
                 metablock_absolute_pos: file_pos.metablock_absolute_pos,
-                event_batch_index: file_pos.event_batch_index,
-                event_index: file_pos.event_index,
-                min_event_batch_index: file_pos.min_event_batch_index,
+                aggregate_version: file_pos.aggregate_version,
+                event_seq: file_pos.event_seq,
+                min_aggregate_version: file_pos.min_aggregate_version,
             };
         }
 
         MetablockPosition {
             log_id: 0,
             metablock_absolute_pos: 0,
-            event_batch_index: 0,
-            event_index: 0,
-            min_event_batch_index: 0,
+            aggregate_version: 0,
+            event_seq: 0,
+            min_aggregate_version: 0,
         }
     }
 
     /// Get the latest batch and event index for an aggregate
     /// Preference the queue first, then fallback to file if no queued items for aggregate
-    pub fn get_write_event_indexes(&mut self, aggregate_key: &AggregateKey) -> EventIndexes {
+    pub fn get_write_event_seqes(&mut self, aggregate_key: &AggregateKey) -> EventIndexes {
         // Check queue first
         if let Some(queue_pos) = self.aggregate_queue_positions.get(aggregate_key) {
             return EventIndexes {
                 pending_delete_or_deleted: queue_pos.pending_delete,
                 allow_recreate: queue_pos.allow_recreate,
-                allow_index_continuation: queue_pos.allow_index_continuation,
-                event_batch_index: queue_pos.event_batch_index,
-                event_index: queue_pos.event_index,
-                min_event_batch_index: queue_pos.min_event_batch_index,
+                allow_sequence_continuation: queue_pos.allow_sequence_continuation,
+                aggregate_version: queue_pos.aggregate_version,
+                event_seq: queue_pos.event_seq,
+                min_aggregate_version: queue_pos.min_aggregate_version,
             };
         }
 
@@ -757,51 +757,51 @@ impl<V: Validate> ShardMemCache<V> {
             return EventIndexes {
                 pending_delete_or_deleted: file_pos.status == AggregateStatus::Deleted,
                 allow_recreate: file_pos.allow_recreate,
-                allow_index_continuation: file_pos.allow_index_continuation,
-                event_batch_index: file_pos.event_batch_index,
-                event_index: file_pos.event_index,
-                min_event_batch_index: file_pos.min_event_batch_index,
+                allow_sequence_continuation: file_pos.allow_sequence_continuation,
+                aggregate_version: file_pos.aggregate_version,
+                event_seq: file_pos.event_seq,
+                min_aggregate_version: file_pos.min_aggregate_version,
             };
         }
 
         EventIndexes {
             pending_delete_or_deleted: false,
             allow_recreate: false,
-            allow_index_continuation: false,
-            event_batch_index: 0,
-            event_index: 0,
-            min_event_batch_index: 0,
+            allow_sequence_continuation: false,
+            aggregate_version: 0,
+            event_seq: 0,
+            min_aggregate_version: 0,
         }
     }
 
-    /// Cache a WAL index position for list pagination optimization
-    pub fn cache_wal_index_position(&mut self, wal_index: u64, log_id: u64, metablock_absolute_pos: u64) {
-        self.wal_index_positions.put(
-            wal_index,
-            WalIndexPosition {
+    /// Cache a WAL sequence position for list pagination optimization
+    pub fn cache_wal_seq_position(&mut self, wal_seq: u64, log_id: u64, metablock_absolute_pos: u64) {
+        self.wal_seq_positions.put(
+            wal_seq,
+            WalSeqPosition {
                 log_id,
                 metablock_absolute_pos,
             },
         );
     }
 
-    /// Get cached position for a WAL index, if available
-    pub fn get_wal_index_position(&mut self, wal_index: u64) -> Option<WalIndexPosition> {
-        self.wal_index_positions.get(&wal_index).cloned()
+    /// Get cached position for a WAL sequence, if available
+    pub fn get_wal_seq_position(&mut self, wal_seq: u64) -> Option<WalSeqPosition> {
+        self.wal_seq_positions.get(&wal_seq).cloned()
     }
 
-    /// Find the nearest cached position at or before the given WAL index
-    pub fn find_nearest_wal_index_position(&mut self, target_wal_index: u64) -> Option<(u64, WalIndexPosition)> {
+    /// Find the nearest cached position at or before the given WAL sequence
+    pub fn find_nearest_wal_seq_position(&mut self, target_wal_seq: u64) -> Option<(u64, WalSeqPosition)> {
         // Peek through cache to find nearest position <= target
         // This is O(n) but cache is bounded and small
-        let mut best: Option<(u64, WalIndexPosition)> = None;
+        let mut best: Option<(u64, WalSeqPosition)> = None;
 
-        for (&wal_index, pos) in self.wal_index_positions.iter() {
-            if wal_index <= target_wal_index {
+        for (&wal_seq, pos) in self.wal_seq_positions.iter() {
+            if wal_seq <= target_wal_seq {
                 match &best {
-                    None => best = Some((wal_index, pos.clone())),
-                    Some((best_idx, _)) if wal_index > *best_idx => {
-                        best = Some((wal_index, pos.clone()));
+                    None => best = Some((wal_seq, pos.clone())),
+                    Some((best_idx, _)) if wal_seq > *best_idx => {
+                        best = Some((wal_seq, pos.clone()));
                     }
                     _ => {}
                 }
@@ -940,13 +940,13 @@ impl<V: Validate> ShardMemCache<V> {
         recent_write_cache_bytes: u64,
         aggregate_write_snapshots_cache_bytes: u64,
         aggregate_client_snapshots_cache_bytes: u64,
-        list_wal_index_cache_bytes: u64,
+        list_wal_seq_cache_bytes: u64,
         schema_cache_bytes: u64,
         internode_max_request_size: u64,
     ) -> Self {
         let aggregate_cap = NonZeroUsize::new((aggregate_write_snapshots_cache_bytes / 112) as usize).unwrap_or(NonZeroUsize::new(10_000).unwrap());
         let client_cap = NonZeroUsize::new((aggregate_client_snapshots_cache_bytes / 128) as usize).unwrap_or(NonZeroUsize::new(100_000).unwrap());
-        let wal_index_cap = NonZeroUsize::new((list_wal_index_cache_bytes / 24) as usize).unwrap_or(NonZeroUsize::new(1_000).unwrap());
+        let wal_seq_cap = NonZeroUsize::new((list_wal_seq_cache_bytes / 24) as usize).unwrap_or(NonZeroUsize::new(1_000).unwrap());
         let schema_half = schema_cache_bytes / 2;
         // Validated/CompilationFailed entries: ~100 bytes each (SchemaKey 56 + validator ref + LRU overhead)
         let schema_cap = NonZeroUsize::new((schema_half / 100) as usize).unwrap_or(NonZeroUsize::new(1_000).unwrap());
@@ -963,7 +963,7 @@ impl<V: Validate> ShardMemCache<V> {
             aggregate_write_snapshots: LruCache::new(aggregate_cap),
             aggregate_read_snapshots: LruCache::new(aggregate_cap),
             aggregate_write_client_snapshots: LruCache::new(client_cap),
-            wal_index_positions: LruCache::new(wal_index_cap),
+            wal_seq_positions: LruCache::new(wal_seq_cap),
             schema_cache: LruCache::new(schema_cap),
             no_schema_cache: LruCache::new(no_schema_cap),
             pending_schema_registrations: HashSet::new(),
@@ -988,13 +988,13 @@ impl<V: Validate> ShardMemCache<V> {
                 self.segment_summary_types.insert(AggregateTypeKey::new(key.org_id, key.aggregate_type_id));
                 let entry = self.segment_summary.entry(key.clone()).or_insert_with(|| {
                     let mut e = SegmentAggregateEntry::new(key.org_id, key.aggregate_type_id, key.aggregate_id);
-                    e.min_event_batch_index = eb.min_event_batch_index;
+                    e.min_aggregate_version = eb.trimmed_below_version;
                     e
                 });
                 entry.is_deleted = false;
                 entry.event_batch_count += 1;
-                if eb.event_batch_index > entry.last_event_batch_index {
-                    entry.last_event_batch_index = eb.event_batch_index;
+                if eb.aggregate_version > entry.last_aggregate_version {
+                    entry.last_aggregate_version = eb.aggregate_version;
                 }
                 if metablock.server_timestamp > entry.last_server_timestamp {
                     entry.last_server_timestamp = metablock.server_timestamp;
@@ -1016,8 +1016,8 @@ impl<V: Validate> ShardMemCache<V> {
             MetablockKind::SoftTrim(st) => {
                 let key = &st.aggregate_key;
                 if let Some(entry) = self.segment_summary.get_mut(key) {
-                    if st.keep_from_event_batch_index > entry.min_event_batch_index {
-                        entry.min_event_batch_index = st.keep_from_event_batch_index;
+                    if st.keep_from_aggregate_version > entry.min_aggregate_version {
+                        entry.min_aggregate_version = st.keep_from_aggregate_version;
                     }
                 }
             }
@@ -1079,13 +1079,13 @@ impl<V: Validate> ShardMemCache<V> {
                 sealed.aggregate_types.insert(AggregateTypeKey::new(key.org_id, key.aggregate_type_id));
                 let entry = sealed.aggregates.entry(key.clone()).or_insert_with(|| {
                     let mut e = SegmentAggregateEntry::new(key.org_id, key.aggregate_type_id, key.aggregate_id);
-                    e.min_event_batch_index = eb.min_event_batch_index;
+                    e.min_aggregate_version = eb.trimmed_below_version;
                     e
                 });
                 entry.is_deleted = false;
                 entry.event_batch_count += 1;
-                if eb.event_batch_index > entry.last_event_batch_index {
-                    entry.last_event_batch_index = eb.event_batch_index;
+                if eb.aggregate_version > entry.last_aggregate_version {
+                    entry.last_aggregate_version = eb.aggregate_version;
                 }
                 if metablock.server_timestamp > entry.last_server_timestamp {
                     entry.last_server_timestamp = metablock.server_timestamp;
@@ -1107,8 +1107,8 @@ impl<V: Validate> ShardMemCache<V> {
             MetablockKind::SoftTrim(st) => {
                 let key = &st.aggregate_key;
                 if let Some(entry) = sealed.aggregates.get_mut(key) {
-                    if st.keep_from_event_batch_index > entry.min_event_batch_index {
-                        entry.min_event_batch_index = st.keep_from_event_batch_index;
+                    if st.keep_from_aggregate_version > entry.min_aggregate_version {
+                        entry.min_aggregate_version = st.keep_from_aggregate_version;
                     }
                 }
             }
@@ -1153,15 +1153,15 @@ impl<V: Validate> ShardMemCache<V> {
 pub struct EventIndexes {
     pub pending_delete_or_deleted: bool,
     pub allow_recreate: bool,
-    pub allow_index_continuation: bool,
-    pub event_batch_index: u64,
-    pub min_event_batch_index: u64,
-    pub event_index: u64,
+    pub allow_sequence_continuation: bool,
+    pub aggregate_version: u64,
+    pub min_aggregate_version: u64,
+    pub event_seq: u64,
 }
 
-/// Cached position for a WAL index, used to optimize list pagination
+/// Cached position for a WAL sequence, used to optimize list pagination
 #[derive(Clone, Debug)]
-pub struct WalIndexPosition {
+pub struct WalSeqPosition {
     pub log_id: u64,
     pub metablock_absolute_pos: u64,
 }

@@ -12,7 +12,7 @@
 //! 9. Replication works from B to A
 //!
 //! Subsumes the old s3_failover test (phases 1-7 were a strict subset).
-//! Invariants tested: 1 (single leader), 2 (monotonic lease_index),
+//! Invariants tested: 1 (single leader), 2 (monotonic lease_epoch),
 //!   3 (write gating), 15 (valid transitions), 17 (membership CAS).
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
@@ -116,9 +116,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let initial_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let initial_lease = deserialise_lease(&initial_lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
-    let initial_lease_index = initial_lease.lease_index;
-    println!("  Initial lease_index={}, leader_node_id={:x}",
-        initial_lease_index, initial_lease.leader_node_id);
+    let initial_lease_epoch = initial_lease.lease_epoch;
+    println!("  Initial lease_epoch={}, leader_node_id={:x}",
+        initial_lease_epoch, initial_lease.leader_node_id);
 
     node_a.stop();
     println!("  ✓ Node A (old leader) stopped\n");
@@ -136,15 +136,15 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let post_takeover_lease = deserialise_lease(&post_takeover_lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
 
-    println!("  Post-takeover lease: leader_node_id={:x}, lease_index={}",
-        post_takeover_lease.leader_node_id, post_takeover_lease.lease_index);
+    println!("  Post-takeover lease: leader_node_id={:x}, lease_epoch={}",
+        post_takeover_lease.leader_node_id, post_takeover_lease.lease_epoch);
     assert!(
-        post_takeover_lease.lease_index > initial_lease_index,
-        "lease_index should have increased after takeover: was {}, now {}",
-        initial_lease_index, post_takeover_lease.lease_index
+        post_takeover_lease.lease_epoch > initial_lease_epoch,
+        "lease_epoch should have increased after takeover: was {}, now {}",
+        initial_lease_epoch, post_takeover_lease.lease_epoch
     );
-    println!("  ✓ Node B took over: lease_index {} → {}\n",
-        initial_lease_index, post_takeover_lease.lease_index);
+    println!("  ✓ Node B took over: lease_epoch {} → {}\n",
+        initial_lease_epoch, post_takeover_lease.lease_epoch);
 
     // ========================================
     // PHASE 5: Verify node B is now leader (can accept writes)

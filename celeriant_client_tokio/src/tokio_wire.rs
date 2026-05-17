@@ -143,12 +143,12 @@ mod tests {
     fn aggregate_details_response() -> ClientResponse {
         ClientResponse::AggregateDetails(AggregateDetailsResponse {
             correlation_id: Some(0xDEAD_BEEF),
-            min_event_batch_index: 0,
-            max_event_batch_index: 42,
-            max_event_index: 100,
+            min_aggregate_version: 0,
+            max_aggregate_version: 42,
+            max_event_seq: 100,
             is_deleted: false,
             allow_recreate: false,
-            allow_index_continuation: true,
+            allow_sequence_continuation: true,
             last_server_timestamp: 1234,
             last_client_id: 5678,
             last_user_id: None,
@@ -162,9 +162,9 @@ mod tests {
                 aggregate_type_id: 2,
                 aggregate_id: (i as u128) + 3,
                 operation: 1,
-                from_event_batch_index: Some(i as u64),
-                to_event_batch_index: Some(i as u64 + 1),
-                keep_from_event_batch_index: None,
+                from_aggregate_version: Some(i as u64),
+                to_aggregate_version: Some(i as u64 + 1),
+                keep_from_aggregate_version: None,
             })
             .collect();
         ClientResponse::Watch(WatchResponse { events })
@@ -297,8 +297,8 @@ mod tests {
             // Build a Write with enough payload that the codec path is exercised.
             let key = AggregateKey::new(1, 2, 3);
             let event = DatablockAggregateEvent {
-                client_event_index: 0,
-                event_index: 0,
+                client_seq: 0,
+                event_seq: 0,
                 event_id: Some(0xAA),
                 event_timestamp: 100,
                 event_type_major: 1,
@@ -313,7 +313,7 @@ mod tests {
                 writes: HashMap::from([(key, SingleAggregateWrite {
                     events: vec![event],
                     allow_create: true,
-                    expected_event_batch_index: None,
+                    expected_version: None,
                     enforce_client_idempotency: false,
                 })]),
             });

@@ -65,7 +65,7 @@ List operations (ListOrgs, ListAggregateTypes, ListAggregates) require explicit 
 
 Writes are replicated synchronously to the follower before the client gets an ACK. Both leader and follower fsync to disk. Acknowledged writes are durable on two nodes.
 
-Follower validates each batch: WAL index continuity, tip hash match, clock drift threshold, lease fencing. Any mismatch -> explicit rejection with reason. Not a generic error - the FollowerRejection enum tells you exactly what went wrong.
+Follower validates each batch: WAL sequence continuity, tip hash match, clock drift threshold, lease fencing. Any mismatch -> explicit rejection with reason. Not a generic error - the FollowerRejection enum tells you exactly what went wrong.
 
 Heartbeats are pure liveness signals. No WAL data. Separate validation path.
 

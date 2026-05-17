@@ -23,18 +23,18 @@ const CLIENT_ID: u128 = 7777;
 async fn write_occ(
     client: &mut CeleriantClient,
     aggregate_key: &AggregateKey,
-    client_event_index: u64,
-    expected_event_batch_index: Option<u64>,
+    client_seq: u64,
+    expected_version: Option<u64>,
     enforce_idempotency: bool,
 ) -> Result<(), ClientError> {
     let event = DatablockAggregateEvent {
-        client_event_index,
-        event_index: 0,
+        client_seq,
+        event_seq: 0,
         event_id: None,
-        event_timestamp: 1000 + client_event_index,
+        event_timestamp: 1000 + client_seq,
         event_type_major: 100,
         event_type_minor: 0,
-        event_value: Arc::new(format!("occ_{}", client_event_index).into_bytes()),
+        event_value: Arc::new(format!("occ_{}", client_seq).into_bytes()),
         iv: None,
     };
 
@@ -44,7 +44,7 @@ async fn write_occ(
         SingleAggregateWrite {
             events: vec![event],
             allow_create: false,
-            expected_event_batch_index,
+            expected_version,
             enforce_client_idempotency: enforce_idempotency,
         },
     );
@@ -87,36 +87,36 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create aggregate
     write_event(&mut client, &key, 1, true).await?;
-    println!("  Aggregate created (event_batch_index=1)");
+    println!("  Aggregate created (aggregate_version=1)");
 
-    // Write with OCC to discover the current batch index
-    // Try expected=1 first (FIRST_EVENT_BATCH_INDEX)
+    // Write with OCC to discover the current aggregate version
+    // Try expected=1 first (FIRST_AGGREGATE_VERSION)
     write_occ(&mut client, &key, 1, Some(1), false).await?;
-    println!("  OCC write succeeded with expected=1 (event_batch_index now 2)");
+    println!("  OCC write succeeded with expected=1 (aggregate_version now 2)");
 
     // Write another to bump it to 3
     write_occ(&mut client, &key, 2, Some(2), false).await?;
-    println!("  OCC write succeeded with expected=2 (event_batch_index now 3)");
+    println!("  OCC write succeeded with expected=2 (aggregate_version now 3)");
 
     let count = count_events(&mut client, &key).await?;
     assert_eq!(count, 3, "Should have 3 events");
     println!("  Verified: {} events total\n", count);
 
-    // At this point: event_batch_index=3, client 7777 has client_event_index 1 and 2
+    // At this point: aggregate_version=3, client 7777 has client_seq 1 and 2
 
     // ========================================
     // TEST 1: Stale OCC + duplicate idempotency → OCC fires first
     // ========================================
-    println!("TEST 1: Stale OCC (expected=1) + duplicate idempotency (client_event_index=1)");
+    println!("TEST 1: Stale OCC (expected=1) + duplicate idempotency (client_seq=1)");
     println!("------------------------------------------------------------------------------");
 
     let result = write_occ(&mut client, &key, 1, Some(1), true).await;
     match &result {
         Err(ClientError::Server(ServerError::Write {
-            kind: WriteError::OptimisticConcurrencyViolation { expected_event_batch_index, current_event_batch_index },
+            kind: WriteError::OptimisticConcurrencyViolation { expected_version, current_aggregate_version },
             ..
         })) => {
-            println!("  Got OCC violation (expected={:?}, current={:?})", expected_event_batch_index, current_event_batch_index);
+            println!("  Got OCC violation (expected={:?}, current={:?})", expected_version, current_aggregate_version);
             println!("  CORRECT: OCC fires before idempotency\n");
         }
         Err(ClientError::Server(ServerError::Write {
@@ -130,16 +130,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // ========================================
     // TEST 2: Correct OCC + duplicate idempotency → idempotency fires
     // ========================================
-    println!("TEST 2: Correct OCC (expected=3) + duplicate idempotency (client_event_index=1)");
+    println!("TEST 2: Correct OCC (expected=3) + duplicate idempotency (client_seq=1)");
     println!("---------------------------------------------------------------------------------");
 
     let result = write_occ(&mut client, &key, 1, Some(3), true).await;
     match &result {
         Err(ClientError::Server(ServerError::Write {
-            kind: WriteError::ClientIdempotencyViolation { last_client_event_index, attempted_client_event_index },
+            kind: WriteError::ClientIdempotencyViolation { last_client_seq, attempted_client_seq },
             ..
         })) => {
-            println!("  Got idempotency violation (last={:?}, attempted={:?})", last_client_event_index, attempted_client_event_index);
+            println!("  Got idempotency violation (last={:?}, attempted={:?})", last_client_seq, attempted_client_seq);
             println!("  CORRECT: OCC passed, idempotency caught the duplicate\n");
         }
         Err(ClientError::Server(ServerError::Write {
@@ -153,7 +153,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // ========================================
     // TEST 3: Correct OCC + fresh idempotency → success
     // ========================================
-    println!("TEST 3: Correct OCC (expected=3) + fresh client_event_index=3");
+    println!("TEST 3: Correct OCC (expected=3) + fresh client_seq=3");
     println!("--------------------------------------------------------------");
 
     write_occ(&mut client, &key, 3, Some(3), true).await?;

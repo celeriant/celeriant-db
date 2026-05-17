@@ -39,8 +39,8 @@ async fn write_with_payload(
     payload: &[u8],
 ) -> Result<(), ClientError> {
     let event = DatablockAggregateEvent {
-        client_event_index: rand::random::<u64>() % 100_000,
-        event_index: 0,
+        client_seq: rand::random::<u64>() % 100_000,
+        event_seq: 0,
         event_id: Some(rand::random()),
         event_timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -58,7 +58,7 @@ async fn write_with_payload(
         SingleAggregateWrite {
             events: vec![event],
             allow_create: false,
-            expected_event_batch_index: None,
+            expected_version: None,
             enforce_client_idempotency: false,
         },
     );

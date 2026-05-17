@@ -120,10 +120,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let initial_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let initial_lease = deserialise_lease(&initial_lease_bytes)
         .map_err(|e| format!("Failed to deserialise initial lease: {:?}", e))?;
-    let initial_lease_index = initial_lease.lease_index;
+    let initial_lease_epoch = initial_lease.lease_epoch;
     println!(
-        "  Initial lease_index={}, leader={:x}",
-        initial_lease_index, initial_lease.leader_node_id
+        "  Initial lease_epoch={}, leader={:x}",
+        initial_lease_epoch, initial_lease.leader_node_id
     );
 
     // ========================================
@@ -270,14 +270,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let final_lease = deserialise_lease(&final_lease_bytes)
         .map_err(|e| format!("Failed to deserialise final lease: {:?}", e))?;
     assert!(
-        final_lease.lease_index >= initial_lease_index,
-        "lease_index should not regress: was {}, now {}",
-        initial_lease_index,
-        final_lease.lease_index
+        final_lease.lease_epoch >= initial_lease_epoch,
+        "lease_epoch should not regress: was {}, now {}",
+        initial_lease_epoch,
+        final_lease.lease_epoch
     );
     println!(
-        "  lease_index: {} -> {} (monotonic)",
-        initial_lease_index, final_lease.lease_index
+        "  lease_epoch: {} -> {} (monotonic)",
+        initial_lease_epoch, final_lease.lease_epoch
     );
     println!("  Cluster reconverged to exactly one leader");
 

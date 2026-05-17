@@ -9,19 +9,19 @@ pub enum ShardWriteError {
 
     /// Event type 0 is reserved as a sentinel value.
     ZeroEventType {
-        client_event_index: u64,
+        client_seq: u64,
     },
 
-    /// Client already wrote an event with this or higher client_event_index.
+    /// Client already wrote an event with this or higher client_seq.
     ClientIdempotencyViolation {
-        last_client_event_index: u64,
-        attempted_client_event_index: u64,
+        last_client_seq: u64,
+        attempted_client_seq: u64,
     },
 
-    /// Expected event_batch_index doesn't match current aggregate state.
+    /// Expected aggregate_version doesn't match current aggregate state.
     OptimisticConcurrencyViolation {
-        expected_event_batch_index: u64,
-        current_event_batch_index: u64,
+        expected_version: u64,
+        current_aggregate_version: u64,
     },
 
     FailedToSerialiseDatablocks(CodecError),
@@ -48,7 +48,7 @@ pub enum ShardWriteError {
     SchemaValidationFailed {
         event_type_major: u64,
         event_type_minor: u64,
-        client_event_index: u64,
+        client_seq: u64,
         validation_error: String,
     },
 
@@ -56,7 +56,7 @@ pub enum ShardWriteError {
     SchemaCompilationFailed {
         event_type_major: u64,
         event_type_minor: u64,
-        client_event_index: u64,
+        client_seq: u64,
         compilation_error: String,
     },
 }

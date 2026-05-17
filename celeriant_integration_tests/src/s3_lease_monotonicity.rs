@@ -1,19 +1,19 @@
 //! S3 Lease Monotonicity Integration Test - Multiple consecutive failovers
 //!
-//! Tests that lease_index strictly increases across cross-node failovers.
+//! Tests that lease_epoch strictly increases across cross-node failovers.
 //! Design spec (docs/s3-lease-high-level-design.md, invariant 1):
-//! "lease_index is monotonically increasing. Cross-node Lease::promote() bumps by 1;
+//! "lease_epoch is monotonically increasing. Cross-node Lease::promote() bumps by 1;
 //!  same-leader Lease::renew() leaves it unchanged. Never decremented, never reused."
 //!
 //! Scenario:
-//! 1. Start cluster: leader A + follower B, verify healthy (lease_index=1)
-//! 2. Failover 1: Kill leader A, follower B takes over (lease_index=2)
+//! 1. Start cluster: leader A + follower B, verify healthy (lease_epoch=1)
+//! 2. Failover 1: Kill leader A, follower B takes over (lease_epoch=2)
 //! 3. Write to new leader B, verify accepted
 //! 4. Restart old leader A as follower
-//! 5. Failover 2: Kill leader B, follower A takes over (lease_index=3)
-//! 6. Verify final state: lease_index=3, leader A accepts writes
+//! 5. Failover 2: Kill leader B, follower A takes over (lease_epoch=3)
+//! 6. Verify final state: lease_epoch=3, leader A accepts writes
 //!
-//! This chains: Leader A → Leader B → Leader A, with lease_index going 1 → 2 → 3.
+//! This chains: Leader A → Leader B → Leader A, with lease_epoch going 1 → 2 → 3.
 //!
 //! Run with: cargo run --bin s3_lease_monotonicity_main
 
@@ -105,11 +105,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let lease_1 = deserialise_lease(&lease_1_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
 
-    println!("  Initial lease: leader_node_id={:x}, lease_index={}",
-        lease_1.leader_node_id, lease_1.lease_index);
-    let initial_lease_index = lease_1.lease_index;
+    println!("  Initial lease: leader_node_id={:x}, lease_epoch={}",
+        lease_1.leader_node_id, lease_1.lease_epoch);
+    let initial_lease_epoch = lease_1.lease_epoch;
     let node_a_id = lease_1.leader_node_id;
-    println!("  ✓ Initial state verified: lease_index={}\n", initial_lease_index);
+    println!("  ✓ Initial state verified: lease_epoch={}\n", initial_lease_epoch);
 
     // ========================================
     // PHASE 2: First failover - Kill leader A
@@ -127,27 +127,27 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // ========================================
-    // PHASE 3: Verify follower B is now leader with lease_index=2
+    // PHASE 3: Verify follower B is now leader with lease_epoch=2
     // ========================================
-    println!("\nPHASE 3: Verify follower B is now leader (lease_index=2)");
+    println!("\nPHASE 3: Verify follower B is now leader (lease_epoch=2)");
     println!("--------------------------------------------------------");
 
     let lease_2_bytes = minio.get_object("cluster/lease.json").await?;
     let lease_2 = deserialise_lease(&lease_2_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
 
-    println!("  Lease after failover 1: leader_node_id={:x}, lease_index={}",
-        lease_2.leader_node_id, lease_2.lease_index);
+    println!("  Lease after failover 1: leader_node_id={:x}, lease_epoch={}",
+        lease_2.leader_node_id, lease_2.lease_epoch);
     assert!(
-        lease_2.lease_index > initial_lease_index,
-        "lease_index should have increased after first failover: was {}, now {}",
-        initial_lease_index, lease_2.lease_index
+        lease_2.lease_epoch > initial_lease_epoch,
+        "lease_epoch should have increased after first failover: was {}, now {}",
+        initial_lease_epoch, lease_2.lease_epoch
     );
     assert_ne!(lease_2.leader_node_id, node_a_id, "leader_node_id should have changed");
     let node_b_id = lease_2.leader_node_id;
-    let lease_index_after_failover_1 = lease_2.lease_index;
-    println!("  ✓ Lease updated: lease_index {} → {}, new leader B",
-        initial_lease_index, lease_2.lease_index);
+    let lease_epoch_after_failover_1 = lease_2.lease_epoch;
+    println!("  ✓ Lease updated: lease_epoch {} → {}, new leader B",
+        initial_lease_epoch, lease_2.lease_epoch);
 
     println!("  Writing events 4-5 to new leader B...");
     for i in 4..=5 {
@@ -195,26 +195,26 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // ========================================
-    // PHASE 6: Verify follower A is now leader again with lease_index=3
+    // PHASE 6: Verify follower A is now leader again with lease_epoch=3
     // ========================================
-    println!("\nPHASE 6: Verify A is now leader again (lease_index=3)");
+    println!("\nPHASE 6: Verify A is now leader again (lease_epoch=3)");
     println!("-----------------------------------------------------");
 
     let lease_3_bytes = minio.get_object("cluster/lease.json").await?;
     let lease_3 = deserialise_lease(&lease_3_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
 
-    println!("  Lease after failover 2: leader_node_id={:x}, lease_index={}",
-        lease_3.leader_node_id, lease_3.lease_index);
+    println!("  Lease after failover 2: leader_node_id={:x}, lease_epoch={}",
+        lease_3.leader_node_id, lease_3.lease_epoch);
     assert!(
-        lease_3.lease_index > lease_index_after_failover_1,
-        "lease_index should have increased after second failover: was {}, now {}",
-        lease_index_after_failover_1, lease_3.lease_index
+        lease_3.lease_epoch > lease_epoch_after_failover_1,
+        "lease_epoch should have increased after second failover: was {}, now {}",
+        lease_epoch_after_failover_1, lease_3.lease_epoch
     );
     assert_eq!(lease_3.leader_node_id, node_a_id, "leader should be A again");
     assert_ne!(lease_3.leader_node_id, node_b_id, "leader should not be B");
-    println!("  ✓ Lease updated: lease_index {} → {}, leader is A again",
-        lease_index_after_failover_1, lease_3.lease_index);
+    println!("  ✓ Lease updated: lease_epoch {} → {}, leader is A again",
+        lease_epoch_after_failover_1, lease_3.lease_epoch);
 
     println!("  Writing events 6-7 to re-promoted leader A...");
     for i in 6..=7 {
@@ -233,12 +233,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Summary
     // ========================================
     println!("=== All Tests Passed ===\n");
-    println!("Summary: lease_index monotonicity verified across multiple failovers:");
-    println!("  - Initial state (Leader A): lease_index={}", initial_lease_index);
-    println!("  - After failover 1 (A→B):   lease_index={}", lease_index_after_failover_1);
-    println!("  - After failover 2 (B→A):   lease_index={}", lease_3.lease_index);
+    println!("Summary: lease_epoch monotonicity verified across multiple failovers:");
+    println!("  - Initial state (Leader A): lease_epoch={}", initial_lease_epoch);
+    println!("  - After failover 1 (A→B):   lease_epoch={}", lease_epoch_after_failover_1);
+    println!("  - After failover 2 (B→A):   lease_epoch={}", lease_3.lease_epoch);
     println!("  - Invariant satisfied: {} < {} < {} (strictly monotonically increasing)",
-        initial_lease_index, lease_index_after_failover_1, lease_3.lease_index);
+        initial_lease_epoch, lease_epoch_after_failover_1, lease_3.lease_epoch);
 
     Ok(())
 }

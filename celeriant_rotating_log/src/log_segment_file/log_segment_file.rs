@@ -62,9 +62,9 @@ impl LogSegmentFile {
     }
 
     pub async fn rotate(&self, shard_dir: &PathBuf, preallocate_bytes: u64) -> Result<Self, OpenOrCreateError> {
-        let (new_log_id, wal_index, tip_hash, last_received_replication_wal_index) = {
+        let (new_log_id, wal_seq, tip_hash, last_received_replication_wal_seq) = {
             let meta = self.metadata.borrow();
-            (meta.log_id + 1, meta.write.wal_index, meta.write.tip_hash, meta.last_received_replication_wal_index)
+            (meta.log_id + 1, meta.write.wal_seq, meta.write.tip_hash, meta.last_received_replication_wal_seq)
         };
 
         let log_path = shard_dir.join(log_file_name(new_log_id));
@@ -141,7 +141,7 @@ impl LogSegmentFile {
             }
         };
 
-        create_new_file(new_log_id, &log_path, writer, preallocate_bytes, shard_dir, false, wal_index, tip_hash, last_received_replication_wal_index).await
+        create_new_file(new_log_id, &log_path, writer, preallocate_bytes, shard_dir, false, wal_seq, tip_hash, last_received_replication_wal_seq).await
     }
 
     /// Open a log file, if it doesn't exist, create it.
@@ -245,11 +245,11 @@ async fn create_new_file(
     file_len: u64,
     dir_path: &PathBuf,
     advance_read: bool,
-    wal_index: u64,
+    wal_seq: u64,
     tip_hash: [u8; 32],
-    last_received_replication_wal_index: u64,
+    last_received_replication_wal_seq: u64,
 ) -> Result<LogSegmentFile, OpenOrCreateError> {
-    let header = setup_new_file(&mut writer, log_id, dir_path, file_len, wal_index, tip_hash, last_received_replication_wal_index).await?;
+    let header = setup_new_file(&mut writer, log_id, dir_path, file_len, wal_seq, tip_hash, last_received_replication_wal_seq).await?;
     build_log_segment(log_id, log_path, writer, file_len, &header, advance_read).await
 }
 
@@ -320,14 +320,14 @@ async fn load_header_detecting_corruption(dma_file: &mut DmaFile, file_len: u64,
 /// Setup a new file, writing the header to the start and end of the file
 /// Assumes the file already is preallocated to file_len. Will fsync the
 /// file and fsync the parent directory.
-async fn setup_new_file(dma_file: &mut DmaFile, log_id: u64, dir_path: &PathBuf, file_len: u64, wal_index: u64, tip_hash: [u8; 32], last_received_replication_wal_index: u64) -> Result<ShardLogHeader, OpenOrCreateError> {
+async fn setup_new_file(dma_file: &mut DmaFile, log_id: u64, dir_path: &PathBuf, file_len: u64, wal_seq: u64, tip_hash: [u8; 32], last_received_replication_wal_seq: u64) -> Result<ShardLogHeader, OpenOrCreateError> {
     let header = ShardLogHeader {
         metablocks_position: HEADER_BLOCK_SIZE_BYTES as u64,
         datablocks_position: file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64),
-        wal_index,
+        wal_seq,
         aggregate_bloom: vec![0u64; AGGREGATE_BLOOM_BYTES / 8],
         tip_hash,
-        last_received_replication_wal_index,
+        last_received_replication_wal_seq,
     };
 
     write_dual_shard_log_header(dma_file, header.datablocks_position, &header)
@@ -570,7 +570,7 @@ mod tests {
             let tip: [u8; 32] = [0xAB; 32];
             {
                 let mut meta = file.metadata.borrow_mut();
-                meta.write.wal_index = 42;
+                meta.write.wal_seq = 42;
                 meta.write.tip_hash = tip;
             }
 
@@ -578,7 +578,7 @@ mod tests {
             let meta = rotated.metadata.borrow();
 
             assert_eq!(meta.log_id, 2);
-            assert_eq!(meta.write.wal_index, 42);
+            assert_eq!(meta.write.wal_seq, 42);
             assert_eq!(meta.write.tip_hash, tip);
             assert_eq!(meta.write.metablocks_position, HEADER_BLOCK_SIZE_BYTES as u64);
             assert!(meta.read.is_none());
@@ -685,12 +685,12 @@ mod tests {
 
             {
                 let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true).await.unwrap();
-                file.metadata.borrow_mut().write.wal_index = 42;
+                file.metadata.borrow_mut().write.wal_seq = 42;
                 file.close().await;
             }
 
             let file = LogSegmentFile::open_existing(&dir, 1).await.unwrap();
-            assert_eq!(file.metadata.borrow().write.wal_index, 0);
+            assert_eq!(file.metadata.borrow().write.wal_seq, 0);
             file.close().await;
         });
     }

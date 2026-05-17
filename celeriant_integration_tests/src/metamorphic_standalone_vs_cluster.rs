@@ -4,7 +4,7 @@
 //! against a 2-node S3 cluster — then compares the per-aggregate event lists.
 //! Catches bugs where the shard's write path behaves differently with
 //! replication enabled vs disabled (cache only populated on one path, off-by-one
-//! batch index between modes, different compression decision, etc.); such bugs
+//! aggregate version between modes, different compression decision, etc.); such bugs
 //! would escape a leader/follower parity test because both distributed nodes
 //! could agree and both drift relative to standalone.
 //!

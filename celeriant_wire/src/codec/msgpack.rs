@@ -107,8 +107,8 @@ mod tests {
         use std::sync::Arc;
 
         let event = DatablockAggregateEvent {
-            client_event_index: 1,
-            event_index: 10,
+            client_seq: 1,
+            event_seq: 10,
             event_id: Some(0xDEADBEEF_CAFEBABE),
             event_timestamp: 1234567890,
             event_type_major: 42,
@@ -120,8 +120,8 @@ mod tests {
         let encoded = serialise_heap(&event).unwrap();
         let decoded: DatablockAggregateEvent = deserialise(&encoded).unwrap();
 
-        assert_eq!(event.client_event_index, decoded.client_event_index);
-        assert_eq!(event.event_index, decoded.event_index);
+        assert_eq!(event.client_seq, decoded.client_seq);
+        assert_eq!(event.event_seq, decoded.event_seq);
         assert_eq!(event.event_id, decoded.event_id);
         assert_eq!(event.iv, decoded.iv);
     }
@@ -132,8 +132,8 @@ mod tests {
         use std::sync::Arc;
 
         let event = DatablockAggregateEvent {
-            client_event_index: 1,
-            event_index: 10,
+            client_seq: 1,
+            event_seq: 10,
             event_id: Some(0xDEADBEEF_CAFEBABE),
             event_timestamp: 1234567890,
             event_type_major: 42,
@@ -145,7 +145,7 @@ mod tests {
         let encoded = serialise_heap(&event).unwrap();
         let decoded: DatablockAggregateEvent = deserialise(&encoded).unwrap();
 
-        assert_eq!(event.client_event_index, decoded.client_event_index);
+        assert_eq!(event.client_seq, decoded.client_seq);
         assert_eq!(event.iv, decoded.iv);
     }
 }

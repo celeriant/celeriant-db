@@ -38,12 +38,12 @@ mod tests {
         }
     }
 
-    fn write_event(org: u128, type_id: u128, id: u128, batch_index: u64) -> AggregateWatchEvent {
+    fn write_event(org: u128, type_id: u128, id: u128, aggregate_version: u64) -> AggregateWatchEvent {
         AggregateWatchEvent {
             aggregate_key: AggregateKey::new(org, type_id, id),
             operation: AggregateWatchEventOperation::Write {
-                from_event_batch_index: batch_index,
-                to_event_batch_index: batch_index,
+                from_aggregate_version: aggregate_version,
+                to_aggregate_version: aggregate_version,
             },
         }
     }
@@ -214,8 +214,8 @@ mod tests {
             watchers.broadcast(AggregateWatchEvent {
                 aggregate_key: AggregateKey::new(1, 1, 1),
                 operation: AggregateWatchEventOperation::Read {
-                    from_event_batch_index: 1,
-                    to_event_batch_index: Some(5),
+                    from_aggregate_version: 1,
+                    to_aggregate_version: Some(5),
                 },
             });
             assert!(poll_once(client.borrow().receiver.recv()).await.is_none());
@@ -250,17 +250,17 @@ mod tests {
 
             let operations = [
                 AggregateWatchEventOperation::Write {
-                    from_event_batch_index: 1,
-                    to_event_batch_index: 1,
+                    from_aggregate_version: 1,
+                    to_aggregate_version: 1,
                 },
                 AggregateWatchEventOperation::Read {
-                    from_event_batch_index: 1,
-                    to_event_batch_index: Some(5),
+                    from_aggregate_version: 1,
+                    to_aggregate_version: Some(5),
                 },
                 AggregateWatchEventOperation::Delete {},
                 AggregateWatchEventOperation::AggregateDetails {},
                 AggregateWatchEventOperation::TrimStart {
-                    keep_from_event_batch_index: 10,
+                    keep_from_aggregate_version: 10,
                 },
             ];
 
@@ -287,8 +287,8 @@ mod tests {
             assert_eq!(response.events.len(), 1);
             let write = &response.events[0];
             assert_eq!(write.operation, AggregateWatchEvent::WRITE);
-            assert_eq!(write.from_event_batch_index, Some(2));
-            assert_eq!(write.to_event_batch_index, Some(10));
+            assert_eq!(write.from_aggregate_version, Some(2));
+            assert_eq!(write.to_aggregate_version, Some(10));
         })
     }
 
@@ -300,24 +300,24 @@ mod tests {
             acc.accumulate(AggregateWatchEvent {
                 aggregate_key: AggregateKey::new(1, 2, 3),
                 operation: AggregateWatchEventOperation::Read {
-                    from_event_batch_index: 5,
-                    to_event_batch_index: Some(10),
+                    from_aggregate_version: 5,
+                    to_aggregate_version: Some(10),
                 },
             });
 
             acc.accumulate(AggregateWatchEvent {
                 aggregate_key: AggregateKey::new(1, 2, 3),
                 operation: AggregateWatchEventOperation::Read {
-                    from_event_batch_index: 3,
-                    to_event_batch_index: None,
+                    from_aggregate_version: 3,
+                    to_aggregate_version: None,
                 },
             });
 
             let response = acc.into_response();
             let read = &response.events[0];
             assert_eq!(read.operation, AggregateWatchEvent::READ);
-            assert_eq!(read.from_event_batch_index, Some(3));
-            assert_eq!(read.to_event_batch_index, Some(10));
+            assert_eq!(read.from_aggregate_version, Some(3));
+            assert_eq!(read.to_aggregate_version, Some(10));
         })
     }
 
@@ -329,21 +329,21 @@ mod tests {
             acc.accumulate(AggregateWatchEvent {
                 aggregate_key: AggregateKey::new(1, 2, 3),
                 operation: AggregateWatchEventOperation::TrimStart {
-                    keep_from_event_batch_index: 5,
+                    keep_from_aggregate_version: 5,
                 },
             });
 
             acc.accumulate(AggregateWatchEvent {
                 aggregate_key: AggregateKey::new(1, 2, 3),
                 operation: AggregateWatchEventOperation::TrimStart {
-                    keep_from_event_batch_index: 10,
+                    keep_from_aggregate_version: 10,
                 },
             });
 
             let response = acc.into_response();
             let trim = &response.events[0];
             assert_eq!(trim.operation, AggregateWatchEvent::TRIM_START);
-            assert_eq!(trim.keep_from_event_batch_index, Some(10));
+            assert_eq!(trim.keep_from_aggregate_version, Some(10));
         })
     }
 
@@ -375,7 +375,7 @@ mod tests {
             acc.accumulate(AggregateWatchEvent {
                 aggregate_key: AggregateKey::new(3, 3, 3),
                 operation: AggregateWatchEventOperation::TrimStart {
-                    keep_from_event_batch_index: 50,
+                    keep_from_aggregate_version: 50,
                 },
             });
 
@@ -523,8 +523,8 @@ mod tests {
                     assert_eq!(r.events.len(), 1);
                     let write = &r.events[0];
                     assert_eq!(write.operation, AggregateWatchEvent::WRITE);
-                    assert_eq!(write.from_event_batch_index, Some(1));
-                    assert_eq!(write.to_event_batch_index, Some(2));
+                    assert_eq!(write.from_aggregate_version, Some(1));
+                    assert_eq!(write.to_aggregate_version, Some(2));
                 }
                 other => panic!("Expected Response, got {:?}", other),
             }
@@ -630,8 +630,8 @@ mod tests {
             assert_eq!(response.events.len(), 1);
 
             let write = &response.events[0];
-            assert_eq!(write.from_event_batch_index, Some(0));
-            assert_eq!(write.to_event_batch_index, Some(999));
+            assert_eq!(write.from_aggregate_version, Some(0));
+            assert_eq!(write.to_aggregate_version, Some(999));
         })
     }
 }

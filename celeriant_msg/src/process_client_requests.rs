@@ -263,8 +263,8 @@ mod tests {
 
     fn event(idx: u64) -> DatablockAggregateEvent {
         DatablockAggregateEvent {
-            client_event_index: idx,
-            event_index: idx * 10,
+            client_seq: idx,
+            event_seq: idx * 10,
             event_id: Some(0xEEEE_FFFF_0000_1111),
             event_timestamp: 1234567890,
             event_type_major: 42,
@@ -285,7 +285,7 @@ mod tests {
                 correlation_id: Some(0xFEED_FACE_DEAD_C0DE),
                 aggregate_key: k,
                 filters: ReadFilters::new(42)
-                    .to_event_batch_index(100)
+                    .to_aggregate_version(100)
                     .include_event_types(vec![1, 2, 3])
                     .exclude_client_id(999)
                     .min_server_timestamp(1000)
@@ -300,7 +300,7 @@ mod tests {
                     SingleAggregateWrite {
                         events: vec![event(1)],
                         allow_create: true,
-                        expected_event_batch_index: Some(5),
+                        expected_version: Some(5),
                         enforce_client_idempotency: true,
                     },
                 )]),
@@ -308,7 +308,7 @@ mod tests {
             ClientRequestType::TrimStart => ClientRequest::TrimStart(TrimStartRequest {
                 correlation_id: Some(0xBAD_C0FFEE),
                 aggregate_key: k,
-                keep_from_event_batch_index: 50,
+                keep_from_aggregate_version: 50,
                 client_id: 0xABCD_EF01_2345_6789,
                 user_id: Some(0x9876_5432_10FE_DCBA),
             }),
@@ -320,8 +320,8 @@ mod tests {
                     k,
                     SingleAggregateDelete {
                         allow_recreate: false,
-                        allow_index_continuation: true,
-                        expected_event_batch_index: Some(99),
+                        allow_sequence_continuation: true,
+                        expected_version: Some(99),
                     },
                 )]),
             }),
@@ -583,7 +583,7 @@ mod tests {
                     SingleAggregateWrite {
                         events: vec![large_event],
                         allow_create: true,
-                        expected_event_batch_index: Some(42),
+                        expected_version: Some(42),
                         enforce_client_idempotency: true,
                     },
                 )]),

@@ -5,8 +5,8 @@ pub enum ShardDeleteError {
     AggregateNotExists,
     EmptyDeleteList,
     OptimisticConcurrencyViolation {
-        expected_event_batch_index: u64,
-        current_event_batch_index: u64,
+        expected_version: u64,
+        current_aggregate_version: u64,
     },
     AggregateExistsAndCacheError(ShardCacheLoadError),
     ReplicationError(ReplicationError),

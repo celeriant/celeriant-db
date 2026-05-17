@@ -22,8 +22,8 @@ pub fn read_metablock_kind_discriminant(bytes: &[u8]) -> u8 {
 }
 
 #[inline]
-pub fn read_wal_index(bytes: &[u8]) -> u64 {
-    let offset = HEADER_SIZE + Metablock::OFFSET_WAL_INDEX;
+pub fn read_wal_seq(bytes: &[u8]) -> u64 {
+    let offset = HEADER_SIZE + Metablock::OFFSET_WAL_SEQ;
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
@@ -134,7 +134,7 @@ pub fn read_soft_trim_aggregate_id(bytes: &[u8]) -> u128 {
 }
 
 #[inline]
-pub fn read_soft_trim_keep_from_event_batch_index(bytes: &[u8]) -> u64 {
+pub fn read_soft_trim_keep_from_aggregate_version(bytes: &[u8]) -> u64 {
     // AggregateKey is 3 x u128 = 48 bytes
     let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + AggregateKey::WIRE_SIZE_TOTAL;
     read_u64_le(bytes, offset)
@@ -175,8 +175,8 @@ pub fn read_event_batch_max_event_timestamp(bytes: &[u8]) -> u64 {
 }
 
 #[inline]
-pub fn read_event_batch_min_event_index(bytes: &[u8]) -> u64 {
-    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_MIN_EVENT_INDEX;
+pub fn read_event_batch_min_event_seq(bytes: &[u8]) -> u64 {
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_MIN_EVENT_SEQ;
     read_u64_le(bytes, offset)
 }
 
@@ -205,20 +205,20 @@ pub fn read_event_batch_aggregate_id(bytes: &[u8]) -> u128 {
 }
 
 #[inline]
-pub fn read_event_batch_min_event_batch_index(bytes: &[u8]) -> u64 {
-    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_MIN_EVENT_BATCH_INDEX;
+pub fn read_event_batch_min_aggregate_version(bytes: &[u8]) -> u64 {
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_MIN_AGGREGATE_VERSION;
     read_u64_le(bytes, offset)
 }
 
 #[inline]
-pub fn read_event_batch_event_batch_index(bytes: &[u8]) -> u64 {
-    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_EVENT_BATCH_INDEX;
+pub fn read_event_batch_aggregate_version(bytes: &[u8]) -> u64 {
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_AGGREGATE_VERSION;
     read_u64_le(bytes, offset)
 }
 
 #[inline]
-pub fn read_event_batch_max_event_index(bytes: &[u8]) -> u64 {
-    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_MAX_EVENT_INDEX;
+pub fn read_event_batch_max_event_seq(bytes: &[u8]) -> u64 {
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_MAX_EVENT_SEQ;
     read_u64_le(bytes, offset)
 }
 
@@ -229,8 +229,8 @@ pub fn read_event_batch_client_id(bytes: &[u8]) -> u128 {
 }
 
 #[inline]
-pub fn read_event_batch_max_client_event_index(bytes: &[u8]) -> u64 {
-    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_MAX_CLIENT_EVENT_INDEX;
+pub fn read_event_batch_max_client_seq(bytes: &[u8]) -> u64 {
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_MAX_CLIENT_EVENT_SEQ;
     read_u64_le(bytes, offset)
 }
 
@@ -317,7 +317,7 @@ mod tests {
     }
 
     fn make_event_batch_metablock(
-        wal_index: u64,
+        wal_seq: u64,
         server_timestamp: u64,
         _aggregate_key: AggregateKey,
         event_batch: MetablockEventBatch,
@@ -326,9 +326,9 @@ mod tests {
         uncompressed_size: u64,
     ) -> Metablock {
         Metablock {
-            wal_index,
+            wal_seq,
             server_timestamp,
-            lease_index: 1,
+            lease_epoch: 1,
             node_id: 0xDEADBEEF,
             compressed_size,
             uncompressed_size,
@@ -342,16 +342,16 @@ mod tests {
     }
 
     fn make_soft_delete_metablock(
-        wal_index: u64,
+        wal_seq: u64,
         server_timestamp: u64,
         aggregate_key: AggregateKey,
         compressed_size: u64,
         uncompressed_size: u64,
     ) -> Metablock {
         Metablock {
-            wal_index,
+            wal_seq,
             server_timestamp,
-            lease_index: 1,
+            lease_epoch: 1,
             node_id: 0xCAFEBABE,
             compressed_size,
             uncompressed_size,
@@ -360,9 +360,9 @@ mod tests {
             wal_metablock_type: MetablockKind::SoftDelete(MetablockSoftDelete {
                 aggregate_key,
                 allow_recreate: true,
-                allow_index_continuation: false,
-                event_batch_index: 999,
-                event_index: 888,
+                allow_sequence_continuation: false,
+                aggregate_version: 999,
+                event_seq: 888,
                 client_id: 777,
                 user_id: Some(666),
             }),
@@ -373,17 +373,17 @@ mod tests {
     }
 
     fn make_soft_trim_metablock(
-        wal_index: u64,
+        wal_seq: u64,
         server_timestamp: u64,
         aggregate_key: AggregateKey,
-        keep_from_event_batch_index: u64,
+        keep_from_aggregate_version: u64,
         compressed_size: u64,
         uncompressed_size: u64,
     ) -> Metablock {
         Metablock {
-            wal_index,
+            wal_seq,
             server_timestamp,
-            lease_index: 1,
+            lease_epoch: 1,
             node_id: 0xFEEDFACE,
             compressed_size,
             uncompressed_size,
@@ -391,9 +391,9 @@ mod tests {
             datablock_compression_type: 0,
             wal_metablock_type: MetablockKind::SoftTrim(MetablockSoftTrim {
                 aggregate_key,
-                keep_from_event_batch_index,
-                event_batch_index: 0,
-                event_index: 0,
+                keep_from_aggregate_version,
+                aggregate_version: 0,
+                event_seq: 0,
                 client_id: 111,
                 user_id: None,
             }),
@@ -410,14 +410,14 @@ mod tests {
         let key = AggregateKey::new(1, 2, 3);
         let batch = MetablockEventBatch {
             aggregate_key: key.clone(),
-            event_batch_index: 1,
-            min_event_batch_index: 1,
-            min_client_event_index: 0,
-            max_client_event_index: 10,
+            aggregate_version: 1,
+            trimmed_below_version: 1,
+            min_client_seq: 0,
+            max_client_seq: 10,
             min_event_timestamp: 1000,
             max_event_timestamp: 2000,
-            min_event_index: 0,
-            max_event_index: 5,
+            min_event_seq: 0,
+            max_event_seq: 5,
             client_id: 100,
             user_id: None,
             event_types_data: EventTypesKind::Direct([1, 2, 0, 0]),
@@ -458,18 +458,18 @@ mod tests {
     // ==================== Common Metablock Field Tests ====================
 
     #[test]
-    fn read_wal_index_from_event_batch() {
+    fn read_wal_seq_from_event_batch() {
         let key = AggregateKey::new(1, 2, 3);
         let batch = MetablockEventBatch {
             aggregate_key: key.clone(),
-            event_batch_index: 1,
-            min_event_batch_index: 1,
-            min_client_event_index: 0,
-            max_client_event_index: 10,
+            aggregate_version: 1,
+            trimmed_below_version: 1,
+            min_client_seq: 0,
+            max_client_seq: 10,
             min_event_timestamp: 1000,
             max_event_timestamp: 2000,
-            min_event_index: 0,
-            max_event_index: 5,
+            min_event_seq: 0,
+            max_event_seq: 5,
             client_id: 100,
             user_id: None,
             event_types_data: EventTypesKind::Direct([0; 4]),
@@ -477,7 +477,7 @@ mod tests {
         let metablock = make_event_batch_metablock(0xDEAD_BEEF_CAFE_BABE, 1000, key, batch, DatablockStorageKind::None, 0, 0);
         let bytes = serialize_metablock(&metablock);
 
-        assert_eq!(read_wal_index(&bytes), 0xDEAD_BEEF_CAFE_BABE);
+        assert_eq!(read_wal_seq(&bytes), 0xDEAD_BEEF_CAFE_BABE);
     }
 
     #[test]
@@ -485,14 +485,14 @@ mod tests {
         let key = AggregateKey::new(1, 2, 3);
         let batch = MetablockEventBatch {
             aggregate_key: key.clone(),
-            event_batch_index: 1,
-            min_event_batch_index: 1,
-            min_client_event_index: 0,
-            max_client_event_index: 10,
+            aggregate_version: 1,
+            trimmed_below_version: 1,
+            min_client_seq: 0,
+            max_client_seq: 10,
             min_event_timestamp: 1000,
             max_event_timestamp: 2000,
-            min_event_index: 0,
-            max_event_index: 5,
+            min_event_seq: 0,
+            max_event_seq: 5,
             client_id: 100,
             user_id: None,
             event_types_data: EventTypesKind::Direct([0; 4]),
@@ -504,21 +504,21 @@ mod tests {
     }
 
     #[test]
-    fn read_wal_index_from_soft_delete() {
+    fn read_wal_seq_from_soft_delete() {
         let key = AggregateKey::new(1, 2, 3);
         let metablock = make_soft_delete_metablock(42424242, 1000, key, 0, 0);
         let bytes = serialize_metablock(&metablock);
 
-        assert_eq!(read_wal_index(&bytes), 42424242);
+        assert_eq!(read_wal_seq(&bytes), 42424242);
     }
 
     #[test]
-    fn read_wal_index_from_soft_trim() {
+    fn read_wal_seq_from_soft_trim() {
         let key = AggregateKey::new(1, 2, 3);
         let metablock = make_soft_trim_metablock(99887766, 1000, key, 50, 0, 0);
         let bytes = serialize_metablock(&metablock);
 
-        assert_eq!(read_wal_index(&bytes), 99887766);
+        assert_eq!(read_wal_seq(&bytes), 99887766);
     }
 
     // ==================== Event Batch Field Tests ====================
@@ -532,14 +532,14 @@ mod tests {
         );
         let batch = MetablockEventBatch {
             aggregate_key: key.clone(),
-            event_batch_index: 1,
-            min_event_batch_index: 1,
-            min_client_event_index: 0,
-            max_client_event_index: 10,
+            aggregate_version: 1,
+            trimmed_below_version: 1,
+            min_client_seq: 0,
+            max_client_seq: 10,
             min_event_timestamp: 1000,
             max_event_timestamp: 2000,
-            min_event_index: 0,
-            max_event_index: 5,
+            min_event_seq: 0,
+            max_event_seq: 5,
             client_id: 100,
             user_id: None,
             event_types_data: EventTypesKind::Direct([0; 4]),
@@ -558,18 +558,18 @@ mod tests {
     }
 
     #[test]
-    fn read_event_batch_index_fields() {
+    fn read_aggregate_version_fields() {
         let key = AggregateKey::new(1, 2, 3);
         let batch = MetablockEventBatch {
             aggregate_key: key.clone(),
-            event_batch_index: 0xFEDC_BA98_7654_3210,
-            min_event_batch_index: 0x0123_4567_89AB_CDEF,
-            min_client_event_index: 0,
-            max_client_event_index: 10,
+            aggregate_version: 0xFEDC_BA98_7654_3210,
+            trimmed_below_version: 0x0123_4567_89AB_CDEF,
+            min_client_seq: 0,
+            max_client_seq: 10,
             min_event_timestamp: 1000,
             max_event_timestamp: 2000,
-            min_event_index: 0,
-            max_event_index: 5,
+            min_event_seq: 0,
+            max_event_seq: 5,
             client_id: 100,
             user_id: None,
             event_types_data: EventTypesKind::Direct([0; 4]),
@@ -577,23 +577,23 @@ mod tests {
         let metablock = make_event_batch_metablock(1, 1000, key, batch, DatablockStorageKind::None, 0, 0);
         let bytes = serialize_metablock(&metablock);
 
-        assert_eq!(read_event_batch_event_batch_index(&bytes), 0xFEDC_BA98_7654_3210);
-        assert_eq!(read_event_batch_min_event_batch_index(&bytes), 0x0123_4567_89AB_CDEF);
+        assert_eq!(read_event_batch_aggregate_version(&bytes), 0xFEDC_BA98_7654_3210);
+        assert_eq!(read_event_batch_min_aggregate_version(&bytes), 0x0123_4567_89AB_CDEF);
     }
 
     #[test]
-    fn read_event_batch_event_index_fields() {
+    fn read_event_batch_event_seq_fields() {
         let key = AggregateKey::new(1, 2, 3);
         let batch = MetablockEventBatch {
             aggregate_key: key.clone(),
-            event_batch_index: 1,
-            min_event_batch_index: 1,
-            min_client_event_index: 0,
-            max_client_event_index: 10,
+            aggregate_version: 1,
+            trimmed_below_version: 1,
+            min_client_seq: 0,
+            max_client_seq: 10,
             min_event_timestamp: 1000,
             max_event_timestamp: 2000,
-            min_event_index: 0xAAAA_BBBB_CCCC_DDDD,
-            max_event_index: 0xEEEE_FFFF_0000_1111,
+            min_event_seq: 0xAAAA_BBBB_CCCC_DDDD,
+            max_event_seq: 0xEEEE_FFFF_0000_1111,
             client_id: 100,
             user_id: None,
             event_types_data: EventTypesKind::Direct([0; 4]),
@@ -601,8 +601,8 @@ mod tests {
         let metablock = make_event_batch_metablock(1, 1000, key, batch, DatablockStorageKind::None, 0, 0);
         let bytes = serialize_metablock(&metablock);
 
-        assert_eq!(read_event_batch_min_event_index(&bytes), 0xAAAA_BBBB_CCCC_DDDD);
-        assert_eq!(read_event_batch_max_event_index(&bytes), 0xEEEE_FFFF_0000_1111);
+        assert_eq!(read_event_batch_min_event_seq(&bytes), 0xAAAA_BBBB_CCCC_DDDD);
+        assert_eq!(read_event_batch_max_event_seq(&bytes), 0xEEEE_FFFF_0000_1111);
     }
 
     #[test]
@@ -610,14 +610,14 @@ mod tests {
         let key = AggregateKey::new(1, 2, 3);
         let batch = MetablockEventBatch {
             aggregate_key: key.clone(),
-            event_batch_index: 1,
-            min_event_batch_index: 1,
-            min_client_event_index: 0,
-            max_client_event_index: 10,
+            aggregate_version: 1,
+            trimmed_below_version: 1,
+            min_client_seq: 0,
+            max_client_seq: 10,
             min_event_timestamp: 0x1234_5678_9ABC_DEF0,
             max_event_timestamp: 0xFEDC_BA98_7654_3210,
-            min_event_index: 0,
-            max_event_index: 5,
+            min_event_seq: 0,
+            max_event_seq: 5,
             client_id: 100,
             user_id: None,
             event_types_data: EventTypesKind::Direct([0; 4]),
@@ -634,14 +634,14 @@ mod tests {
         let key = AggregateKey::new(1, 2, 3);
         let batch = MetablockEventBatch {
             aggregate_key: key.clone(),
-            event_batch_index: 1,
-            min_event_batch_index: 1,
-            min_client_event_index: 0,
-            max_client_event_index: 0xABCD_EF01_2345_6789,
+            aggregate_version: 1,
+            trimmed_below_version: 1,
+            min_client_seq: 0,
+            max_client_seq: 0xABCD_EF01_2345_6789,
             min_event_timestamp: 1000,
             max_event_timestamp: 2000,
-            min_event_index: 0,
-            max_event_index: 5,
+            min_event_seq: 0,
+            max_event_seq: 5,
             client_id: 0x1111_2222_3333_4444_5555_6666_7777_8888,
             user_id: None,
             event_types_data: EventTypesKind::Direct([0; 4]),
@@ -650,7 +650,7 @@ mod tests {
         let bytes = serialize_metablock(&metablock);
 
         assert_eq!(read_event_batch_client_id(&bytes), 0x1111_2222_3333_4444_5555_6666_7777_8888);
-        assert_eq!(read_event_batch_max_client_event_index(&bytes), 0xABCD_EF01_2345_6789);
+        assert_eq!(read_event_batch_max_client_seq(&bytes), 0xABCD_EF01_2345_6789);
     }
 
     // ==================== Aggregate Key Matching Tests ====================
@@ -660,14 +660,14 @@ mod tests {
         let key = AggregateKey::new(111, 222, 333);
         let batch = MetablockEventBatch {
             aggregate_key: key.clone(),
-            event_batch_index: 1,
-            min_event_batch_index: 1,
-            min_client_event_index: 0,
-            max_client_event_index: 10,
+            aggregate_version: 1,
+            trimmed_below_version: 1,
+            min_client_seq: 0,
+            max_client_seq: 10,
             min_event_timestamp: 1000,
             max_event_timestamp: 2000,
-            min_event_index: 0,
-            max_event_index: 5,
+            min_event_seq: 0,
+            max_event_seq: 5,
             client_id: 100,
             user_id: None,
             event_types_data: EventTypesKind::Direct([0; 4]),
@@ -684,14 +684,14 @@ mod tests {
         let different_key = AggregateKey::new(111, 222, 999); // Different aggregate_id
         let batch = MetablockEventBatch {
             aggregate_key: key.clone(),
-            event_batch_index: 1,
-            min_event_batch_index: 1,
-            min_client_event_index: 0,
-            max_client_event_index: 10,
+            aggregate_version: 1,
+            trimmed_below_version: 1,
+            min_client_seq: 0,
+            max_client_seq: 10,
             min_event_timestamp: 1000,
             max_event_timestamp: 2000,
-            min_event_index: 0,
-            max_event_index: 5,
+            min_event_seq: 0,
+            max_event_seq: 5,
             client_id: 100,
             user_id: None,
             event_types_data: EventTypesKind::Direct([0; 4]),
@@ -757,14 +757,14 @@ mod tests {
         let key = AggregateKey::new(100, 200, 300);
         let batch = MetablockEventBatch {
             aggregate_key: key.clone(),
-            event_batch_index: 1,
-            min_event_batch_index: 1,
-            min_client_event_index: 0,
-            max_client_event_index: 10,
+            aggregate_version: 1,
+            trimmed_below_version: 1,
+            min_client_seq: 0,
+            max_client_seq: 10,
             min_event_timestamp: 1000,
             max_event_timestamp: 2000,
-            min_event_index: 0,
-            max_event_index: 5,
+            min_event_seq: 0,
+            max_event_seq: 5,
             client_id: 100,
             user_id: None,
             event_types_data: EventTypesKind::Direct([0; 4]),
@@ -793,12 +793,12 @@ mod tests {
     }
 
     #[test]
-    fn read_soft_trim_keep_from_event_batch_index_field() {
+    fn read_soft_trim_keep_from_aggregate_version_field() {
         let key = AggregateKey::new(1, 2, 3);
         let metablock = make_soft_trim_metablock(1, 1000, key, 0xDEAD_BEEF_CAFE_BABE, 0, 0);
         let bytes = serialize_metablock(&metablock);
 
-        assert_eq!(read_soft_trim_keep_from_event_batch_index(&bytes), 0xDEAD_BEEF_CAFE_BABE);
+        assert_eq!(read_soft_trim_keep_from_aggregate_version(&bytes), 0xDEAD_BEEF_CAFE_BABE);
     }
 
     #[test]
@@ -836,14 +836,14 @@ mod tests {
         let key = AggregateKey::new(u128::MAX, u128::MAX, u128::MAX);
         let batch = MetablockEventBatch {
             aggregate_key: key.clone(),
-            event_batch_index: u64::MAX,
-            min_event_batch_index: u64::MAX,
-            min_client_event_index: u64::MAX,
-            max_client_event_index: u64::MAX,
+            aggregate_version: u64::MAX,
+            trimmed_below_version: u64::MAX,
+            min_client_seq: u64::MAX,
+            max_client_seq: u64::MAX,
             min_event_timestamp: u64::MAX,
             max_event_timestamp: u64::MAX,
-            min_event_index: u64::MAX,
-            max_event_index: u64::MAX,
+            min_event_seq: u64::MAX,
+            max_event_seq: u64::MAX,
             client_id: u128::MAX,
             user_id: Some(u128::MAX),
             event_types_data: EventTypesKind::Direct([u64::MAX; 4]),
@@ -851,19 +851,19 @@ mod tests {
         let metablock = make_event_batch_metablock(u64::MAX, u64::MAX, key.clone(), batch, DatablockStorageKind::None, 0, 0);
         let bytes = serialize_metablock(&metablock);
 
-        assert_eq!(read_wal_index(&bytes), u64::MAX);
+        assert_eq!(read_wal_seq(&bytes), u64::MAX);
         assert_eq!(read_server_timestamp(&bytes), u64::MAX);
         assert_eq!(read_event_batch_org_id(&bytes), u128::MAX);
         assert_eq!(read_event_batch_aggregate_type_id(&bytes), u128::MAX);
         assert_eq!(read_event_batch_aggregate_id(&bytes), u128::MAX);
-        assert_eq!(read_event_batch_event_batch_index(&bytes), u64::MAX);
-        assert_eq!(read_event_batch_min_event_batch_index(&bytes), u64::MAX);
+        assert_eq!(read_event_batch_aggregate_version(&bytes), u64::MAX);
+        assert_eq!(read_event_batch_min_aggregate_version(&bytes), u64::MAX);
         assert_eq!(read_event_batch_min_event_timestamp(&bytes), u64::MAX);
         assert_eq!(read_event_batch_max_event_timestamp(&bytes), u64::MAX);
-        assert_eq!(read_event_batch_min_event_index(&bytes), u64::MAX);
-        assert_eq!(read_event_batch_max_event_index(&bytes), u64::MAX);
+        assert_eq!(read_event_batch_min_event_seq(&bytes), u64::MAX);
+        assert_eq!(read_event_batch_max_event_seq(&bytes), u64::MAX);
         assert_eq!(read_event_batch_client_id(&bytes), u128::MAX);
-        assert_eq!(read_event_batch_max_client_event_index(&bytes), u64::MAX);
+        assert_eq!(read_event_batch_max_client_seq(&bytes), u64::MAX);
     }
 
     #[test]
@@ -871,14 +871,14 @@ mod tests {
         let key = AggregateKey::new(0, 0, 0);
         let batch = MetablockEventBatch {
             aggregate_key: key.clone(),
-            event_batch_index: 0,
-            min_event_batch_index: 0,
-            min_client_event_index: 0,
-            max_client_event_index: 0,
+            aggregate_version: 0,
+            trimmed_below_version: 0,
+            min_client_seq: 0,
+            max_client_seq: 0,
             min_event_timestamp: 0,
             max_event_timestamp: 0,
-            min_event_index: 0,
-            max_event_index: 0,
+            min_event_seq: 0,
+            max_event_seq: 0,
             client_id: 0,
             user_id: None,
             event_types_data: EventTypesKind::Direct([0; 4]),
@@ -886,12 +886,12 @@ mod tests {
         let metablock = make_event_batch_metablock(0, 0, key.clone(), batch, DatablockStorageKind::None, 0, 0);
         let bytes = serialize_metablock(&metablock);
 
-        assert_eq!(read_wal_index(&bytes), 0);
+        assert_eq!(read_wal_seq(&bytes), 0);
         assert_eq!(read_server_timestamp(&bytes), 0);
         assert_eq!(read_event_batch_org_id(&bytes), 0);
         assert_eq!(read_event_batch_aggregate_type_id(&bytes), 0);
         assert_eq!(read_event_batch_aggregate_id(&bytes), 0);
-        assert_eq!(read_event_batch_event_batch_index(&bytes), 0);
+        assert_eq!(read_event_batch_aggregate_version(&bytes), 0);
         assert_eq!(read_event_batch_client_id(&bytes), 0);
     }
 
@@ -920,7 +920,7 @@ mod tests {
         assert_eq!(read_soft_trim_org_id(&bytes), u128::MAX);
         assert_eq!(read_soft_trim_aggregate_type_id(&bytes), u128::MAX);
         assert_eq!(read_soft_trim_aggregate_id(&bytes), u128::MAX);
-        assert_eq!(read_soft_trim_keep_from_event_batch_index(&bytes), u64::MAX);
+        assert_eq!(read_soft_trim_keep_from_aggregate_version(&bytes), u64::MAX);
     }
 
     // ==================== Cross-type Verification Tests ====================
@@ -932,14 +932,14 @@ mod tests {
         // EventBatchMetadata
         let batch = MetablockEventBatch {
             aggregate_key: key.clone(),
-            event_batch_index: 1,
-            min_event_batch_index: 1,
-            min_client_event_index: 0,
-            max_client_event_index: 10,
+            aggregate_version: 1,
+            trimmed_below_version: 1,
+            min_client_seq: 0,
+            max_client_seq: 10,
             min_event_timestamp: 1000,
             max_event_timestamp: 2000,
-            min_event_index: 0,
-            max_event_index: 5,
+            min_event_seq: 0,
+            max_event_seq: 5,
             client_id: 100,
             user_id: None,
             event_types_data: EventTypesKind::Direct([0; 4]),
@@ -980,14 +980,14 @@ mod tests {
         let key = AggregateKey::new(100, 200, 300);
         let batch = MetablockEventBatch {
             aggregate_key: key.clone(),
-            event_batch_index: 1,
-            min_event_batch_index: 1,
-            min_client_event_index: 0,
-            max_client_event_index: 10,
+            aggregate_version: 1,
+            trimmed_below_version: 1,
+            min_client_seq: 0,
+            max_client_seq: 10,
             min_event_timestamp: 1000,
             max_event_timestamp: 2000,
-            min_event_index: 0,
-            max_event_index: 5,
+            min_event_seq: 0,
+            max_event_seq: 5,
             client_id: 100,
             user_id: None,
             event_types_data: EventTypesKind::Direct([0; 4]),
@@ -1009,39 +1009,39 @@ mod tests {
     #[test]
     fn common_fields_consistent_across_metablock_types() {
         let key = AggregateKey::new(1, 2, 3);
-        let wal_index = 0xABCD_EF01_2345_6789;
+        let wal_seq = 0xABCD_EF01_2345_6789;
         let server_timestamp = 0x9876_5432_10FE_DCBA;
 
         // EventBatch
         let batch = MetablockEventBatch {
             aggregate_key: key.clone(),
-            event_batch_index: 1,
-            min_event_batch_index: 1,
-            min_client_event_index: 0,
-            max_client_event_index: 10,
+            aggregate_version: 1,
+            trimmed_below_version: 1,
+            min_client_seq: 0,
+            max_client_seq: 10,
             min_event_timestamp: 1000,
             max_event_timestamp: 2000,
-            min_event_index: 0,
-            max_event_index: 5,
+            min_event_seq: 0,
+            max_event_seq: 5,
             client_id: 100,
             user_id: None,
             event_types_data: EventTypesKind::Direct([0; 4]),
         };
-        let event_batch_metablock = make_event_batch_metablock(wal_index, server_timestamp, key.clone(), batch, DatablockStorageKind::None, 0, 0);
+        let event_batch_metablock = make_event_batch_metablock(wal_seq, server_timestamp, key.clone(), batch, DatablockStorageKind::None, 0, 0);
         let event_batch_bytes = serialize_metablock(&event_batch_metablock);
 
         // SoftDelete
-        let soft_delete_metablock = make_soft_delete_metablock(wal_index, server_timestamp, key.clone(), 0, 0);
+        let soft_delete_metablock = make_soft_delete_metablock(wal_seq, server_timestamp, key.clone(), 0, 0);
         let soft_delete_bytes = serialize_metablock(&soft_delete_metablock);
 
         // SoftTrim
-        let soft_trim_metablock = make_soft_trim_metablock(wal_index, server_timestamp, key.clone(), 50, 0, 0);
+        let soft_trim_metablock = make_soft_trim_metablock(wal_seq, server_timestamp, key.clone(), 50, 0, 0);
         let soft_trim_bytes = serialize_metablock(&soft_trim_metablock);
 
-        // Verify wal_index is read correctly from all types
-        assert_eq!(read_wal_index(&event_batch_bytes), wal_index);
-        assert_eq!(read_wal_index(&soft_delete_bytes), wal_index);
-        assert_eq!(read_wal_index(&soft_trim_bytes), wal_index);
+        // Verify wal_seq is read correctly from all types
+        assert_eq!(read_wal_seq(&event_batch_bytes), wal_seq);
+        assert_eq!(read_wal_seq(&soft_delete_bytes), wal_seq);
+        assert_eq!(read_wal_seq(&soft_trim_bytes), wal_seq);
 
         // Verify server_timestamp is read correctly from all types
         assert_eq!(read_server_timestamp(&event_batch_bytes), server_timestamp);
@@ -1052,16 +1052,16 @@ mod tests {
     // ==================== SchemaRegistration helpers ====================
 
     fn make_schema_registration_metablock(
-        wal_index: u64,
+        wal_seq: u64,
         server_timestamp: u64,
         schema_key: SchemaKey,
         client_id: u128,
         user_id: Option<u128>,
     ) -> Metablock {
         Metablock {
-            wal_index,
+            wal_seq,
             server_timestamp,
-            lease_index: 1,
+            lease_epoch: 1,
             node_id: 0x5C4E3A,
             compressed_size: 0,
             uncompressed_size: 0,
@@ -1133,14 +1133,14 @@ mod tests {
         let key = AggregateKey::new(100, 200, 300);
         let batch = MetablockEventBatch {
             aggregate_key: key.clone(),
-            event_batch_index: 1,
-            min_event_batch_index: 1,
-            min_client_event_index: 0,
-            max_client_event_index: 10,
+            aggregate_version: 1,
+            trimmed_below_version: 1,
+            min_client_seq: 0,
+            max_client_seq: 10,
             min_event_timestamp: 1000,
             max_event_timestamp: 2000,
-            min_event_index: 0,
-            max_event_index: 5,
+            min_event_seq: 0,
+            max_event_seq: 5,
             client_id: 100,
             user_id: None,
             event_types_data: EventTypesKind::Direct([0; 4]),
@@ -1156,7 +1156,7 @@ mod tests {
         let key = SchemaKey::new(u128::MAX, u128::MAX, u64::MAX, u64::MAX);
         let bytes = serialize_metablock(&make_schema_registration_metablock(u64::MAX, u64::MAX, key.clone(), u128::MAX, Some(u128::MAX)));
 
-        assert_eq!(read_wal_index(&bytes), u64::MAX);
+        assert_eq!(read_wal_seq(&bytes), u64::MAX);
         assert_eq!(read_server_timestamp(&bytes), u64::MAX);
         assert_eq!(read_schema_registration_org_id(&bytes), u128::MAX);
         assert_eq!(read_schema_registration_aggregate_type_id(&bytes), u128::MAX);

@@ -86,7 +86,7 @@ async fn get_accounts() -> Json<Value> {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EventsQuery {
-    from_batch_index: Option<u64>,
+    from_version: Option<u64>,
 }
 
 async fn get_events(
@@ -95,7 +95,7 @@ async fn get_events(
     State(state): State<SharedState>,
 ) -> Result<Json<Value>, StatusCode> {
     let key = account_key(account_id.as_u128());
-    let from = params.from_batch_index.unwrap_or(1);
+    let from = params.from_version.unwrap_or(1);
 
     match state.pool.read(ReadRequest {
         correlation_id: None,
@@ -104,7 +104,7 @@ async fn get_events(
     }).await {
         Ok(response) => {
             let batches: Vec<Value> = response.event_batches.iter().map(|b| json!({
-                "batchIndex": b.event_batch_index,
+                "batchIndex": b.aggregate_version,
                 "clientId": u128_to_uuid(b.client_id),
                 "serverTimestamp": b.server_timestamp,
                 "events": b.events.iter().map(deserialize_event).collect::<Vec<_>>(),
@@ -126,7 +126,7 @@ async fn get_events(
 struct DepositRequest {
     client_id: Uuid,
     amount_cents: i32,
-    expected_batch_index: u64,
+    expected_aggregate_version: u64,
 }
 
 async fn deposit(
@@ -140,7 +140,7 @@ async fn deposit(
     match state.pool.write_events_with(key.clone(), vec![evt], WriteEventsOptions {
         client_id: req.client_id.as_u128(),
         allow_create: true,
-        expected_event_batch_index: Some(req.expected_batch_index),
+        expected_version: Some(req.expected_aggregate_version),
         ..Default::default()
     }).await {
         Ok(_) => {
@@ -148,13 +148,13 @@ async fn deposit(
                 correlation_id: None,
                 aggregate_key: key,
             }).await.map_err(|e| internal_error(&e.to_string()))?;
-            Ok(Json(json!({ "newBatchIndex": details.max_event_batch_index })))
+            Ok(Json(json!({ "newBatchIndex": details.max_aggregate_version })))
         }
         Err(ClientError::Server(ServerError::Write {
-            kind: WriteError::OptimisticConcurrencyViolation { current_event_batch_index, .. }, ..
+            kind: WriteError::OptimisticConcurrencyViolation { current_aggregate_version, .. }, ..
         })) => Err((StatusCode::CONFLICT, Json(json!({
             "error": "OCC_CONFLICT",
-            "currentBatchIndex": current_event_batch_index,
+            "currentBatchIndex": current_aggregate_version,
             "message": "Account was modified. Please refresh and retry.",
         })))),
         Err(e) => Err(internal_error(&e.to_string())),
@@ -166,7 +166,7 @@ async fn deposit(
 struct WithdrawRequest {
     client_id: Uuid,
     amount_cents: i32,
-    expected_batch_index: u64,
+    expected_aggregate_version: u64,
 }
 
 async fn withdraw(
@@ -180,7 +180,7 @@ async fn withdraw(
     match state.pool.write_events_with(key.clone(), vec![evt], WriteEventsOptions {
         client_id: req.client_id.as_u128(),
         allow_create: true,
-        expected_event_batch_index: Some(req.expected_batch_index),
+        expected_version: Some(req.expected_aggregate_version),
         ..Default::default()
     }).await {
         Ok(_) => {
@@ -188,13 +188,13 @@ async fn withdraw(
                 correlation_id: None,
                 aggregate_key: key,
             }).await.map_err(|e| internal_error(&e.to_string()))?;
-            Ok(Json(json!({ "newBatchIndex": details.max_event_batch_index })))
+            Ok(Json(json!({ "newBatchIndex": details.max_aggregate_version })))
         }
         Err(ClientError::Server(ServerError::Write {
-            kind: WriteError::OptimisticConcurrencyViolation { current_event_batch_index, .. }, ..
+            kind: WriteError::OptimisticConcurrencyViolation { current_aggregate_version, .. }, ..
         })) => Err((StatusCode::CONFLICT, Json(json!({
             "error": "OCC_CONFLICT",
-            "currentBatchIndex": current_event_batch_index,
+            "currentBatchIndex": current_aggregate_version,
             "message": "Account was modified. Please refresh and retry.",
         })))),
         Err(e) => Err(internal_error(&e.to_string())),
@@ -208,8 +208,8 @@ struct TransferRequest {
     from_account_id: Uuid,
     to_account_id: Uuid,
     amount_cents: i32,
-    expected_from_batch_index: u64,
-    expected_to_batch_index: u64,
+    expected_from_version: u64,
+    expected_to_version: u64,
 }
 
 async fn transfer(
@@ -236,13 +236,13 @@ async fn transfer(
             (from_key.clone(), SingleAggregateWrite {
                 events: vec![transfer_out],
                 allow_create: true,
-                expected_event_batch_index: Some(req.expected_from_batch_index),
+                expected_version: Some(req.expected_from_version),
                 enforce_client_idempotency: false,
             }),
             (to_key.clone(), SingleAggregateWrite {
                 events: vec![transfer_in],
                 allow_create: true,
-                expected_event_batch_index: Some(req.expected_to_batch_index),
+                expected_version: Some(req.expected_to_version),
                 enforce_client_idempotency: false,
             }),
         ]),
@@ -260,8 +260,8 @@ async fn transfer(
             }).await.map_err(|e| internal_error(&e.to_string()))?;
 
             Ok(Json(json!({
-                "newFromBatchIndex": from_details.max_event_batch_index,
-                "newToBatchIndex": to_details.max_event_batch_index,
+                "newFromBatchIndex": from_details.max_aggregate_version,
+                "newToBatchIndex": to_details.max_aggregate_version,
             })))
         }
         Err(ClientError::Server(ServerError::Write {
@@ -331,7 +331,7 @@ async fn seed_accounts(pool: &CeleriantPool) {
             correlation_id: None,
             aggregate_key: key.clone(),
         }).await {
-            Ok(details) if details.max_event_batch_index > 0 => continue,
+            Ok(details) if details.max_aggregate_version > 0 => continue,
             _ => {}
         }
 
@@ -388,7 +388,7 @@ async fn watch_loop(
             let watch_event = json!({
                 "aggregateId": u128_to_uuid(evt.aggregate_id),
                 "operation": "Write",
-                "toBatchIndex": evt.to_event_batch_index,
+                "toBatchIndex": evt.to_aggregate_version,
             });
             let _ = tx.send(watch_event);
         }

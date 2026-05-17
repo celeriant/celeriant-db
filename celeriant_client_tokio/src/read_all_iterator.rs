@@ -10,7 +10,7 @@ use crate::client_error::ClientError;
 
 /// Streaming iterator for reading all event batches from an aggregate.
 ///
-/// Automatically follows `next_event_batch_index` cursors until the aggregate
+/// Automatically follows `next_aggregate_version` cursors until the aggregate
 /// is fully consumed.
 pub struct ReadAllIterator<'a> {
     client: &'a mut CeleriantClient,
@@ -68,9 +68,9 @@ impl<'a> ReadAllIterator<'a> {
 
         self.buffer.extend(response.event_batches);
 
-        match response.next_event_batch_index {
+        match response.next_aggregate_version {
             Some(next_index) => {
-                self.filters.from_event_batch_index = next_index;
+                self.filters.from_aggregate_version = next_index;
                 Ok(true)
             }
             None => Ok(false),

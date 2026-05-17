@@ -141,7 +141,7 @@ mod tests {
         let now = unix_epoch_now_ms();
         // Lease expires 200ms from now — within the drift window (500ms)
         let status = ValidatedNodeStatus::create_custom_status(
-            NodeStatus::Leader { lease_index: 1 },
+            NodeStatus::Leader { lease_epoch: 1 },
             DRIFT,
             now + 200, // 200ms left < 500ms drift -> must_fence() fires
         );
@@ -155,11 +155,11 @@ mod tests {
     fn leader_active_when_ttl_sufficient() {
         let now = unix_epoch_now_ms();
         let status = ValidatedNodeStatus::create_custom_status(
-            NodeStatus::Leader { lease_index: 1 },
+            NodeStatus::Leader { lease_epoch: 1 },
             DRIFT,
             now + 5000, // 5s left >> 500ms drift
         );
-        assert_eq!(status.effective_node_status(), NodeStatus::Leader { lease_index: 1 },
+        assert_eq!(status.effective_node_status(), NodeStatus::Leader { lease_epoch: 1 },
             "Leader should remain active when TTL >> drift");
     }
 
@@ -168,7 +168,7 @@ mod tests {
         let now = unix_epoch_now_ms();
         // Follower with 200ms remaining — within leader's drift window but NOT expired
         let status = ValidatedNodeStatus::create_custom_status(
-            NodeStatus::Follower { leader_lease_index: 1 },
+            NodeStatus::Follower { leader_lease_epoch: 1 },
             DRIFT,
             now + 200,
         );
@@ -180,17 +180,17 @@ mod tests {
     #[test]
     fn follower_active_when_ttl_sufficient() {
         let status = ValidatedNodeStatus::create_custom_status(
-            NodeStatus::Follower { leader_lease_index: 1 },
+            NodeStatus::Follower { leader_lease_epoch: 1 },
             DRIFT,
             FAR_FUTURE,
         );
-        assert_eq!(status.effective_node_status(), NodeStatus::Follower { leader_lease_index: 1 });
+        assert_eq!(status.effective_node_status(), NodeStatus::Follower { leader_lease_epoch: 1 });
     }
 
     #[test]
     fn expired_leader_is_fenced() {
         let status = ValidatedNodeStatus::create_custom_status(
-            NodeStatus::Leader { lease_index: 1 },
+            NodeStatus::Leader { lease_epoch: 1 },
             DRIFT,
             FAR_PAST,
         );
@@ -202,7 +202,7 @@ mod tests {
     #[test]
     fn expired_follower_is_fenced() {
         let status = ValidatedNodeStatus::create_custom_status(
-            NodeStatus::Follower { leader_lease_index: 1 },
+            NodeStatus::Follower { leader_lease_epoch: 1 },
             DRIFT,
             FAR_PAST,
         );
@@ -228,13 +228,13 @@ mod tests {
     #[test]
     fn follower_catching_up_ttl_exempt() {
         let status = ValidatedNodeStatus::create_custom_status(
-            NodeStatus::FollowerCatchingUp { leader_lease_index: 1 },
+            NodeStatus::FollowerCatchingUp { leader_lease_epoch: 1 },
             DRIFT,
             FAR_PAST, // lease "expired" long ago
         );
         assert_eq!(
             status.effective_node_status(),
-            NodeStatus::FollowerCatchingUp { leader_lease_index: 1 },
+            NodeStatus::FollowerCatchingUp { leader_lease_epoch: 1 },
             "FollowerCatchingUp must not decay to Fenced even with expired TTL"
         );
         assert!(!status.is_fenced());
@@ -245,12 +245,12 @@ mod tests {
     fn set_node_status_and_metric_updates_cell_on_shard_zero() {
         let cell = std::cell::Cell::new(ValidatedNodeStatus::create_boot_catchup());
         let target = ValidatedNodeStatus::create_custom_status(
-            NodeStatus::Leader { lease_index: 3 },
+            NodeStatus::Leader { lease_epoch: 3 },
             DRIFT,
             FAR_FUTURE,
         );
         set_node_status_and_metric(&cell, target, 0);
-        assert_eq!(cell.get().raw(), NodeStatus::Leader { lease_index: 3 });
+        assert_eq!(cell.get().raw(), NodeStatus::Leader { lease_epoch: 3 });
     }
 
     #[test]
@@ -258,25 +258,25 @@ mod tests {
         // Non-shard-0 callers must still update the cell. Only the gauge is gated.
         let cell = std::cell::Cell::new(ValidatedNodeStatus::create_boot_catchup());
         let target = ValidatedNodeStatus::create_custom_status(
-            NodeStatus::Follower { leader_lease_index: 7 },
+            NodeStatus::Follower { leader_lease_epoch: 7 },
             DRIFT,
             FAR_FUTURE,
         );
         set_node_status_and_metric(&cell, target, 1);
-        assert_eq!(cell.get().raw(), NodeStatus::Follower { leader_lease_index: 7 });
+        assert_eq!(cell.get().raw(), NodeStatus::Follower { leader_lease_epoch: 7 });
         set_node_status_and_metric(&cell, target, 42);
-        assert_eq!(cell.get().raw(), NodeStatus::Follower { leader_lease_index: 7 });
+        assert_eq!(cell.get().raw(), NodeStatus::Follower { leader_lease_epoch: 7 });
     }
 
     #[test]
     fn leader_since_ms_stamped_on_follower_to_leader_transition() {
         let cell = std::cell::Cell::new(ValidatedNodeStatus::create_custom_status(
-            NodeStatus::Follower { leader_lease_index: 1 }, DRIFT, FAR_FUTURE,
+            NodeStatus::Follower { leader_lease_epoch: 1 }, DRIFT, FAR_FUTURE,
         ));
         assert_eq!(cell.get().leader_since_ms(), 0, "follower starts at 0");
 
         let promoted = ValidatedNodeStatus::create_custom_status(
-            NodeStatus::Leader { lease_index: 2 }, DRIFT, FAR_FUTURE,
+            NodeStatus::Leader { lease_epoch: 2 }, DRIFT, FAR_FUTURE,
         );
         let before = unix_epoch_now_ms();
         set_node_status_and_metric(&cell, promoted, 0);
@@ -288,18 +288,18 @@ mod tests {
     #[test]
     fn leader_since_ms_preserved_across_heartbeat_refresh() {
         let cell = std::cell::Cell::new(ValidatedNodeStatus::create_custom_status(
-            NodeStatus::Follower { leader_lease_index: 1 }, DRIFT, FAR_FUTURE,
+            NodeStatus::Follower { leader_lease_epoch: 1 }, DRIFT, FAR_FUTURE,
         ));
         // Promote -> stamps leader_since_ms.
         set_node_status_and_metric(&cell, ValidatedNodeStatus::create_custom_status(
-            NodeStatus::Leader { lease_index: 2 }, DRIFT, FAR_FUTURE,
+            NodeStatus::Leader { lease_epoch: 2 }, DRIFT, FAR_FUTURE,
         ), 0);
         let stamped = cell.get().leader_since_ms();
         assert!(stamped > 0);
 
         // Heartbeat refresh: same role, fresh expires_at. leader_since_ms must persist.
         let refreshed = ValidatedNodeStatus::create_custom_status(
-            NodeStatus::Leader { lease_index: 2 }, DRIFT, FAR_FUTURE,
+            NodeStatus::Leader { lease_epoch: 2 }, DRIFT, FAR_FUTURE,
         );
         set_node_status_and_metric(&cell, refreshed, 0);
         assert_eq!(cell.get().leader_since_ms(), stamped, "refresh must preserve stamp");
@@ -308,16 +308,16 @@ mod tests {
     #[test]
     fn leader_since_ms_preserved_across_same_node_lease_bump() {
         let cell = std::cell::Cell::new(ValidatedNodeStatus::create_custom_status(
-            NodeStatus::Follower { leader_lease_index: 1 }, DRIFT, FAR_FUTURE,
+            NodeStatus::Follower { leader_lease_epoch: 1 }, DRIFT, FAR_FUTURE,
         ));
         set_node_status_and_metric(&cell, ValidatedNodeStatus::create_custom_status(
-            NodeStatus::Leader { lease_index: 2 }, DRIFT, FAR_FUTURE,
+            NodeStatus::Leader { lease_epoch: 2 }, DRIFT, FAR_FUTURE,
         ), 0);
         let stamped = cell.get().leader_since_ms();
 
         // Same-node lease re-issue at lease=3 (still leader, no Follower->Leader edge).
         set_node_status_and_metric(&cell, ValidatedNodeStatus::create_custom_status(
-            NodeStatus::Leader { lease_index: 3 }, DRIFT, FAR_FUTURE,
+            NodeStatus::Leader { lease_epoch: 3 }, DRIFT, FAR_FUTURE,
         ), 0);
         assert_eq!(cell.get().leader_since_ms(), stamped, "same-node lease bump must preserve stamp");
     }
@@ -325,10 +325,10 @@ mod tests {
     #[test]
     fn leader_since_ms_preserved_through_demotion() {
         let cell = std::cell::Cell::new(ValidatedNodeStatus::create_custom_status(
-            NodeStatus::Follower { leader_lease_index: 1 }, DRIFT, FAR_FUTURE,
+            NodeStatus::Follower { leader_lease_epoch: 1 }, DRIFT, FAR_FUTURE,
         ));
         set_node_status_and_metric(&cell, ValidatedNodeStatus::create_custom_status(
-            NodeStatus::Leader { lease_index: 2 }, DRIFT, FAR_FUTURE,
+            NodeStatus::Leader { lease_epoch: 2 }, DRIFT, FAR_FUTURE,
         ), 0);
         let stamped = cell.get().leader_since_ms();
 
@@ -337,7 +337,7 @@ mod tests {
         // edge later re-stamps. Here we just assert the cell still holds a
         // known value, and the next promotion overwrites with a fresh stamp.
         set_node_status_and_metric(&cell, ValidatedNodeStatus::create_custom_status(
-            NodeStatus::Follower { leader_lease_index: 4 }, DRIFT, FAR_FUTURE,
+            NodeStatus::Follower { leader_lease_epoch: 4 }, DRIFT, FAR_FUTURE,
         ), 0);
         assert_eq!(cell.get().leader_since_ms(), stamped, "demotion preserves prior stamp (irrelevant while not leader)");
 
@@ -345,7 +345,7 @@ mod tests {
         let before = unix_epoch_now_ms();
         // Sleep-free test — just assert >= stamped (and same-or-later than `before`).
         set_node_status_and_metric(&cell, ValidatedNodeStatus::create_custom_status(
-            NodeStatus::Leader { lease_index: 5 }, DRIFT, FAR_FUTURE,
+            NodeStatus::Leader { lease_epoch: 5 }, DRIFT, FAR_FUTURE,
         ), 0);
         let new_stamp = cell.get().leader_since_ms();
         assert!(new_stamp >= before, "re-promotion stamps fresh leader_since_ms");
@@ -376,10 +376,10 @@ mod tests {
     #[test]
     fn only_leader_and_standalone_accept_writes() {
         let cases = [
-            (NodeStatus::Leader { lease_index: 1 }, true),
+            (NodeStatus::Leader { lease_epoch: 1 }, true),
             (NodeStatus::Standalone, true),
-            (NodeStatus::Follower { leader_lease_index: 1 }, false),
-            (NodeStatus::FollowerCatchingUp { leader_lease_index: 1 }, false),
+            (NodeStatus::Follower { leader_lease_epoch: 1 }, false),
+            (NodeStatus::FollowerCatchingUp { leader_lease_epoch: 1 }, false),
             (NodeStatus::BootCatchup, false),
             (NodeStatus::Fenced, false),
         ];
@@ -395,15 +395,15 @@ mod tests {
         let now = unix_epoch_now_ms();
         // expected: None means no budget; Some((min, max)) is the allowed ms range.
         let cases: [(NodeStatus, u64, Option<(u64, u64)>, &str); 8] = [
-            (NodeStatus::Follower { leader_lease_index: 1 }, FAR_FUTURE, None, "follower"),
+            (NodeStatus::Follower { leader_lease_epoch: 1 }, FAR_FUTURE, None, "follower"),
             (NodeStatus::Standalone, FAR_FUTURE, None, "standalone"),
             (NodeStatus::BootCatchup, FAR_FUTURE, None, "boot catchup"),
             (NodeStatus::Fenced, FAR_FUTURE, None, "fenced"),
-            (NodeStatus::FollowerCatchingUp { leader_lease_index: 1 }, FAR_FUTURE, None, "follower catching up"),
-            (NodeStatus::Leader { lease_index: 1 }, now + 100, None, "leader inside fence window"),
-            (NodeStatus::Leader { lease_index: 1 }, FAR_PAST, None, "leader lease fully expired"),
+            (NodeStatus::FollowerCatchingUp { leader_lease_epoch: 1 }, FAR_FUTURE, None, "follower catching up"),
+            (NodeStatus::Leader { lease_epoch: 1 }, now + 100, None, "leader inside fence window"),
+            (NodeStatus::Leader { lease_epoch: 1 }, FAR_PAST, None, "leader lease fully expired"),
             // safe_until = (now+5000) - 500 drift = now+4500; allow ±50ms for execution time
-            (NodeStatus::Leader { lease_index: 1 }, now + 5000, Some((4400, 4500)), "healthy leader"),
+            (NodeStatus::Leader { lease_epoch: 1 }, now + 5000, Some((4400, 4500)), "healthy leader"),
         ];
         for (status, expires_ms, expected, label) in cases {
             let vns = ValidatedNodeStatus::create_custom_status(status, DRIFT, expires_ms);

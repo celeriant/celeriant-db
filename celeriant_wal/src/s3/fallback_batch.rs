@@ -5,12 +5,12 @@ use crate::metablocks::metablock::Metablock;
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct FallbackBatch {
     pub fallback_index: u64,
-    pub end_wal_index: u64,
+    pub end_wal_seq: u64,
     pub shard_id: u32,
     pub uploaded_by_node_id: u128,
     pub items: Vec<FallbackItem>,
     pub upload_sequence: u64,
-    pub lease_index: u64,
+    pub lease_epoch: u64,
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
@@ -20,15 +20,15 @@ pub struct FallbackItem {
 }
 
 impl FallbackBatch {
-    pub fn new(fallback_index: u64, end_wal_index: u64, shard_id: u32, uploaded_by_node_id: u128, upload_sequence: u64, lease_index: u64) -> Self {
+    pub fn new(fallback_index: u64, end_wal_seq: u64, shard_id: u32, uploaded_by_node_id: u128, upload_sequence: u64, lease_epoch: u64) -> Self {
         Self {
             fallback_index,
-            end_wal_index,
+            end_wal_seq,
             shard_id,
             uploaded_by_node_id,
             items: Vec::new(),
             upload_sequence,
-            lease_index,
+            lease_epoch,
         }
     }
 

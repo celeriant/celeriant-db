@@ -119,7 +119,7 @@ async fn test_successful_identity_verification(
         SingleAggregateWrite {
             events: vec![event],
             allow_create: true,
-            expected_event_batch_index: Some(0),
+            expected_version: Some(0),
             enforce_client_idempotency: false,
         },
     );
@@ -181,7 +181,7 @@ async fn test_identity_mismatch_rejection(
         SingleAggregateWrite {
             events: vec![event],
             allow_create: true,
-            expected_event_batch_index: Some(0),
+            expected_version: Some(0),
             enforce_client_idempotency: false,
         },
     );
@@ -246,7 +246,7 @@ async fn test_backward_compatibility_no_identity(
         SingleAggregateWrite {
             events: vec![event],
             allow_create: true,
-            expected_event_batch_index: Some(0),
+            expected_version: Some(0),
             enforce_client_idempotency: false,
         },
     );
@@ -294,7 +294,7 @@ async fn test_enforcement_rejects_unidentified(
         SingleAggregateWrite {
             events: vec![event],
             allow_create: true,
-            expected_event_batch_index: Some(0),
+            expected_version: Some(0),
             enforce_client_idempotency: false,
         },
     );
@@ -357,7 +357,7 @@ async fn test_enforcement_allows_identified(
         SingleAggregateWrite {
             events: vec![event],
             allow_create: true,
-            expected_event_batch_index: Some(0),
+            expected_version: Some(0),
             enforce_client_idempotency: false,
         },
     );
@@ -388,8 +388,8 @@ async fn test_enforcement_allows_identified(
 
 fn create_test_event(event_num: u64) -> DatablockAggregateEvent {
     DatablockAggregateEvent {
-        client_event_index: event_num,
-        event_index: 0,
+        client_seq: event_num,
+        event_seq: 0,
         event_id: None,
         event_timestamp: 1000 + event_num,
         event_type_major: 100,

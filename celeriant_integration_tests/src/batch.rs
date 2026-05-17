@@ -1019,8 +1019,8 @@ async fn run_connection_benchmark(
         let prefix = format!("[connection-{}-event-{}] ", connection_id, request_count);
 
         let event_1 = DatablockAggregateEvent {
-            client_event_index: 3,
-            event_index: 0,
+            client_seq: 3,
+            event_seq: 0,
             event_id: Some(1234567890),
             event_timestamp: 0,
             event_type_major: 2,
@@ -1030,8 +1030,8 @@ async fn run_connection_benchmark(
         };
 
         let event_2 = DatablockAggregateEvent {
-            client_event_index: 3,
-            event_index: 0,
+            client_seq: 3,
+            event_seq: 0,
             event_id: Some(1234567890),
             event_timestamp: 0,
             event_type_major: 2,
@@ -1068,7 +1068,7 @@ async fn run_connection_benchmark(
                     vec![event_1, event_2]
                 },
                 allow_create: true,
-                expected_event_batch_index: None,
+                expected_version: None,
                 enforce_client_idempotency: false,
             },
         );

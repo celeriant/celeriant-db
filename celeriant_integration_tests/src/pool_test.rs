@@ -26,10 +26,10 @@ use celeriant_wal::{
 };
 use tokio::time::Duration;
 
-fn make_event(client_event_index: u64, payload: &str) -> DatablockAggregateEvent {
+fn make_event(client_seq: u64, payload: &str) -> DatablockAggregateEvent {
     DatablockAggregateEvent {
-        client_event_index,
-        event_index: 0,
+        client_seq,
+        event_seq: 0,
         event_id: Some(rand::random()),
         event_timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -60,7 +60,7 @@ async fn test_pool_write(pool: &CeleriantPool) {
         SingleAggregateWrite {
             events: vec![make_event(0, "pool write")],
             allow_create: true,
-            expected_event_batch_index: Some(0),
+            expected_version: Some(0),
             enforce_client_idempotency: false,
         },
     );
@@ -129,8 +129,8 @@ async fn test_pool_delete(pool: &CeleriantPool) {
         agg.clone(),
         SingleAggregateDelete {
             allow_recreate: false,
-            allow_index_continuation: false,
-            expected_event_batch_index: None,
+            allow_sequence_continuation: false,
+            expected_version: None,
         },
     );
     let req = DeleteRequest { correlation_id: None, client_id: 1, user_id: None, deletes };
@@ -164,7 +164,7 @@ async fn test_pool_read_all(pool: &CeleriantPool) {
         let opts = WriteEventsOptions {
             client_id: 1,
             allow_create: i == 0,
-            expected_event_batch_index: Some(i),
+            expected_version: Some(i),
             enforce_client_idempotency: false,
         };
         let events = vec![make_event(i, &format!("read_all batch {}", i))];
@@ -247,7 +247,7 @@ async fn test_get_leader_connection(pool: &CeleriantPool) {
                 SingleAggregateWrite {
                     events: vec![make_event(0, "leader connection write")],
                     allow_create: true,
-                    expected_event_batch_index: Some(0),
+                    expected_version: Some(0),
                     enforce_client_idempotency: false,
                 },
             );

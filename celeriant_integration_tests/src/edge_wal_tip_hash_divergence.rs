@@ -2,17 +2,17 @@
 //!
 //! Verifies that a follower with a divergent WAL tip hash auto-heals via S3 catchup.
 //!
-//! How divergence is created so that TipHashMismatch (not WalIndexMismatch) is triggered:
-//! 1. Start node A (standalone), write 5 events, stop. (wal_index = 5)
+//! How divergence is created so that TipHashMismatch (not WalSeqMismatch) is triggered:
+//! 1. Start node A (standalone), write 5 events, stop. (wal_seq = 5)
 //! 2. Copy A's shard data to B's data dir.
 //! 3. Start B (standalone from copy), write 1 LARGE divergent event (event 6), stop.
-//!    B: wal_index = 6, tip_hash = hash(tip_5 || large_event_6_bytes)
+//!    B: wal_seq = 6, tip_hash = hash(tip_5 || large_event_6_bytes)
 //! 4. Start A (original data), write 3 SMALL events (events 6, 7, 8), stop.
-//!    A: wal_index = 8, tip_hash at index 6 = hash(tip_5 || small_event_6_bytes)
-//! 5. Start A as distributed leader (wal_index 8) with S3.
+//!    A: wal_seq = 8, tip_hash at index 6 = hash(tip_5 || small_event_6_bytes)
+//! 5. Start A as distributed leader (wal_seq 8) with S3.
 //!    Leader uploads fallback batches (events 6-8) to S3.
-//! 6. Start B as distributed follower (wal_index 6, divergent).
-//!    - Leader sends replication batch starting at wal_index 7.
+//! 6. Start B as distributed follower (wal_seq 6, divergent).
+//!    - Leader sends replication batch starting at wal_seq 7.
 //!      Batch's previous_tip_hash = A's hash at 6, but B's hash at 6 is divergent
 //!      → TipHashMismatch. Leader falls back to S3.
 //!    - B's S3 catchup detects TipHashMismatch, truncates divergent WAL entries,
@@ -82,16 +82,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let count_a = count_events(&mut client_a, &aggregate_key).await?;
     assert_eq!(count_a, 5, "Node A should have 5 events, got {}", count_a);
-    println!("  Node A has {} events (wal_index=5)", count_a);
+    println!("  Node A has {} events (wal_seq=5)", count_a);
 
     drop(client_a);
     node_a.stop();
-    println!("  Node A stopped. WAL at wal_index=5.\n");
+    println!("  Node A stopped. WAL at wal_seq=5.\n");
 
     // ========================================
     // Phase 2: Copy A's data to B. Start B standalone.
     //          Write 1 LARGE event (event 6) to B, then stop.
-    //          B: wal_index=6, tip_hash at 6 = hash(tip_5 || large_event_6)
+    //          B: wal_seq=6, tip_hash at 6 = hash(tip_5 || large_event_6)
     // ========================================
     println!("PHASE 2: Create node B with 1 divergent large event (event 6)");
     println!("----------------------------------------------------------------");
@@ -113,17 +113,17 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     write_large_event(&mut client_b, &aggregate_key, 6, 4096).await?;
     let count_b = count_events(&mut client_b, &aggregate_key).await?;
     assert_eq!(count_b, 6, "Node B should have 6 events (5 + 1 divergent), got {}", count_b);
-    println!("  Node B has {} events (wal_index=6, divergent tip_hash at 6)", count_b);
+    println!("  Node B has {} events (wal_seq=6, divergent tip_hash at 6)", count_b);
 
     let node_b_data_root = node_b.config().data_root.clone();
     drop(client_b);
     node_b.stop();
-    println!("  Node B stopped. Divergent WAL tip at wal_index=6 saved to disk.\n");
+    println!("  Node B stopped. Divergent WAL tip at wal_seq=6 saved to disk.\n");
 
     // ========================================
     // Phase 3: Restart A as distributed leader.
     //          Write 3 SMALL events (events 6, 7, 8).
-    //          A: wal_index=8, tip_hash at 6 = hash(tip_5 || small_event_6) ≠ B's
+    //          A: wal_seq=8, tip_hash at 6 = hash(tip_5 || small_event_6) ≠ B's
     // ========================================
     println!("PHASE 3: Restart A as distributed leader, write 3 small events (6, 7, 8)");
     println!("--------------------------------------------------------------------------");
@@ -154,7 +154,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let count_after = count_events(&mut client_a, &aggregate_key).await?;
     assert_eq!(count_after, 8, "Leader should have 8 events (5+3), got {}", count_after);
-    println!("  Leader has {} events (wal_index=8). tip_hash at 6 differs from B.", count_after);
+    println!("  Leader has {} events (wal_seq=8). tip_hash at 6 differs from B.", count_after);
 
     // Wait for S3 fallback writes to land. No follower → all new events go to S3.
     println!("  Waiting 6s for S3 fallback writes to complete...");
@@ -170,18 +170,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  S3 fallback batches present (leader's events 6-8 available for catchup)\n");
 
     // ========================================
-    // Phase 4: Start B as distributed follower (divergent WAL, wal_index=6).
-    //          Leader sends batch at wal_index 7. Batch's previous_tip_hash = A's hash at 6.
+    // Phase 4: Start B as distributed follower (divergent WAL, wal_seq=6).
+    //          Leader sends batch at wal_seq 7. Batch's previous_tip_hash = A's hash at 6.
     //          B's hash at 6 is divergent → TipHashMismatch.
     //          Leader falls back to S3.
     //          B's S3 catchup encounters the same mismatch → fatal → B shuts down.
     // ========================================
-    println!("PHASE 4: Start B as distributed follower (divergent WAL at wal_index=6)");
+    println!("PHASE 4: Start B as distributed follower (divergent WAL at wal_seq=6)");
     println!("-------------------------------------------------------------------------");
 
     let fresh_b_temp = TempDir::new()?;
     copy_shard_dirs(&node_b_data_root, fresh_b_temp.path())?;
-    println!("  Copied B's divergent shard data (wal_index=6) to fresh temp dir");
+    println!("  Copied B's divergent shard data (wal_seq=6) to fresh temp dir");
 
     let follower_config = ServerConfig {
         routing_rule: RoutingRule::AggregateTypeId,

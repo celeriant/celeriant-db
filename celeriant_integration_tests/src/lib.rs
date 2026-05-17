@@ -1108,8 +1108,8 @@ pub async fn write_event(
     allow_create: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let event = DatablockAggregateEvent {
-        client_event_index: event_num,
-        event_index: 0,
+        client_seq: event_num,
+        event_seq: 0,
         event_id: None,
         event_timestamp: 1000 + event_num,
         event_type_major: 100,
@@ -1124,7 +1124,7 @@ pub async fn write_event(
         SingleAggregateWrite {
             events: vec![event],
             allow_create,
-            expected_event_batch_index: if event_num == 1 { Some(0) } else { None },
+            expected_version: if event_num == 1 { Some(0) } else { None },
             enforce_client_idempotency: false,
         },
     );
@@ -1176,8 +1176,8 @@ pub async fn write_large_event(
     fill_incompressible(&mut payload, event_num);
 
     let event = DatablockAggregateEvent {
-        client_event_index: event_num,
-        event_index: 0,
+        client_seq: event_num,
+        event_seq: 0,
         event_id: None,
         event_timestamp: 1000 + event_num,
         event_type_major: 100,
@@ -1192,7 +1192,7 @@ pub async fn write_large_event(
         SingleAggregateWrite {
             events: vec![event],
             allow_create: false,
-            expected_event_batch_index: None,
+            expected_version: None,
             enforce_client_idempotency: false,
         },
     );
@@ -1214,7 +1214,7 @@ pub async fn write_large_event(
     }
 }
 
-/// Read every event batch for an aggregate, paging through `next_event_batch_index`
+/// Read every event batch for an aggregate, paging through `next_aggregate_version`
 /// until exhausted. Returns the concatenated list in WAL order.
 ///
 /// Prefer this over hand-rolled pagination — tests that stop after the first
@@ -1237,7 +1237,7 @@ pub async fn read_all_batches(
         match resp {
             ClientResponse::Read(r) => {
                 batches.extend(r.event_batches);
-                match r.next_event_batch_index {
+                match r.next_aggregate_version {
                     Some(next) => from_batch = next,
                     None => return Ok(batches),
                 }
@@ -1283,7 +1283,7 @@ pub async fn count_events(
                         .iter()
                         .map(|b| b.events.len())
                         .sum::<usize>();
-                    match read_resp.next_event_batch_index {
+                    match read_resp.next_aggregate_version {
                         Some(next) => from_batch = next,
                         None => return Ok(total),
                     }
@@ -1297,8 +1297,8 @@ pub async fn count_events(
                     use celeriant_client_tokio::server_error::ReadError;
                     match kind {
                         ReadError::AggregateNotExists => return Ok(total),
-                        ReadError::UnavailableBatchIndex { minimum_available_batch_index, .. } => {
-                            if let Some(&min) = minimum_available_batch_index.as_ref() {
+                        ReadError::UnavailableBatchIndex { minimum_available_version, .. } => {
+                            if let Some(&min) = minimum_available_version.as_ref() {
                                 from_batch = min;
                                 continue;
                             }

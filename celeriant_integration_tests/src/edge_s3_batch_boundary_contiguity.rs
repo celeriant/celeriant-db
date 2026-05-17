@@ -1,8 +1,8 @@
 //! Edge Case: S3 Fallback Batch Boundary Contiguity Under Load
 //!
-//! Targets the WalIndexGap bug from docs/wal-mismatch-pi-cluster.md.
+//! Targets the WalSeqGap bug from docs/wal-mismatch-pi-cluster.md.
 //! Under high write throughput, the leader creates multiple S3 fallback batches.
-//! Each batch's start_wal_index must equal the previous batch's end_wal_index + 1.
+//! Each batch's start_wal_seq must equal the previous batch's end_wal_seq + 1.
 //! The bug manifested as overlapping boundaries (off-by-one or off-by-batch-size)
 //! when the sidecar S3 uploader and shard executor had concurrent batch creation.
 //!
@@ -11,7 +11,7 @@
 //! 2. Stop follower (force S3 fallback)
 //! 3. Write many events rapidly (enough to create multiple S3 batches)
 //! 4. Verify S3 batch boundaries are strictly contiguous (no gaps, no overlaps)
-//! 5. Restart follower, verify it catches up without WalIndexGap
+//! 5. Restart follower, verify it catches up without WalSeqGap
 //!
 //! Invariants tested: 7 (WAL continuity), 11 (S3 fallback batches)
 
@@ -99,7 +99,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("  Only {} batch(es) — can't verify contiguity (need >= 2).", objects.len());
         println!("  This is OK: all events fit in a single batch.\n");
     } else {
-        // Parse batch names to extract WAL index ranges
+        // Parse batch names to extract WAL sequence ranges
         // Format: cluster/fallback/shard_NNN/batch_SSSSSSSSS_EEEEEEEEE_UUID.bin
         let mut boundaries: Vec<(u64, u64)> = Vec::new();
         for obj in &objects {
@@ -133,7 +133,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         assert_eq!(
             contiguity_errors, 0,
-            "S3 batch boundaries are not contiguous: {} errors found. This is the WalIndexGap bug.",
+            "S3 batch boundaries are not contiguous: {} errors found. This is the WalSeqGap bug.",
             contiguity_errors
         );
         println!("  All {} batch boundaries are contiguous", boundaries.len());
@@ -152,7 +152,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_secs(12)).await;
 
     follower.check_alive()
-        .map_err(|e| format!("Follower crashed during S3 catchup (WalIndexGap?): {}", e))?;
+        .map_err(|e| format!("Follower crashed during S3 catchup (WalSeqGap?): {}", e))?;
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     let f_count = count_events(&mut follower_client, &aggregate_key).await?;
@@ -164,7 +164,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("S3 batch boundary contiguity verified:");
     println!("  1. {} events written via S3 fallback", total_writes);
     println!("  2. All batch boundaries contiguous (no gaps or overlaps)");
-    println!("  3. Follower caught up without WalIndexGap\n");
+    println!("  3. Follower caught up without WalSeqGap\n");
 
     Ok(())
 }

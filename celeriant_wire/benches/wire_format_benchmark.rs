@@ -25,8 +25,8 @@ criterion_main!(benches);
 
 fn create_event(index: u64, payload_size: usize) -> DatablockAggregateEvent {
     DatablockAggregateEvent {
-        client_event_index: index,
-        event_index: index * 2,
+        client_seq: index,
+        event_seq: index * 2,
         event_id: Some(index as u128),
         event_timestamp: 1700000000000 + index,
         event_type_major: 1,
@@ -42,7 +42,7 @@ fn create_event_batch(event_count: usize, payload_size: usize) -> DatablockAggre
         .collect();
 
     DatablockAggregateEventBatch {
-        event_batch_index: 42,
+        aggregate_version: 42,
         events,
     }
 }
@@ -51,16 +51,16 @@ fn create_metadata() -> MetablockEventBatch {
     MetablockEventBatch {
         aggregate_key: AggregateKey::new(1, 2, 3),
         event_types_data: EventTypesKind::Direct([1, 2, 3, 4]),
-        event_batch_index: 42,
-        min_event_batch_index: 1,
+        aggregate_version: 42,
+        trimmed_below_version: 1,
         client_id: 0x123456789ABCDEF0,
         user_id: Some(0xFEDCBA9876543210),
-        min_client_event_index: 0,
-        max_client_event_index: 99,
+        min_client_seq: 0,
+        max_client_seq: 99,
         min_event_timestamp: 1700000000000,
         max_event_timestamp: 1700000099000,
-        min_event_index: 0,
-        max_event_index: 198,
+        min_event_seq: 0,
+        max_event_seq: 198,
     }
 }
 

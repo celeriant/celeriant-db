@@ -147,7 +147,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         objects.len()
     );
 
-    // Sort by path — lexicographic order matches WAL index order.
+    // Sort by path — lexicographic order matches WAL sequence order.
     objects.sort();
 
     // Corrupt the last batch. Using the last batch guarantees it was written while the

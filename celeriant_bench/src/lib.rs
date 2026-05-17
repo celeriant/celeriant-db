@@ -98,8 +98,8 @@ impl<'a> PoolBuilder<'a> {
 pub async fn smoke_test(pool: &Arc<CeleriantPool>) -> Result<(), Box<dyn std::error::Error>> {
     let smoke_key = AggregateKey::new(99, 99, 99);
     let smoke_event = DatablockAggregateEvent {
-        client_event_index: 0,
-        event_index: 0,
+        client_seq: 0,
+        event_seq: 0,
         event_id: None,
         event_timestamp: 0,
         event_type_major: 1,
@@ -146,8 +146,8 @@ pub async fn run_benchmark(
 
             while Instant::now() < deadline {
                 let event = DatablockAggregateEvent {
-                    client_event_index: 0,
-                    event_index: 0,
+                    client_seq: 0,
+                    event_seq: 0,
                     event_id: None,
                     event_timestamp: 0,
                     event_type_major: 1,

@@ -87,7 +87,7 @@ pub fn shard_routing_error_to_code(error: ShardRoutingError) -> (u32, String) {
 fn read_error(e: ShardReadError) -> (u32, String) {
     match e {
         ShardReadError::UnavailableBatchIndex { minimum_available, requested } => (
-            READ_UNAVAILABLE_BATCH_INDEX,
+            READ_UNAVAILABLE_VERSION,
             format!(r#"{{"requested":{},"minimum_available":{}}}"#, requested, minimum_available),
         ),
         ShardReadError::AggregateNotExists => (READ_AGGREGATE_NOT_EXISTS, "{}".into()),
@@ -100,17 +100,17 @@ fn read_error(e: ShardReadError) -> (u32, String) {
 fn write_error(e: ShardWriteError) -> (u32, String) {
     match e {
         ShardWriteError::EmptyEventsList => (WRITE_EMPTY_EVENTS_LIST, "{}".into()),
-        ShardWriteError::ZeroEventType { client_event_index } => (
+        ShardWriteError::ZeroEventType { client_seq } => (
             WRITE_ZERO_EVENT_TYPE,
-            format!(r#"{{"client_event_index":{}}}"#, client_event_index),
+            format!(r#"{{"client_seq":{}}}"#, client_seq),
         ),
-        ShardWriteError::ClientIdempotencyViolation { last_client_event_index, attempted_client_event_index } => (
+        ShardWriteError::ClientIdempotencyViolation { last_client_seq, attempted_client_seq } => (
             WRITE_CLIENT_IDEMPOTENCY_VIOLATION,
-            format!(r#"{{"last_client_event_index":{},"attempted_client_event_index":{}}}"#, last_client_event_index, attempted_client_event_index),
+            format!(r#"{{"last_client_seq":{},"attempted_client_seq":{}}}"#, last_client_seq, attempted_client_seq),
         ),
-        ShardWriteError::OptimisticConcurrencyViolation { expected_event_batch_index, current_event_batch_index } => (
+        ShardWriteError::OptimisticConcurrencyViolation { expected_version, current_aggregate_version } => (
             WRITE_OPTIMISTIC_CONCURRENCY_VIOLATION,
-            format!(r#"{{"expected_event_batch_index":{},"current_event_batch_index":{}}}"#, expected_event_batch_index, current_event_batch_index),
+            format!(r#"{{"expected_version":{},"current_aggregate_version":{}}}"#, expected_version, current_aggregate_version),
         ),
         ShardWriteError::FailedToSerialiseDatablocks(e) => (
             WRITE_FAILED_TO_SERIALISE_DATABLOCKS,
@@ -124,23 +124,23 @@ fn write_error(e: ShardWriteError) -> (u32, String) {
         ShardWriteError::AggregateExistsAndCacheError(e) => cache_load_error(WRITE_AGGREGATE_EXISTS_CACHE_ERROR, WRITE_AGGREGATE_EXISTS_CACHE_ERROR, e),
         ShardWriteError::ShardCannotAcceptWrites { leader_address } => (WRITE_NOT_LEADER, cannot_accept_writes_message(leader_address)),
         ShardWriteError::ReplicationBackpressure => (WRITE_REPLICATION_BACKPRESSURE, "{}".into()),
-        ShardWriteError::SchemaValidationFailed { event_type_major, event_type_minor, client_event_index, validation_error } => (
+        ShardWriteError::SchemaValidationFailed { event_type_major, event_type_minor, client_seq, validation_error } => (
             WRITE_SCHEMA_VALIDATION_FAILED,
             format!(
-                r#"{{"event_type_major":{},"event_type_minor":{},"client_event_index":{},"validation_error":{}}}"#,
+                r#"{{"event_type_major":{},"event_type_minor":{},"client_seq":{},"validation_error":{}}}"#,
                 event_type_major,
                 event_type_minor,
-                client_event_index,
+                client_seq,
                 json_string(&validation_error)
             ),
         ),
-        ShardWriteError::SchemaCompilationFailed { event_type_major, event_type_minor, client_event_index, compilation_error } => (
+        ShardWriteError::SchemaCompilationFailed { event_type_major, event_type_minor, client_seq, compilation_error } => (
             WRITE_SCHEMA_COMPILATION_FAILED,
             format!(
-                r#"{{"event_type_major":{},"event_type_minor":{},"client_event_index":{},"compilation_error":{}}}"#,
+                r#"{{"event_type_major":{},"event_type_minor":{},"client_seq":{},"compilation_error":{}}}"#,
                 event_type_major,
                 event_type_minor,
-                client_event_index,
+                client_seq,
                 json_string(&compilation_error)
             ),
         ),
@@ -153,9 +153,9 @@ fn trim_error(e: ShardTrimError) -> (u32, String) {
         ShardTrimError::AggregateExistsAndCacheError(e) => cache_load_error(TRIM_CACHE_ERROR, TRIM_CACHE_ERROR, e),
         ShardTrimError::ReplicationError(e) => (TRIM_REPLICATION_ERROR, replication_message(e)),
         ShardTrimError::ShardFsyncError(e) => (TRIM_FSYNC_ERROR, fsync_message(e)),
-        ShardTrimError::TrimIndexOutOfRange { requested, max_event_batch_index } => (
+        ShardTrimError::TrimIndexOutOfRange { requested, max_aggregate_version } => (
             TRIM_INDEX_OUT_OF_RANGE,
-            format!(r#"{{"requested":{},"max_event_batch_index":{}}}"#, requested, max_event_batch_index),
+            format!(r#"{{"requested":{},"max_aggregate_version":{}}}"#, requested, max_aggregate_version),
         ),
         ShardTrimError::ShardCannotAcceptWrites { leader_address } => (TRIM_NOT_LEADER, cannot_accept_writes_message(leader_address)),
     }
@@ -165,9 +165,9 @@ fn delete_error(e: ShardDeleteError) -> (u32, String) {
     match e {
         ShardDeleteError::AggregateNotExists => (DELETE_AGGREGATE_NOT_EXISTS, "{}".into()),
         ShardDeleteError::EmptyDeleteList => (DELETE_EMPTY_DELETE_LIST, "{}".into()),
-        ShardDeleteError::OptimisticConcurrencyViolation { expected_event_batch_index, current_event_batch_index } => (
+        ShardDeleteError::OptimisticConcurrencyViolation { expected_version, current_aggregate_version } => (
             DELETE_OPTIMISTIC_CONCURRENCY_VIOLATION,
-            format!(r#"{{"expected_event_batch_index":{},"current_event_batch_index":{}}}"#, expected_event_batch_index, current_event_batch_index),
+            format!(r#"{{"expected_version":{},"current_aggregate_version":{}}}"#, expected_version, current_aggregate_version),
         ),
         ShardDeleteError::AggregateExistsAndCacheError(e) => cache_load_error(DELETE_CACHE_ERROR, DELETE_CACHE_ERROR, e),
         ShardDeleteError::ReplicationError(e) => (DELETE_REPLICATION_ERROR, replication_message(e)),
@@ -228,8 +228,8 @@ fn replication_batch_error(e: FollowerReplicationWriteError) -> (u32, String) {
             REPLICATION_BATCH_SERIALISE_DATABLOCKS,
             r#"{"detail":"leader Block storage became Inline on follower re-serialization"}"#.to_string(),
         ),
-        FollowerReplicationWriteError::BatchWalIndexGap { index, expected, actual } => (
-            REPLICATION_BATCH_WAL_INDEX_GAP,
+        FollowerReplicationWriteError::BatchWalSeqGap { index, expected, actual } => (
+            REPLICATION_BATCH_WAL_SEQ_GAP,
             format!(r#"{{"index":{index},"expected":{expected},"actual":{actual}}}"#),
         ),
     }
@@ -301,9 +301,9 @@ fn fsync_message(e: ShardFsyncError) -> String {
 
 fn fetch_datablock_message(e: FetchDatablockError) -> String {
     match e {
-        FetchDatablockError::DatablockError { log_id, wal_index, source, is_inline } => format!(
-            r#"{{"log_id":{},"wal_index":{},"is_inline":{},"detail":{}}}"#,
-            log_id, wal_index, is_inline, json_string(&format!("{:?}", source))
+        FetchDatablockError::DatablockError { log_id, wal_seq, source, is_inline } => format!(
+            r#"{{"log_id":{},"wal_seq":{},"is_inline":{},"detail":{}}}"#,
+            log_id, wal_seq, is_inline, json_string(&format!("{:?}", source))
         ),
         FetchDatablockError::LogSegmentFileError(e) => format!(r#"{{"detail":{}}}"#, json_string(&format!("{:?}", e))),
         FetchDatablockError::LogSegmentFileReaderContention => "{}".into(),
@@ -379,8 +379,8 @@ mod tests {
         let resp = shard_error_to_client_response(
             None,
             ShardError::Write(ShardWriteError::OptimisticConcurrencyViolation {
-                expected_event_batch_index: 5,
-                current_event_batch_index: 7,
+                expected_version: 5,
+                current_aggregate_version: 7,
             }),
         );
         match resp {
@@ -388,7 +388,7 @@ mod tests {
                 assert_eq!(e.error_code, WRITE_OPTIMISTIC_CONCURRENCY_VIOLATION);
                 assert_eq!(
                     e.error_message,
-                    r#"{"expected_event_batch_index":5,"current_event_batch_index":7}"#
+                    r#"{"expected_version":5,"current_aggregate_version":7}"#
                 );
             }
             _ => panic!("expected GenericError"),
@@ -400,8 +400,8 @@ mod tests {
         let resp = shard_error_to_client_response(
             None,
             ShardError::Delete(ShardDeleteError::OptimisticConcurrencyViolation {
-                expected_event_batch_index: 1,
-                current_event_batch_index: 3,
+                expected_version: 1,
+                current_aggregate_version: 3,
             }),
         );
         match resp {
@@ -409,7 +409,7 @@ mod tests {
                 assert_eq!(e.error_code, DELETE_OPTIMISTIC_CONCURRENCY_VIOLATION);
                 assert_eq!(
                     e.error_message,
-                    r#"{"expected_event_batch_index":1,"current_event_batch_index":3}"#
+                    r#"{"expected_version":1,"current_aggregate_version":3}"#
                 );
             }
             _ => panic!("expected GenericError"),
@@ -422,7 +422,7 @@ mod tests {
             None,
             ShardError::TrimStart(ShardTrimError::TrimIndexOutOfRange {
                 requested: 100,
-                max_event_batch_index: 50,
+                max_aggregate_version: 50,
             }),
         );
         match resp {
@@ -430,7 +430,7 @@ mod tests {
                 assert_eq!(e.error_code, TRIM_INDEX_OUT_OF_RANGE);
                 assert_eq!(
                     e.error_message,
-                    r#"{"requested":100,"max_event_batch_index":50}"#
+                    r#"{"requested":100,"max_aggregate_version":50}"#
                 );
             }
             _ => panic!("expected GenericError"),
@@ -456,14 +456,14 @@ mod tests {
     }
 
     #[test]
-    fn read_unavailable_batch_index_response() {
+    fn read_unavailable_version_response() {
         let resp = shard_error_to_client_response(
             None,
             ShardError::Read(ShardReadError::UnavailableBatchIndex { minimum_available: 10, requested: 5 }),
         );
         match resp {
             ClientResponse::GenericError(e) => {
-                assert_eq!(e.error_code, READ_UNAVAILABLE_BATCH_INDEX);
+                assert_eq!(e.error_code, READ_UNAVAILABLE_VERSION);
                 assert_eq!(
                     e.error_message,
                     r#"{"requested":5,"minimum_available":10}"#
@@ -478,8 +478,8 @@ mod tests {
         let resp = shard_error_to_client_response(
             None,
             ShardError::Write(ShardWriteError::ClientIdempotencyViolation {
-                last_client_event_index: 10,
-                attempted_client_event_index: 8,
+                last_client_seq: 10,
+                attempted_client_seq: 8,
             }),
         );
         match resp {
@@ -487,7 +487,7 @@ mod tests {
                 assert_eq!(e.error_code, WRITE_CLIENT_IDEMPOTENCY_VIOLATION);
                 assert_eq!(
                     e.error_message,
-                    r#"{"last_client_event_index":10,"attempted_client_event_index":8}"#
+                    r#"{"last_client_seq":10,"attempted_client_seq":8}"#
                 );
             }
             _ => panic!("expected GenericError"),
@@ -641,14 +641,14 @@ mod tests {
             ShardError::Write(ShardWriteError::SchemaValidationFailed {
                 event_type_major: 1,
                 event_type_minor: 0,
-                client_event_index: 7,
+                client_seq: 7,
                 validation_error: "missing field".into(),
             }),
         );
         match resp {
             ClientResponse::GenericError(e) => {
                 assert_eq!(e.error_code, WRITE_SCHEMA_VALIDATION_FAILED);
-                assert!(e.error_message.contains(r#""client_event_index":7"#));
+                assert!(e.error_message.contains(r#""client_seq":7"#));
             }
             other => panic!("expected GenericError, got {other:?}"),
         }
@@ -661,14 +661,14 @@ mod tests {
             ShardError::Write(ShardWriteError::SchemaCompilationFailed {
                 event_type_major: 1,
                 event_type_minor: 0,
-                client_event_index: 3,
+                client_seq: 3,
                 compilation_error: "bad schema".into(),
             }),
         );
         match resp {
             ClientResponse::GenericError(e) => {
                 assert_eq!(e.error_code, WRITE_SCHEMA_COMPILATION_FAILED);
-                assert!(e.error_message.contains(r#""client_event_index":3"#));
+                assert!(e.error_message.contains(r#""client_seq":3"#));
             }
             other => panic!("expected GenericError, got {other:?}"),
         }

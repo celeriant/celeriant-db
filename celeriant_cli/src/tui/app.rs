@@ -65,7 +65,7 @@ pub struct AggregateContext {
 pub struct AggregateContextInfo {
     pub min_batch: u64,
     pub max_batch: u64,
-    pub max_event_index: u64,
+    pub max_event_seq: u64,
     pub is_deleted: bool,
 }
 
@@ -322,8 +322,8 @@ impl App {
 
     pub fn setup_read_events_fields(&mut self) {
         self.input_fields = vec![
-            InputField::with_value("From Batch Index", &self.read_from_index),
-            InputField::with_value("To Batch Index (optional)", &self.read_to_index),
+            InputField::with_value("From version", &self.read_from_index),
+            InputField::with_value("To Aggregate version (optional)", &self.read_to_index),
         ];
         self.input_field_index = 0;
         self.result_output.clear();
@@ -340,7 +340,7 @@ impl App {
 
     pub fn setup_trim_start_fields(&mut self) {
         self.input_fields = vec![
-            InputField::with_value("Keep From Batch Index", &self.trim_keep_from),
+            InputField::with_value("Keep From version", &self.trim_keep_from),
         ];
         self.input_field_index = 0;
     }
@@ -746,9 +746,9 @@ impl App {
         }).await {
             Ok(res) => {
                 ctx.info = Some(AggregateContextInfo {
-                    min_batch: res.min_event_batch_index,
-                    max_batch: res.max_event_batch_index,
-                    max_event_index: res.max_event_index,
+                    min_batch: res.min_aggregate_version,
+                    max_batch: res.max_aggregate_version,
+                    max_event_seq: res.max_event_seq,
                     is_deleted: res.is_deleted,
                 });
                 self.set_status("Aggregate info loaded");
@@ -768,7 +768,7 @@ impl App {
         let key = AggregateKey::new(ctx.org_id, ctx.aggregate_type_id, ctx.aggregate_id);
         let mut filters = ReadFilters::new(from);
         if let Some(to_idx) = to {
-            filters = filters.to_event_batch_index(to_idx);
+            filters = filters.to_aggregate_version(to_idx);
         }
 
         let res = pool.read(ReadRequest {
@@ -779,15 +779,15 @@ impl App {
 
         self.result_output.clear();
         self.result_output.push(format!("Read {} event batches", res.event_batches.len()));
-        if let Some(next) = res.next_event_batch_index {
-            self.result_output.push(format!("Next batch index: {}", next));
+        if let Some(next) = res.next_aggregate_version {
+            self.result_output.push(format!("Next aggregate version: {}", next));
         }
         self.result_output.push(String::new());
 
         for batch in &res.event_batches {
             self.result_output.push(format!(
                 "━━━ Batch {} ━━━ {} ━━━",
-                batch.event_batch_index,
+                batch.aggregate_version,
                 crate::utils::format_timestamp(batch.server_timestamp)
             ));
             self.result_output.push(format!(
@@ -803,7 +803,7 @@ impl App {
                     "  [{}] Type: {} | Index: {} | Time: {}",
                     humansize::format_size(event.event_value.len(), humansize::BINARY),
                     event.event_type_major,
-                    event.event_index,
+                    event.event_seq,
                     format_timestamp(event.event_timestamp)
                 ));
                 let lines: Vec<&str> = data_str.lines().collect();
@@ -843,10 +843,10 @@ impl App {
         let event = DatablockAggregateEvent {
             event_type_major: event_type,
             event_type_minor: 0,
-            client_event_index: 0,
+            client_seq: 0,
             event_timestamp: chrono::Utc::now().timestamp_millis() as u64,
             event_value: Arc::new(data),
-            event_index: 0,
+            event_seq: 0,
             event_id: None,
             iv: None,
         };
@@ -876,8 +876,8 @@ impl App {
         let mut deletes = std::collections::HashMap::new();
         deletes.insert(key, SingleAggregateDelete {
             allow_recreate: true,
-            allow_index_continuation: true,
-            expected_event_batch_index: None,
+            allow_sequence_continuation: true,
+            expected_version: None,
         });
 
         pool.delete(DeleteRequest {
@@ -899,14 +899,14 @@ impl App {
         let ctx = self.aggregate_context.as_ref().ok_or("No aggregate selected")?;
 
         let keep_from: u64 = self.trim_keep_from.parse()
-            .map_err(|_| "Invalid batch index")?;
+            .map_err(|_| "Invalid aggregate version")?;
 
         let key = AggregateKey::new(ctx.org_id, ctx.aggregate_type_id, ctx.aggregate_id);
 
         pool.trim_start(TrimStartRequest {
             correlation_id: None,
             aggregate_key: key,
-            keep_from_event_batch_index: keep_from,
+            keep_from_aggregate_version: keep_from,
             client_id: self.client_id,
             user_id: None,
         })
@@ -1094,7 +1094,7 @@ impl App {
                         Ok(agg) => {
                             let deleted_marker = if agg.is_deleted { " [DELETED]" } else { "" };
                             let last_updated = crate::utils::format_timestamp(agg.max_server_timestamp);
-                            let events = agg.max_event_index.saturating_add(1);
+                            let events = agg.max_event_seq.saturating_add(1);
                             self.list_results.push(format!(
                                 "  [{}] - size {} | {} batches, {} events | updated {}{}",
                                 format_u128_uuid(agg.aggregate_id),
@@ -1378,13 +1378,13 @@ fn format_watch_events(
             event.operation
         ));
 
-        if let Some(from) = event.from_event_batch_index {
+        if let Some(from) = event.from_aggregate_version {
             lines.push(format!("    From batch: {}", from));
         }
-        if let Some(to) = event.to_event_batch_index {
+        if let Some(to) = event.to_aggregate_version {
             lines.push(format!("    To batch: {}", to));
         }
-        if let Some(keep_from) = event.keep_from_event_batch_index {
+        if let Some(keep_from) = event.keep_from_aggregate_version {
             lines.push(format!("    Keep from batch: {}", keep_from));
         }
         lines.push(String::new());

@@ -46,7 +46,7 @@ pub struct ScenarioExpectations {
     pub max_role_flips: u64,
 
     /// If true, run `EventualConvergence`: at the end of the bench window
-    /// the lagging node's `wal_index_max` must either equal the leading
+    /// the lagging node's `wal_seq_max` must either equal the leading
     /// node's, or have strictly advanced over the final settle window.
     /// Catches genuine stuck-state divergence (lagging node frozen at a
     /// non-zero diff) while accepting "still catching up" as a pass.
@@ -65,7 +65,7 @@ pub struct ScenarioExpectations {
     /// at the last ok tick of the bench window must have strictly advanced
     /// its `writes_total` from the first tick it held leadership to that
     /// last tick. Catches "promoted leader that never actually served client
-    /// writes" — a failure mode that `WalIndexAdvanced` and
+    /// writes" — a failure mode that `WalSeqAdvanced` and
     /// `EventualConvergence` both miss because they can be satisfied by
     /// frozen, matching-but-dead values. Required by SCEN-4/5.
     pub require_final_leader_write_progress: bool,
@@ -172,7 +172,7 @@ pub fn run_all(data: &RunData, expect: &ScenarioExpectations) -> Vec<CheckResult
         check_counter("NoNodeStarts", data, |s| s.node_starts_total, expect.max_node_starts),
         check_bench_errors(data, expect),
         check_bench_throughput_floor(data),
-        check_wal_index_advanced(data),
+        check_wal_seq_advanced(data),
     ];
     if expect.require_leader_retained {
         out.push(check_leader_retained(data));
@@ -348,7 +348,7 @@ fn check_leader_retained(data: &RunData) -> CheckResult {
 }
 
 /// PROGRESS check: at the end of the bench+settle window, the lagging
-/// node must either (a) have converged to the leading node's `wal_index_max`,
+/// node must either (a) have converged to the leading node's `wal_seq_max`,
 /// or (b) be strictly advancing across the final `PROGRESS_WINDOW_MS`.
 /// A "lagging node frozen at a non-zero diff" is the stuck-state failure
 /// this catches; "still catching up, just slower than settle" passes.
@@ -376,11 +376,11 @@ fn check_eventual_convergence(data: &RunData) -> CheckResult {
         None => return CheckResult::fail(NAME, "missing ok samples for follower host in bench window"),
     };
 
-    if l.wal_index_max == f.wal_index_max {
+    if l.wal_seq_max == f.wal_seq_max {
         return CheckResult::pass(NAME);
     }
 
-    let (lagging_host, lagging_final) = if l.wal_index_max < f.wal_index_max {
+    let (lagging_host, lagging_final) = if l.wal_seq_max < f.wal_seq_max {
         (data.leader_host, l)
     } else {
         (data.follower_host, f)
@@ -391,18 +391,18 @@ fn check_eventual_convergence(data: &RunData) -> CheckResult {
         .find(|s| s.host == lagging_host && s.ok && s.t_ms >= window_start_ms);
 
     match lagging_window_first {
-        Some(first) if lagging_final.wal_index_max > first.wal_index_max => CheckResult::pass(NAME),
+        Some(first) if lagging_final.wal_seq_max > first.wal_seq_max => CheckResult::pass(NAME),
         Some(first) => {
-            let diff = l.wal_index_max.max(f.wal_index_max) - l.wal_index_max.min(f.wal_index_max);
+            let diff = l.wal_seq_max.max(f.wal_seq_max) - l.wal_seq_max.min(f.wal_seq_max);
             CheckResult::fail(
                 NAME,
                 format!(
-                    "STUCK: lagging host {} frozen at wal_index={} for {}ms (diff from peer: {}); leading host {} at wal_index={}",
-                    lagging_host, lagging_final.wal_index_max,
+                    "STUCK: lagging host {} frozen at wal_seq={} for {}ms (diff from peer: {}); leading host {} at wal_seq={}",
+                    lagging_host, lagging_final.wal_seq_max,
                     lagging_final.t_ms.saturating_sub(first.t_ms),
                     diff,
                     if lagging_host == data.leader_host { data.follower_host } else { data.leader_host },
-                    if lagging_host == data.leader_host { f.wal_index_max } else { l.wal_index_max },
+                    if lagging_host == data.leader_host { f.wal_seq_max } else { l.wal_seq_max },
                 ),
             )
         }
@@ -595,19 +595,19 @@ fn check_failover_within_budget(data: &RunData, max_ms: u64) -> CheckResult {
     }
 }
 
-fn check_wal_index_advanced(data: &RunData) -> CheckResult {
-    const NAME: &str = "WalIndexAdvanced";
+fn check_wal_seq_advanced(data: &RunData) -> CheckResult {
+    const NAME: &str = "WalSeqAdvanced";
     let Some((first, last)) = data.leader_first_last() else {
         return CheckResult::fail(NAME, "no leader samples in bench window");
     };
-    if last.wal_index_max > first.wal_index_max {
+    if last.wal_seq_max > first.wal_seq_max {
         CheckResult::pass(NAME)
     } else {
         CheckResult::fail(
             NAME,
             format!(
-                "leader wal_index did not advance: {} → {}",
-                first.wal_index_max, last.wal_index_max
+                "leader wal_seq did not advance: {} → {}",
+                first.wal_seq_max, last.wal_seq_max
             ),
         )
     }

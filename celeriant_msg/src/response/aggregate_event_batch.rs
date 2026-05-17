@@ -13,7 +13,7 @@ use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEven
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct AggregateEventBatch {
     /// Unique, incremented integer assigned to each event batch when persisted on the server
-    pub event_batch_index: u64,
+    pub aggregate_version: u64,
 
     /// Client ID that created this batch
     pub client_id: u128,
@@ -39,7 +39,7 @@ impl AggregateEventBatch {
         };
 
         Some(Self {
-            event_batch_index: metablock_event_batch.event_batch_index,
+            aggregate_version: metablock_event_batch.aggregate_version,
             client_id: metablock_event_batch.client_id,
             user_id: metablock_event_batch.user_id,
             server_timestamp: metablock.server_timestamp,

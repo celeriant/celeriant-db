@@ -416,8 +416,8 @@ async fn write_event(
     event_num: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let event = DatablockAggregateEvent {
-        client_event_index: event_num,
-        event_index: 0,
+        client_seq: event_num,
+        event_seq: 0,
         event_id: Some(rand::random()),
         event_timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -435,7 +435,7 @@ async fn write_event(
         SingleAggregateWrite {
             events: vec![event],
             allow_create: true,
-            expected_event_batch_index: None,
+            expected_version: None,
             enforce_client_idempotency: false,
         },
     );

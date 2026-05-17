@@ -57,7 +57,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             SingleAggregateWrite {
                 events: vec![event],
                 allow_create: true,
-                expected_event_batch_index: Some(0),
+                expected_version: Some(0),
                 enforce_client_idempotency: true,
             },
         );
@@ -171,10 +171,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn create_event(client_event_index: u64, message: String) -> DatablockAggregateEvent {
+fn create_event(client_seq: u64, message: String) -> DatablockAggregateEvent {
     DatablockAggregateEvent {
-        client_event_index,
-        event_index: 0,
+        client_seq,
+        event_seq: 0,
         event_id: Some(rand::random()),
         event_timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

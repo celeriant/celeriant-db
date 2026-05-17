@@ -6,7 +6,7 @@
 //!
 //! Scenario:
 //! 1. Start cluster, establish leader/follower, verify healthy
-//! 2. Kill follower — leader self-heals via S3 CAS renewals (lease_index unchanged, same leader)
+//! 2. Kill follower — leader self-heals via S3 CAS renewals (lease_epoch unchanged, same leader)
 //! 3. Restart follower — it reads the stale S3 lease (different leader, expired)
 //! 4. Verify follower does NOT race to S3 — leader_node_id unchanged
 //! 5. Verify follower rejoins as follower and replication works
@@ -115,18 +115,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let self_heal_lease = deserialise_lease(&self_heal_lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
 
-    println!("  After self-heal: leader_node_id={:x}, lease_index={}, expires_at_ms={}",
-        self_heal_lease.leader_node_id, self_heal_lease.lease_index, self_heal_lease.expires_at_ms);
+    println!("  After self-heal: leader_node_id={:x}, lease_epoch={}, expires_at_ms={}",
+        self_heal_lease.leader_node_id, self_heal_lease.lease_epoch, self_heal_lease.expires_at_ms);
 
     let leader_node_id = self_heal_lease.leader_node_id;
-    let lease_index_after_heal = self_heal_lease.lease_index;
+    let lease_epoch_after_heal = self_heal_lease.lease_epoch;
     assert!(
         self_heal_lease.expires_at_ms > 0,
         "self-heal should have produced a lease with expiry set"
     );
 
     write_event(&mut leader_client, &aggregate_key, 4, false).await?;
-    println!("  ✓ Leader self-healed at lease_index={}\n", lease_index_after_heal);
+    println!("  ✓ Leader self-healed at lease_epoch={}\n", lease_epoch_after_heal);
 
     // ========================================
     // PHASE 3: Restart follower (reads stale S3 lease)
@@ -167,20 +167,20 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let post_restart_lease = deserialise_lease(&post_restart_lease_bytes)
         .map_err(|e| format!("Failed to deserialise post-restart lease: {:?}", e))?;
 
-    println!("  Post-restart lease: leader_node_id={:x}, lease_index={}",
-        post_restart_lease.leader_node_id, post_restart_lease.lease_index);
+    println!("  Post-restart lease: leader_node_id={:x}, lease_epoch={}",
+        post_restart_lease.leader_node_id, post_restart_lease.lease_epoch);
 
     assert_eq!(
         post_restart_lease.leader_node_id, leader_node_id,
         "leader_node_id should NOT have changed"
     );
     assert_eq!(
-        post_restart_lease.lease_index, lease_index_after_heal,
-        "lease_index should NOT change while same leader holds the lease"
+        post_restart_lease.lease_epoch, lease_epoch_after_heal,
+        "lease_epoch should NOT change while same leader holds the lease"
     );
     println!("  ✓ Follower did NOT attempt takeover despite stale S3 lease");
-    println!("    (lease_index unchanged at {}, same leader self-renewing)\n",
-        post_restart_lease.lease_index);
+    println!("    (lease_epoch unchanged at {}, same leader self-renewing)\n",
+        post_restart_lease.lease_epoch);
 
     // ========================================
     // PHASE 5: Verify cluster works after follower rejoin

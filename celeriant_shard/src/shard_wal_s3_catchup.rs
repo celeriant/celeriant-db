@@ -46,7 +46,7 @@ pub struct S3CatchupResult {
 
 struct FallbackBatchRef {
     path: String,
-    start_wal_index: u64,
+    start_wal_seq: u64,
     node_id: u128,
 }
 
@@ -78,17 +78,17 @@ fn retain_peer_batches(batches: Vec<FallbackBatchRef>, self_node_id: u128, peer_
 struct CatchupCandidate {
     path: String,
     size: u64,
-    start_wal_index: u64,
-    end_wal_index: u64,
+    start_wal_seq: u64,
+    end_wal_seq: u64,
 }
 
-/// A batch is contiguous when every adjacent pair of items differs by exactly one in wal_index.
+/// A batch is contiguous when every adjacent pair of items differs by exactly one in wal_seq.
 fn is_batch_contiguous(batch: &FallbackBatch) -> bool {
-    batch.items.windows(2).all(|w| w[0].metablock.wal_index + 1 == w[1].metablock.wal_index)
+    batch.items.windows(2).all(|w| w[0].metablock.wal_seq + 1 == w[1].metablock.wal_seq)
 }
 
 fn is_batch_lease_consistent(batch: &FallbackBatch) -> bool {
-    batch.items.iter().all(|i| i.metablock.lease_index == batch.lease_index)
+    batch.items.iter().all(|i| i.metablock.lease_epoch == batch.lease_epoch)
 }
 
 pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
@@ -109,11 +109,11 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
         rounds: 0,
         completion: CatchupCompletion::Retry,
     };
-    let current_wal_index = {
+    let current_wal_seq = {
         let active = log_segments_cache.active();
-        active.metadata.borrow().write.wal_index
+        active.metadata.borrow().write.wal_seq
     };
-    let mut next_wal_index = current_wal_index + 1;
+    let mut next_wal_seq = current_wal_seq + 1;
 
     // List all available files we can work with
     let prefix = fallback_shard_prefix(shard_id);
@@ -131,7 +131,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
         // Filter and order stage. not reading from s3 yet.
         for obj in downloader.list_objects(&prefix).await? {
             // Parse out file name
-            let Some((_sid, start_wal_index, end_wal_index, source_node_id)) = parse_fallback_path(&obj.path) else {
+            let Some((_sid, start_wal_seq, end_wal_seq, source_node_id)) = parse_fallback_path(&obj.path) else {
                 continue;
             };
 
@@ -147,18 +147,18 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
             }
 
             // Add to set with start index as key
-            entries.entry(start_wal_index).or_default().push(CatchupCandidate {
+            entries.entry(start_wal_seq).or_default().push(CatchupCandidate {
                 path: obj.path,
                 size: obj.size,
-                start_wal_index,
-                end_wal_index,
+                start_wal_seq,
+                end_wal_seq,
             });
         }
 
         let remaining_bytes: u64 = entries
             .values()
             .flatten()
-            .filter(|c| c.end_wal_index >= next_wal_index)
+            .filter(|c| c.end_wal_seq >= next_wal_seq)
             .map(|c| c.size)
             .sum();
 
@@ -168,13 +168,13 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
         }
 
         loop {
-            // Gather every candidate that could supply next_wal_index (start <= next_wal_index
+            // Gather every candidate that could supply next_wal_seq (start <= next_wal_seq
             // <= end). Download each and deserialize. Batches that fail contiguity checks are
             // dropped (leader-side rollback cascade artefacts).
             let covering: Vec<&CatchupCandidate> = entries
                 .values()
                 .flatten()
-                .filter(|c| c.start_wal_index <= next_wal_index && c.end_wal_index >= next_wal_index)
+                .filter(|c| c.start_wal_seq <= next_wal_seq && c.end_wal_seq >= next_wal_seq)
                 .filter(|c| !applied_paths.contains(&c.path))
                 .collect();
 
@@ -195,43 +195,43 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                     }
                 };
 
-                // Skip batches with internal wal_index gaps - observed under cascades of
+                // Skip batches with internal wal_seq gaps - observed under cascades of
                 // leader rollback + re-upload where items from two chain generations get
                 // stitched into a single file. Never safe to apply.
                 if !is_batch_contiguous(&batch) {
-                    tracing::warn!(shard_id, path = %candidate.path, "skipping S3 batch with internal wal_index gap");
+                    tracing::warn!(shard_id, path = %candidate.path, "skipping S3 batch with internal wal_seq gap");
                     continue;
                 }
 
                 if !is_batch_lease_consistent(&batch) {
-                    tracing::warn!(shard_id, path = %candidate.path, batch_lease = batch.lease_index, "skipping S3 batch with inconsistent per-item lease_index");
+                    tracing::warn!(shard_id, path = %candidate.path, batch_lease = batch.lease_epoch, "skipping S3 batch with inconsistent per-item lease_epoch");
                     continue;
                 }
 
                 downloaded.push((batch, candidate));
             }
 
-            // Dedupe per start_wal_index by (lease_index, upload_sequence) lex. lease_index is
+            // Dedupe per start_wal_seq by (lease_epoch, upload_sequence) lex. lease_epoch is
             // globally monotonic via S3 CAS election; upload_sequence is per-process and resets
             // on handover, so it is only a within-lease tiebreaker.
             let mut by_start: HashMap<u64, (FallbackBatch, &CatchupCandidate)> = HashMap::new();
             for (batch, cand) in downloaded {
-                let start = cand.start_wal_index;
-                let key = (batch.lease_index, batch.upload_sequence);
+                let start = cand.start_wal_seq;
+                let key = (batch.lease_epoch, batch.upload_sequence);
                 let replace = match by_start.get(&start) {
-                    Some((prev, _)) => key > (prev.lease_index, prev.upload_sequence),
+                    Some((prev, _)) => key > (prev.lease_epoch, prev.upload_sequence),
                     None => true,
                 };
                 if replace {
                     if let Some((prev_batch, prev_cand)) = by_start.insert(start, (batch, cand)) {
-                        tracing::debug!(shard_id, path = %prev_cand.path, stale_lease = prev_batch.lease_index, stale_seq = prev_batch.upload_sequence, "excluded stale same-start batch");
+                        tracing::debug!(shard_id, path = %prev_cand.path, stale_lease = prev_batch.lease_epoch, stale_seq = prev_batch.upload_sequence, "excluded stale same-start batch");
                     }
                 } else if let Some((winner_batch, _)) = by_start.get(&start) {
-                    tracing::debug!(shard_id, path = %cand.path, stale_lease = batch.lease_index, stale_seq = batch.upload_sequence, winner_lease = winner_batch.lease_index, winner_seq = winner_batch.upload_sequence, "excluded stale same-start batch");
+                    tracing::debug!(shard_id, path = %cand.path, stale_lease = batch.lease_epoch, stale_seq = batch.upload_sequence, winner_lease = winner_batch.lease_epoch, winner_seq = winner_batch.upload_sequence, "excluded stale same-start batch");
                 }
             }
 
-            let best = by_start.into_values().max_by_key(|(batch, _)| (batch.lease_index, batch.upload_sequence));
+            let best = by_start.into_values().max_by_key(|(batch, _)| (batch.lease_epoch, batch.upload_sequence));
 
             let (batch, candidate) = match best {
                 Some(b) => b,
@@ -239,7 +239,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
             };
 
             // Skip already-applied entries within the batch (partial overlap)
-            let current_wal = log_segments_cache.active().metadata.borrow().write.wal_index;
+            let current_wal = log_segments_cache.active().metadata.borrow().write.wal_seq;
             let current_tip = log_segments_cache.active().metadata.borrow().write.tip_hash;
 
             let all_items: Vec<ReplicationBatchItem> = batch
@@ -253,16 +253,16 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
 
             let skip = all_items
                 .iter()
-                .position(|item| item.metablock.wal_index > current_wal)
+                .position(|item| item.metablock.wal_seq > current_wal)
                 .unwrap_or(all_items.len());
             let items = &all_items[skip..];
 
             if items.is_empty() {
-                let new_next = candidate.end_wal_index + 1;
-                if new_next <= next_wal_index {
+                let new_next = candidate.end_wal_seq + 1;
+                if new_next <= next_wal_seq {
                     break; // candidate can't advance us, stop inner loop
                 }
-                next_wal_index = new_next;
+                next_wal_seq = new_next;
                 continue;
             }
 
@@ -276,7 +276,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                     Ok(r) => Some(r),
                     Err(_) => find_divergence_via_s3(log_segments_cache, downloader, &prefix, current_wal, node_id, peer_node_id).await.ok(),
                 };
-                let (ancestor_hash, ancestor_log_id, divergent_wal_index, divergent_position) = match divergence {
+                let (ancestor_hash, ancestor_log_id, divergent_wal_seq, divergent_position) = match divergence {
                     Some(r) => r,
                     None => {
                         // No common ancestor in any S3 batch we can see right now.
@@ -284,10 +284,10 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                         // structural (operator-territory). Either way: not safe to
                         // truncate, not fatal — skip this batch and let the loop bail to
                         // Retry. The caller's retry will re-list S3 next round.
-                        let batch_first_wal = all_items.first().map(|i| i.metablock.wal_index).unwrap_or(0);
+                        let batch_first_wal = all_items.first().map(|i| i.metablock.wal_seq).unwrap_or(0);
                         let batch_first_prev_hash = all_items.first().map(|i| hex_short(&i.metablock.previous_tip_hash)).unwrap_or_default();
                         // Post-skip values — the chain check uses items[0], not all_items[0].
-                        let mismatch_wal = items.first().map(|i| i.metablock.wal_index).unwrap_or(0);
+                        let mismatch_wal = items.first().map(|i| i.metablock.wal_seq).unwrap_or(0);
                         let mismatch_prev_hash = items.first().map(|i| hex_short(&i.metablock.previous_tip_hash)).unwrap_or_default();
                         // Re-fetch live state at warn-time. `current_wal`/`current_tip`
                         // captured earlier may be stale because we awaited S3 downloads
@@ -297,10 +297,10 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                             let active = log_segments_cache.active();
                             let m = active.metadata.borrow();
                             let (rw, rt) = match &m.read {
-                                Some(r) => (r.wal_index, hex_short(&r.tip_hash)),
+                                Some(r) => (r.wal_seq, hex_short(&r.tip_hash)),
                                 None => (0u64, "none".to_string()),
                             };
-                            (m.write.wal_index, hex_short(&m.write.tip_hash), rw, rt)
+                            (m.write.wal_seq, hex_short(&m.write.tip_hash), rw, rt)
                         };
                         tracing::warn!(
                             shard_id,
@@ -315,7 +315,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                             batch_first_prev_hash = %batch_first_prev_hash,
                             mismatch_wal,
                             mismatch_prev_hash = %mismatch_prev_hash,
-                            batch_lease = batch.lease_index,
+                            batch_lease = batch.lease_epoch,
                             batch_seq = batch.upload_sequence,
                             path = %candidate.path,
                             "Chain mismatch with no common ancestor — skipping batch, will retry catchup"
@@ -333,7 +333,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                     shard_id,
                     current_wal,
                     ancestor_log_id,
-                    divergent_wal_index,
+                    divergent_wal_seq,
                     "TipHashMismatch - truncating divergent WAL entries"
                 );
                 truncate_wal(
@@ -342,7 +342,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                     fsync_coordinator,
                     ancestor_hash,
                     ancestor_log_id,
-                    divergent_wal_index,
+                    divergent_wal_seq,
                     divergent_position,
                 )
                 .await
@@ -351,7 +351,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                 // Break inner loop so the outer loop re-lists S3 and retries
                 // from the truncated state with a fresh view of candidates.
                 truncated = true;
-                next_wal_index = log_segments_cache.active().metadata.borrow().write.wal_index + 1;
+                next_wal_seq = log_segments_cache.active().metadata.borrow().write.wal_seq + 1;
                 break;
             }
 
@@ -372,7 +372,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
             result.batches_applied += 1;
 
             // What's our next position to pull down
-            next_wal_index = candidate.end_wal_index + 1;
+            next_wal_seq = candidate.end_wal_seq + 1;
         }
 
         if !truncated && result.batches_applied == inner_applied {
@@ -401,25 +401,25 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
 /// Validate WAL continuity and queue entries. Does not fsync.
 ///
 /// Handles mid-batch resume: if the batch contains entries at or before the
-/// current WAL index (from a previous partial application that crashed before
+/// current WAL sequence (from a previous partial application that crashed before
 /// completing the full batch), those entries are skipped and application
-/// resumes from `current_wal_index + 1`.
+/// resumes from `current_wal_seq + 1`.
 pub(crate) fn apply_external_batch(
     log_segments_cache: &Rc<LogSegmentsCache>,
     shard_mem_cache: &Rc<RefCell<MemCache>>,
     items: &[ReplicationBatchItem],
     dict_codec: &DictCodec,
 ) -> Result<(), ApplyBatchError> {
-    let (current_tip_hash, current_wal_index) = {
+    let (current_tip_hash, current_wal_seq) = {
         let active = log_segments_cache.active();
         let metadata = active.metadata.borrow();
-        (metadata.write.tip_hash, metadata.write.wal_index)
+        (metadata.write.tip_hash, metadata.write.wal_seq)
     };
 
     // Skip entries already applied (mid-batch resume after crash)
     let skip = items
         .iter()
-        .position(|item| item.metablock.wal_index > current_wal_index)
+        .position(|item| item.metablock.wal_seq > current_wal_seq)
         .unwrap_or(items.len());
     let items = &items[skip..];
 
@@ -427,21 +427,21 @@ pub(crate) fn apply_external_batch(
         return Ok(());
     }
 
-    let batch_wal_index = items[0].metablock.wal_index;
+    let batch_wal_seq = items[0].metablock.wal_seq;
     let batch_tip_hash = items[0].metablock.previous_tip_hash;
 
-    if current_wal_index.saturating_add(1) != batch_wal_index {
-        return Err(ApplyBatchError::WalIndexMismatch {
-            current: current_wal_index,
-            batch_first: batch_wal_index,
+    if current_wal_seq.saturating_add(1) != batch_wal_seq {
+        return Err(ApplyBatchError::WalSeqMismatch {
+            current: current_wal_seq,
+            batch_first: batch_wal_seq,
         });
     }
     if current_tip_hash != batch_tip_hash {
         return Err(ApplyBatchError::TipHashMismatch {
             current: current_tip_hash,
-            current_wal_index,
+            current_wal_seq,
             batch: batch_tip_hash,
-            batch_wal_index,
+            batch_wal_seq,
         });
     }
 
@@ -450,11 +450,11 @@ pub(crate) fn apply_external_batch(
 
 fn queue_replicated_entries(shard_mem_cache: &Rc<RefCell<MemCache>>, items: &[ReplicationBatchItem], dict_codec: &DictCodec) -> Result<(), ApplyBatchError> {
     for (i, w) in items.windows(2).enumerate() {
-        if w[0].metablock.wal_index + 1 != w[1].metablock.wal_index {
-            return Err(ApplyBatchError::BatchWalIndexGap {
+        if w[0].metablock.wal_seq + 1 != w[1].metablock.wal_seq {
+            return Err(ApplyBatchError::BatchWalSeqGap {
                 index: i + 1,
-                expected: w[0].metablock.wal_index + 1,
-                actual: w[1].metablock.wal_index,
+                expected: w[0].metablock.wal_seq + 1,
+                actual: w[1].metablock.wal_seq,
             });
         }
     }
@@ -515,7 +515,7 @@ async fn sync_applied_batch(
 /// Find the common ancestor using the already-downloaded batch from catchup_round.
 ///
 /// The batch that triggered TipHashMismatch often overlaps local WAL entries
-/// (items were skipped because wal_index <= current). The earliest item's
+/// (items were skipped because wal_seq <= current). The earliest item's
 /// `previous_tip_hash` points to the state before any of the remote leader's
 /// writes in that range - the common ancestor. This avoids any additional S3 calls.
 async fn find_divergence_from_batch(
@@ -540,7 +540,7 @@ async fn find_divergence_via_s3<D: S3Downloader + 'static>(
     log_segments_cache: &Rc<LogSegmentsCache>,
     downloader: &Rc<D>,
     prefix: &str,
-    current_wal_index: u64,
+    current_wal_seq: u64,
     node_id: u128,
     peer_node_id: Option<u128>,
 ) -> Result<([u8; 32], u64, u64, u64), S3CatchupError> {
@@ -552,18 +552,18 @@ async fn find_divergence_via_s3<D: S3Downloader + 'static>(
             let (_sid, start, _end, nid) = parse_fallback_path(&obj.path)?;
             Some(FallbackBatchRef {
                 path: obj.path,
-                start_wal_index: start,
+                start_wal_seq: start,
                 node_id: nid,
             })
         })
-        .filter(|b| b.start_wal_index <= current_wal_index)
+        .filter(|b| b.start_wal_seq <= current_wal_seq)
         .collect();
 
     let earlier_total_unfiltered = earlier_batches.len();
     let mut earlier_batches = retain_peer_batches(earlier_batches, node_id, peer_node_id);
     let earlier_total_after_peer_filter = earlier_batches.len();
 
-    earlier_batches.sort_by(|a, b| b.start_wal_index.cmp(&a.start_wal_index));
+    earlier_batches.sort_by(|a, b| b.start_wal_seq.cmp(&a.start_wal_seq));
 
     // 16-way pipeline: must outpace leader's concurrent fallback uploads or follower never closes the gap.
     const PARALLEL_DOWNLOADS: usize = 16;
@@ -575,7 +575,7 @@ async fn find_divergence_via_s3<D: S3Downloader + 'static>(
         for batch_ref in chunk {
             let downloader = downloader.clone();
             let path = batch_ref.path.clone();
-            let start_wal = batch_ref.start_wal_index;
+            let start_wal = batch_ref.start_wal_seq;
             handles.push(glommio::spawn_local(async move {
                 let data = match downloader.download(&path).await {
                     Ok(d) => d,
@@ -613,7 +613,7 @@ async fn find_divergence_via_s3<D: S3Downloader + 'static>(
             earlier_total_unfiltered,
             earlier_total_after_peer_filter,
             tried,
-            current_wal_index,
+            current_wal_seq,
             "find_divergence_via_s3: no usable candidates"
         );
         metrics::counter!("celeriant_s3_catchup_via_s3_exhausted_total").increment(1);
@@ -622,19 +622,19 @@ async fn find_divergence_via_s3<D: S3Downloader + 'static>(
         )));
     }
 
-    // A candidate hash at batch start S can only match local wal_index = S, so floor at min - 1.
+    // A candidate hash at batch start S can only match local wal_seq = S, so floor at min - 1.
     let min_candidate_start = hash_to_batch_path.values().map(|(_, s)| *s).min().unwrap_or(0);
-    let scan_floor_wal_index = min_candidate_start.saturating_sub(1);
-    let result = scan_local_metablocks_for_hashes(log_segments_cache, &candidate_hashes, scan_floor_wal_index).await;
+    let scan_floor_wal_seq = min_candidate_start.saturating_sub(1);
+    let result = scan_local_metablocks_for_hashes(log_segments_cache, &candidate_hashes, scan_floor_wal_seq).await;
 
-    if let Ok((hash, log_id, wal_index, position)) = &result {
+    if let Ok((hash, log_id, wal_seq, position)) = &result {
         let path = hash_to_batch_path.get(hash).map(|(p, _)| p.as_str()).unwrap_or("<unknown>");
         let batch_start_wal = hash_to_batch_path.get(hash).map(|(_, s)| *s).unwrap_or(0);
         tracing::info!(
             path = %path,
             batch_start_wal,
             candidate_hash = %hex_short(hash),
-            divergent_wal_index = wal_index,
+            divergent_wal_seq = wal_seq,
             divergent_log_id = log_id,
             divergent_position = position,
             tried,
@@ -648,7 +648,7 @@ async fn find_divergence_via_s3<D: S3Downloader + 'static>(
             earlier_total_after_peer_filter,
             tried,
             candidates = candidate_hashes.len(),
-            current_wal_index,
+            current_wal_seq,
             "find_divergence_via_s3: no candidate hash matched any local metablock in unconfirmed suffix"
         );
         metrics::counter!("celeriant_s3_catchup_via_s3_exhausted_total").increment(1);
@@ -658,11 +658,11 @@ async fn find_divergence_via_s3<D: S3Downloader + 'static>(
 }
 
 /// Reverse-scan local WAL for a metablock whose `previous_tip_hash` is in `candidate_hashes`.
-/// Stops at `scan_floor_wal_index` (0 disables). First match is the divergence boundary.
+/// Stops at `scan_floor_wal_seq` (0 disables). First match is the divergence boundary.
 async fn scan_local_metablocks_for_hashes(
     log_segments_cache: &Rc<LogSegmentsCache>,
     candidate_hashes: &HashSet<[u8; 32]>,
-    scan_floor_wal_index: u64,
+    scan_floor_wal_seq: u64,
 ) -> Result<([u8; 32], u64, u64, u64), S3CatchupError> {
     const READ_CHUNK_SIZE: u64 = 64 * 1024;
     let active_log_id = log_segments_cache.active_log_id();
@@ -678,11 +678,11 @@ async fn scan_local_metablocks_for_hashes(
             let Ok(metablock) = deserialise_metablock(block) else {
                 return Ok(None);
             };
-            if scan_floor_wal_index > 0 && metablock.wal_index < scan_floor_wal_index {
+            if scan_floor_wal_seq > 0 && metablock.wal_seq < scan_floor_wal_seq {
                 return Ok(Some(ScanHit::BelowFloor));
             }
             if candidate_hashes.contains(&metablock.previous_tip_hash) {
-                Ok(Some(ScanHit::Match(metablock.previous_tip_hash, log_id, metablock.wal_index, pos)))
+                Ok(Some(ScanHit::Match(metablock.previous_tip_hash, log_id, metablock.wal_seq, pos)))
             } else {
                 Ok(None)
             }
@@ -691,7 +691,7 @@ async fn scan_local_metablocks_for_hashes(
         .map_err(|e| S3CatchupError::TruncationFailed(ShardFsyncError::MetablockSerialisationError(format!("scan error: {:?}", e))))?;
 
     match result {
-        Some(ScanHit::Match(hash, log_id, wal_index, position)) => Ok((hash, log_id, wal_index, position)),
+        Some(ScanHit::Match(hash, log_id, wal_seq, position)) => Ok((hash, log_id, wal_seq, position)),
         Some(ScanHit::BelowFloor) | None => Err(S3CatchupError::TruncationFailed(ShardFsyncError::MetablockSerialisationError(
             "candidate hash not found in local metablocks above scan floor".into(),
         ))),
@@ -712,7 +712,7 @@ async fn truncate_wal(
     fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
     common_ancestor_hash: [u8; 32],
     divergent_log_id: u64,
-    divergent_wal_index: u64,
+    divergent_wal_seq: u64,
     divergent_entry_position: u64,
 ) -> Result<u64, ShardFsyncError> {
     // Step 1: Acquire rollback lock to block concurrent writes
@@ -736,23 +736,23 @@ async fn truncate_wal(
     }
 
     let active = log_segments_cache.active();
-    let current_wal_index = active.metadata.borrow().write.wal_index;
+    let current_wal_seq = active.metadata.borrow().write.wal_seq;
 
     // Calculate how many entries to truncate (including the divergent one)
-    let divergent_count = current_wal_index.saturating_sub(divergent_wal_index).saturating_add(1);
-    let new_wal_index = divergent_wal_index.saturating_sub(1);
+    let divergent_count = current_wal_seq.saturating_sub(divergent_wal_seq).saturating_add(1);
+    let new_wal_seq = divergent_wal_seq.saturating_sub(1);
     let new_metablocks_position = divergent_entry_position;
 
     // Step 3: Rewind cursors (both read and write)
     {
         let mut metadata = active.metadata.borrow_mut();
-        metadata.write.wal_index = new_wal_index;
+        metadata.write.wal_seq = new_wal_seq;
         metadata.write.tip_hash = common_ancestor_hash;
         metadata.write.metablocks_position = new_metablocks_position;
 
         // Also update read cursor to match
         if let Some(ref mut read) = metadata.read {
-            read.wal_index = new_wal_index;
+            read.wal_seq = new_wal_seq;
             read.tip_hash = common_ancestor_hash;
             read.metablocks_position = new_metablocks_position;
         }
@@ -785,7 +785,7 @@ async fn truncate_wal(
             .map_err(|e| ShardFsyncError::MetablockSerialisationError(format!("carry-over read failed: {:?}", e)))?;
     }
 
-    tracing::warn!(divergent_count, new_wal_index, "WAL truncated due to divergent entries");
+    tracing::warn!(divergent_count, new_wal_seq, "WAL truncated due to divergent entries");
 
     Ok(divergent_count)
 }
@@ -832,9 +832,9 @@ mod tests {
         (tmp, dir)
     }
 
-    fn test_metablock(wal_index: u64, previous_tip_hash: [u8; 32]) -> Metablock {
+    fn test_metablock(wal_seq: u64, previous_tip_hash: [u8; 32]) -> Metablock {
         let mut mb = Metablock::default_inline_event_batch_metadata(AggregateKey::new(1, 1, 1));
-        mb.wal_index = wal_index;
+        mb.wal_seq = wal_seq;
         mb.previous_tip_hash = previous_tip_hash;
         mb
     }
@@ -856,11 +856,11 @@ mod tests {
         make_fallback_batch_with_lease_seq(shard_id, start, end, tip_hash, node_id, upload_sequence, 0)
     }
 
-    fn make_fallback_batch_with_lease_seq(shard_id: u32, start: u64, end: u64, tip_hash: [u8; 32], node_id: u128, upload_sequence: u64, lease_index: u64) -> (String, Bytes) {
-        let mut batch = FallbackBatch::new(start, end, shard_id, node_id, upload_sequence, lease_index);
-        for wal_index in start..=end {
-            let mut mb = test_metablock(wal_index, tip_hash);
-            mb.lease_index = lease_index;
+    fn make_fallback_batch_with_lease_seq(shard_id: u32, start: u64, end: u64, tip_hash: [u8; 32], node_id: u128, upload_sequence: u64, lease_epoch: u64) -> (String, Bytes) {
+        let mut batch = FallbackBatch::new(start, end, shard_id, node_id, upload_sequence, lease_epoch);
+        for wal_seq in start..=end {
+            let mut mb = test_metablock(wal_seq, tip_hash);
+            mb.lease_epoch = lease_epoch;
             batch.push_item(FallbackItem {
                 metablock: mb,
                 datablock: None,
@@ -988,8 +988,8 @@ mod tests {
             }
         }
 
-        fn wal_index(&self) -> u64 {
-            self.log_segments_cache.active().metadata.borrow().write.wal_index
+        fn wal_seq(&self) -> u64 {
+            self.log_segments_cache.active().metadata.borrow().write.wal_seq
         }
 
         fn tip_hash(&self) -> [u8; 32] {
@@ -1063,7 +1063,7 @@ mod tests {
     // ── apply_external_batch tests ──
 
     #[test]
-    fn apply_rejects_wal_index_mismatch() {
+    fn apply_rejects_wal_seq_mismatch() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let tc = TestComponents::new(&dir).await;
@@ -1073,7 +1073,7 @@ mod tests {
                 datablock: None,
             };
             let err = apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &[item], &test_codec()).unwrap_err();
-            assert!(matches!(err, ApplyBatchError::WalIndexMismatch { current: 0, batch_first: 99 }));
+            assert!(matches!(err, ApplyBatchError::WalSeqMismatch { current: 0, batch_first: 99 }));
 
             tc.close().await;
         });
@@ -1125,7 +1125,7 @@ mod tests {
                 datablock: None,
             };
             apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &[item1], &test_codec()).unwrap();
-            // Flush the pending queue so WAL index advances
+            // Flush the pending queue so WAL sequence advances
             sync_applied_batch(
                 &tc.log_segments_cache,
                 &tc.shard_mem_cache,
@@ -1136,7 +1136,7 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(tc.wal_index(), 1);
+            assert_eq!(tc.wal_seq(), 1);
 
             // Now send a batch [1, 2] - entry 1 should be skipped, entry 2 applied
             let tip = tc.tip_hash();
@@ -1176,7 +1176,7 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(tc.wal_index(), 1);
+            assert_eq!(tc.wal_seq(), 1);
 
             // Re-send same entry - should be a no-op
             apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &[item], &test_codec()).unwrap();
@@ -1215,7 +1215,7 @@ mod tests {
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
             assert_eq!(result.batches_applied, 1);
             assert_eq!(result.completion, CatchupCompletion::Caught);
-            assert_eq!(tc.wal_index(), 1);
+            assert_eq!(tc.wal_seq(), 1);
 
             tc.close().await;
         });
@@ -1233,7 +1233,7 @@ mod tests {
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
             assert_eq!(result.batches_applied, 1);
-            assert_eq!(tc.wal_index(), 5);
+            assert_eq!(tc.wal_seq(), 5);
             assert_eq!(result.completion, CatchupCompletion::Caught);
 
             tc.close().await;
@@ -1256,7 +1256,7 @@ mod tests {
             // Gaps are handled gracefully - apply [1-2], stop at gap.
             // remaining gap is small enough for TCP, so completion is Caught.
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 2);
+            assert_eq!(tc.wal_seq(), 2);
             assert_eq!(result.batches_applied, 1);
 
             tc.close().await;
@@ -1276,7 +1276,7 @@ mod tests {
             dl.insert(path, data);
 
             tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 3);
+            assert_eq!(tc.wal_seq(), 3);
             assert!(dl.deleted_paths().is_empty());
 
             tc.close().await;
@@ -1294,7 +1294,7 @@ mod tests {
             let (path, data) = make_fallback_batch(0, 1, 1, GENESIS_HASH);
             dl.insert(path, data);
             tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 1);
+            assert_eq!(tc.wal_seq(), 1);
 
             // Add batch 2, but also re-add batch 1 (already applied)
             let tip = tc.tip_hash();
@@ -1305,7 +1305,7 @@ mod tests {
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
             assert_eq!(result.batches_applied, 1);
-            assert_eq!(tc.wal_index(), 2);
+            assert_eq!(tc.wal_seq(), 2);
 
             tc.close().await;
         });
@@ -1327,7 +1327,7 @@ mod tests {
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
             assert_eq!(result.batches_applied, 1);
-            assert_eq!(tc.wal_index(), 1);
+            assert_eq!(tc.wal_seq(), 1);
 
             tc.close().await;
         });
@@ -1344,7 +1344,7 @@ mod tests {
             let (path, data) = make_fallback_batch(0, 1, 3, GENESIS_HASH);
             dl.insert(path, data);
             tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 3);
+            assert_eq!(tc.wal_seq(), 3);
 
             // Add overlapping batch 2-6: entries 2-3 already applied, 4-6 are new.
             // All items get the same tip_hash; only item 4 (first after slicing) is checked.
@@ -1354,7 +1354,7 @@ mod tests {
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
             assert_eq!(result.batches_applied, 1);
-            assert_eq!(tc.wal_index(), 6);
+            assert_eq!(tc.wal_seq(), 6);
             assert_eq!(result.completion, CatchupCompletion::Caught);
 
             tc.close().await;
@@ -1383,7 +1383,7 @@ mod tests {
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
             assert_eq!(result.batches_applied, 2);
-            assert_eq!(tc.wal_index(), 6);
+            assert_eq!(tc.wal_seq(), 6);
             assert_eq!(result.completion, CatchupCompletion::Caught);
 
             tc.close().await;
@@ -1403,14 +1403,14 @@ mod tests {
             let (path1_5, data1_5) = make_fallback_batch(0, 1, 5, GENESIS_HASH);
             dl.insert(path1_5, data1_5);
             tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 5);
+            assert_eq!(tc.wal_seq(), 5);
             let tip_after_5 = tc.tip_hash();
 
             // Step 2: Apply divergent entry 6 (simulates follower receiving from old leader)
             let (path6_divergent, data6_divergent) = make_fallback_batch(0, 6, 6, tip_after_5);
             dl.insert(path6_divergent, data6_divergent);
             tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 6);
+            assert_eq!(tc.wal_seq(), 6);
             let tip_after_divergent_6 = tc.tip_hash();
             assert_ne!(tip_after_5, tip_after_divergent_6, "Tip hash should change after entry 6");
 
@@ -1422,7 +1422,7 @@ mod tests {
 
             // Step 4: Catchup detects TipHashMismatch, truncates entry 6, re-applies 6-8
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 8, "Should catch up to wal_index 8 after truncation");
+            assert_eq!(tc.wal_seq(), 8, "Should catch up to wal_seq 8 after truncation");
             assert_eq!(result.completion, CatchupCompletion::Caught);
 
             tc.close().await;
@@ -1458,7 +1458,7 @@ mod tests {
             dl.insert(new_path.clone(), new_data);
 
             tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 8);
+            assert_eq!(tc.wal_seq(), 8);
 
             // The old batch (1-5) should never have been downloaded
             let downloads = dl.downloaded_paths();
@@ -1489,7 +1489,7 @@ mod tests {
             let (path, data) = make_fallback_batch(0, 6, 8, tip_after_5);
             dl.insert(path, data);
             tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 8);
+            assert_eq!(tc.wal_seq(), 8);
 
             // New leader wrote 6-12 (overlapping batch starting before our divergence)
             dl.objects.borrow_mut().clear();
@@ -1497,7 +1497,7 @@ mod tests {
             dl.insert(path, data);
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 12);
+            assert_eq!(tc.wal_seq(), 12);
             assert_eq!(result.completion, CatchupCompletion::Caught);
 
             tc.close().await;
@@ -1521,7 +1521,7 @@ mod tests {
             let (path, data) = make_fallback_batch(0, 4, 8, tip_after_3);
             dl.insert(path, data);
             tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 8);
+            assert_eq!(tc.wal_seq(), 8);
 
             // B wrote 4-14 (5 more entries than A, starting from same common ancestor)
             dl.objects.borrow_mut().clear();
@@ -1529,7 +1529,7 @@ mod tests {
             dl.insert(path, data);
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 14);
+            assert_eq!(tc.wal_seq(), 14);
             assert_eq!(result.completion, CatchupCompletion::Caught);
 
             tc.close().await;
@@ -1586,7 +1586,7 @@ mod tests {
             let (path, data) = make_fallback_batch(0, 6, 6, tip_after_5);
             dl_setup.insert(path, data);
             tc.catchup(&dl_setup, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 6);
+            assert_eq!(tc.wal_seq(), 6);
 
             // Fresh downloader for the divergence scenario.
             // S3 has batch 6-6 (filtered out by catchup_round since end=6 = current)
@@ -1614,7 +1614,7 @@ mod tests {
             });
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 9);
+            assert_eq!(tc.wal_seq(), 9);
             assert_eq!(result.completion, CatchupCompletion::Caught);
 
             // Verify the S3 fallback downloaded batch 6-6 to find the ancestor
@@ -1648,7 +1648,7 @@ mod tests {
             resume_after_truncate(&dl, tc.log_segments_cache.clone(), trigger_path, 7, 9);
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 9);
+            assert_eq!(tc.wal_seq(), 9);
             assert_eq!(result.completion, CatchupCompletion::Caught);
 
             let downloads = dl.downloaded_paths();
@@ -1678,7 +1678,7 @@ mod tests {
             let (p, d) = make_fallback_batch(0, 6, 6, tip_5);
             dl_setup.insert(p, d);
             tc.catchup(&dl_setup, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 6);
+            assert_eq!(tc.wal_seq(), 6);
 
             let dl = Rc::new(MockDownloader::new());
             let (trigger_path, trigger_data) = make_fallback_batch(0, 7, 9, [0xEE; 32]);
@@ -1691,7 +1691,7 @@ mod tests {
             resume_after_truncate(&dl, tc.log_segments_cache.clone(), trigger_path, 7, 9);
 
             tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 9);
+            assert_eq!(tc.wal_seq(), 9);
         });
     }
 
@@ -1714,7 +1714,7 @@ mod tests {
             let (p, d) = make_fallback_batch(0, 16, 16, tip_15);
             dl_setup.insert(p, d);
             tc.catchup(&dl_setup, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 16);
+            assert_eq!(tc.wal_seq(), 16);
 
             let dl = Rc::new(MockDownloader::new());
             let (p, d) = make_fallback_batch(0, 17, 19, [0xEE; 32]);
@@ -1724,7 +1724,7 @@ mod tests {
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
             assert_eq!(result.completion, CatchupCompletion::Retry);
-            assert_eq!(tc.wal_index(), 16, "scan floor must block the collisional match at wal=2");
+            assert_eq!(tc.wal_seq(), 16, "scan floor must block the collisional match at wal=2");
         });
     }
 
@@ -1748,7 +1748,7 @@ mod tests {
             resume_after_truncate(&dl, tc.log_segments_cache.clone(), trigger_path, 7, 9);
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 9);
+            assert_eq!(tc.wal_seq(), 9);
             assert_eq!(result.completion, CatchupCompletion::Caught);
         });
     }
@@ -1771,7 +1771,7 @@ mod tests {
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
             assert_eq!(result.completion, CatchupCompletion::Retry);
-            assert_eq!(tc.wal_index(), 18, "no candidate matched; local must not be truncated");
+            assert_eq!(tc.wal_seq(), 18, "no candidate matched; local must not be truncated");
 
             let downloads = dl.downloaded_paths();
             for start in 1..=18u64 {
@@ -1785,7 +1785,7 @@ mod tests {
     fn test_fallback_batch_s3_path() {
         let batch = FallbackBatch::new(5, 10, 2, 0, 0, 0);
         assert_eq!(
-            fallback_batch_path(batch.shard_id, batch.fallback_index, batch.end_wal_index, batch.uploaded_by_node_id),
+            fallback_batch_path(batch.shard_id, batch.fallback_index, batch.end_wal_seq, batch.uploaded_by_node_id),
             "cluster/fallback/shard_002/batch_000000005_000000010_00000000-0000-0000-0000-000000000000.bin"
         );
     }
@@ -1795,9 +1795,9 @@ mod tests {
         let aggregate_key = AggregateKey::new(1, 2, 3);
 
         let metablock1 = Metablock {
-            wal_index: 42,
+            wal_seq: 42,
             server_timestamp: 1000,
-            lease_index: 5,
+            lease_epoch: 5,
             node_id: 999,
             uncompressed_size: 1024,
             compressed_size: 512,
@@ -1806,14 +1806,14 @@ mod tests {
             previous_tip_hash: [1u8; 32],
             wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
                 aggregate_key: aggregate_key.clone(),
-                event_batch_index: 10,
-                min_event_batch_index: 1,
-                min_client_event_index: 1,
-                max_client_event_index: 5,
+                aggregate_version: 10,
+                trimmed_below_version: 1,
+                min_client_seq: 1,
+                max_client_seq: 5,
                 min_event_timestamp: 100,
                 max_event_timestamp: 500,
-                min_event_index: 1,
-                max_event_index: 5,
+                min_event_seq: 1,
+                max_event_seq: 5,
                 client_id: 123,
                 user_id: None,
                 event_types_data: celeriant_wal::metablocks::metablock_event_batch::EventTypesKind::Direct([7, 0, 0, 0]),
@@ -1823,9 +1823,9 @@ mod tests {
         };
 
         let metablock2 = Metablock {
-            wal_index: 43,
+            wal_seq: 43,
             server_timestamp: 2000,
-            lease_index: 5,
+            lease_epoch: 5,
             node_id: 999,
             uncompressed_size: 2048,
             compressed_size: 1024,
@@ -1834,14 +1834,14 @@ mod tests {
             previous_tip_hash: [2u8; 32],
             wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
                 aggregate_key: aggregate_key.clone(),
-                event_batch_index: 11,
-                min_event_batch_index: 1,
-                min_client_event_index: 6,
-                max_client_event_index: 10,
+                aggregate_version: 11,
+                trimmed_below_version: 1,
+                min_client_seq: 6,
+                max_client_seq: 10,
                 min_event_timestamp: 600,
                 max_event_timestamp: 1000,
-                min_event_index: 6,
-                max_event_index: 10,
+                min_event_seq: 6,
+                max_event_seq: 10,
                 client_id: 123,
                 user_id: None,
                 event_types_data: celeriant_wal::metablocks::metablock_event_batch::EventTypesKind::Direct([7, 0, 0, 0]),
@@ -1852,18 +1852,18 @@ mod tests {
 
         let datablock1 = Some(Datablock {
             datablock_kind: DatablockKind::EventBatchItem(DatablockAggregateEventBatch {
-                event_batch_index: 10,
+                aggregate_version: 10,
                 events: vec![],
             }),
         });
 
         let original_batch = FallbackBatch {
             fallback_index: 42,
-            end_wal_index: 43,
+            end_wal_seq: 43,
             shard_id: 7,
             uploaded_by_node_id: 1,
             upload_sequence: 0,
-            lease_index: 0,
+            lease_epoch: 0,
             items: vec![
                 FallbackItem {
                     metablock: metablock1,
@@ -1885,27 +1885,27 @@ mod tests {
         let deserialized = celeriant_wire::disk::versioned_block::deserialise_fallback_batch(&serialized).expect("deserialization should succeed");
 
         assert_eq!(deserialized.fallback_index, 42);
-        assert_eq!(deserialized.end_wal_index, 43);
+        assert_eq!(deserialized.end_wal_seq, 43);
         assert_eq!(deserialized.shard_id, 7);
         assert_eq!(deserialized.items.len(), 2);
 
-        assert_eq!(deserialized.items[0].metablock.wal_index, 42);
+        assert_eq!(deserialized.items[0].metablock.wal_seq, 42);
         assert_eq!(deserialized.items[0].metablock.server_timestamp, 1000);
         assert!(deserialized.items[0].datablock.is_some());
 
-        assert_eq!(deserialized.items[1].metablock.wal_index, 43);
+        assert_eq!(deserialized.items[1].metablock.wal_seq, 43);
         assert_eq!(deserialized.items[1].metablock.server_timestamp, 2000);
         assert!(deserialized.items[1].datablock.is_none());
     }
 
     #[test]
-    fn test_fallback_index_is_first_wal_index() {
+    fn test_fallback_index_is_first_wal_seq() {
         let aggregate_key = AggregateKey::new(1, 2, 3);
 
         let metablock_first = Metablock {
-            wal_index: 100,
+            wal_seq: 100,
             server_timestamp: 1000,
-            lease_index: 5,
+            lease_epoch: 5,
             node_id: 999,
             uncompressed_size: 1024,
             compressed_size: 512,
@@ -1914,14 +1914,14 @@ mod tests {
             previous_tip_hash: [1u8; 32],
             wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
                 aggregate_key: aggregate_key.clone(),
-                event_batch_index: 10,
-                min_event_batch_index: 1,
-                min_client_event_index: 1,
-                max_client_event_index: 5,
+                aggregate_version: 10,
+                trimmed_below_version: 1,
+                min_client_seq: 1,
+                max_client_seq: 5,
                 min_event_timestamp: 100,
                 max_event_timestamp: 500,
-                min_event_index: 1,
-                max_event_index: 5,
+                min_event_seq: 1,
+                max_event_seq: 5,
                 client_id: 123,
                 user_id: None,
                 event_types_data: celeriant_wal::metablocks::metablock_event_batch::EventTypesKind::Direct([7, 0, 0, 0]),
@@ -1931,17 +1931,17 @@ mod tests {
         };
 
         let metablock_second = Metablock {
-            wal_index: 101,
+            wal_seq: 101,
             ..metablock_first.clone()
         };
 
         let batch = FallbackBatch {
             fallback_index: 100,
-            end_wal_index: 101,
+            end_wal_seq: 101,
             shard_id: 5,
             uploaded_by_node_id: 1,
             upload_sequence: 0,
-            lease_index: 0,
+            lease_epoch: 0,
             items: vec![
                 FallbackItem {
                     metablock: metablock_first,
@@ -1954,8 +1954,8 @@ mod tests {
             ],
         };
 
-        assert_eq!(batch.fallback_index, batch.items[0].metablock.wal_index);
-        assert_eq!(batch.end_wal_index, batch.items[batch.items.len() - 1].metablock.wal_index);
+        assert_eq!(batch.fallback_index, batch.items[0].metablock.wal_seq);
+        assert_eq!(batch.end_wal_seq, batch.items[batch.items.len() - 1].metablock.wal_seq);
     }
 
     #[test]
@@ -1965,7 +1965,7 @@ mod tests {
             fallback_batch_path(
                 batch_0.shard_id,
                 batch_0.fallback_index,
-                batch_0.end_wal_index,
+                batch_0.end_wal_seq,
                 batch_0.uploaded_by_node_id
             ),
             "cluster/fallback/shard_000/batch_000000001_000000005_00000000-0000-0000-0000-000000000000.bin"
@@ -1976,7 +1976,7 @@ mod tests {
             fallback_batch_path(
                 batch_999.shard_id,
                 batch_999.fallback_index,
-                batch_999.end_wal_index,
+                batch_999.end_wal_seq,
                 batch_999.uploaded_by_node_id
             ),
             "cluster/fallback/shard_999/batch_000000001_000000010_00000000-0000-0000-0000-000000000000.bin"
@@ -1987,7 +1987,7 @@ mod tests {
 
     #[test]
     fn dedup_picks_winner_from_same_start() {
-        // Two batches at same start_wal_index: the stale one (lower upload_sequence)
+        // Two batches at same start_wal_seq: the stale one (lower upload_sequence)
         // must be excluded from consideration entirely; only the winner is applied.
         // Both stay in S3 (no deletes during catchup).
         glommio_test!({
@@ -2002,7 +2002,7 @@ mod tests {
             dl.insert(path_winner, data_winner);
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 5, "winner (seq=2, end=5) should be applied, not stale (seq=1, end=3)");
+            assert_eq!(tc.wal_seq(), 5, "winner (seq=2, end=5) should be applied, not stale (seq=1, end=3)");
             assert_eq!(result.batches_applied, 1);
             assert!(dl.deleted_paths().is_empty());
 
@@ -2011,11 +2011,11 @@ mod tests {
     }
 
     #[test]
-    fn divergent_s3_paths_higher_lease_index_wins() {
+    fn divergent_s3_paths_higher_lease_epoch_wins() {
         // Cross-leader scenario: prior leader (lease=1) uploaded chain A with seq=5.
         // New leader (lease=2) just uploaded chain B with seq=1. Under upload_sequence
         // alone the stale chain A would win (seq=5 > seq=1) and we'd diverge.
-        // (lease_index, upload_sequence) lex must pick B because lease_index is
+        // (lease_epoch, upload_sequence) lex must pick B because lease_epoch is
         // globally monotonic via S3 CAS.
         glommio_test!({
             let (_tmp, dir) = test_dir();
@@ -2028,7 +2028,7 @@ mod tests {
             dl.insert(path_b, data_b);
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 5, "higher-lease chain B (lease=2, seq=1, end=5) must win over stale chain A (lease=1, seq=5, end=3)");
+            assert_eq!(tc.wal_seq(), 5, "higher-lease chain B (lease=2, seq=1, end=5) must win over stale chain A (lease=1, seq=5, end=3)");
             assert_eq!(result.batches_applied, 1);
 
             tc.close().await;
@@ -2049,7 +2049,7 @@ mod tests {
             dl.insert(path_b, data_b);
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 5, "within-lease tiebreaker: seq=5 wins over seq=2");
+            assert_eq!(tc.wal_seq(), 5, "within-lease tiebreaker: seq=5 wins over seq=2");
             assert_eq!(result.batches_applied, 1);
 
             tc.close().await;
@@ -2075,7 +2075,7 @@ mod tests {
             dl.insert(path_4_6, data_4_6);
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 6);
+            assert_eq!(tc.wal_seq(), 6);
             assert_eq!(result.batches_applied, 1);
 
             tc.close().await;
@@ -2102,7 +2102,7 @@ mod tests {
             dl.insert(path_self, data_self);
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 5);
+            assert_eq!(tc.wal_seq(), 5);
             assert_eq!(result.batches_applied, 1);
 
             // Self-uploaded batch must NOT be deleted - the other node may need it
@@ -2144,7 +2144,7 @@ mod tests {
     #[test]
     fn contained_batch_skipped_when_wider_applied_first() {
         // Large batch [1-20] applied first. Smaller [5-10] is fully behind
-        // next_wal_index after that, so it's never downloaded.
+        // next_wal_seq after that, so it's never downloaded.
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let tc = TestComponents::new(&dir).await;
@@ -2156,7 +2156,7 @@ mod tests {
             dl.insert(path_stale, data_stale);
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 20);
+            assert_eq!(tc.wal_seq(), 20);
             assert_eq!(result.batches_applied, 1);
 
             tc.close().await;
@@ -2164,7 +2164,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_overlap_does_not_trigger_wal_index_gap() {
+    fn partial_overlap_does_not_trigger_wal_seq_gap() {
         // Two batches from different leadership terms that partially overlap.
         // The contiguity check must allow overlaps (got < expected), only forward
         // gaps are fatal. The apply path handles divergence via TipHashMismatch.
@@ -2181,10 +2181,10 @@ mod tests {
             dl.insert(path_b, data_b);
 
             let result = tc.catchup(&dl, 0, 10).await;
-            // Must NOT be WalIndexGap. overlaps are allowed
+            // Must NOT be WalSeqGap. overlaps are allowed
             assert!(
-                !matches!(result, Err(S3CatchupError::WalIndexGap { .. })),
-                "Overlapping batches must not trigger WalIndexGap, got: {:?}",
+                !matches!(result, Err(S3CatchupError::WalSeqGap { .. })),
+                "Overlapping batches must not trigger WalSeqGap, got: {:?}",
                 result
             );
 
@@ -2206,7 +2206,7 @@ mod tests {
             dl.insert(path_b, data_b);
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 5);
+            assert_eq!(tc.wal_seq(), 5);
             assert_eq!(result.batches_applied, 1);
 
             tc.close().await;
@@ -2217,7 +2217,7 @@ mod tests {
     fn unknown_node_batches_ignored_when_peer_known() {
         // Stale S3 batches from a previous cluster generation (different node_ids)
         // must be ignored when the current peer is known. This prevents
-        // WalIndexGap errors from leftover data after a partial teardown.
+        // WalSeqGap errors from leftover data after a partial teardown.
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let tc = TestComponents::new(&dir).await;
@@ -2230,13 +2230,13 @@ mod tests {
             let (path_peer, data_peer) = make_fallback_batch_with_node(0, 1, 5, GENESIS_HASH, peer_id);
             dl.insert(path_peer, data_peer);
 
-            // Batch 10-15 from stale node - would cause WalIndexGap if not filtered
+            // Batch 10-15 from stale node - would cause WalSeqGap if not filtered
             let (path_stale, data_stale) = make_fallback_batch_with_node(0, 10, 15, GENESIS_HASH, stale_id);
             let stale_path = path_stale.clone();
             dl.insert(path_stale, data_stale);
 
             let result = tc.catchup_with_peer(&dl, 0, Some(peer_id)).await.unwrap();
-            assert_eq!(tc.wal_index(), 5);
+            assert_eq!(tc.wal_seq(), 5);
             assert_eq!(result.batches_applied, 1);
 
             // Stale batch must not be deleted (not our responsibility)
@@ -2259,7 +2259,7 @@ mod tests {
             dl.insert(path, data);
 
             let result = tc.catchup_with_peer(&dl, 0, None).await.unwrap();
-            assert_eq!(tc.wal_index(), 5);
+            assert_eq!(tc.wal_seq(), 5);
             assert_eq!(result.batches_applied, 1);
 
             tc.close().await;
@@ -2280,7 +2280,7 @@ mod tests {
             let (path, data) = make_fallback_batch(0, 1, 47, GENESIS_HASH);
             dl.insert(path, data);
             tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 47);
+            assert_eq!(tc.wal_seq(), 47);
             let tip = tc.tip_hash();
 
             // Stale: seq=1, ends at 52. Winner: seq=2, ends at 60.
@@ -2290,7 +2290,7 @@ mod tests {
             dl.insert(path_winner, data_winner);
 
             tc.catchup(&dl, 0, 10).await.unwrap();
-            assert_eq!(tc.wal_index(), 60, "winner (seq=2, end=60) should be applied, not stale (seq=1, end=52)");
+            assert_eq!(tc.wal_seq(), 60, "winner (seq=2, end=60) should be applied, not stale (seq=1, end=52)");
 
             tc.close().await;
         });

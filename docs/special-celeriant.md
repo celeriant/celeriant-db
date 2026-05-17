@@ -114,9 +114,9 @@ The system auto-selects inline vs block storage transparently. Compression still
 
 Every metablock includes the hash of its predecessor, forming a tamper-evident chain. But the datablock position is explicitly excluded from the hash, because that's a node-local offset that legitimately differs between leader and follower.
 
-This means the follower can verify WAL integrity via the hash chain even though its physical on-disk layout differs from the leader's. Before accepting replicated data, the follower validates both WAL index continuity and the previous tip hash. You get an immutable audit log for free.
+This means the follower can verify WAL integrity via the hash chain even though its physical on-disk layout differs from the leader's. Before accepting replicated data, the follower validates both WAL sequence continuity and the previous tip hash. You get an immutable audit log for free.
 
-The hash chain carries over across log file rotations — the new file's header picks up the WAL index and tip hash from the previous file, maintaining continuity.
+The hash chain carries over across log file rotations — the new file's header picks up the WAL sequence and tip hash from the previous file, maintaining continuity.
 
 ## 13. Anti-Scan-Pollution in the Cache
 
@@ -132,7 +132,7 @@ The stream is unbound from the current executor, sent through the intrashard mes
 
 ## 15. Visibility Filtering in the Read Cache
 
-Each cached write carries the WAL index that produced it. When reading from cache, the reader supplies the highest WAL index that's safe to serve — the replication frontier. Writes beyond that boundary are silently excluded.
+Each cached write carries the WAL sequence that produced it. When reading from cache, the reader supplies the highest WAL sequence that's safe to serve — the replication frontier. Writes beyond that boundary are silently excluded.
 
 The hot cache can hold speculative pre-replication data without ever leaking it to readers. The visibility boundary is a runtime parameter, not a cache eviction concern.
 
@@ -142,7 +142,7 @@ The same 32-byte storage is used for two different purposes. If an event batch h
 
 ## 17. Zero-Copy Metablock Field Access
 
-Metablock fields are read directly from raw byte slices at hardcoded offsets — no deserialisation needed. The reverse WAL scanner can check aggregate key membership, read batch indexes, and apply filters without ever allocating. On the hot scan path, it's pure pointer arithmetic.
+Metablock fields are read directly from raw byte slices at hardcoded offsets — no deserialisation needed. The reverse WAL scanner can check aggregate key membership, read aggregate versions, and apply filters without ever allocating. On the hot scan path, it's pure pointer arithmetic.
 
 All metablocks define precise offset and wire size constants for fixed-size layout guarantees. Compile-time size assertions verify everything fits.
 
@@ -189,7 +189,7 @@ Composite keys (aggregate key, aggregate+client key, aggregate+type key) store a
 
 ## 24. O(1) Batch Lookup via Tracked Starting Index
 
-Recent writes for an aggregate are stored in a ring buffer with a tracked starting batch index. Since batch indexes are monotonic with no gaps, any batch can be looked up in O(1) by subtracting the starting index. No HashMap, no search.
+Recent writes for an aggregate are stored in a ring buffer with a tracked starting aggregate version. Since aggregate versions are monotonic with no gaps, any batch can be looked up in O(1) by subtracting the starting index. No HashMap, no search.
 
 ## 25. Separate Connections for Replication and Heartbeat
 

@@ -73,9 +73,9 @@ struct AggregateTrackingState {
     delete_count: AtomicU64,
     /// Whether this aggregate currently exists (not deleted)
     exists: AtomicBool,
-    /// Last event batch index written
+    /// Last aggregate version written
     #[allow(dead_code)]
-    last_event_batch_index: AtomicU64,
+    last_aggregate_version: AtomicU64,
 }
 
 /// Global tracking state shared across all workers
@@ -483,7 +483,7 @@ async fn run_writer_task(
     state: Arc<GlobalTrackingState>,
 ) -> Result<(), String> {
     let mut rng = StdRng::from_entropy();
-    let mut event_index = 0u64;
+    let mut event_seq = 0u64;
 
     barrier.wait().await;
 
@@ -491,8 +491,8 @@ async fn run_writer_task(
 
     while Instant::now() < deadline {
         // Pick a random aggregate
-        let aggregate_index = rng.gen_range(0..TOTAL_AGGREGATES);
-        let aggregate_key = index_to_aggregate_key(aggregate_index);
+        let aggregate_version = rng.gen_range(0..TOTAL_AGGREGATES);
+        let aggregate_key = index_to_aggregate_key(aggregate_version);
 
         // Decide whether to delete or write
         let should_delete = rng.gen_ratio(1, DELETE_PROBABILITY);
@@ -503,8 +503,8 @@ async fn run_writer_task(
                 aggregate_key.clone(),
                 SingleAggregateDelete {
                     allow_recreate: true,
-                    allow_index_continuation: false,
-                    expected_event_batch_index: None,
+                    allow_sequence_continuation: false,
+                    expected_version: None,
                 },
             );
             // Delete request (allow_recreate = true so future writes work)
@@ -520,7 +520,7 @@ async fn run_writer_task(
                 .await
             {
                 Ok(_) => {
-                    state.record_delete(aggregate_index);
+                    state.record_delete(aggregate_version);
                 }
                 Err(ClientError::Server(ref err)) => {
                     use celeriant_client_tokio::server_error::{DeleteError, ReadError, ServerError};
@@ -548,8 +548,8 @@ async fn run_writer_task(
             let payload = generate_random_payload(&mut rng, payload_size);
 
             let event = DatablockAggregateEvent {
-                client_event_index: event_index,
-                event_index: 0,
+                client_seq: event_seq,
+                event_seq: 0,
                 event_id: Some(rng.r#gen()),
                 event_timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -567,7 +567,7 @@ async fn run_writer_task(
                 SingleAggregateWrite {
                     events: vec![event],
                     allow_create: true,
-                    expected_event_batch_index: None,
+                    expected_version: None,
                     enforce_client_idempotency: false,
                 },
             );
@@ -585,9 +585,9 @@ async fn run_writer_task(
             {
                 Ok(_) => {
                     state
-                        .record_write(aggregate_index, &aggregate_key, payload_size as u64)
+                        .record_write(aggregate_version, &aggregate_key, payload_size as u64)
                         .await;
-                    event_index += 1;
+                    event_seq += 1;
                 }
                 Err(ClientError::Server(err)) => {
                     eprintln!("[Writer {}] Write error: {}", worker_id, err);
@@ -624,8 +624,8 @@ async fn run_reader_task(
 
     while Instant::now() < deadline {
         // Pick a random aggregate to read
-        let aggregate_index = rng.gen_range(0..TOTAL_AGGREGATES);
-        let aggregate_key = index_to_aggregate_key(aggregate_index);
+        let aggregate_version = rng.gen_range(0..TOTAL_AGGREGATES);
+        let aggregate_key = index_to_aggregate_key(aggregate_version);
 
         let request = ClientRequest::Read(ReadRequest {
             correlation_id: None,

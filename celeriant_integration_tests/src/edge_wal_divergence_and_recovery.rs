@@ -15,14 +15,14 @@
 //! 2. Copy A's shard data to B (simulates B being a synced follower via replication).
 //! 3. Start A standalone, write events 6-8 (large, divergent).
 //!    Simulates unreplicated fsyncs on A's disk when the leader process crashed.
-//!    A: wal_index=8, tip_hash diverges from B's starting at entry 6.
+//!    A: wal_seq=8, tip_hash diverges from B's starting at entry 6.
 //! 4. Start B as distributed leader. B writes events 6-14 (small, different bytes).
-//!    B: wal_index=14. S3 has events 1-5 (Phase 1) + events 6-14 (Phase 4).
+//!    B: wal_seq=14. S3 has events 1-5 (Phase 1) + events 6-14 (Phase 4).
 //!    Old S3 batches from Phase 1 are still present — the divergence repair must
 //!    identify WAL 5 as the common ancestor, not roll back to an earlier S3 batch.
-//! 5. Start A as distributed follower (divergent wal_index=8).
-//!    A does S3 catchup, detects TipHashMismatch, truncates WAL back to wal_index=5,
-//!    re-applies events 6-14 from S3 -> wal_index=14, converged with B.
+//! 5. Start A as distributed follower (divergent wal_seq=8).
+//!    A does S3 catchup, detects TipHashMismatch, truncates WAL back to wal_seq=5,
+//!    re-applies events 6-14 from S3 -> wal_seq=14, converged with B.
 //! 6. Verify A is alive with 14 events, B still healthy with 14 events.
 //! 7. Write events 15-16 to B, verify they replicate to A.
 //!
@@ -115,7 +115,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let count_a = count_events(&mut client_a, &aggregate_key).await?;
     assert_eq!(count_a, 5, "Node A should have 5 events, got {}", count_a);
-    println!("  Node A has {} events (wal_index=5)", count_a);
+    println!("  Node A has {} events (wal_seq=5)", count_a);
 
     println!("  Waiting 4s for S3 fallback writes for events 1-5...");
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -171,7 +171,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         count_a
     );
     println!(
-        "  A has {} events (wal_index=8, divergent tip_hash from entry 6 onward)",
+        "  A has {} events (wal_seq=8, divergent tip_hash from entry 6 onward)",
         count_a
     );
 
@@ -228,7 +228,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         count_b
     );
     println!(
-        "  B has {} events (wal_index=14). tip_hash at 6 differs from A.",
+        "  B has {} events (wal_seq=14). tip_hash at 6 differs from A.",
         count_b
     );
 
@@ -248,16 +248,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  S3 fallback batches present (events 1-5 from Phase 1, events 6-14 from Phase 4)\n");
 
     // ========================================
-    // Phase 5: Start A as distributed follower (divergent wal_index=8).
+    // Phase 5: Start A as distributed follower (divergent wal_seq=8).
     //          S3 has old batches (events 1-5) AND new batches (events 6-14).
     //          A does S3 catchup:
     //          - Encounters batch from B overlapping A's divergent range
     //          - TipHashMismatch detected (B's hash at 6 != A's hash at 6)
     //          - find_divergence_via_s3 must identify WAL 5 as common ancestor,
     //            NOT roll back to WAL 2 or earlier despite old S3 batches existing
-    //          - A truncates WAL to wal_index=5, re-applies 6-14 from S3
+    //          - A truncates WAL to wal_seq=5, re-applies 6-14 from S3
     // ========================================
-    println!("PHASE 5: Start A as distributed follower (divergent WAL at wal_index=8)");
+    println!("PHASE 5: Start A as distributed follower (divergent WAL at wal_seq=8)");
     println!("-----------------------------------------------------------------------");
 
     drop(client_b);

@@ -42,8 +42,8 @@ fn create_large_event(event_num: u64, payload_size: usize) -> DatablockAggregate
     payload.push_str("\"}");
 
     DatablockAggregateEvent {
-        client_event_index: event_num,
-        event_index: 0,
+        client_seq: event_num,
+        event_seq: 0,
         event_id: None,
         event_timestamp: 1000 + event_num,
         event_type_major: 100,
@@ -80,7 +80,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             SingleAggregateWrite {
                 events: vec![event],
                 allow_create: true,
-                expected_event_batch_index: Some(0),
+                expected_version: Some(0),
                 enforce_client_idempotency: false,
             },
         );

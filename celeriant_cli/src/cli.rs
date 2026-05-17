@@ -133,11 +133,11 @@ pub struct ReadArgs {
     #[command(flatten)]
     pub key: AggregateKeyArgs,
 
-    /// Starting event batch index (1-based)
+    /// Starting aggregate version (1-based)
     #[arg(long, default_value = "1")]
     pub from: u64,
 
-    /// Ending event batch index (inclusive)
+    /// Ending aggregate version (inclusive)
     #[arg(long)]
     pub to: Option<u64>,
 
@@ -179,19 +179,19 @@ pub struct ReadArgs {
 
     /// Minimum event index
     #[arg(long)]
-    pub min_event_index: Option<u64>,
+    pub min_event_seq: Option<u64>,
 
     /// Maximum event index
     #[arg(long)]
-    pub max_event_index: Option<u64>,
+    pub max_event_seq: Option<u64>,
 
     /// Minimum client event index
     #[arg(long)]
-    pub min_client_event_index: Option<u64>,
+    pub min_client_seq: Option<u64>,
 
     /// Maximum client event index
     #[arg(long)]
-    pub max_client_event_index: Option<u64>,
+    pub max_client_seq: Option<u64>,
 
     /// Output format
     #[arg(long, value_enum, default_value = "json")]
@@ -215,13 +215,13 @@ pub struct DeleteArgs {
     #[arg(long)]
     pub allow_recreate: bool,
 
-    /// On recreation after delete, continue from last batch and event indexes instead of resetting
+    /// On recreation after delete, continue from last batch and event sequences instead of resetting
     #[arg(long)]
-    pub allow_index_continuation: bool,
+    pub allow_sequence_continuation: bool,
 
-    /// Expected event batch index (for optimistic concurrency)
+    /// Expected version (for optimistic concurrency)
     #[arg(long)]
-    pub expected_index: Option<u64>,
+    pub expected_version: Option<u64>,
 }
 
 #[derive(Args, Clone)]
@@ -253,9 +253,9 @@ pub struct WriteArgs {
     #[arg(long)]
     pub allow_create: bool,
 
-    /// Expected event batch index (for optimistic concurrency)
+    /// Expected version (for optimistic concurrency)
     #[arg(long)]
-    pub expected_index: Option<u64>,
+    pub expected_version: Option<u64>,
 
     /// Enforce client idempotency
     #[arg(long)]
@@ -276,7 +276,7 @@ pub struct TrimArgs {
     #[arg(long, value_parser = parse_u128)]
     pub user_id: Option<u128>,
 
-    /// Keep events from this batch index onwards
+    /// Keep events from this aggregate version onwards
     #[arg(long)]
     pub keep_from: u64,
 }

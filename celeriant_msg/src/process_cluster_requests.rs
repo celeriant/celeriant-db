@@ -130,14 +130,14 @@ mod tests {
                 correlation_id: Some(0x4444_5555_6666_7777),
                 shard_id: 2,
                 leader_timestamp_ms: 9999999,
-                leader_confirmed_wal_index: 12345,
+                leader_confirmed_wal_seq: 12345,
                 batches: vec![],
             }),
             ClusterRequestType::Heartbeat => ClusterRequest::Heartbeat(HeartbeatRequest {
                 correlation_id: Some(0x6666_7777_8888_9999),
                 shard_id: 0,
                 leader_timestamp_ms: 1234567890123,
-                lease_index: 7,
+                lease_epoch: 7,
             }),
             ClusterRequestType::KickFollower => ClusterRequest::KickFollower(KickFollowerRequest {
                 correlation_id: Some(0x7777_8888_9999_AAAA),

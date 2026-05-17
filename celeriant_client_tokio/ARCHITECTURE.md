@@ -137,7 +137,7 @@ If `max_shard_hint` is provided, the multi-shard path is taken directly without 
 
 ### ReadAllIterator: paginated streaming reads
 
-Follows `next_event_batch_index` cursors automatically, buffering event batches and yielding them one at a time. Exhaustion is detected when the server returns no next cursor.
+Follows `next_aggregate_version` cursors automatically, buffering event batches and yielding them one at a time. Exhaustion is detected when the server returns no next cursor.
 
 ### Shard discovery via probing
 

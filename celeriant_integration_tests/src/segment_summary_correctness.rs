@@ -125,8 +125,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         AggregateKey::new(2, 10, 200),
         SingleAggregateDelete {
             allow_recreate: false,
-            allow_index_continuation: false,
-            expected_event_batch_index: None,
+            allow_sequence_continuation: false,
+            expected_version: None,
         },
     );
     let req = ClientRequest::Delete(DeleteRequest {
@@ -183,22 +183,22 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     write_event(&mut client, &trim_key, 4, false).await?;
     write_event(&mut client, &trim_key, 5, false).await?;
 
-    // Check min_event_batch_index before trim
+    // Check min_aggregate_version before trim
     let aggs = ListAggregatesIterator::new(&mut client, Some(1), Some(10), options.clone())
         .collect()
         .await?;
     let before = aggs.iter().find(|a| a.aggregate_id == 888).unwrap();
     println!(
-        "Before trim: min_event_batch_index={}, max_event_batch_index={}",
-        before.min_event_batch_index, before.max_event_batch_index
+        "Before trim: min_aggregate_version={}, max_aggregate_version={}",
+        before.min_aggregate_version, before.max_aggregate_version
     );
-    let original_min = before.min_event_batch_index;
+    let original_min = before.min_aggregate_version;
 
-    // Trim: keep from batch index 3 onwards
+    // Trim: keep from version 3 onwards
     let req = TrimStartRequest {
         correlation_id: Some(200),
         aggregate_key: trim_key.clone(),
-        keep_from_event_batch_index: 3,
+        keep_from_aggregate_version: 3,
         client_id: 999,
         user_id: Some(888),
     };
@@ -211,13 +211,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let after = aggs.iter().find(|a| a.aggregate_id == 888).unwrap();
     println!(
-        "After trim: min_event_batch_index={}, max_event_batch_index={}",
-        after.min_event_batch_index, after.max_event_batch_index
+        "After trim: min_aggregate_version={}, max_aggregate_version={}",
+        after.min_aggregate_version, after.max_aggregate_version
     );
     assert!(
-        after.min_event_batch_index > original_min,
-        "min_event_batch_index should increase after trim (was {}, now {})",
-        original_min, after.min_event_batch_index
+        after.min_aggregate_version > original_min,
+        "min_aggregate_version should increase after trim (was {}, now {})",
+        original_min, after.min_aggregate_version
     );
 
     println!("Sub-test 3 PASSED");
@@ -236,8 +236,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         recreate_key.clone(),
         SingleAggregateDelete {
             allow_recreate: true,
-            allow_index_continuation: false,
-            expected_event_batch_index: None,
+            allow_sequence_continuation: false,
+            expected_version: None,
         },
     );
     let req = ClientRequest::Delete(DeleteRequest {

@@ -35,7 +35,7 @@ const MAX_PAYLOAD_SIZE: usize = 5 * 1024 * 1024; // 5MB
 
 // Shared state between reader and writer for an aggregate
 struct AggregateState {
-    latest_event_batch_index: AtomicU64,
+    latest_aggregate_version: AtomicU64,
     write_count: AtomicU64,
     read_count: AtomicU64,
     write_errors: AtomicU64,
@@ -45,7 +45,7 @@ struct AggregateState {
 impl AggregateState {
     fn new() -> Self {
         Self {
-            latest_event_batch_index: AtomicU64::new(0),
+            latest_aggregate_version: AtomicU64::new(0),
             write_count: AtomicU64::new(0),
             read_count: AtomicU64::new(0),
             write_errors: AtomicU64::new(0),
@@ -249,7 +249,7 @@ async fn run_writer_task(
 
     let mut rng = StdRng::from_entropy();
     let mut total_bytes_written = 0u64;
-    let mut event_index = 0u64;
+    let mut event_seq = 0u64;
 
     // Wait for all tasks to be ready
     barrier.wait().await;
@@ -262,8 +262,8 @@ async fn run_writer_task(
         let payload = generate_random_payload(&mut rng, payload_size);
 
         let event = DatablockAggregateEvent {
-            client_event_index: event_index,
-            event_index: 0,
+            client_seq: event_seq,
+            event_seq: 0,
             event_id: Some(rng.r#gen()),
             event_timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -281,7 +281,7 @@ async fn run_writer_task(
             SingleAggregateWrite {
                 events: vec![event],
                 allow_create: true,
-                expected_event_batch_index: None,
+                expected_version: None,
                 enforce_client_idempotency: false,
             },
         );
@@ -299,13 +299,13 @@ async fn run_writer_task(
         {
             Ok(_) => {
                 state.write_count.fetch_add(1, Ordering::Relaxed);
-                event_index += 1;
+                event_seq += 1;
                 total_bytes_written += payload_size as u64;
 
-                // Update latest batch index (assume sequential)
+                // Update latest aggregate version (assume sequential)
                 state
-                    .latest_event_batch_index
-                    .fetch_max(event_index, Ordering::Release);
+                    .latest_aggregate_version
+                    .fetch_max(event_seq, Ordering::Release);
             }
             Err(ClientError::Server(err)) => {
                 eprintln!("[Writer {}] Server error: {}", aggregate_id, err);
@@ -348,7 +348,7 @@ async fn run_reader_task(
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     while Instant::now() < deadline {
-        let latest_batch = state.latest_event_batch_index.load(Ordering::Acquire);
+        let latest_batch = state.latest_aggregate_version.load(Ordering::Acquire);
 
         // Only read if there's something to read
         if latest_batch == 0 {
@@ -362,7 +362,7 @@ async fn run_reader_task(
         let request = ClientRequest::Read(ReadRequest {
             correlation_id: None,
             aggregate_key: aggregate_key.clone(),
-            filters: ReadFilters::new(from_batch).to_event_batch_index(latest_batch),
+            filters: ReadFilters::new(from_batch).to_aggregate_version(latest_batch),
         });
 
         match client

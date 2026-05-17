@@ -29,10 +29,10 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 fn make_datablock(payload_size: usize) -> Datablock {
     Datablock {
         datablock_kind: DatablockKind::EventBatchItem(DatablockAggregateEventBatch {
-            event_batch_index: 1,
+            aggregate_version: 1,
             events: vec![DatablockAggregateEvent {
-                client_event_index: 1,
-                event_index: 1,
+                client_seq: 1,
+                event_seq: 1,
                 event_id: Some(0xAA),
                 event_timestamp: 1_700_000_000,
                 event_type_major: 1,

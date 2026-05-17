@@ -84,12 +84,12 @@
       "options": { "colorMode": "background", "graphMode": "none" }
     },
     {
-      "title": "WAL Index (max per node)",
-      "description": "Highest WAL index across shards on each node. Diverging across nodes = replication lag.",
+      "title": "WAL Sequence (max per node)",
+      "description": "Highest WAL sequence across shards on each node. Diverging across nodes = replication lag.",
       "type": "stat",
       "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
-      "targets": [{ "expr": "max by (instance) (celeriant_wal_index{instance=~\"$instance\"})", "legendFormat": "{{instance}}" }],
+      "targets": [{ "expr": "max by (instance) (celeriant_wal_seq{instance=~\"$instance\"})", "legendFormat": "{{instance}}" }],
       "options": { "graphMode": "none" }
     },
 
@@ -367,11 +367,11 @@
 
     { "title": "Tier 2 — WAL & Storage", "type": "row", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 79 }, "collapsed": false },
     {
-      "title": "WAL Index (max per node)",
+      "title": "WAL Sequence (max per node)",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 80 },
-      "targets": [{ "expr": "max by (instance) (celeriant_wal_index{instance=~\"$instance\"})", "legendFormat": "{{instance}}" }]
+      "targets": [{ "expr": "max by (instance) (celeriant_wal_seq{instance=~\"$instance\"})", "legendFormat": "{{instance}}" }]
     },
     {
       "title": "Log Segments",
@@ -416,11 +416,11 @@
 
     { "title": "Tier 3 — Per-Shard Drill-Down (filter via $shard_id)", "type": "row", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 97 }, "collapsed": true, "panels": [
       {
-        "title": "WAL Index by Shard",
+        "title": "WAL Sequence by Shard",
         "type": "timeseries",
         "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
         "gridPos": { "h": 8, "w": 12, "x": 0, "y": 98 },
-        "targets": [{ "expr": "celeriant_wal_index{instance=~\"$instance\", shard_id=~\"$shard_id\"}", "legendFormat": "{{instance}} shard={{shard_id}}" }]
+        "targets": [{ "expr": "celeriant_wal_seq{instance=~\"$instance\", shard_id=~\"$shard_id\"}", "legendFormat": "{{instance}} shard={{shard_id}}" }]
       },
       {
         "title": "Replication Health Signals by Shard",
@@ -475,7 +475,7 @@
         "type": "query",
         "label": "Shard",
         "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
-        "query": { "query": "label_values(celeriant_wal_index, shard_id)", "refId": "Variable" },
+        "query": { "query": "label_values(celeriant_wal_seq, shard_id)", "refId": "Variable" },
         "multi": true,
         "includeAll": true,
         "current": { "text": "All", "value": "$__all" },

@@ -10,8 +10,8 @@ fn parse_u64_field(json: &str, field: &str) -> Option<u64> {
 #[derive(Debug)]
 pub enum ReadError {
     UnavailableBatchIndex {
-        requested_batch_index: Option<u64>,
-        minimum_available_batch_index: Option<u64>,
+        requested_version: Option<u64>,
+        minimum_available_version: Option<u64>,
     },
     AggregateNotExists,
     CacheLoadLockTimeout,
@@ -25,12 +25,12 @@ pub enum WriteError {
     EmptyEventsList,
     ZeroEventType,
     ClientIdempotencyViolation {
-        last_client_event_index: Option<u64>,
-        attempted_client_event_index: Option<u64>,
+        last_client_seq: Option<u64>,
+        attempted_client_seq: Option<u64>,
     },
     OptimisticConcurrencyViolation {
-        expected_event_batch_index: Option<u64>,
-        current_event_batch_index: Option<u64>,
+        expected_version: Option<u64>,
+        current_aggregate_version: Option<u64>,
     },
     FailedToSerialiseDatablocks,
     AggregateNotExists,
@@ -60,8 +60,8 @@ pub enum DeleteError {
     AggregateNotExists,
     EmptyDeleteList,
     OptimisticConcurrencyViolation {
-        expected_event_batch_index: Option<u64>,
-        current_event_batch_index: Option<u64>,
+        expected_version: Option<u64>,
+        current_aggregate_version: Option<u64>,
     },
     CacheError,
     ReplicationError,
@@ -125,10 +125,10 @@ impl From<ErrorResponse> for ServerError {
         let code = e.error_code;
         let msg = e.error_message;
         match code {
-            READ_UNAVAILABLE_BATCH_INDEX => ServerError::Read {
+            READ_UNAVAILABLE_VERSION => ServerError::Read {
                 kind: ReadError::UnavailableBatchIndex {
-                    requested_batch_index: parse_u64_field(&msg, "requested"),
-                    minimum_available_batch_index: parse_u64_field(&msg, "minimum_available"),
+                    requested_version: parse_u64_field(&msg, "requested"),
+                    minimum_available_version: parse_u64_field(&msg, "minimum_available"),
                 },
                 error_message: msg,
             },
@@ -142,15 +142,15 @@ impl From<ErrorResponse> for ServerError {
             WRITE_ZERO_EVENT_TYPE => ServerError::Write { kind: WriteError::ZeroEventType, error_message: msg },
             WRITE_CLIENT_IDEMPOTENCY_VIOLATION => ServerError::Write {
                 kind: WriteError::ClientIdempotencyViolation {
-                    last_client_event_index: parse_u64_field(&msg, "last_client_event_index"),
-                    attempted_client_event_index: parse_u64_field(&msg, "attempted_client_event_index"),
+                    last_client_seq: parse_u64_field(&msg, "last_client_seq"),
+                    attempted_client_seq: parse_u64_field(&msg, "attempted_client_seq"),
                 },
                 error_message: msg,
             },
             WRITE_OPTIMISTIC_CONCURRENCY_VIOLATION => ServerError::Write {
                 kind: WriteError::OptimisticConcurrencyViolation {
-                    expected_event_batch_index: parse_u64_field(&msg, "expected_event_batch_index"),
-                    current_event_batch_index: parse_u64_field(&msg, "current_event_batch_index"),
+                    expected_version: parse_u64_field(&msg, "expected_version"),
+                    current_aggregate_version: parse_u64_field(&msg, "current_aggregate_version"),
                 },
                 error_message: msg,
             },
@@ -183,8 +183,8 @@ impl From<ErrorResponse> for ServerError {
             DELETE_EMPTY_DELETE_LIST => ServerError::Delete { kind: DeleteError::EmptyDeleteList, error_message: msg },
             DELETE_OPTIMISTIC_CONCURRENCY_VIOLATION => ServerError::Delete {
                 kind: DeleteError::OptimisticConcurrencyViolation {
-                    expected_event_batch_index: parse_u64_field(&msg, "expected_event_batch_index"),
-                    current_event_batch_index: parse_u64_field(&msg, "current_event_batch_index"),
+                    expected_version: parse_u64_field(&msg, "expected_version"),
+                    current_aggregate_version: parse_u64_field(&msg, "current_aggregate_version"),
                 },
                 error_message: msg,
             },
@@ -196,7 +196,7 @@ impl From<ErrorResponse> for ServerError {
                 ServerError::List { error_code: code, error_message: msg }
             }
 
-            REPLICATION_BATCH_FSYNC | REPLICATION_BATCH_SERIALISE_DATABLOCKS | REPLICATION_BATCH_WAL_INDEX_GAP => {
+            REPLICATION_BATCH_FSYNC | REPLICATION_BATCH_SERIALISE_DATABLOCKS | REPLICATION_BATCH_WAL_SEQ_GAP => {
                 ServerError::Replication { error_code: code, error_message: msg }
             }
 
@@ -232,7 +232,7 @@ impl From<ErrorResponse> for ServerError {
 impl std::fmt::Display for ReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ReadError::UnavailableBatchIndex { .. } => write!(f, "unavailable batch index"),
+            ReadError::UnavailableBatchIndex { .. } => write!(f, "unavailable aggregate version"),
             ReadError::AggregateNotExists => write!(f, "aggregate not exists"),
             ReadError::CacheLoadLockTimeout => write!(f, "cache load lock timeout"),
             ReadError::CacheLoadFileScan => write!(f, "cache load file scan"),

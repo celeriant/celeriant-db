@@ -196,7 +196,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_secs(4)).await;
 
     // ── Phase 4: A rejoins as distributed follower — truncate + S3 catchup ──
-    println!("\nPhase 4: Restart A as distributed follower (divergent WAL at wal_index={})...",
+    println!("\nPhase 4: Restart A as distributed follower (divergent WAL at wal_seq={})...",
         PHASE_1_EVENTS + PHASE_2_EVENTS);
     node_a.restart_with_config(cluster_config_a).await?;
 

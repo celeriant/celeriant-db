@@ -6,12 +6,12 @@
 //! Scenario:
 //! 1. Start 2-node cluster with S3
 //! 2. Write events to verify cluster health
-//! 3. Note initial lease_index from S3
+//! 3. Note initial lease_epoch from S3
 //! 4. Stop BOTH nodes simultaneously
 //! 5. Start both nodes nearly simultaneously (100-500ms apart)
 //! 6. Wait for election (~8s)
 //! 7. Verify exactly one leader via is_leader() on both nodes
-//! 8. Verify lease_index did not regress in S3 (bumps only if a different node won the race)
+//! 8. Verify lease_epoch did not regress in S3 (bumps only if a different node won the race)
 //! 9. Verify cluster is functional (write + read succeeds)
 //!
 //! Run with: cargo run --bin p2_2_dual_restart_main
@@ -101,10 +101,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let lease_initial = deserialise_lease(&lease_initial_bytes)
         .map_err(|e| format!("Failed to deserialise initial lease: {:?}", e))?;
 
-    println!("  Initial lease: leader_node_id={:x}, lease_index={}",
-        lease_initial.leader_node_id, lease_initial.lease_index);
-    let initial_lease_index = lease_initial.lease_index;
-    println!("  ✓ Initial state verified: lease_index={}\n", initial_lease_index);
+    println!("  Initial lease: leader_node_id={:x}, lease_epoch={}",
+        lease_initial.leader_node_id, lease_initial.lease_epoch);
+    let initial_lease_epoch = lease_initial.lease_epoch;
+    println!("  ✓ Initial state verified: lease_epoch={}\n", initial_lease_epoch);
 
     // ========================================
     // PHASE 2: Stop BOTH nodes
@@ -166,24 +166,24 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  ✓ Exactly one leader elected\n");
 
     // ========================================
-    // PHASE 5: Verify lease_index incremented in S3
+    // PHASE 5: Verify lease_epoch incremented in S3
     // ========================================
-    println!("PHASE 5: Verify lease_index incremented in S3");
+    println!("PHASE 5: Verify lease_epoch incremented in S3");
     println!("-----------------------------------------------");
 
     let lease_final_bytes = minio.get_object("cluster/lease.json").await?;
     let lease_final = deserialise_lease(&lease_final_bytes)
         .map_err(|e| format!("Failed to deserialise final lease: {:?}", e))?;
 
-    println!("  Final lease: leader_node_id={:x}, lease_index={}",
-        lease_final.leader_node_id, lease_final.lease_index);
+    println!("  Final lease: leader_node_id={:x}, lease_epoch={}",
+        lease_final.leader_node_id, lease_final.lease_epoch);
 
     assert!(
-        lease_final.lease_index >= initial_lease_index,
-        "lease_index should not regress after dual restart: was {}, now {}",
-        initial_lease_index, lease_final.lease_index
+        lease_final.lease_epoch >= initial_lease_epoch,
+        "lease_epoch should not regress after dual restart: was {}, now {}",
+        initial_lease_epoch, lease_final.lease_epoch
     );
-    println!("  ✓ Lease monotonic: {} → {}\n", initial_lease_index, lease_final.lease_index);
+    println!("  ✓ Lease monotonic: {} → {}\n", initial_lease_epoch, lease_final.lease_epoch);
 
     // ========================================
     // PHASE 6: Verify cluster is functional
@@ -220,7 +220,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  - Both nodes stopped simultaneously");
     println!("  - Both nodes restarted nearly simultaneously");
     println!("  - Exactly one leader elected via S3 CAS race");
-    println!("  - lease_index incremented: {} → {}", initial_lease_index, lease_final.lease_index);
+    println!("  - lease_epoch incremented: {} → {}", initial_lease_epoch, lease_final.lease_epoch);
     println!("  - Cluster accepted writes post-restart");
     println!("  - Dual restart resolves cleanly without split-brain\n");
 

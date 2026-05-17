@@ -13,7 +13,7 @@ struct Entry {
 
 /// In-memory HTTP-level idempotency cache with 90-second TTL and lazy eviction.
 /// Per-instance, non-durable — a convenience layer on top of Celeriant's infrastructure-level
-/// ClientEventIndex deduplication.
+/// ClientSeq deduplication.
 pub struct IdempotencyCache {
     entries: Mutex<HashMap<u128, Entry>>,
 }

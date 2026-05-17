@@ -76,7 +76,7 @@ Identify is handled on the client port before authentication, outside both enums
 
 | Type | ID | Size | Purpose |
 |------|----|------|---------|
-| `AggregateDetailsRequest` | 1 | Fixed | Get aggregate metadata: min/max batch index, deletion status, last op info |
+| `AggregateDetailsRequest` | 1 | Fixed | Get aggregate metadata: aggregate version, deletion status, last op info |
 | `ReadRequest` | 2 | Fixed | Read event batches with filters |
 | `WriteRequest` | 3 | Variable | Append events to one or more aggregates |
 | `TrimStartRequest` | 4 | Fixed | Remove old event batches from start |
@@ -91,7 +91,7 @@ Identify is handled on the client port before authentication, outside both enums
 
 | Type | ID | Size | Purpose |
 |------|----|------|---------|
-| `AggregateDetailsResponse` | 1 | Fixed | Aggregate metadata: min/max batch index, deletion status, recreate/index flags, last op |
+| `AggregateDetailsResponse` | 1 | Fixed | Aggregate metadata: aggregate version, deletion status, recreate/index flags, last op |
 | `ReadResponse` | 2 | Variable | Event batches + next cursor |
 | `SuccessResponse` | 3,4,5,12 | Fixed | Write/TrimStart/Delete/RegisterSchema success |
 | `ProtocolErrorResponse` | 6 | Fixed | Unreadable request (no correlation ID) |
@@ -131,7 +131,7 @@ Identify is handled on the client port before authentication, outside both enums
 | Type | Variants | Purpose |
 |------|----------|---------|
 | `ReplicationResult` | `Success { last_follower_metablock }`, `Rejected(FollowerRejection)` | Outcome of a replication batch |
-| `FollowerRejection` | `NotAFollower`, `TimeDriftTooHigh { leader_ms, follower_ms, max_allowed_ms }`, `WalIndexMismatch { max_follower_wal_index }`, `TipHashMismatch { follower, follower_wal_index, leader, leader_wal_index }`, `EmptyBatch`, `MissingDatablock`, `StaleLease { follower_lease_index, received_lease_index }` | Why follower refused batch |
+| `FollowerRejection` | `NotAFollower`, `TimeDriftTooHigh { leader_ms, follower_ms, max_allowed_ms }`, `WalSeqMismatch { max_follower_wal_seq }`, `TipHashMismatch { follower, follower_wal_seq, leader, leader_wal_seq }`, `EmptyBatch`, `MissingDatablock`, `StaleLease { follower_lease_epoch, received_lease_epoch }` | Why follower refused batch |
 | `HeartbeatResult` | `Ack { follower_timestamp_ms }`, `Rejected(HeartbeatRejection)` | Outcome of a heartbeat |
 | `HeartbeatRejection` | `ClockDriftTooHigh { leader_ms, follower_ms, max_allowed_ms }`, `NotAFollower` | Why follower refused heartbeat |
 
@@ -147,7 +147,7 @@ All error codes are defined in `error_codes.rs`. No other file should define `u3
 | 3xxx | Trim errors | `TRIM_NOT_LEADER` (3005), `TRIM_INDEX_OUT_OF_RANGE` (3004) |
 | 4xxx | Delete errors | `DELETE_NOT_LEADER` (4006), `DELETE_OPTIMISTIC_CONCURRENCY_VIOLATION` (4002) |
 | 5xxx | Listing errors | `LIST_ORGS_DISK_READ` (5000) |
-| 6xxx | Replication batch | `REPLICATION_BATCH_FSYNC` (6000), `REPLICATION_BATCH_WAL_INDEX_GAP` (6002) |
+| 6xxx | Replication batch | `REPLICATION_BATCH_FSYNC` (6000), `REPLICATION_BATCH_wal_seq_GAP` (6002) |
 | 7xxx | Exists/aggregate-details | `EXISTS_AGGREGATE_NOT_EXISTS` (7001) |
 | 8xxx | Watch errors | `WATCH_REQUEST_INVALID` (8000), `WATCH_LATENCY_TOO_HIGH` (8001) |
 | 9xxx | Shard routing | `SHARD_ROUTING_NO_KEY` (9000), `SHARD_ROUTING_MULTIPLE_SHARDS` (9001) |
@@ -176,11 +176,11 @@ Write and Delete support multiple aggregates per request. This enables atomic mu
 
 ### Read Filters and Watch Subscriptions
 
-`ReadFilters` supports rich querying (batch index range, client/user ID filters, server and client timestamp ranges, event type whitelist) without server-side indexing. `WatchRequest` supports filtering by shard, org, aggregate type, aggregate ID, and operation type, with an optional batching latency hint.
+`ReadFilters` supports rich querying (aggregate version range, client/user ID filters, server and client timestamp ranges, event type whitelist) without server-side indexing. `WatchRequest` supports filtering by shard, org, aggregate type, aggregate ID, and operation type, with an optional batching latency hint.
 
 ### Replication Protocol
 
-Leader-to-follower replication uses a push flow. Leader sends `ReplicationBatchRequest` containing a `Vec<ReplicationBatchItem>` (each item is a `Metablock` + optional `Datablock`). Follower validates WAL position and tip hash before applying, returning `ReplicationBatchResponse` with a `ReplicationResult`. `FollowerRejection` variants carry contextual data (timestamps, WAL indexes, hashes) so the leader can take corrective action.
+Leader-to-follower replication uses a push flow. Leader sends `ReplicationBatchRequest` containing a `Vec<ReplicationBatchItem>` (each item is a `Metablock` + optional `Datablock`). Follower validates WAL position and tip hash before applying, returning `ReplicationBatchResponse` with a `ReplicationResult`. `FollowerRejection` variants carry contextual data (timestamps, WAL sequencees, hashes) so the leader can take corrective action.
 
 ### Identify Flow
 

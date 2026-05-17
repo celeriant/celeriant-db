@@ -16,9 +16,9 @@ fn print_usage() {
 
 Commands:
   header                       Print front + rear ShardLogHeader fields
-  wal <wal_index>              Find metablock with the given wal_index
+  wal <wal_seq>              Find metablock with the given wal_seq
   range <start> <end>          Print all metablocks in [start..=end]
-  bounds                       Print first and last metablock wal_index in the file
+  bounds                       Print first and last metablock wal_seq in the file
 
 Examples:
   celeriant-wal-inspect /var/lib/celeriant/shard_003/log_1.wal header
@@ -42,11 +42,11 @@ fn print_header_block(label: &str, hdr: &ShardLogHeader) {
     println!("{label}:");
     println!("  metablocks_position           = {}", hdr.metablocks_position);
     println!("  datablocks_position           = {}", hdr.datablocks_position);
-    println!("  wal_index                     = {}", hdr.wal_index);
+    println!("  wal_seq                     = {}", hdr.wal_seq);
     println!("  tip_hash                      = {}", hex32(&hdr.tip_hash));
     println!(
-        "  last_received_repl_wal_index  = {}",
-        hdr.last_received_replication_wal_index
+        "  last_received_repl_wal_seq  = {}",
+        hdr.last_received_replication_wal_seq
     );
     let n_meta = (hdr
         .metablocks_position
@@ -57,8 +57,8 @@ fn print_header_block(label: &str, hdr: &ShardLogHeader) {
 
 fn print_metablock(mb: &Metablock, file_offset: u64) {
     println!(
-        "wal_index = {} | lease = {} | offset = {} | server_ts = {} | node = {:032x}",
-        mb.wal_index, mb.lease_index, file_offset, mb.server_timestamp, mb.node_id
+        "wal_seq = {} | lease = {} | offset = {} | server_ts = {} | node = {:032x}",
+        mb.wal_seq, mb.lease_epoch, file_offset, mb.server_timestamp, mb.node_id
     );
     println!("  previous_tip_hash             = {}", hex32(&mb.previous_tip_hash));
     println!("  uncompressed_size             = {}", mb.uncompressed_size);
@@ -74,7 +74,7 @@ fn open_file(path: &PathBuf) -> std::io::Result<(File, u64)> {
 }
 
 /// Iterate metablocks in [HEADER_BLOCK_SIZE_BYTES..metablocks_end] and pass each
-/// (wal_index, file_offset, deserialised_metablock) to the visitor. The visitor returns
+/// (wal_seq, file_offset, deserialised_metablock) to the visitor. The visitor returns
 /// `true` to keep going, `false` to stop.
 fn for_each_metablock<F: FnMut(&Metablock, u64) -> bool>(
     file: &mut File,
@@ -128,19 +128,19 @@ fn cmd_wal(file: &mut File, file_len: u64, target: u64) -> std::io::Result<()> {
 
     let mut found = false;
     for_each_metablock(file, metablocks_end, |mb, off| {
-        if mb.wal_index == target {
+        if mb.wal_seq == target {
             print_metablock(mb, off);
             found = true;
             return false;
         }
         // metablocks are wal-ordered, stop scanning once past target
-        if mb.wal_index > target {
+        if mb.wal_seq > target {
             return false;
         }
         true
     })?;
     if !found {
-        println!("wal_index {} not found in this file", target);
+        println!("wal_seq {} not found in this file", target);
     }
     Ok(())
 }
@@ -158,10 +158,10 @@ fn cmd_range(file: &mut File, file_len: u64, start: u64, end: u64) -> std::io::R
 
     let mut printed = 0u64;
     for_each_metablock(file, metablocks_end, |mb, off| {
-        if mb.wal_index < start {
+        if mb.wal_seq < start {
             return true;
         }
-        if mb.wal_index > end {
+        if mb.wal_seq > end {
             return false;
         }
         print_metablock(mb, off);
@@ -188,15 +188,15 @@ fn cmd_bounds(file: &mut File, file_len: u64) -> std::io::Result<()> {
     let mut last: Option<(u64, u64)> = None;
     for_each_metablock(file, metablocks_end, |mb, off| {
         if first.is_none() {
-            first = Some((mb.wal_index, off));
+            first = Some((mb.wal_seq, off));
         }
-        last = Some((mb.wal_index, off));
+        last = Some((mb.wal_seq, off));
         true
     })?;
     match (first, last) {
         (Some((fw, fo)), Some((lw, lo))) => {
-            println!("first metablock: wal_index = {}, offset = {}", fw, fo);
-            println!("last  metablock: wal_index = {}, offset = {}", lw, lo);
+            println!("first metablock: wal_seq = {}, offset = {}", fw, fo);
+            println!("last  metablock: wal_seq = {}, offset = {}", lw, lo);
             println!("count          = {}", lw.saturating_sub(fw) + 1);
         }
         _ => println!("no metablocks found"),
@@ -231,7 +231,7 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             };
             let Ok(wal) = arg.parse::<u64>() else {
-                eprintln!("ERROR: wal_index must be a u64");
+                eprintln!("ERROR: wal_seq must be a u64");
                 return ExitCode::from(2);
             };
             cmd_wal(&mut file, file_len, wal)

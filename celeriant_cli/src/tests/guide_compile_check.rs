@@ -148,7 +148,7 @@ const _: () = {
     async fn occ(pool: &CeleriantPool) -> Result<(), Box<dyn std::error::Error>> {
         let key = AggregateKey::new(1, 2, 3);
         let my_client_id: u128 = 42;
-        let current_batch_index: u64 = 5;
+        let current_version: u64 = 5;
         let events = vec![json_event(1, &order(123))?];
 
         pool.write_events_with(
@@ -156,7 +156,7 @@ const _: () = {
             events,
             WriteEventsOptions {
                 client_id: my_client_id,
-                expected_event_batch_index: Some(current_batch_index),
+                expected_version: Some(current_version),
                 ..Default::default()
             },
         )
@@ -175,8 +175,8 @@ const _: () = {
             Err(ClientError::Server(ServerError::Write {
                 kind:
                     WriteError::OptimisticConcurrencyViolation {
-                        expected_event_batch_index,
-                        current_event_batch_index,
+                        expected_version,
+                        current_aggregate_version,
                     },
                 ..
             })) => {
@@ -194,8 +194,8 @@ const _: () = {
         let from_key = AggregateKey::new(1, 2, 3);
         let to_key = AggregateKey::new(1, 2, 4);
         let my_client_id: u128 = 42;
-        let from_batch_index: u64 = 5;
-        let to_batch_index: u64 = 10;
+        let from_version: u64 = 5;
+        let to_version: u64 = 10;
         let transfer_out_event = json_event(1, &order(1))?;
         let transfer_in_event = json_event(1, &order(2))?;
 
@@ -205,7 +205,7 @@ const _: () = {
                 SingleAggregateWrite {
                     events: vec![transfer_out_event],
                     allow_create: true,
-                    expected_event_batch_index: Some(from_batch_index),
+                    expected_version: Some(from_version),
                     enforce_client_idempotency: true,
                 },
             ),
@@ -214,7 +214,7 @@ const _: () = {
                 SingleAggregateWrite {
                     events: vec![transfer_in_event],
                     allow_create: true,
-                    expected_event_batch_index: Some(to_batch_index),
+                    expected_version: Some(to_version),
                     enforce_client_idempotency: true,
                 },
             ),
@@ -247,7 +247,7 @@ const _: () = {
             .await?;
 
         let filters = ReadFilters::new(1)
-            .to_event_batch_index(100)
+            .to_aggregate_version(100)
             .include_event_types(vec![1, 2, 3])
             .min_event_timestamp(start_ts)
             .max_event_timestamp(end_ts)
@@ -292,8 +292,8 @@ const _: () = {
             })
             .await?;
 
-        let _ = details.min_event_batch_index;
-        let _ = details.max_event_batch_index;
+        let _ = details.min_aggregate_version;
+        let _ = details.max_aggregate_version;
         let _ = details.is_deleted;
         let _ = details.last_server_timestamp;
         Ok(())
@@ -343,8 +343,8 @@ const _: () = {
             let _ = evt.aggregate_type_id;
             let _ = evt.aggregate_id;
             let _ = evt.operation;
-            let _ = evt.from_event_batch_index;
-            let _ = evt.to_event_batch_index;
+            let _ = evt.from_aggregate_version;
+            let _ = evt.to_aggregate_version;
         }
 
         let _ = watch
@@ -362,7 +362,7 @@ const _: () = {
         pool.trim_start(TrimStartRequest {
             correlation_id: None,
             aggregate_key: key,
-            keep_from_event_batch_index: 100,
+            keep_from_aggregate_version: 100,
             client_id: my_client_id,
             user_id: None,
         })
@@ -384,8 +384,8 @@ const _: () = {
                 key,
                 SingleAggregateDelete {
                     allow_recreate: true,
-                    allow_index_continuation: false,
-                    expected_event_batch_index: None,
+                    allow_sequence_continuation: false,
+                    expected_version: None,
                 },
             )]),
         })
@@ -452,7 +452,7 @@ const _: () = {
                 SingleAggregateWrite {
                     events,
                     allow_create: true,
-                    expected_event_batch_index: None,
+                    expected_version: None,
                     enforce_client_idempotency: false,
                 },
             )]),
@@ -463,8 +463,8 @@ const _: () = {
             Err(ClientError::Server(ServerError::Write {
                 kind:
                     WriteError::OptimisticConcurrencyViolation {
-                        expected_event_batch_index,
-                        current_event_batch_index,
+                        expected_version,
+                        current_aggregate_version,
                     },
                 ..
             })) => { /* OCC conflict - retry with fresh state */ }

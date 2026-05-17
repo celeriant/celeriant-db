@@ -89,8 +89,8 @@ Multiple operations on the same aggregate are merged in `WatchEventAccumulator`,
 
 | Operation | Merge Strategy |
 |-----------|---------------|
-| Write | Extend batch index range (min from, max to) |
-| Read | Extend batch index range (None to treated as open-ended) |
+| Write | Extend aggregate version range (min from, max to) |
+| Read | Extend aggregate version range (None to treated as open-ended) |
 | TrimStart | Replace (destructive, latest wins) |
 | Delete | Deduplicate (no payload, stored as None) |
 | AggregateDetails | Deduplicate (no payload, stored as None) |

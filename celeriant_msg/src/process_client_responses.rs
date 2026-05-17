@@ -346,12 +346,12 @@ mod tests {
         match rt {
             ClientResponseType::AggregateDetails => ClientResponse::AggregateDetails(AggregateDetailsResponse {
                 correlation_id: Some(0xDEAD_BEEF_CAFE_BABE),
-                min_event_batch_index: 42,
-                max_event_batch_index: 99,
-                max_event_index: 500,
+                min_aggregate_version: 42,
+                max_aggregate_version: 99,
+                max_event_seq: 500,
                 is_deleted: false,
                 allow_recreate: true,
-                allow_index_continuation: false,
+                allow_sequence_continuation: false,
                 last_server_timestamp: 1700000000000,
                 last_client_id: 0xAAAA_BBBB_CCCC_DDDD,
                 last_user_id: Some(0x1111_2222_3333_4444),
@@ -359,7 +359,7 @@ mod tests {
             ClientResponseType::Read => ClientResponse::Read(ReadResponse {
                 correlation_id: Some(0xFEED_FACE_DEAD_C0DE),
                 event_batches: vec![],
-                next_event_batch_index: Some(100),
+                next_aggregate_version: Some(100),
             }),
             ClientResponseType::Write => ClientResponse::Write(SuccessResponse {
                 correlation_id: Some(0xCAFE_D00D_BEEF_F00D),
@@ -490,7 +490,7 @@ mod tests {
     #[test]
     fn small_payload_always_none() {
         let small_size = RESPONSE_COMPRESSION_THRESHOLD_BYTES - 1;
-        let res = ClientResponse::Read(ReadResponse { correlation_id: None, event_batches: vec![], next_event_batch_index: None });
+        let res = ClientResponse::Read(ReadResponse { correlation_id: None, event_batches: vec![], next_aggregate_version: None });
         assert_eq!(
             determine_compression_type(&res, small_size, true),
             CompressionType::None,
@@ -500,7 +500,7 @@ mod tests {
 
     #[test]
     fn large_payload_with_dict_returns_zstd_dict() {
-        let res = ClientResponse::Read(ReadResponse { correlation_id: None, event_batches: vec![], next_event_batch_index: None });
+        let res = ClientResponse::Read(ReadResponse { correlation_id: None, event_batches: vec![], next_aggregate_version: None });
         assert_eq!(
             determine_compression_type(&res, RESPONSE_COMPRESSION_THRESHOLD_BYTES + 1, true),
             CompressionType::ZstdDict
@@ -509,7 +509,7 @@ mod tests {
 
     #[test]
     fn large_payload_without_dict_returns_none() {
-        let res = ClientResponse::Read(ReadResponse { correlation_id: None, event_batches: vec![], next_event_batch_index: None });
+        let res = ClientResponse::Read(ReadResponse { correlation_id: None, event_batches: vec![], next_aggregate_version: None });
         assert_eq!(
             determine_compression_type(&res, RESPONSE_COMPRESSION_THRESHOLD_BYTES + 1, false),
             CompressionType::None
@@ -524,9 +524,9 @@ mod tests {
             ClientResponse::Write(SuccessResponse { correlation_id: None }),
             ClientResponse::Delete(SuccessResponse { correlation_id: None }),
             ClientResponse::AggregateDetails(AggregateDetailsResponse {
-                correlation_id: None, min_event_batch_index: 0, max_event_batch_index: 0,
-                max_event_index: 0, is_deleted: false, allow_recreate: false,
-                allow_index_continuation: false, last_server_timestamp: 0,
+                correlation_id: None, min_aggregate_version: 0, max_aggregate_version: 0,
+                max_event_seq: 0, is_deleted: false, allow_recreate: false,
+                allow_sequence_continuation: false, last_server_timestamp: 0,
                 last_client_id: 0, last_user_id: None,
             }),
             ClientResponse::RegisterSchema(SuccessResponse { correlation_id: None }),
@@ -551,8 +551,8 @@ mod tests {
                 aggregates: (0u64..100).map(|i| AggregateListItem {
                     is_deleted: false, org_id: i as u128, aggregate_type_id: i as u128,
                     aggregate_id: i as u128, event_batch_count: i, min_event_timestamp: i,
-                    max_event_timestamp: i + 1000, min_event_batch_index: i, max_event_batch_index: i + 10,
-                    min_event_index: i, max_event_index: i + 50, min_server_timestamp: i,
+                    max_event_timestamp: i + 1000, min_aggregate_version: i, max_aggregate_version: i + 10,
+                    min_event_seq: i, max_event_seq: i + 50, min_server_timestamp: i,
                     max_server_timestamp: i + 2000, compressed_size: i * 100, uncompressed_size: i * 200,
                 }).collect(),
                 next_cursor: None,
@@ -631,10 +631,10 @@ mod tests {
                         event_batch_count: i * 10,
                         min_event_timestamp: 1000 + i,
                         max_event_timestamp: 2000 + i,
-                        min_event_batch_index: i,
-                        max_event_batch_index: i + 100,
-                        min_event_index: i * 5,
-                        max_event_index: i * 5 + 50,
+                        min_aggregate_version: i,
+                        max_aggregate_version: i + 100,
+                        min_event_seq: i * 5,
+                        max_event_seq: i * 5 + 50,
                         min_server_timestamp: 3000 + i,
                         max_server_timestamp: 4000 + i,
                         compressed_size: i * 100,

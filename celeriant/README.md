@@ -177,7 +177,7 @@ These checks run before the server accepts connections. Fatal checks abort the p
 
 **Immutable config validation** - `server_meta.toml` is written on first startup with the shard count, timestamp precision, epoch offset, and routing rule. On subsequent starts, any mismatch is a fatal error. These settings are baked into the on-disk WAL format and cannot change without data corruption.
 
-**Automatic memory budget** - detects available memory from `/proc/meminfo` and cgroup v2 `memory.max` (takes the minimum). Applies `--memory-consumption-percent` (default 80%) to get the total budget, then divides across shards. Per-shard budget is split into caches by fixed ratios: recent write cache (71.5%), aggregate snapshots (9%), client idempotency snapshots (9%), schema cache (9%), WAL index positions (1.5%). Can be overridden entirely with `--memory-budget-bytes`.
+**Automatic memory budget** - detects available memory from `/proc/meminfo` and cgroup v2 `memory.max` (takes the minimum). Applies `--memory-consumption-percent` (default 80%) to get the total budget, then divides across shards. Per-shard budget is split into caches by fixed ratios: recent write cache (71.5%), aggregate snapshots (9%), client idempotency snapshots (9%), schema cache (9%), WAL sequence positions (1.5%). Can be overridden entirely with `--memory-budget-bytes`.
 
 **TLS with kTLS** - TLS is handled via rustls with kernel TLS (kTLS) offload. Supports dual CA isolation: a client CA for client connections and an intracluster CA for replication. Client-facing and replication listeners get separate `ServerConfig` instances. TLS 1.3 session tickets are disabled to prevent kTLS sequence counter desync.
 

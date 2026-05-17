@@ -107,7 +107,7 @@ async fn get_accounts() -> Json<Value> {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BalanceQuery {
-    min_batch_index: Option<u64>,
+    min_version: Option<u64>,
 }
 
 async fn get_balance(
@@ -116,19 +116,19 @@ async fn get_balance(
     State(state): State<SharedState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let projection = state.account_service
-        .catch_up(account_id.as_u128(), params.min_batch_index)
+        .catch_up(account_id.as_u128(), params.min_version)
         .await
         .map_err(map_account_error)?;
     Ok(Json(json!({
         "balanceCents": projection.balance_cents,
-        "batchIndex": projection.last_batch_index,
+        "batchIndex": projection.last_version,
     })))
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HistoryQuery {
-    from_batch_index: Option<u64>,
+    from_version: Option<u64>,
 }
 
 async fn get_history(
@@ -136,13 +136,13 @@ async fn get_history(
     Query(params): Query<HistoryQuery>,
     State(state): State<SharedState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let (events, current_batch_index, balance_cents) = state.account_service
-        .get_history(account_id.as_u128(), params.from_batch_index)
+    let (events, current_version, balance_cents) = state.account_service
+        .get_history(account_id.as_u128(), params.from_version)
         .await
         .map_err(map_account_error)?;
     Ok(Json(json!({
         "events": events,
-        "currentBatchIndex": current_batch_index,
+        "currentBatchIndex": current_version,
         "balanceCents": balance_cents,
     })))
 }
@@ -170,7 +170,7 @@ async fn deposit(
 
     let response = json!({
         "balanceCents": result.balance_cents,
-        "batchIndex": result.batch_index,
+        "batchIndex": result.aggregate_version,
     });
     set_idempotency_result(&headers, &state.idempotency, &response);
     Ok(Json(response))
@@ -193,7 +193,7 @@ async fn withdraw(
 
     let response = json!({
         "balanceCents": result.balance_cents,
-        "batchIndex": result.batch_index,
+        "batchIndex": result.aggregate_version,
     });
     set_idempotency_result(&headers, &state.idempotency, &response);
     Ok(Json(response))
@@ -226,8 +226,8 @@ async fn transfer(
         .map_err(map_account_error)?;
 
     let response = json!({
-        "from": { "balanceCents": result.from.balance_cents, "batchIndex": result.from.batch_index },
-        "to": { "balanceCents": result.to.balance_cents, "batchIndex": result.to.batch_index },
+        "from": { "balanceCents": result.from.balance_cents, "batchIndex": result.from.aggregate_version },
+        "to": { "balanceCents": result.to.balance_cents, "batchIndex": result.to.aggregate_version },
     });
     set_idempotency_result(&headers, &state.idempotency, &response);
     Ok(Json(response))
@@ -309,8 +309,8 @@ async fn init_database(db: &tokio_postgres::Client) {
             account_id                UUID PRIMARY KEY,
             account_name              TEXT NOT NULL,
             balance_cents             BIGINT NOT NULL DEFAULT 0,
-            last_batch_index          BIGINT NOT NULL DEFAULT 0,
-            last_client_event_index   BIGINT NOT NULL DEFAULT 0,
+            last_version          BIGINT NOT NULL DEFAULT 0,
+            last_client_seq   BIGINT NOT NULL DEFAULT 0,
             updated_at                TIMESTAMPTZ NOT NULL DEFAULT now()
         )",
         &[],
@@ -326,7 +326,7 @@ async fn seed_accounts(pool: &CeleriantPool, db: &tokio_postgres::Client) {
         // Seed Postgres projection row
         db.execute(
             "INSERT INTO account_balances (account_id, account_name, balance_cents, \
-             last_batch_index, last_client_event_index, updated_at) \
+             last_version, last_client_seq, updated_at) \
              VALUES ($1, $2, 0, 0, 0, now()) \
              ON CONFLICT (account_id) DO NOTHING",
             &[&account_uuid, &account.name],
@@ -341,7 +341,7 @@ async fn seed_accounts(pool: &CeleriantPool, db: &tokio_postgres::Client) {
             correlation_id: None,
             aggregate_key: key.clone(),
         }).await {
-            Ok(details) if details.max_event_batch_index > 0 => continue,
+            Ok(details) if details.max_aggregate_version > 0 => continue,
             _ => {}
         }
 
@@ -398,7 +398,7 @@ async fn watch_loop(
             let watch_event = json!({
                 "aggregateId": u128_to_uuid(evt.aggregate_id),
                 "operation": "Write",
-                "toBatchIndex": evt.to_event_batch_index,
+                "toBatchIndex": evt.to_aggregate_version,
             });
             let _ = tx.send(watch_event);
         }

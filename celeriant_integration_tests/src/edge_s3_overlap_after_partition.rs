@@ -1,8 +1,8 @@
 //! Edge Case: Overlapping S3 Batches After Network Partition
 //!
-//! Reproduces the WalIndexGap bug from docs/wal-mismatch-pi-cluster.md where
+//! Reproduces the WalSeqGap bug from docs/wal-mismatch-pi-cluster.md where
 //! S3 has fallback batches from two different leadership terms with overlapping
-//! WAL index ranges.
+//! WAL sequence ranges.
 //!
 //! Bug scenario (from Pi cluster):
 //! 1. Leader A writes events, follower B replicates via TCP
@@ -10,9 +10,9 @@
 //! 3. A goes offline (cable unplugged) — S3 has A's fallback batches
 //! 4. B comes back, takes over as leader, writes new events via S3 fallback
 //! 5. S3 now has batches from BOTH leaders with overlapping WAL indices
-//! 6. A restarts, runs S3 catchup — must handle the overlap without WalIndexGap
+//! 6. A restarts, runs S3 catchup — must handle the overlap without WalSeqGap
 //!
-//! The overlap occurs because A uploaded S3 batches starting at WAL index N,
+//! The overlap occurs because A uploaded S3 batches starting at WAL sequence N,
 //! then B took over and started uploading from its own WAL position (which may
 //! be < N since B didn't receive A's last S3 fallback writes via TCP).
 //!
@@ -149,13 +149,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     node_a.restart().await?;
     println!("  A restarted (WAL has events 1-20, S3 has batches from both A and B)");
 
-    println!("  Waiting for S3 catchup (the critical moment — WalIndexGap bug)...");
+    println!("  Waiting for S3 catchup (the critical moment — WalSeqGap bug)...");
     tokio::time::sleep(Duration::from_secs(15)).await;
 
-    // Verify A is alive (didn't crash with WalIndexGap)
+    // Verify A is alive (didn't crash with WalSeqGap)
     node_a.check_alive()
-        .map_err(|e| format!("Node A crashed during S3 catchup (WalIndexGap bug): {}", e))?;
-    println!("  Node A is alive (no WalIndexGap crash)");
+        .map_err(|e| format!("Node A crashed during S3 catchup (WalSeqGap bug): {}", e))?;
+    println!("  Node A is alive (no WalSeqGap crash)");
 
     let mut client_a = CeleriantClient::connect(&format!("127.0.0.1:{}", node_a_port)).await?;
     let a_count = count_events(&mut client_a, &aggregate_key).await?;
@@ -185,7 +185,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("Overlapping S3 batches handled correctly:");
     println!("  1. A wrote events 11-20 to S3 as leader");
     println!("  2. B caught up from A's batches, then wrote events 21-30 to S3");
-    println!("  3. A restarted with overlapping S3 batches — no WalIndexGap crash");
+    println!("  3. A restarted with overlapping S3 batches — no WalSeqGap crash");
     println!("  4. Both nodes converged, replication resumed\n");
 
     Ok(())

@@ -32,7 +32,7 @@ celeriant_cli aggregate-details --org 1 --type 1 --id 1
 celeriant_cli aggregate-details --org 1 --type 1 --id 1 --correlation-id 42
 ```
 
-Output includes batch index range, max event index, deleted status, allow-recreate/allow-index-continuation flags, last timestamp, and last client ID.
+Output includes aggregate version range, max event index, deleted status, allow-recreate/allow-sequence-continuation flags, last timestamp, and last client ID.
 
 #### Read Events
 ```bash
@@ -117,9 +117,9 @@ celeriant_cli delete --org 1 --type 1 --id 1 --client-id 1
 celeriant_cli delete --org 1 --type 1 --id 1 \
     --client-id 1 --allow-recreate
 
-# Delete and allow recreation continuing from last batch/event indexes
+# Delete and allow recreation continuing from last batch/event sequences
 celeriant_cli delete --org 1 --type 1 --id 1 \
-    --client-id 1 --allow-recreate --allow-index-continuation
+    --client-id 1 --allow-recreate --allow-sequence-continuation
 
 # Delete with optimistic concurrency check
 celeriant_cli delete --org 1 --type 1 --id 1 \
@@ -266,7 +266,7 @@ done
 ```bash
 # Get all event batch indices
 celeriant_cli read --org 1 --type 1 --id 1 --from 1 --format json \
-    | jq '.event_batches[].event_batch_index'
+    | jq '.event_batches[].aggregate_version'
 
 # Filter events by type
 celeriant_cli read --org 1 --type 1 --id 1 --from 1 --format json \

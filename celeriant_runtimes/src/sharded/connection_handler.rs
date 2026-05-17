@@ -1207,7 +1207,7 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
     metrics::counter!("celeriant_heartbeat_received_total", &[("shard_id", shard_label.clone())]).increment(1);
 
     let current_status = ctx.shard_wal.node_status.get();
-    let local_lease_index = current_status.raw().lease_index().unwrap_or(0);
+    let local_lease_epoch = current_status.raw().lease_epoch().unwrap_or(0);
 
     // Determine whether to accept the heartbeat and which raw_status to use.
     let raw_status = if current_status.is_any_follower_state() {
@@ -1215,27 +1215,27 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
         current_status.raw()
     } else if current_status.is_fenced() {
         // Fenced node (e.g. old leader whose TTL expired): adopt follower role
-        // with the remote leader's lease_index.
+        // with the remote leader's lease_epoch.
         tracing::warn!(
             shard_id = req.shard_id,
-            local_lease_index,
-            remote_lease_index = req.lease_index,
+            local_lease_epoch,
+            remote_lease_epoch = req.lease_epoch,
             "Fenced node accepting heartbeat from leader, transitioning to follower"
         );
-        NodeStatus::Follower { leader_lease_index: req.lease_index }
-    } else if current_status.is_leader() && req.lease_index > local_lease_index {
+        NodeStatus::Follower { leader_lease_epoch: req.lease_epoch }
+    } else if current_status.is_leader() && req.lease_epoch > local_lease_epoch {
         // This node thinks it's leader, but the heartbeat sender won a more
         // recent S3 election. Step down immediately instead of waiting for
         // the slow S3 discovery path.
         tracing::warn!(
             shard_id = req.shard_id,
-            local_lease_index,
-            remote_lease_index = req.lease_index,
-            "Received heartbeat from leader with higher lease_index, stepping down"
+            local_lease_epoch,
+            remote_lease_epoch = req.lease_epoch,
+            "Received heartbeat from leader with higher lease_epoch, stepping down"
         );
-        NodeStatus::Follower { leader_lease_index: req.lease_index }
+        NodeStatus::Follower { leader_lease_epoch: req.lease_epoch }
     } else {
-        // Stale heartbeat (lower/equal lease_index from old leader), or
+        // Stale heartbeat (lower/equal lease_epoch from old leader), or
         // BootCatchup/Standalone — reject.
         metrics::counter!("celeriant_heartbeat_received_outcomes_total", &[("shard_id", shard_label.clone()), ("outcome", "rejected_not_follower".to_string())]).increment(1);
         return ClusterResponse::Heartbeat(HeartbeatResponse {
@@ -1318,9 +1318,9 @@ async fn handle_kick_follower<R: ReplicationClient + 'static, D: S3Downloader + 
 
     // Only transition from Follower (already catching up → ignore duplicate kicks)
     if status.raw().is_follower() {
-        let leader_lease_index = status.raw().lease_index_for_logging();
+        let leader_lease_epoch = status.raw().lease_epoch_for_logging();
         let catching_up = ValidatedNodeStatus::create_custom_status(
-            NodeStatus::FollowerCatchingUp { leader_lease_index }, 0,0,
+            NodeStatus::FollowerCatchingUp { leader_lease_epoch }, 0,0,
         );
         set_node_status_and_metric(&ctx.shard_wal.node_status, catching_up, ctx.current_shard_id as u32);
         broadcast_status(ctx, catching_up).await;
@@ -1470,7 +1470,7 @@ mod tests {
             list_page_size: 100,
             list_max_concurrent: 16,
             read_max_concurrent: 64,
-            list_wal_index_cache_bytes: 1024,
+            list_wal_seq_cache_bytes: 1024,
             schema_cache_bytes: 4_194_304, // 4MB
             max_schema_size_bytes: 16384,
             replication_delay: Duration::from_millis(20),
@@ -1544,7 +1544,7 @@ mod tests {
             correlation_id: None,
             shard_id: 2,
             leader_timestamp_ms: 0,
-            leader_confirmed_wal_index: 0,
+            leader_confirmed_wal_seq: 0,
             batches: vec![],
         });
         let shard = determine_cluster_shard(&request, &config).unwrap();
@@ -1558,7 +1558,7 @@ mod tests {
             correlation_id: None,
             shard_id: 10,
             leader_timestamp_ms: 0,
-            leader_confirmed_wal_index: 0,
+            leader_confirmed_wal_seq: 0,
             batches: vec![],
         });
         let result = determine_cluster_shard(&request, &config);
@@ -1588,7 +1588,7 @@ mod tests {
             correlation_id: None,
             shard_id: 0,
             leader_timestamp_ms: 1000,
-            lease_index: 1,
+            lease_epoch: 1,
         });
         let shard = determine_cluster_shard(&request, &config).unwrap();
         assert_eq!(shard, 0, "Heartbeat must always route to shard 0");
@@ -1651,7 +1651,7 @@ mod tests {
         let key = AggregateKey::new(1, 2, 11);
         let mut writes = HashMap::new();
         writes.insert(key, SingleAggregateWrite {
-            expected_event_batch_index: None,
+            expected_version: None,
             allow_create: true,
             enforce_client_idempotency: false,
             events: vec![],
@@ -1673,7 +1673,7 @@ mod tests {
         writes.insert(
             AggregateKey::new(1, 2, 4),
             SingleAggregateWrite {
-                expected_event_batch_index: None,
+                expected_version: None,
                 allow_create: true,
                 enforce_client_idempotency: false,
                 events: vec![],
@@ -1682,7 +1682,7 @@ mod tests {
         writes.insert(
             AggregateKey::new(1, 2, 8),
             SingleAggregateWrite {
-                expected_event_batch_index: None,
+                expected_version: None,
                 allow_create: true,
                 enforce_client_idempotency: false,
                 events: vec![],
@@ -1705,7 +1705,7 @@ mod tests {
         writes.insert(
             AggregateKey::new(1, 2, 4),
             SingleAggregateWrite {
-                expected_event_batch_index: None,
+                expected_version: None,
                 allow_create: true,
                 enforce_client_idempotency: false,
                 events: vec![],
@@ -1714,7 +1714,7 @@ mod tests {
         writes.insert(
             AggregateKey::new(1, 2, 5),
             SingleAggregateWrite {
-                expected_event_batch_index: None,
+                expected_version: None,
                 allow_create: true,
                 enforce_client_idempotency: false,
                 events: vec![],
@@ -1750,8 +1750,8 @@ mod tests {
         let mut deletes = HashMap::new();
         deletes.insert(key, SingleAggregateDelete {
             allow_recreate: false,
-            allow_index_continuation: false,
-            expected_event_batch_index: None,
+            allow_sequence_continuation: false,
+            expected_version: None,
         });
         let request = ClientRequest::Delete(DeleteRequest {
             correlation_id: None,
@@ -1782,7 +1782,7 @@ mod tests {
         let request = ClientRequest::TrimStart(TrimStartRequest {
             correlation_id: None,
             aggregate_key: AggregateKey::new(1, 2, 6),
-            keep_from_event_batch_index: 10,
+            keep_from_aggregate_version: 10,
             client_id: 1,
             user_id: None,
         });
@@ -1967,7 +1967,7 @@ mod tests {
         let key = AggregateKey::new(1, 2, 3);
         let mut writes = HashMap::new();
         writes.insert(key, SingleAggregateWrite {
-            expected_event_batch_index: None,
+            expected_version: None,
             allow_create: true,
             enforce_client_idempotency: false,
             events: vec![],
@@ -1986,7 +1986,7 @@ mod tests {
         let key = AggregateKey::new(1, 2, 3);
         let mut writes = HashMap::new();
         writes.insert(key, SingleAggregateWrite {
-            expected_event_batch_index: None,
+            expected_version: None,
             allow_create: true,
             enforce_client_idempotency: false,
             events: vec![],
@@ -2005,7 +2005,7 @@ mod tests {
         let key = AggregateKey::new(1, 2, 3);
         let mut writes = HashMap::new();
         writes.insert(key, SingleAggregateWrite {
-            expected_event_batch_index: None,
+            expected_version: None,
             allow_create: true,
             enforce_client_idempotency: false,
             events: vec![],
@@ -2042,7 +2042,7 @@ mod tests {
         let req = ClientRequest::TrimStart(TrimStartRequest {
             correlation_id: Some(123),
             aggregate_key: AggregateKey::new(1, 2, 3),
-            keep_from_event_batch_index: 10,
+            keep_from_aggregate_version: 10,
             client_id: 777,
             user_id: None,
         });
@@ -2056,8 +2056,8 @@ mod tests {
         let mut deletes = HashMap::new();
         deletes.insert(key, SingleAggregateDelete {
             allow_recreate: false,
-            allow_index_continuation: false,
-            expected_event_batch_index: None,
+            allow_sequence_continuation: false,
+            expected_version: None,
         });
         let req = ClientRequest::Delete(DeleteRequest {
             correlation_id: Some(123),

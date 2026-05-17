@@ -164,13 +164,13 @@ let evt = json_event(1, &OrderPlaced { order_id, amount: 99.95 })?;
 let order: OrderPlaced = from_json(&response.event_batches[0].events[0])?;
 ```
 
-`json_event` takes an `event_type_major` and a serializable value. It returns a `DatablockAggregateEvent` with `event_type_minor` defaulted to 0 and other fields zeroed. Set `client_event_index`, `event_timestamp`, etc. on the returned event if you need them.
+`json_event` takes an `event_type_major` and a serializable value. It returns a `DatablockAggregateEvent` with `event_type_minor` defaulted to 0 and other fields zeroed. Set `client_seq`, `event_timestamp`, etc. on the returned event if you need them.
 
 For raw `Vec<u8>` payloads (protobuf wire format, pre-serialized data), set `event_value` directly on a `DatablockAggregateEvent` instead of using the JSON helpers.
 
 ## Client ID
 
-Every write carries a `client_id: u128` that identifies the writing service. Celeriant uses it for exactly-once tracking: the highest `client_event_index` is tracked per `(aggregate_key, client_id)`.
+Every write carries a `client_id: u128` that identifies the writing service. Celeriant uses it for exactly-once tracking: the highest `client_seq` is tracked per `(aggregate_key, client_id)`.
 
 When client identity is enabled on the server, the write `client_id` must match the `client_id` derived from your Identify handshake. The server enforces this on every write, delete, trim, and schema request. A mismatch is rejected with `IDENTIFY_MISMATCH`. So your RSA-derived identity or API key identity IS your write client_id. See the [RSA key pair](#rsa-key-pair) section for how to derive it with `Crypto::generate_short_client_identity`.
 
@@ -196,7 +196,7 @@ pool.write_events(key.clone(), events).await?;
 
 ### Optimistic concurrency control
 
-Pass `expected_event_batch_index` to guard a write. If another writer has appended to the aggregate since you last read it, the write is rejected. This is how you enforce business invariants at write time. No distributed locks needed.
+Pass `expected_version` to guard a write. If another writer has appended to the aggregate since you last read it, the write is rejected. This is how you enforce business invariants at write time. No distributed locks needed.
 
 ```rust
 pool.write_events_with(
@@ -204,7 +204,7 @@ pool.write_events_with(
     events,
     WriteEventsOptions {
         client_id: my_client_id,
-        expected_event_batch_index: Some(current_batch_index),
+        expected_version: Some(current_version),
         ..Default::default()
     },
 ).await?;
@@ -216,8 +216,8 @@ When a concurrency conflict happens, the error tells you exactly what went wrong
 match result {
     Err(ClientError::Server(ServerError::Write {
         kind: WriteError::OptimisticConcurrencyViolation {
-            expected_event_batch_index,
-            current_event_batch_index,
+            expected_version,
+            current_aggregate_version,
         }, ..
     })) => {
         // Re-read, re-validate, retry
@@ -230,12 +230,12 @@ There is no automatic retry on OCC failures. That's by design. Only your domain 
 
 ### Exactly-once writes
 
-Set `enforce_client_idempotency: true` and provide a `client_event_index` on each event. Celeriant tracks the highest `client_event_index` per `(aggregate_key, client_id)`. If a write is retried due to a timeout and the original already landed, the server rejects the duplicate with `ClientIdempotencyViolation` instead of writing it twice.
+Set `enforce_client_idempotency: true` and provide a `client_seq` on each event. Celeriant tracks the highest `client_seq` per `(aggregate_key, client_id)`. If a write is retried due to a timeout and the original already landed, the server rejects the duplicate with `ClientIdempotencyViolation` instead of writing it twice.
 
 The retry behaviour depends on why the write failed:
 
-- **OCC failure**: re-derive `client_event_index` from fresh state (the aggregate moved, your index assumption was wrong)
-- **Timeout**: hold `client_event_index` constant (the write may have already landed, changing the index would bypass the dedup check)
+- **OCC failure**: re-derive `client_seq` from fresh state (the aggregate moved, your index assumption was wrong)
+- **Timeout**: hold `client_seq` constant (the write may have already landed, changing the index would bypass the dedup check)
 - **Idempotency violation**: the prior attempt already landed. Treat as success.
 
 See the [reference example](../celeriant_reference/src/account_service.rs) for the full retry loop with all three cases handled.
@@ -251,7 +251,7 @@ let writes = HashMap::from([
     (from_key, SingleAggregateWrite {
         events: vec![transfer_out_event],
         allow_create: true,
-        expected_event_batch_index: Some(from_batch_index),
+        expected_version: Some(from_version),
         enforce_client_idempotency: true,
         compression_type_id: 0,
         compression_level: None,
@@ -259,7 +259,7 @@ let writes = HashMap::from([
     (to_key, SingleAggregateWrite {
         events: vec![transfer_in_event],
         allow_create: true,
-        expected_event_batch_index: Some(to_batch_index),
+        expected_version: Some(to_version),
         enforce_client_idempotency: true,
         compression_type_id: 0,
         compression_level: None,
@@ -274,7 +274,7 @@ pool.write(WriteRequest {
 }).await?;
 ```
 
-`expected_event_batch_index: Some(0)` means "this aggregate must not have any writes yet". It's how you guard creates. For existing aggregates, use the batch index from your last read. If anything has moved, the entire request is rejected atomically.
+`expected_version: Some(0)` means "this aggregate must not have any writes yet". It's how you guard creates. For existing aggregates, use the aggregate version from your last read. If anything has moved, the entire request is rejected atomically.
 
 This eliminates a whole class of problems that normally require sagas. Transfer between two accounts? Atomic. Reserve inventory while placing an order? Atomic. Any business rule that spans aggregates within the same shard can be enforced in a single request.
 
@@ -282,7 +282,7 @@ The constraint: all aggregates in a single write must belong to the same shard. 
 
 ## Reading events
 
-Read events from an aggregate starting at a batch index:
+Read events from an aggregate starting at a aggregate version:
 
 ```rust
 let response = pool.read(ReadRequest {
@@ -296,7 +296,7 @@ let response = pool.read(ReadRequest {
 
 ```rust
 let filters = ReadFilters::new(1)
-    .to_event_batch_index(100)
+    .to_aggregate_version(100)
     .include_event_types(vec![1, 2, 3])
     .min_event_timestamp(start_ts)
     .max_event_timestamp(end_ts)
@@ -332,7 +332,7 @@ let details = pool.aggregate_details(AggregateDetailsRequest {
     aggregate_key: key,
 }).await?;
 
-// details.min_event_batch_index, details.max_event_batch_index
+// details.min_aggregate_version, details.max_aggregate_version
 // details.is_deleted, details.last_server_timestamp, etc.
 ```
 
@@ -377,7 +377,7 @@ loop {
     for evt in &response.events {
         // evt.org_id, evt.aggregate_type_id, evt.aggregate_id
         // evt.operation - Write, Create, Delete, TrimStart
-        // evt.from_event_batch_index, evt.to_event_batch_index
+        // evt.from_aggregate_version, evt.to_aggregate_version
     }
 }
 ```
@@ -400,7 +400,7 @@ Over time you might want to discard old events to free up disk space. `trim_star
 pool.trim_start(TrimStartRequest {
     correlation_id: None,
     aggregate_key: key,
-    keep_from_event_batch_index: 100, // batches 1-99 are gone
+    keep_from_aggregate_version: 100, // batches 1-99 are gone
     client_id: my_client_id,
     user_id: None,
 }).await?;
@@ -417,8 +417,8 @@ pool.delete(DeleteRequest {
     user_id: None,
     deletes: HashMap::from([(key, SingleAggregateDelete {
         allow_recreate: true,
-        allow_index_continuation: false,
-        expected_event_batch_index: None,
+        allow_sequence_continuation: false,
+        expected_version: None,
     })]),
 }).await?;
 ```
@@ -426,9 +426,9 @@ pool.delete(DeleteRequest {
 Two flags control what happens after deletion:
 
 - `allow_recreate` - can this aggregate be written to again? Set `false` for a permanent, irreversible delete.
-- `allow_index_continuation` - if recreated, do event indices continue from where they left off, or restart from 1?
+- `allow_sequence_continuation` - if recreated, do event indices continue from where they left off, or restart from 1?
 
-You can also pass `expected_event_batch_index` for optimistic concurrency on deletes.
+You can also pass `expected_version` for optimistic concurrency on deletes.
 
 ## Listing and discovery
 
@@ -493,7 +493,7 @@ use celeriant_client_tokio::{ClientError, server_error::*};
 match pool.write(request).await {
     Ok(response) => { /* success */ }
     Err(ClientError::Server(ServerError::Write {
-        kind: WriteError::OptimisticConcurrencyViolation { expected_event_batch_index, current_event_batch_index }, ..
+        kind: WriteError::OptimisticConcurrencyViolation { expected_version, current_aggregate_version }, ..
     })) => { /* OCC conflict - retry with fresh state */ }
     Err(ClientError::Server(ServerError::Write {
         kind: WriteError::ClientIdempotencyViolation { .. }, ..

@@ -612,7 +612,7 @@ impl CeleriantPool {
         writes.insert(aggregate_key, SingleAggregateWrite {
             events,
             allow_create: options.allow_create,
-            expected_event_batch_index: options.expected_event_batch_index,
+            expected_version: options.expected_version,
             enforce_client_idempotency: options.enforce_client_idempotency,
         });
         self.write(WriteRequest {
@@ -975,9 +975,9 @@ impl PooledReadAllIterator {
         };
         let response = self.conn.client().read(request).await?;
         self.buffer.extend(response.event_batches);
-        match response.next_event_batch_index {
+        match response.next_aggregate_version {
             Some(next_index) => {
-                self.filters.from_event_batch_index = next_index;
+                self.filters.from_aggregate_version = next_index;
                 Ok(true)
             }
             None => Ok(false),

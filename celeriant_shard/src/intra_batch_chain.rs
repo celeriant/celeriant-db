@@ -9,9 +9,9 @@ use crate::shard_wal_sync::compute_entry_hash;
 pub struct IntraBatchChainBreak {
     pub at_index: usize,
     pub expected: [u8; 32],
-    pub producer_wal_index: u64,
+    pub producer_wal_seq: u64,
     pub actual: [u8; 32],
-    pub consumer_wal_index: u64,
+    pub consumer_wal_seq: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -31,9 +31,9 @@ pub(crate) fn validate_intra_batch_chain(items: &[ReplicationBatchItem]) -> Resu
             return Err(ValidateChainError::ChainBreak(IntraBatchChainBreak {
                 at_index: i + 1,
                 expected,
-                producer_wal_index: w[0].metablock.wal_index,
+                producer_wal_seq: w[0].metablock.wal_seq,
                 actual: w[1].metablock.previous_tip_hash,
-                consumer_wal_index: w[1].metablock.wal_index,
+                consumer_wal_seq: w[1].metablock.wal_seq,
             }));
         }
     }
@@ -47,9 +47,9 @@ mod tests {
     use celeriant_wal::constants::GENESIS_HASH;
     use celeriant_wal::metablocks::metablock::Metablock;
 
-    fn item(wal_index: u64, previous_tip_hash: [u8; 32]) -> ReplicationBatchItem {
+    fn item(wal_seq: u64, previous_tip_hash: [u8; 32]) -> ReplicationBatchItem {
         let mut mb = Metablock::default_inline_event_batch_metadata(AggregateKey::new(1, 1, 1));
-        mb.wal_index = wal_index;
+        mb.wal_seq = wal_seq;
         mb.previous_tip_hash = previous_tip_hash;
         ReplicationBatchItem { metablock: mb, datablock: None }
     }
@@ -95,8 +95,8 @@ mod tests {
         let i1 = item(2, [0xAB; 32]);
         let b = unwrap_chain_break(validate_intra_batch_chain(&[i0, i1]).unwrap_err());
         assert_eq!(b.at_index, 1);
-        assert_eq!(b.consumer_wal_index, 2);
-        assert_eq!(b.producer_wal_index, 1);
+        assert_eq!(b.consumer_wal_seq, 2);
+        assert_eq!(b.producer_wal_seq, 1);
     }
 
     #[test]
@@ -109,7 +109,7 @@ mod tests {
         let i3 = item(4, [0xFF; 32]);
         let b = unwrap_chain_break(validate_intra_batch_chain(&[i0, i1, i2, i3]).unwrap_err());
         assert_eq!(b.at_index, 3);
-        assert_eq!(b.consumer_wal_index, 4);
-        assert_eq!(b.producer_wal_index, 3);
+        assert_eq!(b.consumer_wal_seq, 4);
+        assert_eq!(b.producer_wal_seq, 3);
     }
 }

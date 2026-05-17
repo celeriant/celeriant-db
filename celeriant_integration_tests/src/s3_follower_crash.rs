@@ -2,17 +2,17 @@
 //!
 //! Tests the follower crash failure mode: leader detects heartbeat loss,
 //! pre-renews its S3 lease without fencing (asymmetric behavior), continues
-//! serving writes. Same-leader renewal keeps lease_index unchanged but
+//! serving writes. Same-leader renewal keeps lease_epoch unchanged but
 //! advances expires_at_ms. Then follower restarts and rejoins.
 //!
 //! Scenario:
 //! 1. Start MinIO, establish two-node cluster (leader + follower)
 //! 2. Write events 1-3, verify cluster is healthy (replication works)
-//! 3. Read initial lease from S3, record lease_index
+//! 3. Read initial lease from S3, record lease_epoch
 //! 4. Kill follower process (simulate crash)
 //! 5. Wait for leader to detect heartbeat loss and self-heal via S3 pre-renewal
-//! 6. Verify leader still accepts writes, lease_index unchanged (same leader)
-//! 7. Verify S3 fallback batches carry the same lease_index
+//! 6. Verify leader still accepts writes, lease_epoch unchanged (same leader)
+//! 7. Verify S3 fallback batches carry the same lease_epoch
 //! 8. Restart follower process
 //! 9. Wait for follower to re-register and rejoin cluster
 //! 10. Verify follower receives replicated data from leader
@@ -83,10 +83,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let initial_lease = deserialise_lease(&initial_lease_bytes)
         .map_err(|e| format!("Failed to deserialise initial lease: {:?}", e))?;
 
-    println!("  Initial lease: leader_node_id={:x}, lease_index={}",
-        initial_lease.leader_node_id, initial_lease.lease_index);
+    println!("  Initial lease: leader_node_id={:x}, lease_epoch={}",
+        initial_lease.leader_node_id, initial_lease.lease_epoch);
 
-    assert!(initial_lease.lease_index >= 1, "Initial lease_index should be >= 1");
+    assert!(initial_lease.lease_epoch >= 1, "Initial lease_epoch should be >= 1");
     println!("  Recorded initial state\n");
 
     // ========================================
@@ -125,13 +125,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let new_lease = deserialise_lease(&new_lease_bytes)
         .map_err(|e| format!("Failed to deserialise new lease: {:?}", e))?;
 
-    println!("  New lease: leader_node_id={:x}, lease_index={}",
-        new_lease.leader_node_id, new_lease.lease_index);
+    println!("  New lease: leader_node_id={:x}, lease_epoch={}",
+        new_lease.leader_node_id, new_lease.lease_epoch);
 
     assert_eq!(
-        new_lease.lease_index, initial_lease.lease_index,
-        "lease_index should NOT change on same-leader self-heal: was {}, now {}",
-        initial_lease.lease_index, new_lease.lease_index
+        new_lease.lease_epoch, initial_lease.lease_epoch,
+        "lease_epoch should NOT change on same-leader self-heal: was {}, now {}",
+        initial_lease.lease_epoch, new_lease.lease_epoch
     );
     assert_eq!(
         new_lease.leader_node_id, initial_lease.leader_node_id,
@@ -142,12 +142,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "expires_at_ms should advance on self-heal: was {}, now {}",
         initial_lease.expires_at_ms, new_lease.expires_at_ms
     );
-    println!("  Lease renewed: lease_index unchanged at {}, expires_at_ms advanced", new_lease.lease_index);
+    println!("  Lease renewed: lease_epoch unchanged at {}, expires_at_ms advanced", new_lease.lease_epoch);
 
     // ========================================
-    // PHASE 5.5: Verify S3 fallback batches carry new lease_index
+    // PHASE 5.5: Verify S3 fallback batches carry new lease_epoch
     // ========================================
-    println!("\nPHASE 5.5: Verify S3 fallback batches carry new lease_index");
+    println!("\nPHASE 5.5: Verify S3 fallback batches carry new lease_epoch");
     println!("------------------------------------------------------------");
 
     let fallback_objects = minio.list_objects(&shard_prefix).await?;
@@ -159,15 +159,15 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let batch = deserialise_fallback_batch(&batch_bytes)
         .map_err(|e| format!("Failed to deserialise fallback batch: {:?}", e))?;
 
-    let batch_lease_index = batch.items[0].metablock.lease_index;
-    println!("  Fallback batch lease_index={}, initial lease_index={}",
-        batch_lease_index, initial_lease.lease_index);
+    let batch_lease_epoch = batch.items[0].metablock.lease_epoch;
+    println!("  Fallback batch lease_epoch={}, initial lease_epoch={}",
+        batch_lease_epoch, initial_lease.lease_epoch);
     assert_eq!(
-        batch_lease_index, initial_lease.lease_index,
-        "S3 fallback batch lease_index ({}) should equal initial ({}) — same leader, same term",
-        batch_lease_index, initial_lease.lease_index
+        batch_lease_epoch, initial_lease.lease_epoch,
+        "S3 fallback batch lease_epoch ({}) should equal initial ({}) — same leader, same term",
+        batch_lease_epoch, initial_lease.lease_epoch
     );
-    println!("  lease_index correctly stamped on S3 fallback batches\n");
+    println!("  lease_epoch correctly stamped on S3 fallback batches\n");
 
     // ========================================
     // PHASE 6: Restart follower

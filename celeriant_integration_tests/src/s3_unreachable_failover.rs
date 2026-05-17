@@ -118,8 +118,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let initial_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let initial_lease = deserialise_lease(&initial_lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
-    let initial_lease_index = initial_lease.lease_index;
-    println!("  Initial lease_index={}", initial_lease_index);
+    let initial_lease_epoch = initial_lease.lease_epoch;
+    println!("  Initial lease_epoch={}", initial_lease_epoch);
 
     // Pause MinIO FIRST to prevent S3 lease renewal on first heartbeat miss
     println!("  Pausing MinIO (S3 unreachable)...");
@@ -195,18 +195,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let final_lease = deserialise_lease(&final_lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
     assert!(
-        final_lease.lease_index >= initial_lease_index,
-        "lease_index should not regress: was {}, now {}",
-        initial_lease_index, final_lease.lease_index
+        final_lease.lease_epoch >= initial_lease_epoch,
+        "lease_epoch should not regress: was {}, now {}",
+        initial_lease_epoch, final_lease.lease_epoch
     );
-    println!("  lease_index {} -> {} (monotonic)", initial_lease_index, final_lease.lease_index);
+    println!("  lease_epoch {} -> {} (monotonic)", initial_lease_epoch, final_lease.lease_epoch);
 
     println!("\n=== All Tests Passed ===");
     println!("S3 unreachable failover validated:");
     println!("  1. Both nodes correctly rejected writes while Fenced (S3 + TCP down)");
     println!("  2. Write rejection consistent across multiple attempts");
     println!("  3. After recovery: exactly one leader emerged");
-    println!("  4. lease_index did not regress (bumps only if a different node won the race)\n");
+    println!("  4. lease_epoch did not regress (bumps only if a different node won the race)\n");
 
     Ok(())
 }

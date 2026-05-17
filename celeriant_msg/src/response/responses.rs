@@ -26,10 +26,10 @@ pub struct AggregateListItem {
     pub event_batch_count: u64,
     pub min_event_timestamp: u64,
     pub max_event_timestamp: u64,
-    pub min_event_batch_index: u64,
-    pub max_event_batch_index: u64,
-    pub min_event_index: u64,
-    pub max_event_index: u64,
+    pub min_aggregate_version: u64,
+    pub max_aggregate_version: u64,
+    pub min_event_seq: u64,
+    pub max_event_seq: u64,
     pub min_server_timestamp: u64,
     pub max_server_timestamp: u64,
     pub compressed_size: u64,
@@ -60,12 +60,12 @@ pub struct ListAggregatesResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct AggregateDetailsResponse {
     pub correlation_id: Option<u128>,
-    pub min_event_batch_index: u64,
-    pub max_event_batch_index: u64,
-    pub max_event_index: u64,
+    pub min_aggregate_version: u64,
+    pub max_aggregate_version: u64,
+    pub max_event_seq: u64,
     pub is_deleted: bool,
     pub allow_recreate: bool,
-    pub allow_index_continuation: bool,
+    pub allow_sequence_continuation: bool,
     pub last_server_timestamp: u64,
     pub last_client_id: u128,
     pub last_user_id: Option<u128>,
@@ -75,7 +75,7 @@ pub struct AggregateDetailsResponse {
 pub struct ReadResponse {
     pub correlation_id: Option<u128>,
     pub event_batches: Vec<AggregateEventBatch>,
-    pub next_event_batch_index: Option<u64>,
+    pub next_aggregate_version: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, Default)]
@@ -139,16 +139,16 @@ pub enum FollowerRejection {
         follower_ms: u64,
         max_allowed_ms: u64,
     },
-    /// Follower's WAL index doesn't match leader's expected position.
-    WalIndexMismatch {
-        max_follower_wal_index: u64,
+    /// Follower's WAL sequence doesn't match leader's expected position.
+    WalSeqMismatch {
+        max_follower_wal_seq: u64,
     },
     /// Follower's tip hash doesn't match leader's expected hash.
     TipHashMismatch {
         follower: EntryHashBytes,
-        follower_wal_index: u64,
+        follower_wal_seq: u64,
         leader: EntryHashBytes,
-        leader_wal_index: u64,
+        leader_wal_seq: u64,
     },
     /// Leader sent empty batch.
     EmptyBatch,
@@ -156,8 +156,8 @@ pub enum FollowerRejection {
     MissingDatablock,
     /// Follower's lease index doesn't match leader's expectation.
     StaleLease {
-        follower_lease_index: u64,
-        received_lease_index: u64,
+        follower_lease_epoch: u64,
+        received_lease_epoch: u64,
     },
 }
 

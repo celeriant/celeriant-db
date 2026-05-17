@@ -15,18 +15,18 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 
 ## WAL Ordering and Integrity
 
-- WAL entries are globally contiguous within a shard. Each new entry receives exactly `current_wal_index + 1`. Gaps are fatal.
+- WAL entries are globally contiguous within a shard. Each new entry receives exactly `current_wal_seq + 1`. Gaps are fatal.
 - Every metablock carries `previous_tip_hash`, forming a Blake3 hash chain over the entire WAL history.
 - Hash computation intentionally excludes `datablock_position` so leader and follower produce identical hashes despite different on-disk layouts.
-- Log segment rotation carries `wal_index` and `tip_hash` from the old file's write cursor into the new file's header. Hash chain and WAL sequence are unbroken across file boundaries.
-- A batch whose items have non-contiguous WAL indices is rejected with `BatchWalIndexGap`.
+- Log segment rotation carries `wal_seq` and `tip_hash` from the old file's write cursor into the new file's header. Hash chain and WAL sequence are unbroken across file boundaries.
+- A batch whose items have non-contiguous WAL indices is rejected with `BatchWalSeqGap`.
 
 ## Read Visibility
 
 - On the leader, writes are invisible to readers until replication completes. After fsync, data sits in `pending_replication_batches`. The read cursor advances only in `commit_replication`.
 - On standalone/follower, writes become readable immediately after fsync.
 - Two separate LRU caches exist: `aggregate_write_snapshots` (updated after fsync, used for OCC/idempotency) and `aggregate_read_snapshots` (updated after replication on leader, used by reads).
-- The recent-write cache filters by `visible_wal_index`. Entries with `wal_index > visible_wal_index` are excluded from reads.
+- The recent-write cache filters by `visible_wal_seq`. Entries with `wal_seq > visible_wal_seq` are excluded from reads.
 - The reverse metablock scanner uses the `read` cursor exclusively. Segments not yet replicated are invisible to scans.
 - Read operations are never rejected based on node status. A fenced or catching-up node serves stale reads silently.
 - There is no cross-shard transactional consistency. Multi-shard listings are sequential per-shard with no cross-shard snapshot isolation.
@@ -36,14 +36,14 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 - OCC validation runs before client idempotency checks. A concurrent writer with a stale read receives `OccConflict`, not `ClientIdempotencyViolation`.
 - OCC checks use the write-ahead snapshot (not the read snapshot). A concurrent write that has been fsynced but not yet replicated still triggers an OCC conflict.
 - Client idempotency checks use write-ahead state. A duplicate write is rejected even if the original is not yet visible to readers.
-- A write is rejected with `ClientIdempotencyViolation` if any event's `client_event_index <= max stored client_event_index` for that `(aggregate_key, client_id)`.
+- A write is rejected with `ClientIdempotencyViolation` if any event's `client_seq <= max stored client_seq` for that `(aggregate_key, client_id)`.
 
 ## Leader Election
 
 - Leader is determined by S3 CAS on a single `cluster/lease.json` object. No Raft, no quorum.
-- `lease_index` is strictly monotonically increasing and never reused. A fresh cluster starts at `lease_index = 1`. Same-leader S3 renewals refresh expiry without bumping the index; the index is a fencing token for cross-node handovers, not a renewal counter.
+- `lease_epoch` is strictly monotonically increasing and never reused. A fresh cluster starts at `lease_epoch = 1`. Same-leader S3 renewals refresh expiry without bumping the index; the index is a fencing token for cross-node handovers, not a renewal counter.
 - A node seeing a valid (non-expired) lease from another node becomes follower unconditionally - no CAS attempt.
-- A lease supersedes another if and only if `lease_index > our_lease_index AND leader_node_id != our_node_id`.
+- A lease supersedes another if and only if `lease_epoch > our_lease_epoch AND leader_node_id != our_node_id`.
 - Membership is a fixed 2-slot array in S3. A third node cannot join.
 - Only `Leader` and `Standalone` nodes can accept writes. All other states reject with a leader address hint.
 - Timing is asymmetric: the leader renews at `heartbeat_interval`, the follower's TTL extends in `heartbeat_lease_duration` chunks. The leader fences at `lease_expires_at_ms - max_clock_drift_ms`, which must always fire before the follower's TTL expires.
@@ -51,7 +51,7 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 - When the follower is unreachable, S3 renewal backs off proportional to `s3_lease_duration`, not `heartbeat_interval`. Peer discovery uses exponential backoff capped at `s3_lease_duration / 2`.
 - A follower waits for its full TTL to expire before challenging for leadership via S3 CAS. This applies to ALL paths that could result in promotion, including the post-`FollowerCatchingUp` CAS attempt — heartbeat-derived TTL is the "current leader is alive" signal, and a fresh heartbeat must override an apparently-expired S3 lease. (Happy-ops S3 lease silently expires while heartbeats keep extending the leader's TTL — S3 expiry alone is not sufficient evidence to promote.)
 - A node booting with no heartbeat TTL history (`lease_expires_at_ms == 0` after catchup) waits at least `heartbeat_lease_duration` before challenging via S3 CAS. This grace window gives any current leader a chance to claim the booting node as follower via heartbeat before it attempts promotion.
-- A newly elected leader runs S3 catchup before serving writes. Catchup also runs whenever the observed `lease_index` is higher than the previous one we held — same-leader renewals leave it unchanged, so any increase means another node held the lease in between (e.g. 6 to 7) and may have uploaded S3 fallback batches.
+- A newly elected leader runs S3 catchup before serving writes. Catchup also runs whenever the observed `lease_epoch` is higher than the previous one we held — same-leader renewals leave it unchanged, so any increase means another node held the lease in between (e.g. 6 to 7) and may have uploaded S3 fallback batches.
 - On promotion, the new leader uploads a "promotion batch" to S3 covering the last TCP-replicated batch. This closes the gap where the old leader rolled back a batch the follower kept.
 
 ## Heartbeat and Fencing
@@ -79,10 +79,10 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 
 - In a healthy cluster where both nodes are reachable and clocks are within drift tolerance, S3 is never touched. No lease renewal, no fallback replication, no S3 reads. All coordination flows over TCP heartbeats, all data over TCP replication. Chaos baseline enforces this via `NoS3Fallbacks`, `NoRollbacks`, `NoHeartbeatFailures`.
 - TCP replication is the primary path. S3 fallback triggers when: the follower is offline, the workset exceeds `max_catchup_gap_bytes`, or the pending queue exceeds `pending_replication_high_water_bytes`.
-- S3 replication uploads a single file per batch. Splitting into sub-batches is prohibited - it creates WAL index gaps on the consumer.
+- S3 replication uploads a single file per batch. Splitting into sub-batches is prohibited - it creates WAL sequence gaps on the consumer.
 - S3 uploads are semaphore-limited to prevent network saturation. When replication backpressure exceeds `pending_replication_high_water_bytes`, clients receive `ServerBusy`.
 - Pending replication entries are never silently dropped. If rollback fails, entries are requeued for the next replication cycle.
-- A follower rejects a TCP batch if: (a) `lease_index < leader_lease_index` (stale leader), (b) WAL index is not `current + 1` (gap), or (c) `previous_tip_hash` doesn't match local tip (divergence).
+- A follower rejects a TCP batch if: (a) `lease_epoch < leader_lease_epoch` (stale leader), (b) WAL sequence is not `current + 1` (gap), or (c) `previous_tip_hash` doesn't match local tip (divergence).
 - The leader attempts one extended catchup (prepending missing entries) on WAL mismatch. If the second attempt also fails, it switches to S3 fallback unconditionally.
 - Empty replication batches are no-ops on both TCP and S3 paths.
 
@@ -105,7 +105,7 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 
 ## S3 Catchup (Follower)
 
-- Among S3 batches covering overlapping wal_index ranges, the authoritative chain is selected by `(lease_index, upload_sequence)` lexicographically. `lease_index` is globally monotonic via the S3 CAS election protocol and is the primary comparator: a batch from a higher-lease leader always supersedes one from a lower-lease leader regardless of `upload_sequence`. `upload_sequence` is per-process and serves only as a within-lease tiebreaker; it resets to zero on each leader handover, so it is not meaningful across leaders.
+- Among S3 batches covering overlapping wal_seq ranges, the authoritative chain is selected by `(lease_epoch, upload_sequence)` lexicographically. `lease_epoch` is globally monotonic via the S3 CAS election protocol and is the primary comparator: a batch from a higher-lease leader always supersedes one from a lower-lease leader regardless of `upload_sequence`. `upload_sequence` is per-process and serves only as a within-lease tiebreaker; it resets to zero on each leader handover, so it is not meaningful across leaders.
 - A node never applies a batch it uploaded itself.
 - A follower doesn't need to be caught-up to the WAL tip of the leader, just close enough to re-join as follower using TCP. It can catchup 'offline' via S3, and when close enough to the leader's WAL tip, it can rejoin.
 - Leader will always ensure S3 contains the data required to catch up. If there is no active TCP follower, the leader never ACKs to clients until it has replicated the WAL data to S3.
@@ -115,7 +115,7 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 - Truncation never leaves orphan segments ahead of the active one. When the ancestor lies in a sealed segment, the active segment and any intermediate sealed segments are discarded from disk before the target segment's headers are rewritten.
 - S3 batches are not deleted during catchup. They remain available for divergence resolution until the follower returns to `Follower` state.
 - Never truncate unless a common hash tip is found on both local disk and in an s3 replicated file
-- Never truncate unless S3 has gap-free contiguous coverage from the ancestor's wal_index up through the current write position. Truncating into a range S3 cannot re-supply would destroy entries that cannot be reconstructed.
+- Never truncate unless S3 has gap-free contiguous coverage from the ancestor's wal_seq up through the current write position. Truncating into a range S3 cannot re-supply would destroy entries that cannot be reconstructed.
 - S3 catchup fsyncs as `Standalone`: read position advances with write position, no replication gate.
 - Post-catchup, the node must win an S3 CAS election before accepting writes.
 

@@ -1,19 +1,19 @@
-//! Edge Case: S3 Catchup After Network Partition (WAL Index Gap Bug)
+//! Edge Case: S3 Catchup After Network Partition (WAL Sequence Gap Bug)
 //!
 //! Reproduces the real-world bug from docs/wal-mismatch-pi-cluster.md where
-//! S3 catchup crashes with WalIndexGap after a network partition + failover.
+//! S3 catchup crashes with WalSeqGap after a network partition + failover.
 //!
 //! Bug scenario:
 //! 1. Leader (A) writes events, some replicated via TCP, some via S3 fallback
 //! 2. Network partition: A goes offline
 //! 3. Follower (B) takes over as leader, writes more events (S3 fallback, no follower)
 //! 4. A comes back, demotes to follower, runs S3 catchup
-//! 5. BUG: S3 batches from B don't align with A's local WAL position → WalIndexGap
+//! 5. BUG: S3 batches from B don't align with A's local WAL position → WalSeqGap
 //!
 //! The test verifies that the catchup correctly handles the transition point
 //! between A's existing WAL and B's S3 batches.
 //!
-//! Invariants tested: 7 (WAL index continuity), 10 (post-election S3 catchup),
+//! Invariants tested: 7 (WAL sequence continuity), 10 (post-election S3 catchup),
 //!   13 (WAL divergence recovery)
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
@@ -24,7 +24,7 @@ use std::time::Duration;
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Edge Case: S3 Catchup After Network Partition ===\n");
-    println!("Reproduces WAL index gap bug from Pi cluster.\n");
+    println!("Reproduces WAL sequence gap bug from Pi cluster.\n");
 
     let port_base = 16100 + (std::process::id() % 100) as u16;
     let node_a_port = port_base;
@@ -122,7 +122,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     assert!(total_s3_objects > 0, "Expected S3 fallback objects from B's writes");
 
     // ========================================
-    // PHASE 4: Restart node A — should catch up from S3 without WalIndexGap
+    // PHASE 4: Restart node A — should catch up from S3 without WalSeqGap
     // ========================================
     println!("\nPHASE 4: Restart node A (catches up from S3)");
     println!("---------------------------------------------");
@@ -131,14 +131,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     node_a.restart().await?;
 
     // This is the critical phase: A's WAL has events 1-10. B uploaded events 11-30
-    // to S3. A must catch up from S3 without WalIndexGap.
+    // to S3. A must catch up from S3 without WalSeqGap.
     println!("  Waiting for boot catchup + S3 catchup + cluster rejoin...");
     tokio::time::sleep(Duration::from_secs(15)).await;
 
-    // Verify A is alive (didn't crash with WalIndexGap)
+    // Verify A is alive (didn't crash with WalSeqGap)
     node_a.check_alive()
-        .map_err(|e| format!("Node A crashed during S3 catchup (WalIndexGap bug?): {}", e))?;
-    println!("  Node A is alive (no WalIndexGap crash)");
+        .map_err(|e| format!("Node A crashed during S3 catchup (WalSeqGap bug?): {}", e))?;
+    println!("  Node A is alive (no WalSeqGap crash)");
 
     let mut client_a = CeleriantClient::connect(&format!("127.0.0.1:{}", node_a_port)).await?;
     let a_count = count_events(&mut client_a, &aggregate_key).await?;
@@ -166,7 +166,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  1. TCP replication worked for events 1-10");
     println!("  2. Node A killed, node B took over");
     println!("  3. Node B wrote events 11-30 via S3 fallback");
-    println!("  4. Node A restarted, caught up from S3 (no WalIndexGap)");
+    println!("  4. Node A restarted, caught up from S3 (no WalSeqGap)");
     println!("  5. Continued replication works (events 31-33)\n");
 
     Ok(())

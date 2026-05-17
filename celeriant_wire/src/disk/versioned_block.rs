@@ -148,9 +148,9 @@ mod tests {
 
     fn indexing_metablock_event_batch() -> Metablock {
         Metablock {
-            wal_index: 324234234,
+            wal_seq: 324234234,
             server_timestamp: 1625079600,
-            lease_index: 1,
+            lease_epoch: 1,
             node_id: 12345678901234567890u128,
             compressed_size: 0,
             uncompressed_size: 0,
@@ -160,16 +160,16 @@ mod tests {
                 celeriant_wal::metablocks::metablock_event_batch::MetablockEventBatch {
                     aggregate_key: AggregateKey::new(23423423423, 33420324432, 230234323),
                     event_types_data: celeriant_wal::metablocks::metablock_event_batch::EventTypesKind::Direct([33242342u64; 4]),
-                    event_batch_index: 43242343,
-                    min_event_batch_index: 1,
+                    aggregate_version: 43242343,
+                    trimmed_below_version: 1,
                     client_id: 534534435,
                     user_id: Some(342352352),
-                    min_client_event_index: 4,
-                    max_client_event_index: 4453,
+                    min_client_seq: 4,
+                    max_client_seq: 4453,
                     min_event_timestamp: 4,
                     max_event_timestamp: 4,
-                    min_event_index: 4,
-                    max_event_index: 476765,
+                    min_event_seq: 4,
+                    max_event_seq: 476765,
                 },
             ),
             datablock: celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind::None,
@@ -214,17 +214,17 @@ mod tests {
         let aggregate_id_offset = batch_base + MetablockEventBatch::OFFSET_AGGREGATE_KEY + AggregateKey::OFFSET_AGGREGATE_ID;
         assert_eq!(read_u128_le(&buffer, aggregate_id_offset), 230234323);
 
-        // Get event_batch_index and max_event_index directly
-        let event_batch_index_offset = batch_base + MetablockEventBatch::OFFSET_EVENT_BATCH_INDEX;
-        let max_event_index_offset = batch_base + MetablockEventBatch::OFFSET_MAX_EVENT_INDEX;
-        assert_eq!(u64::from_le_bytes(buffer[event_batch_index_offset..event_batch_index_offset + 8].try_into().unwrap()), 43242343);
-        assert_eq!(u64::from_le_bytes(buffer[max_event_index_offset..max_event_index_offset + 8].try_into().unwrap()), 476765);
+        // Get aggregate_version and max_event_seq directly
+        let aggregate_version_offset = batch_base + MetablockEventBatch::OFFSET_AGGREGATE_VERSION;
+        let max_event_seq_offset = batch_base + MetablockEventBatch::OFFSET_MAX_EVENT_SEQ;
+        assert_eq!(u64::from_le_bytes(buffer[aggregate_version_offset..aggregate_version_offset + 8].try_into().unwrap()), 43242343);
+        assert_eq!(u64::from_le_bytes(buffer[max_event_seq_offset..max_event_seq_offset + 8].try_into().unwrap()), 476765);
 
-        // Get client_id and the client's max client_event_index
+        // Get client_id and the client's max client_seq
         let client_id_offset = batch_base + MetablockEventBatch::OFFSET_CLIENT_ID;
-        let max_client_event_index_offset = batch_base + MetablockEventBatch::OFFSET_MAX_CLIENT_EVENT_INDEX;
+        let max_client_seq_offset = batch_base + MetablockEventBatch::OFFSET_MAX_CLIENT_EVENT_SEQ;
         assert_eq!(read_u128_le(&buffer, client_id_offset), 534534435);
-        assert_eq!(read_u64_le(&buffer, max_client_event_index_offset), 4453);
+        assert_eq!(read_u64_le(&buffer, max_client_seq_offset), 4453);
 
         // Get the user_id
         let user_id_offset = batch_base + MetablockEventBatch::OFFSET_USER_ID;
@@ -239,10 +239,10 @@ mod tests {
         let header = ShardLogHeader {
             metablocks_position: 0x1234_5678_9ABC_DEF0,
             datablocks_position: 0xFEDC_BA98_7654_3210,
-            wal_index: 0x0FED_CBA9_8765_4321,
+            wal_seq: 0x0FED_CBA9_8765_4321,
             aggregate_bloom: vec![],
             tip_hash: GENESIS_HASH,
-            last_received_replication_wal_index: 0,
+            last_received_replication_wal_seq: 0,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -258,9 +258,9 @@ mod tests {
             "datablocks_position was corrupted - likely due to incorrect zero-fill offset"
         );
         assert_eq!(
-            deserialized.wal_index, 
-            header.wal_index,
-            "wal_index was corrupted - likely due to incorrect zero-fill offset"
+            deserialized.wal_seq, 
+            header.wal_seq,
+            "wal_seq was corrupted - likely due to incorrect zero-fill offset"
         );
     }
 
@@ -275,10 +275,10 @@ mod tests {
         let header = ShardLogHeader {
             metablocks_position: 11,
             datablocks_position: 12,
-            wal_index: 13,
+            wal_seq: 13,
             aggregate_bloom: vec![],
             tip_hash,
-            last_received_replication_wal_index: 0,
+            last_received_replication_wal_seq: 0,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -288,7 +288,7 @@ mod tests {
 
         assert_eq!(deserialized.metablocks_position, header.metablocks_position);
         assert_eq!(deserialized.datablocks_position, header.datablocks_position);
-        assert_eq!(deserialized.wal_index, header.wal_index);
+        assert_eq!(deserialized.wal_seq, header.wal_seq);
         assert_eq!(deserialized.tip_hash, header.tip_hash);
     }
 
@@ -297,10 +297,10 @@ mod tests {
         let header = ShardLogHeader {
             metablocks_position: 11,
             datablocks_position: 12,
-            wal_index: 13,
+            wal_seq: 13,
             aggregate_bloom: vec![],
             tip_hash: GENESIS_HASH,
-            last_received_replication_wal_index: 0,
+            last_received_replication_wal_seq: 0,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -318,10 +318,10 @@ mod tests {
         let header = ShardLogHeader {
             metablocks_position: 0x1111_1111_1111_1111,
             datablocks_position: 0x2222_2222_2222_2222,
-            wal_index: 0x3333_3333_3333_3333,
+            wal_seq: 0x3333_3333_3333_3333,
             aggregate_bloom: vec![],
             tip_hash: GENESIS_HASH,
-            last_received_replication_wal_index: 0,
+            last_received_replication_wal_seq: 0,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -342,10 +342,10 @@ mod tests {
         let header = ShardLogHeader {
             metablocks_position: 11,
             datablocks_position: 12,
-            wal_index: 13,
+            wal_seq: 13,
             aggregate_bloom: vec![],
             tip_hash: GENESIS_HASH,
-            last_received_replication_wal_index: 0,
+            last_received_replication_wal_seq: 0,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -366,10 +366,10 @@ mod tests {
         let header = ShardLogHeader {
             metablocks_position: 11,
             datablocks_position: 12,
-            wal_index: 13,
+            wal_seq: 13,
             aggregate_bloom: vec![],
             tip_hash: GENESIS_HASH,
-            last_received_replication_wal_index: 0,
+            last_received_replication_wal_seq: 0,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -390,10 +390,10 @@ mod tests {
         let header = ShardLogHeader {
             metablocks_position: 11,
             datablocks_position: 12,
-            wal_index: 13,
+            wal_seq: 13,
             aggregate_bloom: vec![],
             tip_hash: GENESIS_HASH,
-            last_received_replication_wal_index: 0,
+            last_received_replication_wal_seq: 0,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -416,10 +416,10 @@ mod tests {
         let header = ShardLogHeader {
             metablocks_position: 11,
             datablocks_position: 12,
-            wal_index: 13,
+            wal_seq: 13,
             aggregate_bloom: vec![],
             tip_hash: GENESIS_HASH,
-            last_received_replication_wal_index: 0,
+            last_received_replication_wal_seq: 0,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -434,7 +434,7 @@ mod tests {
     fn lease_json_roundtrip() {
         let lease = Lease {
             leader_node_id: 42,
-            lease_index: 5,
+            lease_epoch: 5,
             acquired_at_ms: 1000,
             expires_at_ms: 6000,
         };
@@ -448,7 +448,7 @@ mod tests {
     fn lease_json_contains_uuid_string() {
         let lease = Lease {
             leader_node_id: 0x550e8400_e29b_41d4_a716_446655440000u128,
-            lease_index: 5,
+            lease_epoch: 5,
             acquired_at_ms: 1710000000000,
             expires_at_ms: 1710000005000,
         };
@@ -531,8 +531,8 @@ mod tests {
                     aggregate_id: 100,
                     is_deleted: false,
                     event_batch_count: 5,
-                    last_event_batch_index: 10,
-                    min_event_batch_index: 1,
+                    last_aggregate_version: 10,
+                    min_aggregate_version: 1,
                     last_server_timestamp: 999,
                     compressed_size: 512,
                     uncompressed_size: 1024,

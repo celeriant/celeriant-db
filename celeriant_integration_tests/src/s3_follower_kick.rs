@@ -149,7 +149,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Write one more event. The replication pipeline will:
     // 1. Reconnect to follower via proxy
-    // 2. Send batch → follower rejects with WalIndexMismatch (it's 10 entries behind)
+    // 2. Send batch → follower rejects with WalSeqMismatch (it's 10 entries behind)
     // 3. Leader tries fetch_catchup_entries → gap > 4096 → FollowerTooFarBehind
     // 4. Falls back to S3 → sends kick (proxy is open now!)
     // 5. Follower receives kick → transitions to FollowerCatchingUp

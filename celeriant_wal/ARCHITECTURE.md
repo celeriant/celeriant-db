@@ -33,14 +33,14 @@ The header is duplicated at both start and end of file. On torn writes, CRC chec
 
 ## Invariants
 
-- WAL entries are globally contiguous within a shard. Each new entry receives exactly `current_wal_index + 1`. Gaps are fatal.
+- WAL entries are globally contiguous within a shard. Each new entry receives exactly `current_wal_seq + 1`. Gaps are fatal.
 - Every metablock carries `previous_tip_hash`, forming a Blake3 hash chain over the entire WAL history.
 - Hash computation excludes `datablock_position` so leader and follower produce identical hashes despite different on-disk layouts.
 - Metablocks are fixed-size (1024 bytes). Unused trailing bytes are zero-padded.
 - Datablocks use dual storage: inline (up to 512 bytes, stored within the metablock) or external (written to end of file, growing backward). External datablocks carry their own CRC32C.
 - `AggregateKey` serializes as 3 contiguous u128 LE values (48 bytes). The in-memory `hash` field is never serialized.
 - Enum discriminants are 4-byte u32 (fixed-int encoding). `Option<T>` is 1-byte discriminant + T.
-- `lease_index` is strictly monotonically increasing and never reused. A fresh cluster starts at `lease_index = 1`.
+- `lease_epoch` is strictly monotonically increasing and never reused. A fresh cluster starts at `lease_epoch = 1`.
 - Membership is a fixed 2-slot array in S3. A third node cannot join.
 
 ## Key Types
@@ -49,13 +49,13 @@ The header is duplicated at both start and end of file. On torn writes, CRC chec
 
 | Type | Purpose |
 |------|---------|
-| `Metablock` | Container with wal_index, server_timestamp, lease_index, node_id, previous_tip_hash, compression info |
+| `Metablock` | Container with wal_seq, server_timestamp, lease_epoch, node_id, previous_tip_hash, compression info |
 | `MetablockKind` | Enum: EventBatchMetadata, SchemaRegistration, SoftDelete, SoftTrim |
 | `MetablockEventBatch` | Filtering metadata (min/max ranges, bloom filter, aggregate key, client/user ids) |
 | `DatablockStorageKind` | Enum: None, Inline(DatablockInlineData), Block(DatablockBlockRef) |
 | `Datablock` | Container wrapping a DatablockKind |
 | `DatablockKind` | Enum: EventBatchItem, SchemaRegistration |
-| `ShardLogHeader` | metablocks_position, datablocks_position, wal_index, tip_hash, aggregate_bloom |
+| `ShardLogHeader` | metablocks_position, datablocks_position, wal_seq, tip_hash, aggregate_bloom |
 
 ### Composite Keys
 
@@ -71,9 +71,9 @@ The header is duplicated at both start and end of file. On torn writes, CRC chec
 
 | Type | S3 Path | Purpose |
 |------|---------|---------|
-| `Lease` | `cluster/lease.json` | Leader election state: leader_node_id, lease_index, acquired_at_ms, expires_at_ms |
+| `Lease` | `cluster/lease.json` | Leader election state: leader_node_id, lease_epoch, acquired_at_ms, expires_at_ms |
 | `Membership` | `cluster/membership.json` | Two-node cluster state: array of 2 `Option<NodeInfo>` |
-| `FallbackBatch` | — | S3 replication fallback: fallback_index, end_wal_index, shard_id, items |
+| `FallbackBatch` | — | S3 replication fallback: fallback_index, end_wal_seq, shard_id, items |
 
 ## Design Decisions
 
@@ -92,10 +92,10 @@ Both are stored as truncated 128-bit identifiers for storage efficiency.
 
 | Field | Assigned By | Purpose |
 |-------|-------------|---------|
-| `client_event_index` | Client | Idempotency—server rejects duplicates per client |
-| `event_index` | Server | Ordering of individual events within an aggregate |
-| `event_batch_index` | Server | Batch ordering within an aggregate |
-| `wal_index` | Server | Global ordering across all metablocks in shard |
+| `client_seq` | Client | Idempotency—server rejects duplicates per client |
+| `event_seq` | Server | Ordering of individual events within an aggregate |
+| `aggregate_version` | Server | Batch ordering within an aggregate |
+| `wal_seq` | Server | Global ordering across all metablocks in shard |
 
 ### Why `Arc<Vec<u8>>` for event_value?
 
@@ -156,8 +156,8 @@ The `previous_tip_hash` field in each `Metablock` records the hash of the prior 
 
 ### Soft operations
 
-- `MetablockSoftDelete` — marks an aggregate deleted. `allow_recreate` permits a new aggregate with the same key. `allow_index_continuation` permits new events to continue from the last index rather than resetting.
-- `MetablockSoftTrim` — records `keep_from_event_batch_index`; older batches are logically invisible.
+- `MetablockSoftDelete` — marks an aggregate deleted. `allow_recreate` permits a new aggregate with the same key. `allow_sequence_continuation` permits new events to continue from the last index rather than resetting.
+- `MetablockSoftTrim` — records `keep_from_aggregate_version`; older batches are logically invisible.
 
 ## Constants
 
@@ -171,7 +171,7 @@ The `previous_tip_hash` field in each `Metablock` records the hash of the prior 
 | `AGGREGATE_BLOOM_BYTES` | 262144 (256KB) | Aggregate bloom filter size; <1% false positive at 200K entries |
 | `AGGREGATE_BLOOM_HASH_COUNT` | 10 | Hash functions for aggregate bloom |
 | `GENESIS_HASH` | `[0u8; 32]` | Starting hash for the tip_hash chain |
-| `FIRST_EVENT_BATCH_INDEX` | 1 | First valid event batch index |
+| `FIRST_AGGREGATE_VERSION` | 1 | First valid aggregate version |
 
 ### `small-metablock` feature
 

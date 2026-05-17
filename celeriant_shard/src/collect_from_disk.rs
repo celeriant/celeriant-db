@@ -75,7 +75,7 @@ pub async fn fetch_datablocks_for_metablocks(
                 )
                 .map_err(|source| FetchDatablockError::DatablockError {
                     log_id: kept.log_id,
-                    wal_index: kept.metablock.wal_index,
+                    wal_seq: kept.metablock.wal_seq,
                     source,
                     is_inline: true
                 })?;
@@ -130,7 +130,7 @@ pub async fn fetch_datablocks_for_metablocks(
             )
             .map_err(|source| FetchDatablockError::DatablockError {
                 log_id: kept.log_id,
-                wal_index: kept.metablock.wal_index,
+                wal_seq: kept.metablock.wal_seq,
                 source,
                 is_inline: false
             })?;

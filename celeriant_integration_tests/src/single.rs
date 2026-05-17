@@ -161,7 +161,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             SingleAggregateWrite {
                 events: vec![event],
                 allow_create: true,
-                expected_event_batch_index: Some(0),
+                expected_version: Some(0),
                 enforce_client_idempotency: true,
             },
         );
@@ -192,7 +192,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         SingleAggregateWrite {
             events: vec![event_1],
             allow_create: false,
-            expected_event_batch_index: Some(1),
+            expected_version: Some(1),
             enforce_client_idempotency: true,
         },
     );
@@ -201,7 +201,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         SingleAggregateWrite {
             events: vec![event_2],
             allow_create: false,
-            expected_event_batch_index: Some(1),
+            expected_version: Some(1),
             enforce_client_idempotency: true,
         },
     );
@@ -325,8 +325,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         aggregate_1.clone(),
         SingleAggregateDelete {
             allow_recreate: false,
-            allow_index_continuation: false,
-            expected_event_batch_index: Some(2), // We have 2 event batches now (0 and 1)
+            allow_sequence_continuation: false,
+            expected_version: Some(2), // We have 2 event batches now (0 and 1)
         },
     );
     let delete_request = ClientRequest::Delete(DeleteRequest {
@@ -400,8 +400,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("  Verified aggregate 101 is marked as deleted, aggregate 201 is not deleted");
 
-    // Test expected_event_batch_index conflict
-    println!("\n=== Testing expected_event_batch_index conflict ===");
+    // Test expected_version conflict
+    println!("\n=== Testing expected_version conflict ===");
     let conflict_event = create_event(2, "This should fail".to_string());
     let mut writes = HashMap::new();
     writes.insert(
@@ -409,7 +409,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         SingleAggregateWrite {
             events: vec![conflict_event],
             allow_create: false,
-            expected_event_batch_index: Some(0), // Wrong! Should be 2 now
+            expected_version: Some(0), // Wrong! Should be 2 now
             enforce_client_idempotency: true,
         },
     );
@@ -433,10 +433,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn create_event(client_event_index: u64, message: String) -> DatablockAggregateEvent {
+fn create_event(client_seq: u64, message: String) -> DatablockAggregateEvent {
     DatablockAggregateEvent {
-        client_event_index,
-        event_index: 0, // Server will assign
+        client_seq,
+        event_seq: 0, // Server will assign
         event_id: Some(rand::random()),
         event_timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

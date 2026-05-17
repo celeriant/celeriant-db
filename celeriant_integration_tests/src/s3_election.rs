@@ -129,8 +129,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let lease = deserialise_lease(&lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
 
-    println!("  lease_index={}, leader_node_id={:x}", lease.lease_index, lease.leader_node_id);
-    assert!(lease.lease_index >= 1, "Election should produce lease_index >= 1 (got {})", lease.lease_index);
+    println!("  lease_epoch={}, leader_node_id={:x}", lease.lease_epoch, lease.leader_node_id);
+    assert!(lease.lease_epoch >= 1, "Election should produce lease_epoch >= 1 (got {})", lease.lease_epoch);
     assert_ne!(lease.leader_node_id, 0, "leader_node_id must be set");
 
     let membership_bytes = minio.get_object("cluster/membership.json").await?;

@@ -24,7 +24,7 @@ pub struct InternalShardConfig {
     pub list_max_concurrent: u64,
     pub read_max_concurrent: u64,
     pub list_max_duration: Duration,
-    pub list_wal_index_cache_bytes: u64,
+    pub list_wal_seq_cache_bytes: u64,
     pub schema_cache_bytes: u64,
     pub max_schema_size_bytes: u64,
     pub max_catchup_gap_bytes: Option<u64>,

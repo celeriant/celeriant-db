@@ -34,11 +34,11 @@ pub enum AggregateCompactionState {
     Alive,
     /// Aggregate was soft-deleted; all event batches should be skipped.
     Deleted,
-    /// Aggregate was trimmed; batches below `min_event_batch_index` should be skipped.
-    Trimmed { min_event_batch_index: u64 },
-    /// Aggregate was deleted then recreated; event batches with `wal_index <= deletion_wal_index`
-    /// are dead (pre-deletion), those with `wal_index > deletion_wal_index` are alive.
-    RecreatedAfter { deletion_wal_index: u64 },
+    /// Aggregate was trimmed; batches below `min_aggregate_version` should be skipped.
+    Trimmed { min_aggregate_version: u64 },
+    /// Aggregate was deleted then recreated; event batches with `wal_seq <= deletion_wal_seq`
+    /// are dead (pre-deletion), those with `wal_seq > deletion_wal_seq` are alive.
+    RecreatedAfter { deletion_wal_seq: u64 },
 }
 
 /// Default chunk size for forward metablock scanning (32KB = 32 metablocks at 1KB each).
@@ -213,7 +213,7 @@ async fn resolve_aggregate_states(
                                     let state = if seen_event_batch.contains(&sd.aggregate_key) {
                                         // Live batches exist after this deletion → recreated.
                                         AggregateCompactionState::RecreatedAfter {
-                                            deletion_wal_index: metablock.wal_index,
+                                            deletion_wal_seq: metablock.wal_seq,
                                         }
                                     } else {
                                         AggregateCompactionState::Deleted
@@ -228,7 +228,7 @@ async fn resolve_aggregate_states(
                                     // First-seen in reverse = most recent trim floor.
                                     trim_pending
                                         .entry(st.aggregate_key.clone())
-                                        .or_insert(st.keep_from_event_batch_index);
+                                        .or_insert(st.keep_from_aggregate_version);
                                 }
                             }
                             MetablockKind::EventBatchMetadata(eb) => {
@@ -267,7 +267,7 @@ async fn resolve_aggregate_states(
         state_map.insert(
             key,
             AggregateCompactionState::Trimmed {
-                min_event_batch_index: min_index,
+                min_aggregate_version: min_index,
             },
         );
     }
@@ -300,11 +300,11 @@ fn should_keep_metablock(
         MetablockKind::EventBatchMetadata(eb) => {
             match state_map.get(&eb.aggregate_key) {
                 Some(AggregateCompactionState::Deleted) => false,
-                Some(AggregateCompactionState::Trimmed { min_event_batch_index }) => {
-                    eb.event_batch_index >= *min_event_batch_index
+                Some(AggregateCompactionState::Trimmed { min_aggregate_version }) => {
+                    eb.aggregate_version >= *min_aggregate_version
                 }
-                Some(AggregateCompactionState::RecreatedAfter { deletion_wal_index }) => {
-                    metablock.wal_index > *deletion_wal_index
+                Some(AggregateCompactionState::RecreatedAfter { deletion_wal_seq }) => {
+                    metablock.wal_seq > *deletion_wal_seq
                 }
                 // Alive or missing from map (treat as alive).
                 _ => true,
@@ -444,9 +444,9 @@ async fn build_compacted_file(
     // -------------------------------------------------------------------------
     let src_segment = log_segments_cache.get(target_log_id).await?;
 
-    let (metablocks_end, original_tip_hash, original_wal_index, original_last_received_replication_wal_index) = {
+    let (metablocks_end, original_tip_hash, original_wal_seq, original_last_received_replication_wal_seq) = {
         let meta = src_segment.metadata.borrow();
-        (meta.readable_metablocks_end(), meta.write.tip_hash, meta.write.wal_index, meta.last_received_replication_wal_index)
+        (meta.readable_metablocks_end(), meta.write.tip_hash, meta.write.wal_seq, meta.last_received_replication_wal_seq)
     };
     let metablocks_start = HEADER_BLOCK_SIZE_BYTES as u64;
 
@@ -668,18 +668,18 @@ async fn build_compacted_file(
     // If no datablocks were kept it equals `datablocks_region_end`.
     let final_datablocks_position = new_datablocks_cursor;
 
-    // Preserve the original tip_hash and wal_index from before compaction rather than
+    // Preserve the original tip_hash and wal_seq from before compaction rather than
     // recomputing them from surviving metablocks. This is intentional: the segment was
     // fully replicated before compaction (enforced by the is_pending_advance guard), so
-    // the hash chain and wal_index represent already-verified state. The compacted content
+    // the hash chain and wal_seq represent already-verified state. The compacted content
     // no longer chains to this tip_hash — correctness is maintained by metablocks_position.
     let header = ShardLogHeader {
         metablocks_position: final_metablocks_position,
         datablocks_position: final_datablocks_position,
-        wal_index: original_wal_index,
+        wal_seq: original_wal_seq,
         tip_hash: original_tip_hash,
         aggregate_bloom: bloom.to_bytes(),
-        last_received_replication_wal_index: original_last_received_replication_wal_index,
+        last_received_replication_wal_seq: original_last_received_replication_wal_seq,
     };
 
     write_dual_shard_log_header(&new_file, tail_header_pos, &header)

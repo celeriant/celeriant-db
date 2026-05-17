@@ -52,12 +52,12 @@ fn write_event(
     major: u64,
     minor: u64,
     payload: &[u8],
-    batch_index: u64,
+    aggregate_version: u64,
     allow_create: bool,
 ) -> ClientRequest {
     let event = DatablockAggregateEvent {
-        client_event_index: 0,
-        event_index: 0,
+        client_seq: 0,
+        event_seq: 0,
         event_id: Some(rand::random()),
         event_timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -75,7 +75,7 @@ fn write_event(
         SingleAggregateWrite {
             events: vec![event],
             allow_create,
-            expected_event_batch_index: Some(batch_index),
+            expected_version: Some(aggregate_version),
             enforce_client_idempotency: false,
         },
     );

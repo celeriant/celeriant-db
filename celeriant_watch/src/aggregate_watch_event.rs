@@ -15,15 +15,15 @@ pub struct AggregateWatchEvent {
 pub enum AggregateWatchEventOperation {
     Delete {},
     Write {
-        from_event_batch_index: u64,
-        to_event_batch_index: u64,
+        from_aggregate_version: u64,
+        to_aggregate_version: u64,
     },
     Read {
-        from_event_batch_index: u64,
-        to_event_batch_index: Option<u64>,
+        from_aggregate_version: u64,
+        to_aggregate_version: Option<u64>,
     },
     TrimStart {
-        keep_from_event_batch_index: u64,
+        keep_from_aggregate_version: u64,
     },
     AggregateDetails {},
     Create {},
@@ -53,9 +53,9 @@ impl AggregateWatchEvent {
 /// then flattens to a `WatchResponse` for the wire.
 #[derive(Debug, Clone, Default)]
 struct AccumulatedEvent {
-    from_event_batch_index: Option<u64>,
-    to_event_batch_index: Option<u64>,
-    keep_from_event_batch_index: Option<u64>,
+    from_aggregate_version: Option<u64>,
+    to_aggregate_version: Option<u64>,
+    keep_from_aggregate_version: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -75,57 +75,57 @@ impl WatchEventAccumulator {
                 events_map.entry(operation_key).or_default();
             }
             AggregateWatchEventOperation::Write {
-                from_event_batch_index,
-                to_event_batch_index,
+                from_aggregate_version,
+                to_aggregate_version,
             } => {
                 events_map
                     .entry(operation_key)
                     .and_modify(|e| {
-                        e.from_event_batch_index = Some(
-                            e.from_event_batch_index
-                                .unwrap_or(from_event_batch_index)
-                                .min(from_event_batch_index),
+                        e.from_aggregate_version = Some(
+                            e.from_aggregate_version
+                                .unwrap_or(from_aggregate_version)
+                                .min(from_aggregate_version),
                         );
-                        e.to_event_batch_index = Some(
-                            e.to_event_batch_index
-                                .unwrap_or(to_event_batch_index)
-                                .max(to_event_batch_index),
+                        e.to_aggregate_version = Some(
+                            e.to_aggregate_version
+                                .unwrap_or(to_aggregate_version)
+                                .max(to_aggregate_version),
                         );
                     })
                     .or_insert(AccumulatedEvent {
-                        from_event_batch_index: Some(from_event_batch_index),
-                        to_event_batch_index: Some(to_event_batch_index),
+                        from_aggregate_version: Some(from_aggregate_version),
+                        to_aggregate_version: Some(to_aggregate_version),
                         ..Default::default()
                     });
             }
             AggregateWatchEventOperation::Read {
-                from_event_batch_index,
-                to_event_batch_index,
+                from_aggregate_version,
+                to_aggregate_version,
             } => {
                 events_map
                     .entry(operation_key)
                     .and_modify(|e| {
-                        e.from_event_batch_index = Some(
-                            e.from_event_batch_index
-                                .unwrap_or(from_event_batch_index)
-                                .min(from_event_batch_index),
+                        e.from_aggregate_version = Some(
+                            e.from_aggregate_version
+                                .unwrap_or(from_aggregate_version)
+                                .min(from_aggregate_version),
                         );
-                        e.to_event_batch_index = match (e.to_event_batch_index, to_event_batch_index) {
+                        e.to_aggregate_version = match (e.to_aggregate_version, to_aggregate_version) {
                             (Some(a), Some(b)) => Some(a.max(b)),
                             (a, b) => a.or(b),
                         };
                     })
                     .or_insert(AccumulatedEvent {
-                        from_event_batch_index: Some(from_event_batch_index),
-                        to_event_batch_index,
+                        from_aggregate_version: Some(from_aggregate_version),
+                        to_aggregate_version,
                         ..Default::default()
                     });
             }
             AggregateWatchEventOperation::TrimStart {
-                keep_from_event_batch_index,
+                keep_from_aggregate_version,
             } => {
                 events_map.insert(operation_key, AccumulatedEvent {
-                    keep_from_event_batch_index: Some(keep_from_event_batch_index),
+                    keep_from_aggregate_version: Some(keep_from_aggregate_version),
                     ..Default::default()
                 });
             }
@@ -145,9 +145,9 @@ impl WatchEventAccumulator {
                     aggregate_type_id: key.aggregate_type_id,
                     aggregate_id: key.aggregate_id,
                     operation,
-                    from_event_batch_index: acc.from_event_batch_index,
-                    to_event_batch_index: acc.to_event_batch_index,
-                    keep_from_event_batch_index: acc.keep_from_event_batch_index,
+                    from_aggregate_version: acc.from_aggregate_version,
+                    to_aggregate_version: acc.to_aggregate_version,
+                    keep_from_aggregate_version: acc.keep_from_aggregate_version,
                 });
             }
         }

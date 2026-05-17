@@ -395,8 +395,8 @@ async fn pressure_writer(
         let payload = format!("{{\"c\":{},\"e\":{},\"p\":\"{}\"}}", id, count, pad);
 
         let event = DatablockAggregateEvent {
-            client_event_index: count,
-            event_index: 0,
+            client_seq: count,
+            event_seq: 0,
             event_id: None,
             event_timestamp: 0,
             event_type_major: 1,
@@ -411,7 +411,7 @@ async fn pressure_writer(
             SingleAggregateWrite {
                 events: vec![event],
                 allow_create: true,
-                expected_event_batch_index: None,
+                expected_version: None,
                 enforce_client_idempotency: false,
             },
         );

@@ -40,7 +40,7 @@ Runtime orchestration for sharded executors, cluster coordination, and sidecar I
 - All S3/HTTP work runs in a separate tokio sidecar runtime. io_uring and tokio are incompatible in the same thread.
 - Shard routing: `routing_id % num_shards`. Multi-aggregate writes that span multiple shards are rejected with `IncompatibleFilters`.
 - A connection can be redirected between shards on any request via the glommio channel mesh.
-- A newly elected leader runs S3 catchup before serving writes. Catchup also runs if the `lease_index` gap indicates the lease changed hands during a network partition.
+- A newly elected leader runs S3 catchup before serving writes. Catchup also runs if the `lease_epoch` gap indicates the lease changed hands during a network partition.
 
 ## Key Types
 
