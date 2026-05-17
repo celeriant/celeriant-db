@@ -13,7 +13,7 @@
 
     function getState(ci, accountId) {
         if (!state[ci][accountId]) {
-            state[ci][accountId] = { batches: [], currentBatchIndex: 0, balance: 0 };
+            state[ci][accountId] = { batches: [], currentAggregateVersion: 0, balance: 0 };
         }
         return state[ci][accountId];
     }
@@ -69,12 +69,12 @@
 
     async function doFetchEvents(ci, accountId) {
         const s = getState(ci, accountId);
-        const from = s.currentBatchIndex + 1;
-        const res = await fetch(`/api/accounts/${accountId}/events?fromBatchIndex=${from}`);
+        const from = s.currentAggregateVersion + 1;
+        const res = await fetch(`/api/accounts/${accountId}/events?fromVersion=${from}`);
         const data = await res.json();
         if (data.batches && data.batches.length > 0) {
             s.batches.push(...data.batches);
-            s.currentBatchIndex = data.batches[data.batches.length - 1].batchIndex;
+            s.currentAggregateVersion = data.batches[data.batches.length - 1].aggregateVersion;
         }
         reproject(ci, accountId);
     }
@@ -101,7 +101,7 @@
         const body = {
             clientId: clients[ci].id,
             amountCents: cents,
-            expectedBatchIndex: s.currentBatchIndex,
+            expectedAggregateVersion: s.currentAggregateVersion,
         };
 
         try {
@@ -139,7 +139,7 @@
         const body = {
             clientId: clients[ci].id,
             amountCents: cents,
-            expectedBatchIndex: s.currentBatchIndex,
+            expectedAggregateVersion: s.currentAggregateVersion,
         };
 
         try {
@@ -184,8 +184,8 @@
             fromAccountId: accountId,
             toAccountId: toAccountId,
             amountCents: cents,
-            expectedFromBatchIndex: fromState.currentBatchIndex,
-            expectedToBatchIndex: toState.currentBatchIndex,
+            expectedFromVersion: fromState.currentAggregateVersion,
+            expectedToVersion: toState.currentAggregateVersion,
         };
 
         try {
@@ -276,7 +276,7 @@
                 historyHtml += `<div class="history-item">
                     <span>${label.text}</span>
                     <span class="amount ${label.cls}">${formatCents(label.amount)}</span>
-                    <span class="meta">batch #${batch.batchIndex}</span>
+                    <span class="meta">v${batch.aggregateVersion}</span>
                 </div>`;
             }
         }
@@ -288,7 +288,7 @@
             </div>
             <div class="balance-row">
                 <span class="balance">${formatCents(s.balance)}</span>
-                <span class="stream-pos">stream pos: ${s.currentBatchIndex}</span>
+                <span class="stream-pos">stream pos: ${s.currentAggregateVersion}</span>
             </div>
             <div class="actions">
                 <input type="text" class="amount-input" placeholder="$0.00">

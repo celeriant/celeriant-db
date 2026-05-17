@@ -8,7 +8,7 @@
 
     function getState(accountId) {
         if (!state[accountId]) {
-            state[accountId] = { balanceCents: 0, batchIndex: 0, events: [] };
+            state[accountId] = { balanceCents: 0, aggregateVersion: 0, events: [] };
         }
         return state[accountId];
     }
@@ -35,8 +35,45 @@
         }
     }
 
-    function idempotencyKey() {
+    // One UUID per user intent (per button click). Reused across retries so the
+    // BFF can recognise the duplicate via event_id even after a BFF crash.
+    function newIntentKey() {
         return crypto.randomUUID();
+    }
+
+    // Disable a button for the duration of an async action. Suppresses button-smash:
+    // a rapid second click would otherwise be a separate intent (different UUID) and land
+    // a second event in the stream.
+    async function withBusy(btnEl, fn) {
+        btnEl.disabled = true;
+        try {
+            await fn();
+        } finally {
+            btnEl.disabled = false;
+        }
+    }
+
+    // Fetch with a single retry on network failure, reusing the same Idempotency-Key.
+    async function fetchWithRetry(url, body, idempotencyKey) {
+        let lastErr = null;
+        for (let attempt = 1; attempt <= 2; attempt++) {
+            try {
+                return await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Idempotency-Key': idempotencyKey,
+                    },
+                    body: JSON.stringify(body),
+                });
+            } catch (e) {
+                lastErr = e;
+                if (attempt < 2) {
+                    await new Promise(r => setTimeout(r, 300));
+                }
+            }
+        }
+        throw lastErr;
     }
 
     function parseCents(input) {
@@ -62,7 +99,7 @@
         if (!res.ok) return;
         const data = await res.json();
         s.balanceCents = data.balanceCents;
-        s.batchIndex = data.batchIndex;
+        s.aggregateVersion = data.aggregateVersion;
     }
 
     async function fetchHistory(accountId) {
@@ -72,7 +109,7 @@
         const data = await res.json();
         s.events = data.events || [];
         s.balanceCents = data.balanceCents;
-        s.batchIndex = data.currentBatchIndex;
+        s.aggregateVersion = data.currentAggregateVersion;
     }
 
     function showToast(cardEl, msg, type) {
@@ -102,20 +139,18 @@
         const cents = parseCents(input.value);
         if (!cents) { showToast(cardEl, 'Enter a valid amount.', 'warn'); return; }
 
+        const intentKey = newIntentKey();
         try {
-            const res = await fetch(`/api/accounts/${accountId}/deposit`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Idempotency-Key': idempotencyKey(),
-                },
-                body: JSON.stringify({ amountCents: cents }),
-            });
+            const res = await fetchWithRetry(
+                `/api/accounts/${accountId}/deposit`,
+                { amountCents: cents },
+                intentKey,
+            );
             if (!res.ok) { await handleErrorResponse(res, cardEl); return; }
             const data = await res.json();
             const s = getState(accountId);
             s.balanceCents = data.balanceCents;
-            s.batchIndex = data.batchIndex;
+            s.aggregateVersion = data.aggregateVersion;
             input.value = '';
             await fetchHistory(accountId);
             showToast(cardEl, 'Deposit successful.', 'success');
@@ -130,20 +165,18 @@
         const cents = parseCents(input.value);
         if (!cents) { showToast(cardEl, 'Enter a valid amount.', 'warn'); return; }
 
+        const intentKey = newIntentKey();
         try {
-            const res = await fetch(`/api/accounts/${accountId}/withdraw`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Idempotency-Key': idempotencyKey(),
-                },
-                body: JSON.stringify({ amountCents: cents }),
-            });
+            const res = await fetchWithRetry(
+                `/api/accounts/${accountId}/withdraw`,
+                { amountCents: cents },
+                intentKey,
+            );
             if (!res.ok) { await handleErrorResponse(res, cardEl); return; }
             const data = await res.json();
             const s = getState(accountId);
             s.balanceCents = data.balanceCents;
-            s.batchIndex = data.batchIndex;
+            s.aggregateVersion = data.aggregateVersion;
             input.value = '';
             await fetchHistory(accountId);
             showToast(cardEl, 'Withdrawal successful.', 'success');
@@ -162,27 +195,21 @@
         const toAccountId = selectEl.value;
         if (!toAccountId) { showToast(cardEl, 'Select a target account.', 'warn'); return; }
 
+        const intentKey = newIntentKey();
         try {
-            const res = await fetch('/api/transfers', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Idempotency-Key': idempotencyKey(),
-                },
-                body: JSON.stringify({
-                    fromAccountId: accountId,
-                    toAccountId: toAccountId,
-                    amountCents: cents,
-                }),
-            });
+            const res = await fetchWithRetry(
+                '/api/transfers',
+                { fromAccountId: accountId, toAccountId: toAccountId, amountCents: cents },
+                intentKey,
+            );
             if (!res.ok) { await handleErrorResponse(res, cardEl); return; }
             const data = await res.json();
             const fromState = getState(accountId);
             fromState.balanceCents = data.from.balanceCents;
-            fromState.batchIndex = data.from.batchIndex;
+            fromState.aggregateVersion = data.from.aggregateVersion;
             const toState = getState(toAccountId);
             toState.balanceCents = data.to.balanceCents;
-            toState.batchIndex = data.to.batchIndex;
+            toState.aggregateVersion = data.to.aggregateVersion;
             amountInput.value = '';
             await Promise.all([fetchHistory(accountId), fetchHistory(toAccountId)]);
             showToast(cardEl, 'Transfer successful.', 'success');
@@ -255,7 +282,7 @@
             historyHtml += `<div class="history-item">
                 <span>${label.text}</span>
                 <span class="amount ${label.cls}">${formatCents(label.amount)}</span>
-                <span class="meta">batch #${e.batchIndex}</span>
+                <span class="meta">v${e.aggregateVersion}</span>
             </div>`;
         }
 
@@ -266,7 +293,7 @@
             </div>
             <div class="balance-row">
                 <span class="balance">${formatCents(s.balanceCents)}</span>
-                <span class="stream-pos">stream pos: ${s.batchIndex}</span>
+                <span class="stream-pos">stream pos: ${s.aggregateVersion}</span>
             </div>
             <div class="actions">
                 <input type="text" class="amount-input" placeholder="$0.00">
@@ -290,9 +317,9 @@
         `;
 
         card.querySelector('[data-action="refresh"]').onclick = () => doRefresh(account.id, card);
-        card.querySelector('[data-action="deposit"]').onclick = () => doDeposit(account.id, card);
-        card.querySelector('[data-action="withdraw"]').onclick = () => doWithdraw(account.id, card);
-        card.querySelector('[data-action="transfer"]').onclick = () => doTransfer(account.id, card);
+        card.querySelector('[data-action="deposit"]').onclick = (e) => withBusy(e.currentTarget, () => doDeposit(account.id, card));
+        card.querySelector('[data-action="withdraw"]').onclick = (e) => withBusy(e.currentTarget, () => doWithdraw(account.id, card));
+        card.querySelector('[data-action="transfer"]').onclick = (e) => withBusy(e.currentTarget, () => doTransfer(account.id, card));
 
         return card;
     }

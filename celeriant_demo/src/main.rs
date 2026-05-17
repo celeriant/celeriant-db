@@ -104,7 +104,7 @@ async fn get_events(
     }).await {
         Ok(response) => {
             let batches: Vec<Value> = response.event_batches.iter().map(|b| json!({
-                "batchIndex": b.aggregate_version,
+                "aggregateVersion": b.aggregate_version,
                 "clientId": u128_to_uuid(b.client_id),
                 "serverTimestamp": b.server_timestamp,
                 "events": b.events.iter().map(deserialize_event).collect::<Vec<_>>(),
@@ -148,13 +148,13 @@ async fn deposit(
                 correlation_id: None,
                 aggregate_key: key,
             }).await.map_err(|e| internal_error(&e.to_string()))?;
-            Ok(Json(json!({ "newBatchIndex": details.max_aggregate_version })))
+            Ok(Json(json!({ "newAggregateVersion": details.max_aggregate_version })))
         }
         Err(ClientError::Server(ServerError::Write {
             kind: WriteError::OptimisticConcurrencyViolation { current_aggregate_version, .. }, ..
         })) => Err((StatusCode::CONFLICT, Json(json!({
             "error": "OCC_CONFLICT",
-            "currentBatchIndex": current_aggregate_version,
+            "currentAggregateVersion": current_aggregate_version,
             "message": "Account was modified. Please refresh and retry.",
         })))),
         Err(e) => Err(internal_error(&e.to_string())),
@@ -188,13 +188,13 @@ async fn withdraw(
                 correlation_id: None,
                 aggregate_key: key,
             }).await.map_err(|e| internal_error(&e.to_string()))?;
-            Ok(Json(json!({ "newBatchIndex": details.max_aggregate_version })))
+            Ok(Json(json!({ "newAggregateVersion": details.max_aggregate_version })))
         }
         Err(ClientError::Server(ServerError::Write {
             kind: WriteError::OptimisticConcurrencyViolation { current_aggregate_version, .. }, ..
         })) => Err((StatusCode::CONFLICT, Json(json!({
             "error": "OCC_CONFLICT",
-            "currentBatchIndex": current_aggregate_version,
+            "currentAggregateVersion": current_aggregate_version,
             "message": "Account was modified. Please refresh and retry.",
         })))),
         Err(e) => Err(internal_error(&e.to_string())),
@@ -260,8 +260,8 @@ async fn transfer(
             }).await.map_err(|e| internal_error(&e.to_string()))?;
 
             Ok(Json(json!({
-                "newFromBatchIndex": from_details.max_aggregate_version,
-                "newToBatchIndex": to_details.max_aggregate_version,
+                "newFromAggregateVersion": from_details.max_aggregate_version,
+                "newToAggregateVersion": to_details.max_aggregate_version,
             })))
         }
         Err(ClientError::Server(ServerError::Write {
@@ -388,7 +388,7 @@ async fn watch_loop(
             let watch_event = json!({
                 "aggregateId": u128_to_uuid(evt.aggregate_id),
                 "operation": "Write",
-                "toBatchIndex": evt.to_aggregate_version,
+                "toAggregateVersion": evt.to_aggregate_version,
             });
             let _ = tx.send(watch_event);
         }

@@ -26,11 +26,11 @@ First build takes a while (full Rust release build). Subsequent rebuilds use Doc
 | Node 2 (client) | localhost:10002 |
 | Node 1 metrics | localhost:19090/metrics |
 | Node 2 metrics | localhost:29090/metrics |
-| Grafana | localhost:3000 (admin/admin) |
-| Grafana dashboard | localhost:3000/d/celeriant-cluster |
-| Grafana logs | localhost:3000/explore |
-| Prometheus | localhost:9090 |
-| MinIO console | localhost:9001 (minioadmin/minioadmin) |
+| Grafana | localhost:3001 (admin/admin) |
+| Grafana dashboard | localhost:3001/d/celeriant-cluster |
+| Grafana logs | localhost:3001/explore |
+| Prometheus | localhost:9091 |
+| MinIO console | localhost:9101 (minioadmin/minioadmin) |
 
 ## Common Operations
 

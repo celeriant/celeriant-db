@@ -85,7 +85,7 @@ run_one() {
 
     log "Waiting for MinIO healthy..."
     local minio_attempts=0
-    while ! curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1; do
+    while ! curl -sf http://localhost:9100/minio/health/live >/dev/null 2>&1; do
         minio_attempts=$((minio_attempts + 1))
         if (( minio_attempts > 60 )); then
             fail "MinIO failed to start after 60s"

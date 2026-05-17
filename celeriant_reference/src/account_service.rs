@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use tokio_postgres::Client as PgClient;
 use crate::constants::*;
 use crate::events::*;
+use crate::idempotency::{IdempotencyCache, IdempotencyEntry, TTL as CACHE_TTL};
 
 // --- Result types ---
 
@@ -74,11 +75,16 @@ const MAX_RETRIES: usize = 3;
 pub struct AccountService {
     pool: Arc<CeleriantPool>,
     db: Arc<PgClient>,
+    idempotency: Arc<IdempotencyCache>,
 }
 
 impl AccountService {
-    pub fn new(pool: Arc<CeleriantPool>, db: Arc<PgClient>) -> Self {
-        Self { pool, db }
+    pub fn new(
+        pool: Arc<CeleriantPool>,
+        db: Arc<PgClient>,
+        idempotency: Arc<IdempotencyCache>,
+    ) -> Self {
+        Self { pool, db, idempotency }
     }
 
     // --- Catch-Up ---
@@ -145,21 +151,32 @@ impl AccountService {
         }
 
         // Step 3: Replay new events
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let warm_window_ms = CACHE_TTL.as_millis() as u64;
+
         let mut new_version = last_version;
         for batch in &response.event_batches {
             new_version = batch.aggregate_version;
-
-            // Track max ClientSeq for our service ClientId
-            if batch.client_id == *SERVICE_CLIENT_ID {
-                for evt in &batch.events {
-                    if evt.client_seq > max_client_seq {
-                        max_client_seq = evt.client_seq;
-                    }
-                }
-            }
+            let track_client_seq = batch.client_id == *SERVICE_CLIENT_ID;
+            let warm_cache = now_ms.saturating_sub(batch.server_timestamp) < warm_window_ms;
 
             for evt in &batch.events {
+                if track_client_seq && evt.client_seq > max_client_seq {
+                    max_client_seq = evt.client_seq;
+                }
                 balance_cents = replay_event(balance_cents, evt);
+
+                if warm_cache {
+                    if let Some(eid) = evt.event_id {
+                        self.idempotency.set(eid, account_id, IdempotencyEntry {
+                            balance_cents,
+                            aggregate_version: batch.aggregate_version,
+                        });
+                    }
+                }
             }
         }
 
@@ -194,8 +211,19 @@ impl AccountService {
         &self,
         account_id: u128,
         amount_cents: i32,
+        event_id: Option<u128>,
     ) -> Result<WriteResult, AccountError> {
         let mut projection = self.catch_up(account_id, None).await?;
+
+        if let Some(eid) = event_id {
+            if let Some(hit) = self.idempotency.try_get(eid, account_id) {
+                return Ok(WriteResult {
+                    balance_cents: hit.balance_cents,
+                    aggregate_version: hit.aggregate_version,
+                });
+            }
+        }
+
         let mut client_seq = projection.max_client_seq + 1;
         let mut re_derive_cei = false;
 
@@ -203,6 +231,14 @@ impl AccountService {
             if attempt > 1 {
                 backoff(attempt).await;
                 projection = self.catch_up(account_id, None).await?;
+                if let Some(eid) = event_id {
+                    if let Some(hit) = self.idempotency.try_get(eid, account_id) {
+                        return Ok(WriteResult {
+                            balance_cents: hit.balance_cents,
+                            aggregate_version: hit.aggregate_version,
+                        });
+                    }
+                }
                 if re_derive_cei {
                     client_seq = projection.max_client_seq + 1;
                     re_derive_cei = false;
@@ -217,6 +253,7 @@ impl AccountService {
 
             let mut evt = json_event(1, &Deposited { amount_cents }).unwrap();
             evt.client_seq = client_seq;
+            evt.event_id = event_id;
 
             match self.pool.write_events_with(
                 account_key(account_id),
@@ -234,6 +271,12 @@ impl AccountService {
                         account_id, new_balance,
                         new_version, projection.last_version, client_seq,
                     ).await;
+                    if let Some(eid) = event_id {
+                        self.idempotency.set(eid, account_id, IdempotencyEntry {
+                            balance_cents: new_balance,
+                            aggregate_version: new_version,
+                        });
+                    }
                     return Ok(WriteResult { balance_cents: new_balance, aggregate_version: new_version });
                 }
                 Err(ClientError::Server(ServerError::Write {
@@ -251,9 +294,18 @@ impl AccountService {
                 Err(ClientError::Server(ServerError::Write {
                     kind: WriteError::ClientIdempotencyViolation { .. }, ..
                 })) => {
-                    // Prior attempt already landed (K-FAIL recovery)
+                    // Prior attempt with the same client_seq already landed.
+                    // Catch-up will warm the cache from event_id if it matches.
                     tracing::info!("Idempotency hit on deposit for {account_id:x} — prior attempt landed");
                     let p = self.catch_up(account_id, None).await?;
+                    if let Some(eid) = event_id {
+                        if let Some(hit) = self.idempotency.try_get(eid, account_id) {
+                            return Ok(WriteResult {
+                                balance_cents: hit.balance_cents,
+                                aggregate_version: hit.aggregate_version,
+                            });
+                        }
+                    }
                     return Ok(WriteResult { balance_cents: p.balance_cents, aggregate_version: p.last_version });
                 }
                 Err(e) => return Err(e.into()),
@@ -271,8 +323,19 @@ impl AccountService {
         &self,
         account_id: u128,
         amount_cents: i32,
+        event_id: Option<u128>,
     ) -> Result<WriteResult, AccountError> {
         let mut projection = self.catch_up(account_id, None).await?;
+
+        if let Some(eid) = event_id {
+            if let Some(hit) = self.idempotency.try_get(eid, account_id) {
+                return Ok(WriteResult {
+                    balance_cents: hit.balance_cents,
+                    aggregate_version: hit.aggregate_version,
+                });
+            }
+        }
+
         let mut client_seq = projection.max_client_seq + 1;
         let mut re_derive_cei = false;
 
@@ -280,6 +343,14 @@ impl AccountService {
             if attempt > 1 {
                 backoff(attempt).await;
                 projection = self.catch_up(account_id, None).await?;
+                if let Some(eid) = event_id {
+                    if let Some(hit) = self.idempotency.try_get(eid, account_id) {
+                        return Ok(WriteResult {
+                            balance_cents: hit.balance_cents,
+                            aggregate_version: hit.aggregate_version,
+                        });
+                    }
+                }
                 if re_derive_cei {
                     client_seq = projection.max_client_seq + 1;
                     re_derive_cei = false;
@@ -301,6 +372,7 @@ impl AccountService {
 
             let mut evt = json_event(2, &Withdrawn { amount_cents }).unwrap();
             evt.client_seq = client_seq;
+            evt.event_id = event_id;
 
             match self.pool.write_events_with(
                 account_key(account_id),
@@ -318,6 +390,12 @@ impl AccountService {
                         account_id, new_balance,
                         new_version, projection.last_version, client_seq,
                     ).await;
+                    if let Some(eid) = event_id {
+                        self.idempotency.set(eid, account_id, IdempotencyEntry {
+                            balance_cents: new_balance,
+                            aggregate_version: new_version,
+                        });
+                    }
                     return Ok(WriteResult { balance_cents: new_balance, aggregate_version: new_version });
                 }
                 Err(ClientError::Server(ServerError::Write {
@@ -336,6 +414,14 @@ impl AccountService {
                 })) => {
                     tracing::info!("Idempotency hit on withdraw for {account_id:x} — prior attempt landed");
                     let p = self.catch_up(account_id, None).await?;
+                    if let Some(eid) = event_id {
+                        if let Some(hit) = self.idempotency.try_get(eid, account_id) {
+                            return Ok(WriteResult {
+                                balance_cents: hit.balance_cents,
+                                aggregate_version: hit.aggregate_version,
+                            });
+                        }
+                    }
                     return Ok(WriteResult { balance_cents: p.balance_cents, aggregate_version: p.last_version });
                 }
                 Err(e) => return Err(e.into()),
@@ -354,6 +440,7 @@ impl AccountService {
         from_account_id: u128,
         to_account_id: u128,
         amount_cents: i32,
+        event_id: Option<u128>,
     ) -> Result<TransferResult, AccountError> {
         if from_account_id == to_account_id {
             return Err(AccountError::Validation("Cannot transfer to the same account.".into()));
@@ -361,6 +448,12 @@ impl AccountService {
 
         let mut from_proj = self.catch_up(from_account_id, None).await?;
         let mut to_proj = self.catch_up(to_account_id, None).await?;
+
+        // After catching up both aggregates, both sides of the transfer should be in
+        // the cache if a prior attempt landed. Reconstruct only when both hit.
+        if let Some(hit) = self.cached_transfer(event_id, from_account_id, to_account_id) {
+            return Ok(hit);
+        }
 
         let mut from_cei = from_proj.max_client_seq + 1;
         let mut to_cei = to_proj.max_client_seq + 1;
@@ -371,6 +464,9 @@ impl AccountService {
                 backoff(attempt).await;
                 from_proj = self.catch_up(from_account_id, None).await?;
                 to_proj = self.catch_up(to_account_id, None).await?;
+                if let Some(hit) = self.cached_transfer(event_id, from_account_id, to_account_id) {
+                    return Ok(hit);
+                }
                 if re_derive_cei {
                     from_cei = from_proj.max_client_seq + 1;
                     to_cei = to_proj.max_client_seq + 1;
@@ -396,12 +492,14 @@ impl AccountService {
                 to_account_id: u128_to_uuid(to_account_id),
             }).unwrap();
             transfer_out.client_seq = from_cei;
+            transfer_out.event_id = event_id;
 
             let mut transfer_in = json_event(4, &TransferredIn {
                 amount_cents,
                 from_account_id: u128_to_uuid(from_account_id),
             }).unwrap();
             transfer_in.client_seq = to_cei;
+            transfer_in.event_id = event_id;
 
             let write_request = WriteRequest {
                 correlation_id: None,
@@ -438,6 +536,16 @@ impl AccountService {
                         to_account_id, new_to_balance,
                         new_to_batch, to_proj.last_version, to_cei,
                     ).await;
+                    if let Some(eid) = event_id {
+                        self.idempotency.set(eid, from_account_id, IdempotencyEntry {
+                            balance_cents: new_from_balance,
+                            aggregate_version: new_from_batch,
+                        });
+                        self.idempotency.set(eid, to_account_id, IdempotencyEntry {
+                            balance_cents: new_to_balance,
+                            aggregate_version: new_to_batch,
+                        });
+                    }
 
                     return Ok(TransferResult {
                         from: WriteResult { balance_cents: new_from_balance, aggregate_version: new_from_batch },
@@ -461,6 +569,9 @@ impl AccountService {
                     tracing::info!("Idempotency hit on transfer — prior attempt landed");
                     let fp = self.catch_up(from_account_id, None).await?;
                     let tp = self.catch_up(to_account_id, None).await?;
+                    if let Some(hit) = self.cached_transfer(event_id, from_account_id, to_account_id) {
+                        return Ok(hit);
+                    }
                     return Ok(TransferResult {
                         from: WriteResult { balance_cents: fp.balance_cents, aggregate_version: fp.last_version },
                         to: WriteResult { balance_cents: tp.balance_cents, aggregate_version: tp.last_version },
@@ -508,6 +619,21 @@ impl AccountService {
 
     // --- Helpers ---
 
+    fn cached_transfer(
+        &self,
+        event_id: Option<u128>,
+        from_account_id: u128,
+        to_account_id: u128,
+    ) -> Option<TransferResult> {
+        let eid = event_id?;
+        let from = self.idempotency.try_get(eid, from_account_id)?;
+        let to = self.idempotency.try_get(eid, to_account_id)?;
+        Some(TransferResult {
+            from: WriteResult { balance_cents: from.balance_cents, aggregate_version: from.aggregate_version },
+            to: WriteResult { balance_cents: to.balance_cents, aggregate_version: to.aggregate_version },
+        })
+    }
+
     async fn update_projection_optimistically(
         &self,
         account_id: u128,
@@ -552,20 +678,32 @@ fn format_event(
     batch: &celeriant_msg::response::aggregate_event_batch::AggregateEventBatch,
     evt: &celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 ) -> Value {
+    let mut out = json!({
+        "aggregateVersion": batch.aggregate_version,
+        "timestamp": batch.server_timestamp,
+    });
     let (type_name, amount_cents) = match evt.event_type_major {
         1 => ("Deposited", from_json::<Deposited>(evt).map(|d| d.amount_cents).unwrap_or(0)),
         2 => ("Withdrawn", from_json::<Withdrawn>(evt).map(|w| w.amount_cents).unwrap_or(0)),
-        3 => ("TransferredOut", from_json::<TransferredOut>(evt).map(|t| t.amount_cents).unwrap_or(0)),
-        4 => ("TransferredIn", from_json::<TransferredIn>(evt).map(|t| t.amount_cents).unwrap_or(0)),
+        3 => {
+            let t = from_json::<TransferredOut>(evt).ok();
+            if let Some(t) = &t {
+                out["toAccountId"] = json!(t.to_account_id);
+            }
+            ("TransferredOut", t.map(|t| t.amount_cents).unwrap_or(0))
+        }
+        4 => {
+            let t = from_json::<TransferredIn>(evt).ok();
+            if let Some(t) = &t {
+                out["fromAccountId"] = json!(t.from_account_id);
+            }
+            ("TransferredIn", t.map(|t| t.amount_cents).unwrap_or(0))
+        }
         _ => ("Unknown", 0),
     };
-
-    json!({
-        "batchIndex": batch.aggregate_version,
-        "type": type_name,
-        "amountCents": amount_cents,
-        "timestamp": batch.server_timestamp,
-    })
+    out["type"] = json!(type_name);
+    out["amountCents"] = json!(amount_cents);
+    out
 }
 
 async fn backoff(attempt: usize) {

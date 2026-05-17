@@ -31,7 +31,7 @@ use idempotency::IdempotencyCache;
 
 struct AppState {
     account_service: AccountService,
-    idempotency: IdempotencyCache,
+    idempotency: Arc<IdempotencyCache>,
     watch_tx: broadcast::Sender<Value>,
 }
 
@@ -63,11 +63,12 @@ async fn main() {
     seed_accounts(&pool, &db).await;
 
     let (watch_tx, _) = broadcast::channel::<Value>(64);
-    let account_service = AccountService::new(pool.clone(), db.clone());
+    let idempotency = Arc::new(IdempotencyCache::new());
+    let account_service = AccountService::new(pool.clone(), db.clone(), idempotency.clone());
 
     let state = Arc::new(AppState {
         account_service,
-        idempotency: IdempotencyCache::new(),
+        idempotency,
         watch_tx: watch_tx.clone(),
     });
 
@@ -121,7 +122,7 @@ async fn get_balance(
         .map_err(map_account_error)?;
     Ok(Json(json!({
         "balanceCents": projection.balance_cents,
-        "batchIndex": projection.last_version,
+        "aggregateVersion": projection.last_version,
     })))
 }
 
@@ -142,7 +143,7 @@ async fn get_history(
         .map_err(map_account_error)?;
     Ok(Json(json!({
         "events": events,
-        "currentBatchIndex": current_version,
+        "currentAggregateVersion": current_version,
         "balanceCents": balance_cents,
     })))
 }
@@ -159,21 +160,25 @@ async fn deposit(
     State(state): State<SharedState>,
     Json(req): Json<AmountRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    if let Some(cached) = try_idempotency_hit(&headers, &state.idempotency) {
-        return Ok(Json(cached));
+    let event_id = parse_idempotency_key(&headers);
+    if let Some(eid) = event_id {
+        if let Some(hit) = state.idempotency.try_get(eid, account_id.as_u128()) {
+            return Ok(Json(json!({
+                "balanceCents": hit.balance_cents,
+                "aggregateVersion": hit.aggregate_version,
+            })));
+        }
     }
 
     let result = state.account_service
-        .deposit(account_id.as_u128(), req.amount_cents)
+        .deposit(account_id.as_u128(), req.amount_cents, event_id)
         .await
         .map_err(map_account_error)?;
 
-    let response = json!({
+    Ok(Json(json!({
         "balanceCents": result.balance_cents,
-        "batchIndex": result.aggregate_version,
-    });
-    set_idempotency_result(&headers, &state.idempotency, &response);
-    Ok(Json(response))
+        "aggregateVersion": result.aggregate_version,
+    })))
 }
 
 async fn withdraw(
@@ -182,21 +187,25 @@ async fn withdraw(
     State(state): State<SharedState>,
     Json(req): Json<AmountRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    if let Some(cached) = try_idempotency_hit(&headers, &state.idempotency) {
-        return Ok(Json(cached));
+    let event_id = parse_idempotency_key(&headers);
+    if let Some(eid) = event_id {
+        if let Some(hit) = state.idempotency.try_get(eid, account_id.as_u128()) {
+            return Ok(Json(json!({
+                "balanceCents": hit.balance_cents,
+                "aggregateVersion": hit.aggregate_version,
+            })));
+        }
     }
 
     let result = state.account_service
-        .withdraw(account_id.as_u128(), req.amount_cents)
+        .withdraw(account_id.as_u128(), req.amount_cents, event_id)
         .await
         .map_err(map_account_error)?;
 
-    let response = json!({
+    Ok(Json(json!({
         "balanceCents": result.balance_cents,
-        "batchIndex": result.aggregate_version,
-    });
-    set_idempotency_result(&headers, &state.idempotency, &response);
-    Ok(Json(response))
+        "aggregateVersion": result.aggregate_version,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -212,8 +221,16 @@ async fn transfer(
     State(state): State<SharedState>,
     Json(req): Json<TransferRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    if let Some(cached) = try_idempotency_hit(&headers, &state.idempotency) {
-        return Ok(Json(cached));
+    let event_id = parse_idempotency_key(&headers);
+    if let Some(eid) = event_id {
+        let from = state.idempotency.try_get(eid, req.from_account_id.as_u128());
+        let to = state.idempotency.try_get(eid, req.to_account_id.as_u128());
+        if let (Some(f), Some(t)) = (from, to) {
+            return Ok(Json(json!({
+                "from": { "balanceCents": f.balance_cents, "aggregateVersion": f.aggregate_version },
+                "to": { "balanceCents": t.balance_cents, "aggregateVersion": t.aggregate_version },
+            })));
+        }
     }
 
     let result = state.account_service
@@ -221,16 +238,15 @@ async fn transfer(
             req.from_account_id.as_u128(),
             req.to_account_id.as_u128(),
             req.amount_cents,
+            event_id,
         )
         .await
         .map_err(map_account_error)?;
 
-    let response = json!({
-        "from": { "balanceCents": result.from.balance_cents, "batchIndex": result.from.aggregate_version },
-        "to": { "balanceCents": result.to.balance_cents, "batchIndex": result.to.aggregate_version },
-    });
-    set_idempotency_result(&headers, &state.idempotency, &response);
-    Ok(Json(response))
+    Ok(Json(json!({
+        "from": { "balanceCents": result.from.balance_cents, "aggregateVersion": result.from.aggregate_version },
+        "to": { "balanceCents": result.to.balance_cents, "aggregateVersion": result.to.aggregate_version },
+    })))
 }
 
 async fn watch_sse(
@@ -285,20 +301,13 @@ fn map_account_error(e: AccountError) -> (StatusCode, Json<Value>) {
 
 // --- Idempotency helpers ---
 
-fn try_idempotency_hit(headers: &HeaderMap, cache: &IdempotencyCache) -> Option<Value> {
+/// Parse the `Idempotency-Key` header as a UUID. This becomes the `event_id`
+/// stamped on the WriteRequest, so retries can be detected by catch-up replay
+/// even on a cold BFF instance.
+fn parse_idempotency_key(headers: &HeaderMap) -> Option<u128> {
     let header = headers.get("idempotency-key")?;
-    let key: Uuid = header.to_str().ok()?.parse().ok()?;
-    cache.try_get(key.as_u128())
-}
-
-fn set_idempotency_result(headers: &HeaderMap, cache: &IdempotencyCache, result: &Value) {
-    if let Some(header) = headers.get("idempotency-key") {
-        if let Ok(s) = header.to_str() {
-            if let Ok(key) = s.parse::<Uuid>() {
-                cache.set(key.as_u128(), result.clone());
-            }
-        }
-    }
+    let parsed: Uuid = header.to_str().ok()?.parse().ok()?;
+    Some(parsed.as_u128())
 }
 
 // --- Database init ---
@@ -398,7 +407,7 @@ async fn watch_loop(
             let watch_event = json!({
                 "aggregateId": u128_to_uuid(evt.aggregate_id),
                 "operation": "Write",
-                "toBatchIndex": evt.to_aggregate_version,
+                "toAggregateVersion": evt.to_aggregate_version,
             });
             let _ = tx.send(watch_event);
         }
