@@ -17,6 +17,8 @@ use crate::config::ClusterConfig;
 use crate::report::{RunDir, write_run_report, write_scenario};
 use crate::scenario::{
     ScenarioParams, ScenarioReport, run_baseline, run_follower_graceful_stop, run_follower_sigkill,
+    run_idempotency_audit_baseline, run_idempotency_audit_minio_outage,
+    run_idempotency_audit_partition_then_kill_minio, run_idempotency_audit_fast_blackout,
     run_leader_graceful_stop, run_leader_restart_loop, run_leader_sigkill,
     run_bench_load_sweep, run_clock_skew_follower, run_follower_disk_full,
     run_minio_outage_long, run_minio_outage_short, run_network_flap,
@@ -113,6 +115,10 @@ async fn main() -> Result<(), String> {
         Some("clock_skew_follower") => vec!["clock_skew_follower"],
         Some("follower_disk_full") => vec!["follower_disk_full"],
         Some("bench_load_sweep") => vec!["bench_load_sweep"],
+        Some("idempotency_audit_baseline") => vec!["idempotency_audit_baseline"],
+        Some("idempotency_audit_minio_outage") => vec!["idempotency_audit_minio_outage"],
+        Some("idempotency_audit_partition_then_kill_minio") => vec!["idempotency_audit_partition_then_kill_minio"],
+        Some("idempotency_audit_fast_blackout") => vec!["idempotency_audit_fast_blackout"],
         Some(other) => return Err(format!("unknown scenario: {other}")),
         None if args.full => vec![
             "baseline",
@@ -132,6 +138,9 @@ async fn main() -> Result<(), String> {
             "clock_skew_follower",
             "sigstop_leader",
             "follower_disk_full",
+            "idempotency_audit_baseline",
+            "idempotency_audit_minio_outage",
+            "idempotency_audit_partition_then_kill_minio",
             // Previously excluded: partition_then_kill_minio exposed a
             // follower-orphan-entries-after-leader-rollback bug that the
             // `rollback_active_to_read_cursor` fallback from SCEN-15
@@ -188,6 +197,10 @@ async fn run_one_iteration(
             "clock_skew_follower" => run_clock_skew_follower(cfg, params, &dir.root).await?,
             "follower_disk_full" => run_follower_disk_full(cfg, params, &dir.root).await?,
             "bench_load_sweep" => run_bench_load_sweep(cfg, params, &dir.root).await?,
+            "idempotency_audit_baseline" => run_idempotency_audit_baseline(cfg, params, &dir.root).await?,
+            "idempotency_audit_minio_outage" => run_idempotency_audit_minio_outage(cfg, params, &dir.root).await?,
+            "idempotency_audit_partition_then_kill_minio" => run_idempotency_audit_partition_then_kill_minio(cfg, params, &dir.root).await?,
+            "idempotency_audit_fast_blackout" => run_idempotency_audit_fast_blackout(cfg, params, &dir.root).await?,
             _ => unreachable!(),
         };
         write_scenario(&dir, &report)?;

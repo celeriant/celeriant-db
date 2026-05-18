@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use celeriant_bench::{BenchmarkResult, Pool, PoolBuilder, run_benchmark, smoke_test};
+use celeriant_bench::{
+    BenchmarkResult, DataIntegrityReport, DeepAuditReport, IdempotentBenchCounters, Pool, PoolBuilder,
+    deep_audit_failing_aggregates, run_benchmark, run_benchmark_idempotent, smoke_test, verify_no_seq_gaps,
+};
 
 use crate::actions::{Action, ActionExecutor};
 use crate::config::ClusterConfig;
@@ -34,6 +37,20 @@ pub struct ScenarioReport {
     /// Paths (relative to the run directory) to per-host journalctl dumps,
     /// fetched only when the scenario failed.
     pub log_files: Vec<String>,
+    /// Set only for scenarios that ran the idempotent bench. Captures
+    /// per-error-type counts (Ok ACKs vs. 2002 ACKs vs. transient retries).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotent_counters: Option<IdempotentBenchCounters>,
+    /// Set only for scenarios that audited client_seq durability. Non-zero
+    /// `tasks_with_gaps` is the false-ack data-loss signal the audit exists
+    /// to detect.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integrity: Option<DataIntegrityReport>,
+    /// Per-aggregate forensics for the failing tasks: specific missing seqs
+    /// + duplicate-acceptance detection (same client_seq landing on multiple
+    /// aggregate_versions). Set only when the headline audit found gaps.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deep_audit: Option<DeepAuditReport>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -205,6 +222,34 @@ pub async fn tear_down_and_evaluate(
     params: ScenarioParams,
     run_dir: &PathBuf,
 ) -> Result<ScenarioReport, String> {
+    tear_down_and_evaluate_with_audit(
+        scenario_name, cfg, up, bench_result,
+        bench_window_start_ms, bench_window_end_ms,
+        expectations, params, Vec::new(), None, None, None, run_dir,
+    ).await
+}
+
+/// Extended variant of `tear_down_and_evaluate` for scenarios that want to
+/// attach pre-computed checks (e.g. data-integrity audit) and bench metadata
+/// produced before service tear-down. `extra_checks` are appended to the
+/// invariant checks; any failing one fails the scenario. `integrity` and
+/// `idempotent_counters` are passed through to the JSON report unchanged.
+#[allow(clippy::too_many_arguments)]
+pub async fn tear_down_and_evaluate_with_audit(
+    scenario_name: &str,
+    cfg: &ClusterConfig,
+    up: ClusterUp,
+    bench_result: BenchmarkResult,
+    bench_window_start_ms: u64,
+    bench_window_end_ms: u64,
+    expectations: ScenarioExpectations,
+    params: ScenarioParams,
+    extra_checks: Vec<CheckResult>,
+    integrity: Option<DataIntegrityReport>,
+    idempotent_counters: Option<IdempotentBenchCounters>,
+    deep_audit: Option<DeepAuditReport>,
+    run_dir: &PathBuf,
+) -> Result<ScenarioReport, String> {
     let executor = ActionExecutor::new(cfg);
 
     // Give the scraper one more tick before stopping it.
@@ -235,7 +280,8 @@ pub async fn tear_down_and_evaluate(
         bench_throughput: bench_result.throughput,
         throughput_floor: params.throughput_floor,
     };
-    let checks = run_all(&data, &expectations);
+    let mut checks = run_all(&data, &expectations);
+    checks.extend(extra_checks);
     let passed = checks.iter().all(|c| c.passed);
 
     let log_files = if !passed {
@@ -257,7 +303,95 @@ pub async fn tear_down_and_evaluate(
         checks,
         samples,
         log_files,
+        idempotent_counters,
+        integrity,
+        deep_audit,
     })
+}
+
+/// Convenience: run the headline audit and, if any gaps were detected,
+/// run a per-aggregate deep audit on a capped number of failing tasks.
+/// Returns the integrity report (always populated) and the deep audit
+/// report (only populated when gaps were detected). Both flow into the
+/// scenario report unchanged.
+pub async fn run_integrity_and_deep_audit(
+    scenario_name: &str,
+    pool: &std::sync::Arc<Pool>,
+    task_acks: &[celeriant_bench::TaskAckSummary],
+    deep_inspect_cap: usize,
+) -> (DataIntegrityReport, Option<DeepAuditReport>) {
+    println!("[{scenario_name}] auditing {} task(s)...", task_acks.len());
+    let integrity = verify_no_seq_gaps(pool, task_acks, 16).await;
+    println!(
+        "[{scenario_name}] audit done: tasks={} with_gaps={} missing_acks={} unreadable={}",
+        integrity.tasks_audited, integrity.tasks_with_gaps,
+        integrity.total_missing_acks, integrity.tasks_unreadable,
+    );
+    let deep = if integrity.tasks_with_gaps > 0 {
+        println!(
+            "[{scenario_name}] deep audit: inspecting up to {} of {} failing aggregates",
+            deep_inspect_cap,
+            integrity.failing_task_acks.len(),
+        );
+        let d = deep_audit_failing_aggregates(
+            pool,
+            &integrity.failing_task_acks,
+            deep_inspect_cap,
+            64,
+        ).await;
+        println!(
+            "[{scenario_name}] deep audit done: inspected={} with_duplicates={} total_dup_occurrences={} unreadable={}",
+            d.aggregates_inspected, d.aggregates_with_duplicates,
+            d.total_duplicate_occurrences, d.aggregates_unreadable,
+        );
+        Some(d)
+    } else {
+        None
+    };
+    (integrity, deep)
+}
+
+/// Turn a `DataIntegrityReport` into a `CheckResult`. Any task with a gap is
+/// a hard fail; up to `max_unreadable` tasks that errored during the audit
+/// read pass are tolerated (network blip in the verification step, not a
+/// data-loss signal).
+pub fn data_integrity_check(report: &DataIntegrityReport, max_unreadable: u64) -> CheckResult {
+    const NAME: &str = "NoClientSeqGaps";
+    if report.tasks_with_gaps > 0 {
+        let sample_summary: Vec<String> = report
+            .sample_gaps
+            .iter()
+            .take(4)
+            .map(|g| {
+                format!(
+                    "{}@client_id={}: max_acked={} server_version={} missing_count={}",
+                    g.aggregate_key_str, g.client_id, g.max_acked,
+                    g.max_aggregate_version, g.missing_count
+                )
+            })
+            .collect();
+        return CheckResult {
+            name: NAME,
+            passed: false,
+            detail: format!(
+                "{} task(s) with gaps; {} acked client_seq value(s) missing total; sample: [{}]",
+                report.tasks_with_gaps,
+                report.total_missing_acks,
+                sample_summary.join("; ")
+            ),
+        };
+    }
+    if report.tasks_unreadable > max_unreadable {
+        return CheckResult {
+            name: NAME,
+            passed: false,
+            detail: format!(
+                "{} task(s) unreadable during audit (allowed {})",
+                report.tasks_unreadable, max_unreadable,
+            ),
+        };
+    }
+    CheckResult::pass(NAME)
 }
 
 /// The single happy-path scenario. Drives a clean cluster bring-up, runs the
@@ -297,6 +431,167 @@ pub async fn run_baseline(
         bench_window_end_ms,
         ScenarioExpectations::default(),
         params,
+        run_dir,
+    )
+    .await
+}
+
+/// Idempotency audit on a quiet cluster. Drives the same bench as `baseline`
+/// but with `enforce_client_idempotency: true` and tracked `client_seq` per
+/// task, then reads every aggregate back and checks that the WAL contains
+/// every `client_seq` the client *believed* was durable (either Ok or a
+/// `ClientIdempotencyViolation` ACK).
+///
+/// On a healthy cluster the check is trivial — useful as a regression guard
+/// against the validation/preparation refactor, and as a sanity baseline
+/// before pointing the audit at the chaos scenarios.
+pub async fn run_idempotency_audit_baseline(
+    cfg: &ClusterConfig,
+    params: ScenarioParams,
+    run_dir: &PathBuf,
+) -> Result<ScenarioReport, String> {
+    const SCEN: &str = "idempotency_audit_baseline";
+    let up = bring_up_cluster(cfg, SCEN, run_dir).await?;
+    let pool = build_bench_pool(cfg, &up, params).await?;
+
+    println!("[{SCEN}] smoke test");
+    smoke_test(&pool).await.map_err(|e| format!("smoke: {e}"))?;
+
+    let bench_window_start_ms = up.elapsed_ms();
+    println!("[{SCEN}] idempotent bench: {} tasks, {}s", params.tasks, params.duration_secs);
+    let outcome = run_benchmark_idempotent(&pool, params.tasks, params.duration_secs).await;
+    let bench_window_end_ms = up.elapsed_ms();
+    println!(
+        "[{SCEN}] bench done: {} req, {} err, {:.0} req/s, p50={}ms p99={}ms (ok_acks={} 2002_acks={} repl_retry={} transient_retry={} fatal={})",
+        outcome.benchmark.total_requests,
+        outcome.benchmark.errors,
+        outcome.benchmark.throughput,
+        outcome.benchmark.p50_ms,
+        outcome.benchmark.p99_ms,
+        outcome.counters.ok_acks,
+        outcome.counters.idempotency_acks,
+        outcome.counters.replication_retries,
+        outcome.counters.transient_retries,
+        outcome.counters.fatal_errors,
+    );
+
+    // Allow a brief settle for replication catch-up before the audit reads.
+    sleep(Duration::from_secs(2)).await;
+
+    let (integrity, deep) = run_integrity_and_deep_audit(SCEN, &pool, &outcome.task_acks, 32).await;
+    let integrity_check = data_integrity_check(&integrity, 0);
+
+    tear_down_and_evaluate_with_audit(
+        SCEN,
+        cfg,
+        up,
+        outcome.benchmark.clone(),
+        bench_window_start_ms,
+        bench_window_end_ms,
+        ScenarioExpectations::default(),
+        params,
+        vec![integrity_check],
+        Some(integrity),
+        Some(outcome.counters),
+        deep,
+        run_dir,
+    )
+    .await
+}
+
+/// Idempotency audit *during* a MinIO outage. Mirrors `run_minio_outage_short`
+/// but uses the idempotent bench so the integrity audit can detect
+/// false-ack data loss — the failure mode the visibility-gap fix targets.
+/// Replication will fall back to TCP throughout, but if S3 + follower both
+/// hiccup briefly and the validation path returned a stale 2002 against a
+/// rolled-back fsync, the audit catches it.
+pub async fn run_idempotency_audit_minio_outage(
+    cfg: &ClusterConfig,
+    params: ScenarioParams,
+    run_dir: &PathBuf,
+) -> Result<ScenarioReport, String> {
+    const SCEN: &str = "idempotency_audit_minio_outage";
+    let up = bring_up_cluster(cfg, SCEN, run_dir).await?;
+    let pool = build_bench_pool(cfg, &up, params).await?;
+
+    println!("[{SCEN}] smoke test");
+    smoke_test(&pool).await.map_err(|e| format!("smoke: {e}"))?;
+
+    if cfg.infra_host.is_none() {
+        return Err(format!(
+            "{SCEN}: INFRA_HOST is not set in config.env — this scenario requires a separate MinIO container"
+        ));
+    }
+
+    let executor = ActionExecutor::new(cfg);
+
+    let bench_window_start_ms = up.elapsed_ms();
+    println!("[{SCEN}] idempotent bench: {} tasks, {}s", params.tasks, params.duration_secs);
+    let pool_clone = pool.clone();
+    let tasks = params.tasks;
+    let dur = params.duration_secs;
+    let bench_handle = tokio::spawn(async move { run_benchmark_idempotent(&pool_clone, tasks, dur).await });
+
+    // Steady-state warm-up.
+    sleep(Duration::from_secs(15)).await;
+    println!("[{SCEN}] stopping MinIO");
+    executor.run(&Action::StopMinio)?;
+
+    sleep(Duration::from_secs(10)).await;
+
+    println!("[{SCEN}] starting MinIO");
+    if let Err(e) = executor.run(&Action::StartMinio) {
+        eprintln!("[{SCEN}] StartMinio failed: {e}");
+    }
+
+    let outcome = bench_handle.await.map_err(|e| format!("bench join: {e}"))?;
+    let bench_window_end_ms = up.elapsed_ms();
+    println!(
+        "[{SCEN}] bench done: {} req, {} err, {:.0} req/s (ok_acks={} 2002_acks={} repl_retry={} transient_retry={} fatal={})",
+        outcome.benchmark.total_requests,
+        outcome.benchmark.errors,
+        outcome.benchmark.throughput,
+        outcome.counters.ok_acks,
+        outcome.counters.idempotency_acks,
+        outcome.counters.replication_retries,
+        outcome.counters.transient_retries,
+        outcome.counters.fatal_errors,
+    );
+
+    // Let replication drain anything still in flight before auditing.
+    sleep(Duration::from_secs(5)).await;
+
+    let (integrity, deep) = run_integrity_and_deep_audit(SCEN, &pool, &outcome.task_acks, 32).await;
+
+    // Audit unreadable tolerance: a few connections can blip while MinIO
+    // bounces. The strict signal we want is `tasks_with_gaps == 0`.
+    let integrity_check = data_integrity_check(&integrity, (params.tasks as u64 / 50).max(5));
+
+    let expectations = ScenarioExpectations {
+        // Same envelope as `run_minio_outage_short` for the bench-window
+        // counter checks — MinIO down briefly is the same shape of churn.
+        max_s3_fallbacks: 10,
+        max_bench_errors: 50_000,
+        assert_eventual_progress: true,
+        ..ScenarioExpectations::default()
+    };
+
+    let mut scen_params = params;
+    scen_params.throughput_floor = (params.throughput_floor * 0.5).max(50.0);
+
+    tear_down_and_evaluate_with_audit(
+        SCEN,
+        cfg,
+        up,
+        outcome.benchmark.clone(),
+        bench_window_start_ms,
+        bench_window_end_ms,
+        expectations,
+        scen_params,
+        vec![integrity_check],
+        Some(integrity),
+        Some(outcome.counters),
+        deep,
         run_dir,
     )
     .await
@@ -1802,6 +2097,274 @@ pub async fn run_partition_then_kill_minio(
     .await
 }
 
+/// Idempotency audit under the worst-rollback scenario in the suite.
+/// Mirrors `run_partition_then_kill_minio` (kill follower + stop MinIO →
+/// 40s blackout → heal) but runs `run_benchmark_idempotent` so the audit
+/// can detect false-ack data loss caused by the orphan-snapshot path in
+/// `capture_replication_snapshot` (see `docs/missing-data.md`).
+///
+/// This scenario forces both follower-unreachable AND S3-unreachable for
+/// long enough that the leader self-fences and rollbacks fire. With the
+/// orphan bug present, post-fsync items get popped from
+/// `pending_replication_batches` while the rollback flag is still set,
+/// then dropped — the audit observes the resulting gap (or
+/// `NoCaptureDroppedItems` trips even sooner).
+pub async fn run_idempotency_audit_partition_then_kill_minio(
+    cfg: &ClusterConfig,
+    params: ScenarioParams,
+    run_dir: &PathBuf,
+) -> Result<ScenarioReport, String> {
+    const SCEN: &str = "idempotency_audit_partition_then_kill_minio";
+    let up = bring_up_cluster(cfg, SCEN, run_dir).await?;
+    let pool = build_bench_pool(cfg, &up, params).await?;
+
+    println!("[{SCEN}] smoke test");
+    smoke_test(&pool).await.map_err(|e| format!("smoke: {e}"))?;
+
+    if cfg.infra_host.is_none() {
+        return Err(format!(
+            "{SCEN}: INFRA_HOST is not set in config.env — this scenario requires a separate MinIO container"
+        ));
+    }
+
+    let executor = ActionExecutor::new(cfg);
+
+    let (kill_follower, start_follower) = if up.bench_primary == cfg.leader_addr() {
+        (Action::KillCs2, Action::StartCs2)
+    } else {
+        (Action::KillCs1, Action::StartCs1)
+    };
+
+    const AUDIT_BENCH_SECS: u64 = 120;
+
+    let bench_window_start_ms = up.elapsed_ms();
+    println!("[{SCEN}] idempotent bench: {} tasks, {}s", params.tasks, AUDIT_BENCH_SECS);
+    let pool_clone = pool.clone();
+    let tasks = params.tasks;
+    let bench_handle = tokio::spawn(async move {
+        run_benchmark_idempotent(&pool_clone, tasks, AUDIT_BENCH_SECS).await
+    });
+
+    sleep(Duration::from_secs(15)).await;
+
+    println!("[{SCEN}] killing follower ({:?})", kill_follower);
+    executor.run(&kill_follower)?;
+    println!("[{SCEN}] stopping MinIO");
+    if let Err(e) = executor.run(&Action::StopMinio) {
+        let _ = executor.run(&start_follower);
+        return Err(format!("stop-minio failed: {e}"));
+    }
+
+    sleep(Duration::from_secs(40)).await;
+
+    println!("[{SCEN}] starting MinIO");
+    if let Err(e) = executor.run(&Action::StartMinio) {
+        let _ = executor.run(&Action::StartMinio);
+        let _ = executor.run(&start_follower);
+        return Err(format!("start-minio failed: {e}"));
+    }
+    sleep(Duration::from_secs(5)).await;
+    println!("[{SCEN}] starting follower ({:?})", start_follower);
+    executor.run(&start_follower)?;
+
+    let outcome = bench_handle.await.map_err(|e| format!("bench join: {e}"))?;
+    println!(
+        "[{SCEN}] bench done: {} req, {} err, {:.0} req/s (ok_acks={} 2002_acks={} repl_retry={} transient_retry={} fatal={})",
+        outcome.benchmark.total_requests,
+        outcome.benchmark.errors,
+        outcome.benchmark.throughput,
+        outcome.counters.ok_acks,
+        outcome.counters.idempotency_acks,
+        outcome.counters.replication_retries,
+        outcome.counters.transient_retries,
+        outcome.counters.fatal_errors,
+    );
+
+    println!("[{SCEN}] settle 240s for catchup + role re-stabilisation before audit");
+    sleep(Duration::from_secs(240)).await;
+    let bench_window_end_ms = up.elapsed_ms();
+
+    let _ = executor.run(&Action::StartMinio);
+
+    let (integrity, deep) = run_integrity_and_deep_audit(SCEN, &pool, &outcome.task_acks, 32).await;
+
+    // Tolerate up to 10% audit-time read errors — the audit runs after a
+    // brutal blackout + recovery; some aggregates may briefly be unreadable
+    // even after the settle window. The headline check is still gaps == 0.
+    let max_unreadable = (params.tasks as u64 / 10).max(50);
+    let integrity_check = data_integrity_check(&integrity, max_unreadable);
+
+    let expectations = ScenarioExpectations {
+        max_leader_elections: 80,
+        max_s3_fallbacks: 1000,
+        max_heartbeat_failures: 250,
+        max_bench_errors: 1_500_000,
+        max_role_flips: 20,
+        max_split_brain_ticks: 60,
+        require_leader_retained: false,
+        require_final_leader_write_progress: true,
+        assert_eventual_progress: true,
+        max_shard_panics: 4,
+        max_node_starts: 2,
+        ..ScenarioExpectations::default()
+    };
+
+    let mut scen_params = params;
+    scen_params.throughput_floor = (params.throughput_floor * 0.2).max(30.0);
+    scen_params.duration_secs = AUDIT_BENCH_SECS;
+
+    tear_down_and_evaluate_with_audit(
+        SCEN,
+        cfg,
+        up,
+        outcome.benchmark.clone(),
+        bench_window_start_ms,
+        bench_window_end_ms,
+        expectations,
+        scen_params,
+        vec![integrity_check],
+        Some(integrity),
+        Some(outcome.counters),
+        deep,
+        run_dir,
+    )
+    .await
+}
+
+/// Fast variant of `run_idempotency_audit_partition_then_kill_minio`.
+/// Same chaos shape (kill follower + stop MinIO → blackout → heal) but ~3×
+/// shorter wall time so a soak hour can fit ~25 iterations instead of ~9.
+/// Designed to reproduce the residual failover false-ack bug densely.
+///
+/// Timeline: bring up → bench (30s) → +10s kill follower + stop MinIO →
+/// +20s heal → wait for bench → settle 60s → audit. Total ~2-3 min per
+/// iteration, vs ~7 min for the full scenario.
+pub async fn run_idempotency_audit_fast_blackout(
+    cfg: &ClusterConfig,
+    params: ScenarioParams,
+    run_dir: &PathBuf,
+) -> Result<ScenarioReport, String> {
+    const SCEN: &str = "idempotency_audit_fast_blackout";
+    let up = bring_up_cluster(cfg, SCEN, run_dir).await?;
+    let pool = build_bench_pool(cfg, &up, params).await?;
+
+    println!("[{SCEN}] smoke test");
+    smoke_test(&pool).await.map_err(|e| format!("smoke: {e}"))?;
+
+    if cfg.infra_host.is_none() {
+        return Err(format!(
+            "{SCEN}: INFRA_HOST is not set in config.env — this scenario requires a separate MinIO container"
+        ));
+    }
+
+    let executor = ActionExecutor::new(cfg);
+
+    let (kill_follower, start_follower) = if up.bench_primary == cfg.leader_addr() {
+        (Action::KillCs2, Action::StartCs2)
+    } else {
+        (Action::KillCs1, Action::StartCs1)
+    };
+
+    const FAST_BENCH_SECS: u64 = 30;
+    const FAST_WARMUP_SECS: u64 = 5;
+    const FAST_BLACKOUT_SECS: u64 = 20;
+    const FAST_SETTLE_SECS: u64 = 60;
+
+    let bench_window_start_ms = up.elapsed_ms();
+    println!("[{SCEN}] idempotent bench: {} tasks, {}s", params.tasks, FAST_BENCH_SECS);
+    let pool_clone = pool.clone();
+    let tasks = params.tasks;
+    let bench_handle = tokio::spawn(async move {
+        run_benchmark_idempotent(&pool_clone, tasks, FAST_BENCH_SECS).await
+    });
+
+    sleep(Duration::from_secs(FAST_WARMUP_SECS)).await;
+
+    println!("[{SCEN}] killing follower ({:?})", kill_follower);
+    executor.run(&kill_follower)?;
+    println!("[{SCEN}] stopping MinIO");
+    if let Err(e) = executor.run(&Action::StopMinio) {
+        let _ = executor.run(&start_follower);
+        return Err(format!("stop-minio failed: {e}"));
+    }
+
+    sleep(Duration::from_secs(FAST_BLACKOUT_SECS)).await;
+
+    println!("[{SCEN}] starting MinIO");
+    if let Err(e) = executor.run(&Action::StartMinio) {
+        let _ = executor.run(&Action::StartMinio);
+        let _ = executor.run(&start_follower);
+        return Err(format!("start-minio failed: {e}"));
+    }
+    sleep(Duration::from_secs(2)).await;
+    println!("[{SCEN}] starting follower ({:?})", start_follower);
+    executor.run(&start_follower)?;
+
+    let outcome = bench_handle.await.map_err(|e| format!("bench join: {e}"))?;
+    println!(
+        "[{SCEN}] bench done: {} req, {} err, {:.0} req/s (ok_acks={} 2002_acks={} repl_retry={} transient_retry={} fatal={})",
+        outcome.benchmark.total_requests,
+        outcome.benchmark.errors,
+        outcome.benchmark.throughput,
+        outcome.counters.ok_acks,
+        outcome.counters.idempotency_acks,
+        outcome.counters.replication_retries,
+        outcome.counters.transient_retries,
+        outcome.counters.fatal_errors,
+    );
+
+    println!("[{SCEN}] settle {}s before audit", FAST_SETTLE_SECS);
+    sleep(Duration::from_secs(FAST_SETTLE_SECS)).await;
+    let bench_window_end_ms = up.elapsed_ms();
+
+    let _ = executor.run(&Action::StartMinio);
+
+    let (integrity, deep) = run_integrity_and_deep_audit(SCEN, &pool, &outcome.task_acks, 32).await;
+
+    let max_unreadable = (params.tasks as u64 / 10).max(50);
+    let integrity_check = data_integrity_check(&integrity, max_unreadable);
+
+    let expectations = ScenarioExpectations {
+        // Looser bounds than the full scenario because the recovery window is
+        // tighter — less chance for thorough convergence. The strict signal
+        // is still NoClientSeqGaps + NoCaptureDroppedItems.
+        max_leader_elections: 80,
+        max_s3_fallbacks: 1000,
+        max_heartbeat_failures: 250,
+        max_bench_errors: 1_500_000,
+        max_role_flips: 20,
+        max_split_brain_ticks: 60,
+        require_leader_retained: false,
+        // Skip require_final_leader_write_progress + assert_eventual_progress:
+        // 60s settle is too short for those to hold reliably under load.
+        // The integrity audit is what we're actually testing.
+        max_shard_panics: 4,
+        max_node_starts: 2,
+        ..ScenarioExpectations::default()
+    };
+
+    let mut scen_params = params;
+    scen_params.throughput_floor = (params.throughput_floor * 0.2).max(30.0);
+    scen_params.duration_secs = FAST_BENCH_SECS;
+
+    tear_down_and_evaluate_with_audit(
+        SCEN,
+        cfg,
+        up,
+        outcome.benchmark.clone(),
+        bench_window_start_ms,
+        bench_window_end_ms,
+        expectations,
+        scen_params,
+        vec![integrity_check],
+        Some(integrity),
+        Some(outcome.counters),
+        deep,
+        run_dir,
+    )
+    .await
+}
+
 /// SCEN-17: rolling restart. Gracefully stop the follower, wait for it
 /// to come back and catch up, then gracefully stop the leader and wait
 /// for leadership to transfer and the old leader to rejoin as follower.
@@ -2539,6 +3102,9 @@ pub async fn run_bench_load_sweep(
         checks: vec![CheckResult::pass("BenchLoadSweepCompleted")],
         samples,
         log_files: vec![],
+        idempotent_counters: None,
+        integrity: None,
+        deep_audit: None,
     };
     Ok(report)
 }

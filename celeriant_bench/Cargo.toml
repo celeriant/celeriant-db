@@ -21,3 +21,4 @@ celeriant_msg = { path = "../celeriant_msg" }
 rustls-pki-types.workspace = true
 tokio.workspace = true
 clap.workspace = true
+serde.workspace = true

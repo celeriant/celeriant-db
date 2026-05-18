@@ -173,6 +173,11 @@ pub fn run_all(data: &RunData, expect: &ScenarioExpectations) -> Vec<CheckResult
         check_bench_errors(data, expect),
         check_bench_throughput_floor(data),
         check_wal_seq_advanced(data),
+        // Orphan-snapshot detector. Any non-zero value means some fsynced
+        // PCDs were popped from `pending_replication_batches` after a
+        // rollback flag was set, then dropped without being committed or
+        // re-queued. See `docs/missing-data.md`.
+        check_counter("NoCaptureDroppedItems", data, |s| s.capture_dropped_items_total, 0),
     ];
     if expect.require_leader_retained {
         out.push(check_leader_retained(data));

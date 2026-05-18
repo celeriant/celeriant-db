@@ -3,8 +3,10 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::constants::{FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES};
 use celeriant_wal::metablocks::metablock::Metablock;
+use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_wal::shard_log_header::ShardLogHeader;
 use celeriant_wire::disk::versioned_block::{
     deserialise_metablock, deserialise_shard_log_header,
@@ -19,12 +21,38 @@ Commands:
   wal <wal_seq>              Find metablock with the given wal_seq
   range <start> <end>          Print all metablocks in [start..=end]
   bounds                       Print first and last metablock wal_seq in the file
+  client <org_id> <agg_type_id> <agg_id> <client_id>
+                               List every EventBatchMetadata batch matching
+                               (org, agg_type, agg, client_id). IDs accept
+                               decimal numbers OR 32-char hex strings
+                               (matches the aggregate_key_str format printed
+                               by the chaos audit report). Output one line per
+                               batch: aggregate_version + min/max client_seq.
 
 Examples:
   celeriant-wal-inspect /var/lib/celeriant/shard_003/log_1.wal header
   celeriant-wal-inspect /var/lib/celeriant/shard_003/log_1.wal wal 133939
-  celeriant-wal-inspect /var/lib/celeriant/shard_003/log_1.wal range 133935 133942"
+  celeriant-wal-inspect /var/lib/celeriant/shard_003/log_1.wal range 133935 133942
+  celeriant-wal-inspect /var/lib/celeriant/shard_003/log_1.wal \\
+      client 00000000-0000-0000-0000-000000000001 \\
+             00000000-0000-0000-0000-000000000001 \\
+             00000000-0000-0000-0000-00000000003c 61"
     );
+}
+
+/// Accepts a u128 expressed either as a decimal integer or as a
+/// 32-hex-character string (the audit report's `aggregate_key_str` form,
+/// optionally with hyphens like a UUID). Returns the parsed value.
+fn parse_u128_flexible(s: &str) -> Option<u128> {
+    if let Ok(v) = s.parse::<u128>() {
+        return Some(v);
+    }
+    let stripped: String = s.chars().filter(|c| *c != '-').collect();
+    if stripped.len() == 32 {
+        u128::from_str_radix(&stripped, 16).ok()
+    } else {
+        None
+    }
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {
@@ -173,6 +201,143 @@ fn cmd_range(file: &mut File, file_len: u64, start: u64, end: u64) -> std::io::R
     Ok(())
 }
 
+fn cmd_client(
+    file: &mut File,
+    file_len: u64,
+    agg_key: &AggregateKey,
+    client_id: u128,
+) -> std::io::Result<()> {
+    let hdr = read_header(file, 0)
+        .or_else(|| read_header(file, file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64)));
+    let (metablocks_end, read_metablocks_pos) = match hdr {
+        Some(h) => (h.metablocks_position, h.metablocks_position),
+        None => {
+            eprintln!("ERROR: both headers corrupt; cannot determine metablock region");
+            return Ok(());
+        }
+    };
+
+    // Scan once for write-cursor-bounded records (everything up to file length).
+    // Then mark which ones are within the read cursor.
+    let mut batches: Vec<(u64, u64, u64, u64, u64, bool)> = Vec::new();
+    // tuple: (wal_seq, aggregate_version, min_client_seq, max_client_seq, file_offset, within_read_cursor)
+    let mut soft_deletes_seen = 0usize;
+    let mut soft_trims_seen = 0usize;
+
+    for_each_metablock(file, file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64), |mb, off| {
+        // For empty/zeroed metablock slots, wal_seq is 0 and there's no point continuing.
+        if mb.wal_seq == 0 && off > HEADER_BLOCK_SIZE_BYTES as u64 {
+            return false;
+        }
+        match &mb.wal_metablock_type {
+            MetablockKind::EventBatchMetadata(eb) => {
+                if eb.aggregate_key == *agg_key && eb.client_id == client_id {
+                    let within = off + FIXED_BLOCK_SIZE_BYTES as u64 <= read_metablocks_pos;
+                    batches.push((
+                        mb.wal_seq,
+                        eb.aggregate_version,
+                        eb.min_client_seq,
+                        eb.max_client_seq,
+                        off,
+                        within,
+                    ));
+                }
+            }
+            MetablockKind::SoftDelete(sd) => {
+                if sd.aggregate_key == *agg_key {
+                    soft_deletes_seen += 1;
+                    let within = off + FIXED_BLOCK_SIZE_BYTES as u64 <= read_metablocks_pos;
+                    println!(
+                        "[SoftDelete] wal_seq={} agg_version={} event_seq={} client_id={:032x} allow_recreate={} within_read={}",
+                        mb.wal_seq, sd.aggregate_version, sd.event_seq, sd.client_id, sd.allow_recreate, within
+                    );
+                }
+            }
+            MetablockKind::SoftTrim(st) => {
+                if st.aggregate_key == *agg_key {
+                    soft_trims_seen += 1;
+                    let within = off + FIXED_BLOCK_SIZE_BYTES as u64 <= read_metablocks_pos;
+                    println!(
+                        "[SoftTrim] wal_seq={} agg_version={} event_seq={} keep_from={} within_read={}",
+                        mb.wal_seq, st.aggregate_version, st.event_seq, st.keep_from_aggregate_version, within
+                    );
+                }
+            }
+            MetablockKind::SchemaRegistration(_) => {}
+        }
+        true
+    })?;
+
+    println!("file_len           = {}", file_len);
+    println!("metablocks_end (write) = {}", metablocks_end);
+    println!("metablocks_end (read)  = {}", read_metablocks_pos);
+    println!("aggregate_key      = org={} type={} id={}",
+        agg_key.org_id, agg_key.aggregate_type_id, agg_key.aggregate_id);
+    println!("client_id          = {}", client_id);
+    println!("matched batches    = {}", batches.len());
+    println!("matched soft deletes = {}", soft_deletes_seen);
+    println!("matched soft trims = {}", soft_trims_seen);
+
+    let mut min_seq: Option<u64> = None;
+    let mut max_seq: Option<u64> = None;
+    let mut max_version: Option<u64> = None;
+    let mut count_within_read: u64 = 0;
+    let mut all_client_seqs: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for (wal_seq, agg_version, min_cs, max_cs, off, within) in &batches {
+        if *within {
+            count_within_read += 1;
+        }
+        for cs in *min_cs..=*max_cs {
+            all_client_seqs.insert(cs);
+        }
+        match min_seq {
+            None => min_seq = Some(*min_cs),
+            Some(m) => min_seq = Some(m.min(*min_cs)),
+        }
+        match max_seq {
+            None => max_seq = Some(*max_cs),
+            Some(m) => max_seq = Some(m.max(*max_cs)),
+        }
+        match max_version {
+            None => max_version = Some(*agg_version),
+            Some(m) => max_version = Some(m.max(*agg_version)),
+        }
+        println!(
+            "wal_seq={} agg_version={} client_seq=[{}..{}] offset={} within_read={}",
+            wal_seq, agg_version, min_cs, max_cs, off, within
+        );
+    }
+    println!();
+    println!("summary:");
+    println!("  total batches        = {}", batches.len());
+    println!("  batches within read  = {}", count_within_read);
+    println!("  batches past read    = {}", batches.len() as u64 - count_within_read);
+    println!(
+        "  min client_seq       = {}",
+        min_seq.map(|v| v.to_string()).unwrap_or_else(|| "-".into())
+    );
+    println!(
+        "  max client_seq       = {}",
+        max_seq.map(|v| v.to_string()).unwrap_or_else(|| "-".into())
+    );
+    println!(
+        "  max aggregate_version= {}",
+        max_version.map(|v| v.to_string()).unwrap_or_else(|| "-".into())
+    );
+    println!("  distinct client_seqs = {}", all_client_seqs.len());
+    if let Some(max) = max_seq {
+        let expected: std::collections::BTreeSet<u64> = (1..=max).collect();
+        let missing: Vec<u64> = expected.difference(&all_client_seqs).copied().take(64).collect();
+        if missing.is_empty() {
+            println!("  missing in 1..={}    = none", max);
+        } else {
+            println!("  missing in 1..={}    = {:?}{}", max, missing,
+                if missing.len() >= 64 { " (truncated)" } else { "" });
+        }
+    }
+    Ok(())
+}
+
 fn cmd_bounds(file: &mut File, file_len: u64) -> std::io::Result<()> {
     let hdr = read_header(file, 0)
         .or_else(|| read_header(file, file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64)));
@@ -246,6 +411,32 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             };
             cmd_range(&mut file, file_len, s, e)
+        }
+        "client" => {
+            let (Some(org), Some(atype), Some(agg), Some(client)) =
+                (args.get(3), args.get(4), args.get(5), args.get(6))
+            else {
+                print_usage();
+                return ExitCode::from(2);
+            };
+            let Some(org_id) = parse_u128_flexible(org) else {
+                eprintln!("ERROR: org_id must be a u128 (decimal) or 32-hex-char UUID-form");
+                return ExitCode::from(2);
+            };
+            let Some(atype_id) = parse_u128_flexible(atype) else {
+                eprintln!("ERROR: aggregate_type_id must be u128 or 32-hex-char");
+                return ExitCode::from(2);
+            };
+            let Some(agg_id) = parse_u128_flexible(agg) else {
+                eprintln!("ERROR: aggregate_id must be u128 or 32-hex-char");
+                return ExitCode::from(2);
+            };
+            let Some(client_id) = parse_u128_flexible(client) else {
+                eprintln!("ERROR: client_id must be u128 or 32-hex-char");
+                return ExitCode::from(2);
+            };
+            let agg_key = AggregateKey::new(org_id, atype_id, agg_id);
+            cmd_client(&mut file, file_len, &agg_key, client_id)
         }
         other => {
             eprintln!("ERROR: unknown command '{}'", other);

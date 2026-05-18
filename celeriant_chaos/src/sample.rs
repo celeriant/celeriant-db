@@ -27,6 +27,39 @@ pub struct NodeSample {
     /// Used to distinguish "listener never saw a TCP connection" from
     /// "listener saw it and rejected it" during post-promotion debugging.
     pub client_connections_active: u64,
+    /// Items popped from `pending_replication_batches` but dropped on the
+    /// floor because the rollback flag was set after the pop. Smoking gun
+    /// for the orphan-snapshot missing-data hypothesis
+    /// (`docs/missing-data.md`).
+    pub capture_dropped_items_total: u64,
+    pub capture_dropped_bytes_total: u64,
+    /// Writes that passed idempotency validation because no prior
+    /// client_seq was cached. Most are legitimate first-writes; a spike
+    /// during/after a lease handover signals the duplicate-acceptance
+    /// path in the failover bug.
+    pub writes_accepted_no_prior_client_seq_total: u64,
+    /// WAL scans that found NO metablock for the searched (aggregate, client).
+    /// Used to characterise the cache miss path during/after rollback.
+    pub cache_client_scan_not_found_total: u64,
+    pub cache_client_scan_found_total: u64,
+    /// `replicate_durable` returned `Ok` without doing any work because
+    /// status was non-leader AND pending was empty. For a true follower this
+    /// is correct; for a writer whose lease expired mid-write, this is a
+    /// false ack (`docs/missing-data.md`). Non-zero deltas on a node that
+    /// was leader at any point in the bench window are the smoking gun.
+    pub replicate_durable_short_circuit_total: u64,
+    /// `commit_fsync_with_rollback` took the non-leader branch (broadcast
+    /// only, no `push_pending_replication`). True followers should hit this
+    /// once per incoming batch; a writer's fsync hitting it is the false-ack
+    /// signature.
+    pub fsync_commit_non_leader_branch_total: u64,
+    /// fsync coordinator capture outcomes — distinguishes whether a writer's
+    /// sync_durable actually fsynced (captured), short-circuited because
+    /// someone else took the queue (no_capture_race), or saw a fsync rollback
+    /// flag (failed_rollback).
+    pub fsync_capture_captured_total: u64,
+    pub fsync_capture_no_capture_race_total: u64,
+    pub fsync_capture_failed_rollback_total: u64,
 }
 
 impl NodeSample {
@@ -47,6 +80,16 @@ impl NodeSample {
             shard_panics_total: 0,
             node_starts_total: 0,
             client_connections_active: 0,
+            capture_dropped_items_total: 0,
+            capture_dropped_bytes_total: 0,
+            writes_accepted_no_prior_client_seq_total: 0,
+            cache_client_scan_not_found_total: 0,
+            cache_client_scan_found_total: 0,
+            replicate_durable_short_circuit_total: 0,
+            fsync_commit_non_leader_branch_total: 0,
+            fsync_capture_captured_total: 0,
+            fsync_capture_no_capture_race_total: 0,
+            fsync_capture_failed_rollback_total: 0,
         }
     }
 }
@@ -71,6 +114,16 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         "celeriant_replication_rollbacks_total",
         "celeriant_shard_panics_total",
         "celeriant_node_starts_total",
+        "celeriant_replication_capture_dropped_items_total",
+        "celeriant_replication_capture_dropped_bytes_total",
+        "celeriant_writes_accepted_no_prior_client_seq_total",
+        "celeriant_cache_aggregate_client_scan_not_found_total",
+        "celeriant_cache_aggregate_client_scan_found_total",
+        "celeriant_replicate_durable_short_circuit_total",
+        "celeriant_fsync_commit_non_leader_branch_total",
+        "celeriant_fsync_capture_captured_total",
+        "celeriant_fsync_capture_no_capture_race_total",
+        "celeriant_fsync_capture_failed_rollback_total",
     ];
 
     for line in body.lines() {
@@ -133,6 +186,16 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         shard_panics_total: get("celeriant_shard_panics_total"),
         node_starts_total: get("celeriant_node_starts_total"),
         client_connections_active,
+        capture_dropped_items_total: get("celeriant_replication_capture_dropped_items_total"),
+        capture_dropped_bytes_total: get("celeriant_replication_capture_dropped_bytes_total"),
+        writes_accepted_no_prior_client_seq_total: get("celeriant_writes_accepted_no_prior_client_seq_total"),
+        cache_client_scan_not_found_total: get("celeriant_cache_aggregate_client_scan_not_found_total"),
+        cache_client_scan_found_total: get("celeriant_cache_aggregate_client_scan_found_total"),
+        replicate_durable_short_circuit_total: get("celeriant_replicate_durable_short_circuit_total"),
+        fsync_commit_non_leader_branch_total: get("celeriant_fsync_commit_non_leader_branch_total"),
+        fsync_capture_captured_total: get("celeriant_fsync_capture_captured_total"),
+        fsync_capture_no_capture_race_total: get("celeriant_fsync_capture_no_capture_race_total"),
+        fsync_capture_failed_rollback_total: get("celeriant_fsync_capture_failed_rollback_total"),
     }
 }
 
