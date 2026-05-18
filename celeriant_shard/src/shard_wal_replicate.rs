@@ -58,15 +58,41 @@ pub(crate) fn capture_replication_snapshot(
     let mut cache = shard_mem_cache.borrow_mut();
 
     metrics::gauge!("celeriant_replication_queue_bytes").set(cache.pending_replication_bytes() as f64);
-    let replication_snapshot = cache.take_pending_replication();
 
+    let trigger_label = match trigger {
+        ReplicationTrigger::Write => "write",
+        ReplicationTrigger::Probe => "probe",
+    };
+
+    // Check the rollback flag BEFORE popping. Items in pending stay queued.
     if cache.take_replication_rollback_flag() {
+        let pending_count = cache.pending_replication_count();
+        let pending_bytes = cache.pending_replication_bytes();
+        metrics::counter!(
+            "celeriant_replication_capture_outcome_total",
+            "outcome" => "failed_rollback", "trigger" => trigger_label,
+        ).increment(1);
+        debug!(
+            trigger = trigger_label, pending_count, pending_bytes,
+            "capture: rollback flag set, preserving pending for next cycle"
+        );
         return CaptureResult::Failed(ReplicationError::RollbackInProgress);
     }
 
+    let replication_snapshot = cache.take_pending_replication();
+
     if replication_snapshot.is_empty() && matches!(trigger, ReplicationTrigger::Write) {
+        metrics::counter!(
+            "celeriant_replication_capture_outcome_total",
+            "outcome" => "no_capture_race", "trigger" => trigger_label,
+        ).increment(1);
         return CaptureResult::NoCaptureRaceButOk;
     }
+
+    metrics::counter!(
+        "celeriant_replication_capture_outcome_total",
+        "outcome" => "captured", "trigger" => trigger_label,
+    ).increment(1);
 
     CaptureResult::Captured(ReplicationCapturedData {
         replication_snapshot,
@@ -1319,6 +1345,68 @@ mod tests {
             CaptureResult::NoCaptureRaceButOk => panic!("expected RollbackInProgress, got NoCapture"),
             CaptureResult::Captured(_) => panic!("expected RollbackInProgress, got Captured"),
         }
+    }
+
+    /// Orphan-snapshot regression. 
+    ///
+    /// Sequence:
+    ///   1. Earlier replication batch fails → `execute_replication_rollback`
+    ///      clears pending and sets `replication_rollback_occurred = true`.
+    ///   2. A fsync arrives after the rollback gate drops and pushes a fresh
+    ///      PCD into `pending_replication_batches`.
+    ///   3. The next coordinator leader calls `capture_replication_snapshot`.
+    ///      `take_pending_replication` pops the fresh PCD; then the flag is
+    ///      observed and `Failed(RollbackInProgress)` is returned. The popped
+    ///      PCD is silently dropped — write cursor advanced, fsync acked the
+    ///      client, but the data never replicates.
+    ///
+    /// Desired post-fix behaviour: the fresh PCD must stay in
+    /// `pending_replication_batches` so the next cycle replicates it.
+    #[test]
+    fn capture_preserves_pending_when_rollback_flag_set_after_prior_failure() {
+        let smc = Rc::new(RefCell::new(fresh_memcache()));
+
+        // (1) earlier batch fails → rollback sets the flag and clears pending.
+        let prior_pcd = make_captured(&[1]).replication_snapshot.remove(0);
+        smc.borrow_mut().push_pending_replication(prior_pcd);
+        smc.borrow_mut().execute_replication_rollback();
+        assert_eq!(
+            smc.borrow().pending_replication_count(),
+            0,
+            "rollback should have cleared pending"
+        );
+
+        // (2) fresh fsync after gate releases → new PCD in pending.
+        let fresh_pcd = make_captured_at(&[2], 100).replication_snapshot.remove(0);
+        let fresh_item_count = fresh_pcd.pending_queue.len();
+        smc.borrow_mut().push_pending_replication(fresh_pcd);
+        assert_eq!(
+            smc.borrow().pending_replication_count(),
+            1,
+            "fresh fsync should have queued one PCD"
+        );
+
+        // (3) next capture observes the stale flag.
+        let result = capture_replication_snapshot(&smc, ReplicationTrigger::Write);
+        assert!(
+            matches!(result, CaptureResult::Failed(ReplicationError::RollbackInProgress)),
+            "expected Failed(RollbackInProgress), got {result_kind}",
+            result_kind = match &result {
+                CaptureResult::Captured(_) => "Captured",
+                CaptureResult::Failed(_) => "Failed(other)",
+                CaptureResult::NoCaptureRaceButOk => "NoCapture",
+            }
+        );
+
+        // The bug surface: the freshly fsynced PCD has been popped from
+        // pending and was never committed or returned. Before the fix this
+        // assertion fails with `pending=0` — the PCD is orphaned and the
+        // `fresh_item_count` writes are silently lost from the durable record.
+        assert_eq!(
+            smc.borrow().pending_replication_count(),
+            1,
+            "fresh PCD orphaned: {fresh_item_count} items popped after rollback flag set, never committed or re-queued"
+        );
     }
 
     #[test]

@@ -928,6 +928,10 @@ impl<V: Validate> ShardMemCache<V> {
         self.sealed_segment_summaries.clear();
     }
 
+    pub fn clear_aggregate_write_client_snapshots_for_test(&mut self) {
+        self.aggregate_write_client_snapshots.clear();
+    }
+
     /// Copy a single aggregate's write snapshot to read snapshot.
     /// Used during commit completion to make writes visible to readers.
     pub fn copy_write_to_read_snapshot(&mut self, key: &AggregateKey) {

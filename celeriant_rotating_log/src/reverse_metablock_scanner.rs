@@ -15,6 +15,8 @@ pub struct ReverseMetablockScanner<'a> {
     /// Optional hash for bloom filter optimization.
     /// When set, log segments where the bloom filter says "definitely not present" are skipped.
     bloom_filter_hash: Option<[u8; 8]>,
+    /// When true, scan up to the write cursor (uncommitted region included)
+    use_write_cursor: bool,
 }
 
 impl<'a> ReverseMetablockScanner<'a> {
@@ -25,6 +27,7 @@ impl<'a> ReverseMetablockScanner<'a> {
             chunk_size,
             start_from_position,
             bloom_filter_hash: None,
+            use_write_cursor: false,
         }
     }
 
@@ -41,6 +44,12 @@ impl<'a> ReverseMetablockScanner<'a> {
     #[must_use]
     pub fn with_bloom_filter_hash(mut self, hash_bytes: [u8; 8]) -> Self {
         self.bloom_filter_hash = Some(hash_bytes);
+        self
+    }
+
+    #[must_use]
+    pub fn with_write_cursor_upper_bound(mut self) -> Self {
+        self.use_write_cursor = true;
         self
     }
 
@@ -83,20 +92,28 @@ impl<'a> ReverseMetablockScanner<'a> {
 
         let metablock_position = {
             let metadata = log_segment_file.metadata.borrow();
-            let read = match &metadata.read {
-                Some(r) => r,
-                None => return Ok(None),
+            let (position, bloom) = if self.use_write_cursor {
+                (
+                    metadata.write.metablocks_position,
+                    &metadata.write.aggregate_key_bloom,
+                )
+            } else {
+                let read = match &metadata.read {
+                    Some(r) => r,
+                    None => return Ok(None),
+                };
+                (read.metablocks_position, &read.aggregate_key_bloom)
             };
 
             // Check bloom filter - skip entire log segment if key definitely not present
             if let Some(hash) = &self.bloom_filter_hash {
-                if !read.aggregate_key_bloom.may_contain_hash(hash) {
+                if !bloom.may_contain_hash(hash) {
                     tracing::trace!(log_id, "Bloom filter skip");
                     return Ok(None);
                 }
             }
 
-            read.metablocks_position
+            position
         };
 
         let guard = log_segment_file.lock_reader("scan_single_log").await?;

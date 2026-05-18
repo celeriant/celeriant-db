@@ -1263,75 +1263,65 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             return Err(ShardWriteError::EmptyEventsList);
         }
 
-        // Phase 1: Validation and preparation - all checks that can fail happen here
-        // No mutations to shard_mem_cache until all validations pass
         let total_events: usize = write_request.writes.values().map(|w| w.events.len()).sum();
         let total_payload_bytes: usize = write_request.writes.values()
             .flat_map(|w| w.events.iter())
             .map(|e| e.event_value.len())
             .sum();
-        let mut prepared_writes = Vec::with_capacity(write_request.writes.len());
 
-        for (aggregate_key, single_write) in write_request.writes {
-            // Validate events list is not empty
+        let writes: Vec<(AggregateKey, SingleAggregateWrite)> = write_request.writes.into_iter().collect();
+        let client_id = write_request.client_id;
+        let user_id = write_request.user_id;
+        let correlation_id = write_request.correlation_id;
+
+        // Deterministic input checks - won't change on retry.
+        for (_, single_write) in &writes {
             if single_write.events.is_empty() {
                 return Err(ShardWriteError::EmptyEventsList);
             }
-
-            // Validate that no event uses the sentinel 0 event type
             if let Some(ev) = single_write.events.iter().find(|e| e.event_type_major == 0) {
-                return Err(ShardWriteError::ZeroEventType {
-                    client_seq: ev.client_seq,
-                });
+                return Err(ShardWriteError::ZeroEventType { client_seq: ev.client_seq });
             }
+        }
 
-            // Ensure aggregate snapshot is in memcache, loading from disk if necessary
-            // Returns true for Found, false for NotFound/Deleted
-            let aggregate_exists = self.aggregate_exists_and_cache(&aggregate_key, CachePath::Write).await
-                .map_err(ShardWriteError::AggregateExistsAndCacheError)?;
-            
-            if !aggregate_exists {
-                // Check if it was deleted with allow_recreate = false
-                let (is_loaded, status) = self.shard_mem_cache.borrow_mut().aggregate_load_status(&aggregate_key, CachePath::Write);
-                if is_loaded && status == AggregateStatus::Deleted {
-                    let indexes = self.shard_mem_cache.borrow_mut().get_write_event_seqes(&aggregate_key);
-                    if !indexes.allow_recreate {
-                        return Err(ShardWriteError::AggregateRecreateNotAllowed);
-                    }
-                    // allow_recreate is true, so we can proceed with create
-                } else if !single_write.allow_create {
-                    return Err(ShardWriteError::AggregateNotExists);
+        // Idempotency / OCC / recreate-not-allowed rejections validate against the WRITE cache
+        let mut retried_for_visibility_gap = false;
+        loop {
+            let mut error: Option<ShardWriteError> = None;
+            for (aggregate_key, single_write) in &writes {
+                if let Err(e) = self.validate_single_write(aggregate_key, client_id, single_write).await {
+                    error = Some(e);
+                    break;
                 }
             }
-
-            let aggregate_client_key = AggregateClientKey::new(aggregate_key.clone(), write_request.client_id);
-
-            // Prep work done outside of validate_and_prepare_write as it's async
-            if single_write.enforce_client_idempotency {
-                self.cache_aggregate_client(&aggregate_key, &aggregate_client_key).await
-                    .map_err(ShardWriteError::CacheAggregateClientError)?;
+            match error {
+                None => break,
+                Some(e) if !retried_for_visibility_gap && is_visibility_gap_rejection(&e) => {
+                    retried_for_visibility_gap = true;
+                    let _ = self.replicate_durable().await;
+                }
+                Some(e) => return Err(e),
             }
+        }
 
-            // Pre-warm schema cache for validation
-            self.pre_warm_schema_cache(&single_write.events, &aggregate_key).await
-                .map_err(ShardWriteError::CacheAggregateClientError)?;
-
-            // Validate and prepare - reads from memcache but does not mutate
+        // consumes events to build datablocks/metablocks.
+        // validate_and_prepare_write also re-runs validation as defense-in-depth.
+        let mut prepared_writes = Vec::with_capacity(writes.len());
+        for (aggregate_key, single_write) in writes {
             let prepared = self.validate_and_prepare_write(
                 lease_epoch,
                 &aggregate_key,
-                write_request.client_id,
-                write_request.user_id,
+                client_id,
+                user_id,
                 single_write,
             )?;
-
             prepared_writes.push(prepared);
         }
 
         // Phase 2: Append all prepared writes to queue - cannot fail
         tracing::debug!(
             shard_id = self.config.shard_id,
-            client_id = write_request.client_id,
+            client_id = client_id,
             aggregate_count = prepared_writes.len(),
             total_events,
             total_payload_bytes,
@@ -1366,7 +1356,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         metrics::counter!("celeriant_write_bytes_total", shard_label).increment(total_payload_bytes as u64);
 
         Ok(SuccessResponse {
-            correlation_id: write_request.correlation_id,
+            correlation_id,
         })
     }
 
@@ -1522,7 +1512,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             Some(last_known_metablock.metablock_absolute_pos.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64)), //Include SELF
             self.config.read_max_chunk_size,
         )
-        .with_bloom_filter(aggregate_key);
+        .with_bloom_filter(aggregate_key)
+        .with_write_cursor_upper_bound();
 
         let find_result = scanner
             .scan::<bool, ()>(|_log_id, _metablock_absolute_pos, metablock_bytes| {
@@ -1558,6 +1549,18 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         if !found {
             let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
             shard_mem_cache.put_aggregate_into_cache_as_not_found(aggregate_key.clone(), CachePath::Write);
+            // Sentinel 0 prevents subsequent idempotent writes from this never-before-seen
+            // client from re-triggering the WAL scan above. get_client_seq() treats 0 as None.
+            shard_mem_cache.put_aggregate_client_into_cache(aggregate_client_key.clone(), 0, false);
+            metrics::counter!(
+                "celeriant_cache_aggregate_client_scan_not_found_total",
+                &self.metrics_shard_label,
+            ).increment(1);
+        } else {
+            metrics::counter!(
+                "celeriant_cache_aggregate_client_scan_found_total",
+                &self.metrics_shard_label,
+            ).increment(1);
         }
 
         Ok(())
@@ -1702,6 +1705,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             self.config.read_max_chunk_size,
         )
         .with_bloom_filter(searching_for_aggregate_key);
+        if cache_path == CachePath::Write {
+            scanner = scanner.with_write_cursor_upper_bound();
+        }
 
         let find_result = scanner
             .scan::<bool, ()>(|log_id, metablock_absolute_pos, metablock_bytes| {
@@ -1805,6 +1811,102 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         Ok(found)
     }
 
+    /// Read-only pre-flight validation for a single aggregate write.
+    /// Loads relevant caches (aggregate snapshot, client snapshot, schemas) and runs
+    /// every check that can reject the write.
+    async fn validate_single_write(
+        &self,
+        aggregate_key: &AggregateKey,
+        client_id: u128,
+        single_write: &SingleAggregateWrite,
+    ) -> Result<(), ShardWriteError> {
+        // Ensure aggregate snapshot is in memcache, loading from disk if necessary.
+        let aggregate_exists = self.aggregate_exists_and_cache(aggregate_key, CachePath::Write).await
+            .map_err(ShardWriteError::AggregateExistsAndCacheError)?;
+
+        if !aggregate_exists {
+            let (is_loaded, status) = self.shard_mem_cache.borrow_mut().aggregate_load_status(aggregate_key, CachePath::Write);
+            if is_loaded && status == AggregateStatus::Deleted {
+                let indexes = self.shard_mem_cache.borrow_mut().get_write_event_seqes(aggregate_key);
+                if !indexes.allow_recreate {
+                    return Err(ShardWriteError::AggregateRecreateNotAllowed);
+                }
+            } else if !single_write.allow_create {
+                return Err(ShardWriteError::AggregateNotExists);
+            }
+        }
+
+        let aggregate_client_key = AggregateClientKey::new(aggregate_key.clone(), client_id);
+        if single_write.enforce_client_idempotency {
+            self.cache_aggregate_client(aggregate_key, &aggregate_client_key).await
+                .map_err(ShardWriteError::CacheAggregateClientError)?;
+        }
+
+        self.pre_warm_schema_cache(&single_write.events, aggregate_key).await
+            .map_err(ShardWriteError::CacheAggregateClientError)?;
+
+        let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
+        let aggregate_current_indexes = shard_mem_cache.get_write_event_seqes(aggregate_key);
+
+        if aggregate_current_indexes.pending_delete_or_deleted && !aggregate_current_indexes.allow_recreate {
+            return Err(ShardWriteError::AggregateRecreateNotAllowed);
+        }
+
+        if let Some(expected) = single_write.expected_version {
+            if expected != aggregate_current_indexes.aggregate_version {
+                return Err(ShardWriteError::OptimisticConcurrencyViolation {
+                    expected_version: expected,
+                    current_aggregate_version: aggregate_current_indexes.aggregate_version,
+                });
+            }
+        }
+
+        if single_write.enforce_client_idempotency {
+            if let Some(last_client_seq) = shard_mem_cache.get_client_seq(aggregate_key, client_id) {
+                let attempted_client_seq = single_write.events.iter().map(|e| e.client_seq).min().unwrap_or(0);
+                if attempted_client_seq <= last_client_seq {
+                    return Err(ShardWriteError::ClientIdempotencyViolation {
+                        last_client_seq,
+                        attempted_client_seq,
+                    });
+                }
+            }
+        }
+
+        for event in &single_write.events {
+            if event.iv.is_some() { continue; }
+            let schema_key = SchemaKey::new(
+                aggregate_key.org_id,
+                aggregate_key.aggregate_type_id,
+                event.event_type_major,
+                event.event_type_minor,
+            );
+            match shard_mem_cache.schema_cache_get(&schema_key) {
+                Some(celeriant_memcache::cached_schema::CachedSchema::Validated(validator)) => {
+                    validator.validate(&event.event_value).map_err(|e| {
+                        ShardWriteError::SchemaValidationFailed {
+                            event_type_major: event.event_type_major,
+                            event_type_minor: event.event_type_minor,
+                            client_seq: event.client_seq,
+                            validation_error: e,
+                        }
+                    })?;
+                }
+                Some(celeriant_memcache::cached_schema::CachedSchema::CompilationFailed(err)) => {
+                    return Err(ShardWriteError::SchemaCompilationFailed {
+                        event_type_major: event.event_type_major,
+                        event_type_minor: event.event_type_minor,
+                        client_seq: event.client_seq,
+                        compilation_error: err.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
     /// Validate a write request and prepare all data for appending.
     /// This performs read-only access to shard_mem_cache and can fail.
     fn validate_and_prepare_write(
@@ -1843,9 +1945,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         // Validate client idempotency
         if write_request.enforce_client_idempotency {
-            if let Some(last_client_seq) = shard_mem_cache.get_client_seq(aggregate_key, client_id) {
-                let attempted_client_seq = write_request.events.iter().map(|e| e.client_seq).min().unwrap_or(0);
-                if attempted_client_seq <= last_client_seq {
+            let cached = shard_mem_cache.get_client_seq(aggregate_key, client_id);
+            let attempted_client_seq = write_request.events.iter().map(|e| e.client_seq).min().unwrap_or(0);
+            match cached {
+                Some(last_client_seq) if attempted_client_seq <= last_client_seq => {
                     debug!(
                         shard_id = self.config.shard_id,
                         aggregate_key = %aggregate_key,
@@ -1859,6 +1962,23 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                         attempted_client_seq,
                     });
                 }
+                None => {
+                    // Idempotency was requested but the cache had no prior
+                    // client_seq for this (aggregate, client_id)
+                    tracing::trace!(
+                        shard_id = self.config.shard_id,
+                        aggregate_key = %aggregate_key,
+                        client_id = %celeriant_wal::format_uuid(client_id),
+                        attempted_client_seq,
+                        lease_epoch,
+                        "write accepted with no prior client_seq cached"
+                    );
+                    metrics::counter!(
+                        "celeriant_writes_accepted_no_prior_client_seq_total",
+                        &self.metrics_shard_label,
+                    ).increment(1);
+                }
+                Some(_) => {} // attempted > last_client_seq, fall through to normal path
             }
         }
 
@@ -2044,11 +2164,15 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     }
 
     async fn replicate_durable(&self) -> Result<(), ReplicationError> {
-        // Genuine followers don't need replication. 
+        // Genuine followers don't need replication.
         // Check pending replication in-mem just to be sure we are follower.
         if !self.node_status.get().raw().is_leader()
             && self.shard_mem_cache.borrow().pending_replication_bytes() == 0
         {
+            metrics::counter!(
+                "celeriant_replicate_durable_short_circuit_total",
+                &self.metrics_shard_label,
+            ).increment(1);
             return Ok(());
         }
         Box::pin(self.replicate_durable_leader()).await
@@ -2415,6 +2539,15 @@ async fn scan_for_promotion_batch(
     } else {
         Ok(PromotionBatchScan::Collected(items))
     }
+}
+
+fn is_visibility_gap_rejection(err: &ShardWriteError) -> bool {
+    matches!(
+        err,
+        ShardWriteError::ClientIdempotencyViolation { .. }
+            | ShardWriteError::OptimisticConcurrencyViolation { .. }
+            | ShardWriteError::AggregateRecreateNotAllowed
+    )
 }
 
 impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
@@ -3902,6 +4035,308 @@ mod tests {
 
             let read = unwrap_read(process(&shard, read_req(agg)).await);
             assert_eq!(read.event_batches.len(), 1);
+
+            shard.close().await;
+        });
+    }
+
+    // ── Write-visibility fixes ──
+
+    /// Performance fix: when cache_aggregate_client scans the WAL for a new client
+    /// and finds nothing, it must insert sentinel 0 into the client-snapshots cache
+    /// so subsequent idempotent writes from the same client skip the disk scan.
+    #[test]
+    fn cache_aggregate_client_inserts_sentinel_zero_on_miss() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+            let client_id = 42u128;
+            let client_key = AggregateClientKey::new(agg.clone(), client_id);
+
+            let (loaded_before, _) = shard.shard_mem_cache.borrow_mut()
+                .aggregate_client_load_status(&agg, &client_key);
+            assert!(!loaded_before, "client must not be loaded before first lookup");
+
+            shard.cache_aggregate_client(&agg, &client_key).await.unwrap();
+
+            let (loaded_after, last_seq) = shard.shard_mem_cache.borrow_mut()
+                .aggregate_client_load_status(&agg, &client_key);
+            assert!(loaded_after, "client must be flagged loaded after scan");
+            assert_eq!(last_seq, None, "sentinel 0 should be present (returned as None)");
+
+            shard.close().await;
+        });
+    }
+
+    /// Ensure we extend to write cursor not just read
+    #[test]
+    fn client_dedup_scan_does_not_clamp_to_stale_read_cursor() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+            let client_id = 7u128;
+
+            for n in 1u64..=5 {
+                let evt = DatablockAggregateEvent {
+                    client_seq: n,
+                    event_type_major: 1,
+                    event_value: Arc::new(vec![n as u8]),
+                    ..Default::default()
+                };
+                let req = write_req_full(agg.clone(), vec![evt], true, None, client_id, true);
+                write_ok(&shard, req).await;
+            }
+
+            assert_eq!(
+                shard.shard_mem_cache.borrow_mut().get_client_seq(&agg, client_id),
+                Some(5),
+                "precondition: dedup cache should hold client_seq=5 after 5 writes"
+            );
+
+            // Rewind read cursor so v=4 and v=5 sit on disk past the read cursor.
+            let active = shard.log_segments_cache.active();
+            let rewound_position = HEADER_BLOCK_SIZE_BYTES as u64 + 3 * FIXED_BLOCK_SIZE_BYTES as u64;
+            {
+                let mut metadata = active.metadata.borrow_mut();
+                let read = metadata.read.as_mut().expect("standalone advance_visible_position must have populated read");
+                assert!(read.metablocks_position > rewound_position,
+                    "test invariant: read cursor should be past v=3 before rewind");
+                read.metablocks_position = rewound_position;
+            }
+
+            // Force `cache_aggregate_client` to actually exercise its scanner:
+            // keep the aggregate snapshot (so `get_aggregate_last_metablock_pos`
+            // returns a usable starting position) but drop the client mapping.
+            // This is the production state when a different client_id is being
+            // looked up against an already-warm aggregate, or when the client
+            // LRU evicted this client while the aggregate LRU did not.
+            {
+                let mut mc = shard.shard_mem_cache.borrow_mut();
+                mc.execute_replication_rollback();
+            }
+            shard.aggregate_exists_and_cache(&agg, CachePath::Write)
+                .await
+                .expect("aggregate cache reload should succeed");
+            // Drop only the client snapshot to force a dedup-scan path.
+            shard.shard_mem_cache.borrow_mut().clear_aggregate_write_client_snapshots_for_test();
+            assert_eq!(
+                shard.shard_mem_cache.borrow_mut().get_client_seq(&agg, client_id),
+                None,
+                "precondition: client snapshot must be empty so dedup scan runs"
+            );
+
+            let client_key = AggregateClientKey::new(agg.clone(), client_id);
+            shard.cache_aggregate_client(&agg, &client_key)
+                .await
+                .expect("dedup scan should succeed");
+
+            let cached = shard.shard_mem_cache.borrow_mut().get_client_seq(&agg, client_id);
+            assert_eq!(
+                cached, Some(5),
+                "dedup scan must reach write cursor: a reload returning {cached:?} \
+                 would let a retry with client_seq <=5 be accepted as fresh, producing \
+                 a same-client_seq-with-different-aggregate_version duplicate on disk"
+            );
+
+            shard.close().await;
+        });
+    }
+
+    /// is_visibility_gap_rejection classifies only the three documented rejection types.
+    #[test]
+    fn visibility_gap_rejection_classification() {
+        assert!(is_visibility_gap_rejection(&ShardWriteError::ClientIdempotencyViolation {
+            last_client_seq: 5, attempted_client_seq: 5,
+        }));
+        assert!(is_visibility_gap_rejection(&ShardWriteError::OptimisticConcurrencyViolation {
+            expected_version: 5, current_aggregate_version: 6,
+        }));
+        assert!(is_visibility_gap_rejection(&ShardWriteError::AggregateRecreateNotAllowed));
+
+        assert!(!is_visibility_gap_rejection(&ShardWriteError::AggregateNotExists));
+        assert!(!is_visibility_gap_rejection(&ShardWriteError::EmptyEventsList));
+        assert!(!is_visibility_gap_rejection(&ShardWriteError::ZeroEventType { client_seq: 1 }));
+    }
+
+    /// an idempotent retry whose first attempt rolled back must
+    /// succeed - the rollback wiped the client_seq from the write cache, so on
+    /// re-validation the idempotency check passes.
+    #[test]
+    fn idempotent_retry_succeeds_after_replication_rollback() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+
+            let client = FailThenSucceedReplicationClient::new(1, 1);
+            let shard = open_leader_shard(&dir, client).await;
+            let agg = key(1, 1, 1);
+
+            // First write with idempotency: replication fails, write rolls back.
+            let req = write_req_full(agg.clone(), events(1), true, None, 100, true);
+            let result = process(&shard, req).await;
+            assert!(
+                matches!(result, Err(ShardError::Write(ShardWriteError::ReplicationError(_)))),
+                "expected ReplicationError from rollback, got {:?}", result
+            );
+
+            // Retry with the same client_seq. With the visibility-gap fix the write
+            // sees the rolled-back cache (no client_seq recorded) and is accepted.
+            let req = write_req_full(agg.clone(), events(1), true, None, 100, true);
+            let result = process(&shard, req).await;
+            assert!(
+                matches!(result, Ok(ClientResponse::Write(_))),
+                "idempotent retry after rollback should succeed, got {:?}", result
+            );
+
+            let read = unwrap_read(process(&shard, read_req(agg)).await);
+            assert_eq!(read.event_batches.len(), 1);
+
+            shard.close().await;
+        });
+    }
+
+    /// same setup but with optimistic concurrency. After the first
+    /// write rolls back, a retry against the original expected_version (the value
+    /// the client saw before the failed write) must succeed.
+    #[test]
+    fn occ_retry_succeeds_after_replication_rollback() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+
+            // First successful write to establish aggregate_version=1.
+            let pre_client = FailThenSucceedReplicationClient::new(0, 0);
+            let shard = open_leader_shard(&dir, pre_client).await;
+            let agg = key(1, 1, 1);
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            shard.close().await;
+
+            // Reopen with a client that fails the next replication, simulating
+            // a write that fsyncs but never replicates and gets rolled back.
+            let client = FailThenSucceedReplicationClient::new(1, 1);
+            let shard = open_leader_shard(&dir, client).await;
+
+            // OCC-conditioned write: expected_version=1, would advance to 2.
+            // Replication fails, rolls back. Write cache returns to version=1.
+            let req = write_req_full(agg.clone(), events(1), false, Some(1), 1, false);
+            let result = process(&shard, req).await;
+            assert!(
+                matches!(result, Err(ShardError::Write(ShardWriteError::ReplicationError(_)))),
+                "expected ReplicationError from rollback, got {:?}", result
+            );
+
+            // Retry with the same expected_version=1. Pre-fix this could hit the
+            // visibility gap; with the fix the post-rollback state is consistent
+            // and OCC passes.
+            let req = write_req_full(agg.clone(), events(1), false, Some(1), 1, false);
+            let result = process(&shard, req).await;
+            assert!(
+                matches!(result, Ok(ClientResponse::Write(_))),
+                "OCC retry after rollback should succeed, got {:?}", result
+            );
+
+            shard.close().await;
+        });
+    }
+
+    /// a write whose delete pending replication rolled back
+    /// must allow re-creates again on retry. After the delete rolls back, the
+    /// aggregate is restored and recreate-not-allowed must not fire.
+    #[test]
+    fn recreate_retry_succeeds_after_delete_rollback() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+
+            // Setup: aggregate exists.
+            let pre_client = FailThenSucceedReplicationClient::new(0, 0);
+            let shard = open_leader_shard(&dir, pre_client).await;
+            let agg = key(1, 1, 1);
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            shard.close().await;
+
+            // Reopen with a client that fails the next replication, queue a delete
+            // with allow_recreate=false. Delete fsyncs but replication rolls back.
+            let client = FailThenSucceedReplicationClient::new(1, 1);
+            let shard = open_leader_shard(&dir, client).await;
+
+            let del = delete_req_full(agg.clone(), false, false, None);
+            let result = process(&shard, del).await;
+            assert!(
+                matches!(result, Err(ShardError::Delete(_))),
+                "expected delete error from rollback, got {:?}", result
+            );
+
+            // Write after rollback: aggregate is back, no pending delete with
+            // allow_recreate=false to reject this. Without the visibility-gap fix
+            // a racing retry would have hit AggregateRecreateNotAllowed.
+            let req = write_req(agg.clone(), events(1));
+            let result = process(&shard, req).await;
+            assert!(
+                matches!(result, Ok(ClientResponse::Write(_))),
+                "write after rolled-back delete should succeed, got {:?}", result
+            );
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn write_path_cache_load_does_not_clamp_to_stale_read_cursor() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            for n in 1u64..=5 {
+                let evt = DatablockAggregateEvent {
+                    client_seq: n,
+                    event_type_major: 1,
+                    event_value: Arc::new(vec![n as u8]),
+                    ..Default::default()
+                };
+                write_ok(&shard, write_req(agg.clone(), vec![evt])).await;
+            }
+
+            assert_eq!(
+                shard.shard_mem_cache.borrow_mut().get_write_event_seqes(&agg).aggregate_version,
+                5,
+                "precondition: cache should hold aggregate_version=5 after 5 standalone writes"
+            );
+
+            // Rewind only the read cursor's metablock position so v=4 and v=5
+            // sit physically on disk past the read cursor. write_metablocks_position
+            // and the per-cursor bloom are left intact — that's the exact state
+            // the production bug presents to the cache reloader.
+            let active = shard.log_segments_cache.active();
+            let rewound_position = HEADER_BLOCK_SIZE_BYTES as u64 + 3 * FIXED_BLOCK_SIZE_BYTES as u64;
+            {
+                let mut metadata = active.metadata.borrow_mut();
+                let read = metadata.read.as_mut().expect("standalone advance_visible_position must have populated read");
+                assert!(read.metablocks_position > rewound_position,
+                    "test invariant: read cursor should be past v=3 before rewind");
+                read.metablocks_position = rewound_position;
+            }
+
+            // Simulate the cache wipe a replication rollback performs.
+            shard.shard_mem_cache.borrow_mut().execute_replication_rollback();
+            assert_eq!(
+                shard.shard_mem_cache.borrow_mut().get_write_event_seqes(&agg).aggregate_version,
+                0,
+                "cache wipe should leave aggregate_version unknown until disk scan"
+            );
+
+            shard.aggregate_exists_and_cache(&agg, CachePath::Write)
+                .await
+                .expect("write-path cache load should succeed");
+
+            let cached = shard.shard_mem_cache.borrow_mut().get_write_event_seqes(&agg).aggregate_version;
+            assert_eq!(
+                cached, 5,
+                "write-path scan must reach write cursor, not the stale read cursor: \
+                 a reload returning {cached} would let the next write reuse on-disk aggregate_version {} \
+                 (duplicate-version data corruption)",
+                cached + 1,
+            );
 
             shard.close().await;
         });

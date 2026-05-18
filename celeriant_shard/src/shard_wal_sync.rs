@@ -39,16 +39,23 @@ pub(crate) fn capture_fsync_snapshot(shard_mem_cache: &Rc<RefCell<MemCache>>) ->
     let mut cache = shard_mem_cache.borrow_mut();
 
     if cache.take_fsync_rollback_flag() {
+        metrics::counter!("celeriant_fsync_capture_failed_rollback_total").increment(1);
         return CaptureResult::Failed(ShardFsyncError::RollbackInvalidatedWrites);
     }
 
     if cache.pending_append_queue_is_empty() {
+        // Writer's data was taken by an earlier cycle. If that cycle
+        // succeeded, the data is fsynced + (for leader path) queued for
+        // replication. If it failed via fsync rollback, the flag is set
+        // and would have been observed above.
+        metrics::counter!("celeriant_fsync_capture_no_capture_race_total").increment(1);
         return CaptureResult::NoCaptureRaceButOk;
     }
 
     let required_disk_space = cache.buffer_size_total();
     let sync_positions_snapshot = cache.take_sync_positions_snapshot();
 
+    metrics::counter!("celeriant_fsync_capture_captured_total").increment(1);
     CaptureResult::Captured(FsyncCapturedData {
         required_disk_space,
         sync_positions_snapshot,
@@ -298,6 +305,8 @@ fn commit_sync(
     }
 
     if !node_status.is_leader() {
+        metrics::counter!("celeriant_fsync_commit_non_leader_branch_total")
+            .increment(1);
         event_collector.broadcast_all(&watched_aggregates);
     } else {
         // As leader, after fsync we can now allow replication to proceed
