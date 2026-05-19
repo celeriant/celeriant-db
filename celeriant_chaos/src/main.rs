@@ -1,5 +1,6 @@
 mod actions;
 mod config;
+mod disk_truth;
 mod invariants;
 mod logs;
 mod report;

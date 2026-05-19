@@ -602,6 +602,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             distributed: true,
         },
         TestEntry {
+            name: "p2_5_blackout_acked_writes_survive",
+            description: "Concurrent acked writes survive an S3 blackout + follower kill + heal cycle on both nodes",
+            estimated_secs: 120,
+            categories: &[Durability, Replication, Metamorphic],
+            distributed: true,
+        },
+        TestEntry {
             name: "p2_2_dual_restart",
             description: "Both nodes restart simultaneously, S3 lease race resolves cleanly",
             estimated_secs: 14,

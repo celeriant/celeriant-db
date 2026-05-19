@@ -519,12 +519,21 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
     // node held the lease in between and may have uploaded S3 fallback batches.
     let lease_changed_hands = new_lease_epoch > previous_lease_epoch;
     let became_leader = !is_currently_leader && outcome.status.is_leader();
+    let became_follower_from_leader_or_fenced = is_currently_leader && !outcome.status.is_leader();
 
-    if outcome.status.is_leader() && (became_leader || lease_changed_hands) {
-        if lease_changed_hands {
+    let needs_catchup = became_leader
+        || became_follower_from_leader_or_fenced
+        || lease_changed_hands;
+
+    if needs_catchup {
+        if outcome.status.is_leader() && lease_changed_hands {
             info!(previous_lease_epoch, new_lease_epoch, "Lease changed hands during partition — running S3 catchup");
-        } else {
+        } else if outcome.status.is_leader() {
             info!("Starting post-election S3 catchup");
+        } else if became_follower_from_leader_or_fenced {
+            info!(previous_lease_epoch, new_lease_epoch, "Lost leadership / fenced — running S3 catchup before becoming follower");
+        } else {
+            info!(previous_lease_epoch, new_lease_epoch, "Lease epoch advanced while non-leader — running S3 catchup");
         }
         if !run_s3_catchup(ctx, &rx).await {
             return Err(celeriant_distributed::lease_store::LeaseStoreError::Unavailable { message: "Could not catch up WAL via S3".to_string() });
@@ -637,6 +646,7 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
         let mut last_peer_discovery_attempt = std::time::Instant::now();
         let mut last_auto_fence_warn: Option<std::time::Instant> = None;
         let mut last_s3_lease_write_at_ms: Option<u64> = None;
+        let mut last_probe_at_ms: u64 = 0;
 
         loop {
             if ctx.shutdown_requested.get() {
@@ -746,7 +756,14 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                     ctx.shard_wal.replication_client.set_follower_reachable(reachable);
 
                     let leader_for_ms = unix_epoch_now_ms.saturating_sub(ctx.shard_wal.node_status.get().leader_since_ms());
-                    if should_fire_reachability_probe(was_reachable, reachable, ctx.shard_wal.node_status.get().is_leader(), leader_for_ms, MIN_PROBE_AFTER_LEADER_MS) {
+                    let transition_probe = should_fire_reachability_probe(was_reachable, reachable, ctx.shard_wal.node_status.get().is_leader(), leader_for_ms, MIN_PROBE_AFTER_LEADER_MS);
+                    let periodic_probe = reachable
+                        && ctx.shard_wal.node_status.get().is_leader()
+                        && leader_for_ms >= MIN_PROBE_AFTER_LEADER_MS
+                        && unix_epoch_now_ms.saturating_sub(last_probe_at_ms) >= PERIODIC_PROBE_INTERVAL_MS;
+                    if transition_probe || periodic_probe {
+                        debug!(shard_id = ctx.current_shard_id, transition_probe, periodic_probe, "Firing reconciliation probe");
+                        last_probe_at_ms = unix_epoch_now_ms;
                         let shard_wal = ctx.shard_wal.clone();
                         glommio::spawn_local(async move {
                             if let Err(e) = shard_wal.probe_replicate().await {
@@ -1087,6 +1104,12 @@ async fn maybe_ktls_accept(
 }
 
 const MIN_PROBE_AFTER_LEADER_MS: u64 = 2000;
+/// Periodic-probe interval. After this many ms since the last probe, the
+/// leader fires a `probe_replicate` on the next heartbeat ack as a
+/// convergence safety net — closes the post-quiescence follower-tail gap
+/// the transition-only probe misses (writers stop, follower is reachable,
+/// no transition triggers the probe, follower stays behind forever).
+const PERIODIC_PROBE_INTERVAL_MS: u64 = 5_000;
 
 /// Returns true when a reconciliation probe should fire after a reachability update.
 fn should_fire_reachability_probe(

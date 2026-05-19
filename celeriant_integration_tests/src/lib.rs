@@ -55,6 +55,7 @@ pub mod p1_4_exactly_once;
 pub mod p1_6_ordering_verification;
 pub mod p1_7_multitenancy_isolation;
 pub mod p2_1_write_survival;
+pub mod p2_5_blackout_acked_writes_survive;
 pub mod p2_2_dual_restart;
 pub mod p2_3_wal_corruption;
 pub mod p2_4_s3_capacity;

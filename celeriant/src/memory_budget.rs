@@ -1,9 +1,15 @@
 use std::fs;
 
-const AGGREGATE_SNAPSHOTS_RATIO: f64 = 0.09;
-const AGGREGATE_CLIENT_SNAPSHOTS_RATIO: f64 = 0.09;
-const SCHEMA_CACHE_RATIO: f64 = 0.09;
-const LIST_WAL_SEQ_RATIO: f64 = 0.015;
+// Relative weights for the three "fixed" caches. They split whatever the
+// recent-write cache leaves behind in this ratio (1:1:1 today). The absolute
+// fraction each one consumes depends on recent_write_cache_ratio.
+const AGGREGATE_SNAPSHOTS_WEIGHT: f64 = 1.0;
+const AGGREGATE_CLIENT_SNAPSHOTS_WEIGHT: f64 = 1.0;
+const SCHEMA_CACHE_WEIGHT: f64 = 1.0;
+const FIXED_WEIGHTS_SUM: f64 =
+    AGGREGATE_SNAPSHOTS_WEIGHT + AGGREGATE_CLIENT_SNAPSHOTS_WEIGHT + SCHEMA_CACHE_WEIGHT;
+
+pub const DEFAULT_RECENT_WRITE_CACHE_RATIO: f64 = 0.73;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardMemoryBudget {
@@ -11,7 +17,6 @@ pub struct ShardMemoryBudget {
     pub aggregate_snapshots_cache_bytes: u64,
     pub aggregate_client_snapshots_cache_bytes: u64,
     pub schema_cache_bytes: u64,
-    pub list_wal_seq_cache_bytes: u64,
 }
 
 /// Detects available system memory by checking physical RAM and cgroup limits.
@@ -26,29 +31,30 @@ pub fn detect_available_memory() -> Result<u64, String> {
     }
 }
 
-/// Computes per-shard cache budgets from total budget and number of shards.
-/// Recent write cache absorbs the residual after fixed-ratio allocations.
-/// Replication queue memory is governed by `internode_max_request_size`
-/// (a wire-protocol cap, not a memory ratio) and is small enough relative to
-/// per-shard budgets that we don't subtract it from the residual here.
-pub fn compute_shard_budgets(total_budget: u64, num_shards: u32) -> ShardMemoryBudget {
+/// Computes per-shard cache budgets. The recent-write cache claims
+/// `recent_write_cache_ratio` of per-shard memory; the remainder is split
+/// among the three fixed caches in their relative weights. The four buckets
+/// always sum to the per-shard budget (modulo float rounding).
+pub fn compute_shard_budgets(
+    total_budget: u64,
+    num_shards: u32,
+    recent_write_cache_ratio: f64,
+) -> ShardMemoryBudget {
     assert!(num_shards > 0, "num_shards must be > 0");
+    assert!(
+        (0.0..=1.0).contains(&recent_write_cache_ratio),
+        "recent_write_cache_ratio {} out of range [0.0, 1.0]",
+        recent_write_cache_ratio,
+    );
     let per_shard_budget = total_budget / num_shards as u64;
-
-    let aggregate_snapshots = (per_shard_budget as f64 * AGGREGATE_SNAPSHOTS_RATIO) as u64;
-    let aggregate_client_snapshots = (per_shard_budget as f64 * AGGREGATE_CLIENT_SNAPSHOTS_RATIO) as u64;
-    let schema_cache = (per_shard_budget as f64 * SCHEMA_CACHE_RATIO) as u64;
-    let list_wal_seq = (per_shard_budget as f64 * LIST_WAL_SEQ_RATIO) as u64;
-
-    let fixed_total = aggregate_snapshots + aggregate_client_snapshots + schema_cache + list_wal_seq;
-    let recent_write_cache = per_shard_budget.saturating_sub(fixed_total);
+    let recent_write = (per_shard_budget as f64 * recent_write_cache_ratio) as u64;
+    let remaining = per_shard_budget.saturating_sub(recent_write) as f64;
 
     ShardMemoryBudget {
-        recent_write_cache_bytes: recent_write_cache,
-        aggregate_snapshots_cache_bytes: aggregate_snapshots,
-        aggregate_client_snapshots_cache_bytes: aggregate_client_snapshots,
-        schema_cache_bytes: schema_cache,
-        list_wal_seq_cache_bytes: list_wal_seq,
+        recent_write_cache_bytes: recent_write,
+        aggregate_snapshots_cache_bytes: (remaining * AGGREGATE_SNAPSHOTS_WEIGHT / FIXED_WEIGHTS_SUM) as u64,
+        aggregate_client_snapshots_cache_bytes: (remaining * AGGREGATE_CLIENT_SNAPSHOTS_WEIGHT / FIXED_WEIGHTS_SUM) as u64,
+        schema_cache_bytes: (remaining * SCHEMA_CACHE_WEIGHT / FIXED_WEIGHTS_SUM) as u64,
     }
 }
 
@@ -85,50 +91,89 @@ fn read_cgroup_limit() -> Option<u64> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_compute_shard_budgets_single_shard() {
-        let budget = compute_shard_budgets(1_000_000_000, 1);
+    /// Verify the four buckets always sum to per_shard_budget (modulo float rounding).
+    fn assert_sums_to_budget(budget: &ShardMemoryBudget, per_shard: u64) {
+        let total = budget.recent_write_cache_bytes
+            + budget.aggregate_snapshots_cache_bytes
+            + budget.aggregate_client_snapshots_cache_bytes
+            + budget.schema_cache_bytes;
+        assert!(total <= per_shard, "total {} > per_shard {}", total, per_shard);
+        assert!(
+            per_shard - total <= 4,
+            "rounding slack {} bytes too high (per_shard {})",
+            per_shard - total,
+            per_shard,
+        );
+    }
 
+    #[test]
+    fn test_compute_shard_budgets_single_shard_default_ratio() {
+        let budget = compute_shard_budgets(1_000_000_000, 1, DEFAULT_RECENT_WRITE_CACHE_RATIO);
+        assert_eq!(budget.recent_write_cache_bytes, 730_000_000);
         assert_eq!(budget.aggregate_snapshots_cache_bytes, 90_000_000);
         assert_eq!(budget.aggregate_client_snapshots_cache_bytes, 90_000_000);
         assert_eq!(budget.schema_cache_bytes, 90_000_000);
-        assert_eq!(budget.list_wal_seq_cache_bytes, 15_000_000);
-        let fixed = 90_000_000 + 90_000_000 + 90_000_000 + 15_000_000;
-        assert_eq!(budget.recent_write_cache_bytes, 1_000_000_000 - fixed);
+        assert_sums_to_budget(&budget, 1_000_000_000);
     }
 
     #[test]
-    fn test_compute_shard_budgets_large_machine() {
-        // 32 GB total, 16 shards = 2 GB/shard
-        let budget = compute_shard_budgets(32_000_000_000, 16);
-        let per_shard: u64 = 2_000_000_000;
-
+    fn test_compute_shard_budgets_large_machine_default_ratio() {
+        let budget = compute_shard_budgets(32_000_000_000, 16, DEFAULT_RECENT_WRITE_CACHE_RATIO);
+        assert_eq!(budget.recent_write_cache_bytes, 1_460_000_000);
         assert_eq!(budget.aggregate_snapshots_cache_bytes, 180_000_000);
         assert_eq!(budget.aggregate_client_snapshots_cache_bytes, 180_000_000);
         assert_eq!(budget.schema_cache_bytes, 180_000_000);
-        assert_eq!(budget.list_wal_seq_cache_bytes, 30_000_000);
-        let fixed = 180_000_000 + 180_000_000 + 180_000_000 + 30_000_000;
-        assert_eq!(budget.recent_write_cache_bytes, per_shard - fixed);
+        assert_sums_to_budget(&budget, 2_000_000_000);
     }
 
     #[test]
-    fn test_compute_shard_budgets_fixed_ratios_unchanged() {
-        let sum = AGGREGATE_SNAPSHOTS_RATIO
-            + AGGREGATE_CLIENT_SNAPSHOTS_RATIO
-            + SCHEMA_CACHE_RATIO
-            + LIST_WAL_SEQ_RATIO;
-        // Fixed ratios sum to 28.5%, leaving ~71.5% for recent write cache.
-        assert!((sum - 0.285).abs() < 0.001, "Fixed ratios should sum to 0.285, got {}", sum);
+    fn test_compute_shard_budgets_lower_ratio_expands_fixed_caches() {
+        // Recent-write cache cut to 40%; the remaining 60% splits 1:1:1 across the others.
+        let budget = compute_shard_budgets(1_000_000_000, 1, 0.40);
+        assert_eq!(budget.recent_write_cache_bytes, 400_000_000);
+        assert_eq!(budget.aggregate_snapshots_cache_bytes, 200_000_000);
+        assert_eq!(budget.aggregate_client_snapshots_cache_bytes, 200_000_000);
+        assert_eq!(budget.schema_cache_bytes, 200_000_000);
+        assert_sums_to_budget(&budget, 1_000_000_000);
     }
 
     #[test]
-    fn test_compute_shard_budgets_zero() {
-        let budget = compute_shard_budgets(0, 1);
+    fn test_compute_shard_budgets_zero_ratio_gives_all_to_fixed_caches() {
+        let budget = compute_shard_budgets(900_000_000, 1, 0.0);
+        assert_eq!(budget.recent_write_cache_bytes, 0);
+        assert_eq!(budget.aggregate_snapshots_cache_bytes, 300_000_000);
+        assert_eq!(budget.aggregate_client_snapshots_cache_bytes, 300_000_000);
+        assert_eq!(budget.schema_cache_bytes, 300_000_000);
+        assert_sums_to_budget(&budget, 900_000_000);
+    }
 
+    #[test]
+    fn test_compute_shard_budgets_one_ratio_starves_fixed_caches() {
+        let budget = compute_shard_budgets(1_000_000_000, 1, 1.0);
+        assert_eq!(budget.recent_write_cache_bytes, 1_000_000_000);
+        assert_eq!(budget.aggregate_snapshots_cache_bytes, 0);
+        assert_eq!(budget.aggregate_client_snapshots_cache_bytes, 0);
+        assert_eq!(budget.schema_cache_bytes, 0);
+    }
+
+    #[test]
+    fn test_compute_shard_budgets_zero_budget() {
+        let budget = compute_shard_budgets(0, 1, DEFAULT_RECENT_WRITE_CACHE_RATIO);
         assert_eq!(budget.recent_write_cache_bytes, 0);
         assert_eq!(budget.aggregate_snapshots_cache_bytes, 0);
         assert_eq!(budget.aggregate_client_snapshots_cache_bytes, 0);
         assert_eq!(budget.schema_cache_bytes, 0);
-        assert_eq!(budget.list_wal_seq_cache_bytes, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "recent_write_cache_ratio")]
+    fn test_compute_shard_budgets_panics_on_negative_ratio() {
+        compute_shard_budgets(1_000_000_000, 1, -0.1);
+    }
+
+    #[test]
+    #[should_panic(expected = "recent_write_cache_ratio")]
+    fn test_compute_shard_budgets_panics_on_above_one_ratio() {
+        compute_shard_budgets(1_000_000_000, 1, 1.1);
     }
 }

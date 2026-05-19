@@ -60,6 +60,28 @@ pub struct NodeSample {
     pub fsync_capture_captured_total: u64,
     pub fsync_capture_no_capture_race_total: u64,
     pub fsync_capture_failed_rollback_total: u64,
+    /// `write()` futures that were turned into `RollbackInProgress` because a
+    /// rollback bumped `rollback_generation` between the pre-`sync_durable`
+    /// snapshot and the post-`sync_durable` check. Closes the false-ack
+    /// window where `pending_*` queues were wiped before fsync ran.
+    pub write_rolled_back_pre_replicate_total: u64,
+    /// Same idea, but the generation bumped during `replicate_durable`. Catches
+    /// the `NoCaptureRaceButOk` false-ack path where the replication
+    /// coordinator returned `Ok` because someone else popped our entries.
+    pub write_rolled_back_during_replicate_total: u64,
+    /// Pure instrumentation: counts `write()` futures whose validate loop was
+    /// crossed by a rollback (gen at start ≠ gen at submit). Tells us how
+    /// often the validate-phase race fires; doesn't change behaviour.
+    pub write_validate_loop_crossed_rollback_total: u64,
+    /// `aggregate_details` (used by the headline integrity audit) returned a
+    /// `max_aggregate_version` that was lower than the highest version present
+    /// in `aggregate_recent_writes` visible at the read cursor. Smoking gun
+    /// for the snapshot-staleness false-positive rate described in task #23.
+    pub aggregate_details_snapshot_lag_total: u64,
+    /// Hits in the recent-writes cache during `read()`. When the cache is
+    /// disabled via `recent_write_cache_ratio = 0.0` this must stay at 0 —
+    /// non-zero means the diagnostic isolation didn't fully take.
+    pub cache_recent_write_hits_total: u64,
 }
 
 impl NodeSample {
@@ -90,6 +112,11 @@ impl NodeSample {
             fsync_capture_captured_total: 0,
             fsync_capture_no_capture_race_total: 0,
             fsync_capture_failed_rollback_total: 0,
+            write_rolled_back_pre_replicate_total: 0,
+            write_rolled_back_during_replicate_total: 0,
+            write_validate_loop_crossed_rollback_total: 0,
+            aggregate_details_snapshot_lag_total: 0,
+            cache_recent_write_hits_total: 0,
         }
     }
 }
@@ -124,6 +151,11 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         "celeriant_fsync_capture_captured_total",
         "celeriant_fsync_capture_no_capture_race_total",
         "celeriant_fsync_capture_failed_rollback_total",
+        "celeriant_write_rolled_back_pre_replicate_total",
+        "celeriant_write_rolled_back_during_replicate_total",
+        "celeriant_write_validate_loop_crossed_rollback_total",
+        "celeriant_aggregate_details_snapshot_lag_total",
+        "celeriant_cache_recent_write_hits_total",
     ];
 
     for line in body.lines() {
@@ -196,6 +228,11 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         fsync_capture_captured_total: get("celeriant_fsync_capture_captured_total"),
         fsync_capture_no_capture_race_total: get("celeriant_fsync_capture_no_capture_race_total"),
         fsync_capture_failed_rollback_total: get("celeriant_fsync_capture_failed_rollback_total"),
+        write_rolled_back_pre_replicate_total: get("celeriant_write_rolled_back_pre_replicate_total"),
+        write_rolled_back_during_replicate_total: get("celeriant_write_rolled_back_during_replicate_total"),
+        write_validate_loop_crossed_rollback_total: get("celeriant_write_validate_loop_crossed_rollback_total"),
+        aggregate_details_snapshot_lag_total: get("celeriant_aggregate_details_snapshot_lag_total"),
+        cache_recent_write_hits_total: get("celeriant_cache_recent_write_hits_total"),
     }
 }
 

@@ -29,21 +29,19 @@ impl Validate for StubValidator {
 }
 
 fn cache() -> ShardMemCache<StubValidator> {
-    cache_with(64 * 1024, 64 * 1024, 64 * 1024, 64 * 1024, 1024 * 1024)
+    cache_with(64 * 1024, 64 * 1024, 64 * 1024, 1024 * 1024)
 }
 
 fn cache_with(
     recent_write_bytes: u64,
     agg_write_snap_bytes: u64,
     agg_client_snap_bytes: u64,
-    list_wal_seq_bytes: u64,
     internode_max_request_size: u64,
 ) -> ShardMemCache<StubValidator> {
     ShardMemCache::new(
         recent_write_bytes,
         agg_write_snap_bytes,
         agg_client_snap_bytes,
-        list_wal_seq_bytes,
         4 * 1024 * 1024, // schema_cache_bytes
         internode_max_request_size,
     )
@@ -602,7 +600,7 @@ fn put_aggregate_into_read_does_not_cache_client() {
 #[test]
 fn low_priority_rejected_when_cache_full() {
     // 112 bytes / 112 per entry = capacity of 1
-    let mut c = cache_with(0, 112, 0, 0, 1024);
+    let mut c = cache_with(0, 112, 0, 1024);
     let k1 = agg(1, 1, 1);
     let k2 = agg(1, 1, 2);
 
@@ -801,7 +799,7 @@ fn cache_recent_write_iter_from_skips_earlier_batches() {
 
 #[test]
 fn cache_recent_write_zero_budget_disables_cache() {
-    let mut c = cache_with(0, 64 * 1024, 64 * 1024, 64 * 1024, 1024 * 1024);
+    let mut c = cache_with(0, 64 * 1024, 64 * 1024, 1024 * 1024);
     let k = agg(1, 1, 1);
     let mb = test_metablock(k.clone(), 1, 5, 100, 1);
 
@@ -814,7 +812,7 @@ fn cache_recent_write_zero_budget_disables_cache() {
 #[test]
 fn cache_recent_write_evicts_oldest_under_pressure() {
     // Budget for only ~2 entries
-    let mut c = cache_with(128, 64 * 1024, 64 * 1024, 64 * 1024, 1024 * 1024);
+    let mut c = cache_with(128, 64 * 1024, 64 * 1024, 1024 * 1024);
     let k = agg(1, 1, 1);
 
     for i in 1..=3 {
@@ -1066,6 +1064,20 @@ fn replication_rollback_flag_set_when_pending_batches_exist() {
 }
 
 #[test]
+fn replication_rollback_flag_not_set_when_queue_was_empty() {
+    let mut c = cache();
+
+    // No pending replication batches pushed queue stays empty
+
+    c.execute_replication_rollback();
+
+    assert!(
+        !c.take_replication_rollback_flag(),
+        "flag intentionally not set when queue was empty. Prevents spurious bails in capture_replication_snapshot"
+    );
+}
+
+#[test]
 fn capture_after_fsync_rollback_detects_invalidation() {
     let mut c = cache();
     let k = agg(1, 1, 1);
@@ -1107,56 +1119,13 @@ fn peek_pending_replication() {
 
 #[test]
 fn inflight_pressure_check() {
-    let mut c = cache_with(64 * 1024, 64 * 1024, 64 * 1024, 64 * 1024, 1); // 1 byte cap
+    let mut c = cache_with(64 * 1024, 64 * 1024, 64 * 1024, 1); // 1 byte cap
 
     assert!(!c.is_inflight_pressured());
 
     c.push_pending_replication(test_pending_commit_data());
 
     assert!(c.is_inflight_pressured());
-}
-
-// ── WAL Sequence Position Cache ──
-
-#[test]
-fn wal_seq_position_cache_basic() {
-    let mut c = cache();
-
-    c.cache_wal_seq_position(100, 1, 512);
-    c.cache_wal_seq_position(200, 1, 1024);
-
-    let pos = c.get_wal_seq_position(100);
-    assert!(pos.is_some());
-    let pos = pos.unwrap();
-    assert_eq!(pos.log_id, 1);
-    assert_eq!(pos.metablock_absolute_pos, 512);
-
-    assert!(c.get_wal_seq_position(150).is_none());
-}
-
-#[test]
-fn find_nearest_wal_seq_position() {
-    let mut c = cache();
-
-    for i in [100, 200, 300, 500] {
-        c.cache_wal_seq_position(i, 1, i * 10);
-    }
-
-    // Exact match
-    let (idx, pos) = c.find_nearest_wal_seq_position(200).unwrap();
-    assert_eq!(idx, 200);
-    assert_eq!(pos.metablock_absolute_pos, 2000);
-
-    // Between entries, picks lower
-    let (idx, _) = c.find_nearest_wal_seq_position(250).unwrap();
-    assert_eq!(idx, 200);
-
-    // Past all entries
-    let (idx, _) = c.find_nearest_wal_seq_position(999).unwrap();
-    assert_eq!(idx, 500);
-
-    // Before all entries
-    assert!(c.find_nearest_wal_seq_position(50).is_none());
 }
 
 // ── Full Lifecycle: Queue → Sync → Commit → Read ──
@@ -1390,9 +1359,6 @@ fn clear_all_caches_clears_everything() {
     let mb = test_metablock(k1.clone(), 1, 5, 100, 1);
     c.cache_recent_write(k1.clone(), 1, mb, None, 64);
 
-    // Populate wal_seq_positions
-    c.cache_wal_seq_position(100, 1, 512);
-
     // Populate aggregate_client_snapshots
     let ck = client_key(&k2, 200);
     c.put_aggregate_client_into_cache(ck.clone(), 42, false);
@@ -1404,7 +1370,6 @@ fn clear_all_caches_clears_everything() {
     assert!(loaded);
     let writes: Vec<_> = c.get_cached_writes_from(&k1, 1, u64::MAX).collect();
     assert_eq!(writes.len(), 1);
-    assert!(c.get_wal_seq_position(100).is_some());
     let (loaded, _) = c.aggregate_client_load_status(&k2, &ck);
     assert!(loaded);
 
@@ -1418,7 +1383,6 @@ fn clear_all_caches_clears_everything() {
     assert!(!loaded, "aggregate_write_snapshots should be empty");
     let writes: Vec<_> = c.get_cached_writes_from(&k1, 1, u64::MAX).collect();
     assert_eq!(writes.len(), 0, "aggregate_recent_writes should be empty");
-    assert!(c.get_wal_seq_position(100).is_none(), "wal_seq_positions should be empty");
     let (loaded, _) = c.aggregate_client_load_status(&k2, &ck);
     assert!(!loaded, "aggregate_client_snapshots should be empty");
 }

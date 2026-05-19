@@ -295,7 +295,6 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             config.recent_write_cache_bytes,
             config.aggregate_snapshots_cache_bytes,
             config.aggregate_client_snapshots_cache_bytes,
-            config.list_wal_seq_cache_bytes,
             config.schema_cache_bytes,
             config.internode_max_request_size,
         );
@@ -1011,7 +1010,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     }
 
     pub async fn trim_start(&self, trim_request: TrimStartRequest) -> Result<SuccessResponse, ShardTrimError> {
-        
+
         let lease_epoch = match self.node_status.get().effective_node_status() {
             NodeStatus::Leader { lease_epoch } => lease_epoch,
             NodeStatus::Standalone => 0,
@@ -1083,7 +1082,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         // Wait for durable write
         self.sync_durable().await?;
 
-        // Same deal for replication, if we are the leader, 
+        // Same deal for replication, if we are the leader,
         // wait on durable replication, also batched
         self.replicate_durable().await?;
 
@@ -1093,7 +1092,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     }
     
     pub async fn delete(&self, delete_request: DeleteRequest) -> Result<SuccessResponse, ShardDeleteError> {
-        
+
         let lease_epoch = match self.node_status.get().effective_node_status() {
             NodeStatus::Leader { lease_epoch } => lease_epoch,
             NodeStatus::Standalone => 0,
@@ -1172,7 +1171,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         // Now we wait on disk write before ack to client
         self.sync_durable().await?;
 
-        // Same deal for replication, if we are the leader, 
+        // Same deal for replication, if we are the leader,
         // wait on durable replication, also batched
         self.replicate_durable().await?;
 
@@ -1284,6 +1283,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             }
         }
 
+        let rollback_gen_at_start = self.shard_mem_cache.borrow().rollback_generation();
+
         // Idempotency / OCC / recreate-not-allowed rejections validate against the WRITE cache
         let mut retried_for_visibility_gap = false;
         loop {
@@ -1327,6 +1328,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             total_payload_bytes,
             "Write request accepted",
         );
+        let rollback_gen_at_submit = self.shard_mem_cache.borrow().rollback_generation();
+        if rollback_gen_at_submit != rollback_gen_at_start {
+            metrics::counter!("celeriant_write_validate_loop_crossed_rollback_total", &self.metrics_shard_label).increment(1);
+        }
         self.append_prepared_writes_to_queue(prepared_writes);
 
         // Wait on disk write, it's batched for performance
@@ -1334,11 +1339,21 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         self.sync_durable().await?;
         let fsync_ms = fsync_start.elapsed().as_millis() as u64;
 
+        if self.shard_mem_cache.borrow().rollback_generation() != rollback_gen_at_submit {
+            metrics::counter!("celeriant_write_rolled_back_pre_replicate_total", &self.metrics_shard_label).increment(1);
+            return Err(ShardWriteError::ReplicationError(ReplicationError::RollbackInProgress));
+        }
+
         // Same deal for replication, if we are the leader,
         // wait on durable replication, also batched
         let repl_start = std::time::Instant::now();
         self.replicate_durable().await?;
         let repl_ms = repl_start.elapsed().as_millis() as u64;
+
+        if self.shard_mem_cache.borrow().rollback_generation() != rollback_gen_at_submit {
+            metrics::counter!("celeriant_write_rolled_back_during_replicate_total", &self.metrics_shard_label).increment(1);
+            return Err(ShardWriteError::ReplicationError(ReplicationError::RollbackInProgress));
+        }
 
         let total_ms = fsync_ms + repl_ms;
         if total_ms > 1000 {
@@ -2998,7 +3013,6 @@ mod tests {
             list_page_size: 100,
             list_max_concurrent: 16,
             list_max_duration: Duration::from_secs(2),
-            list_wal_seq_cache_bytes: 1024 * 1024,
             schema_cache_bytes: 4 * 1024 * 1024,
             max_schema_size_bytes: 16384,
             max_catchup_gap_bytes: Some(100 * 1024 * 1024),
@@ -3930,6 +3944,94 @@ mod tests {
         }
 
         async fn send_kick(&self) -> Result<bool, crate::error::send_heartbeat_error::SendHeartbeatError> { Ok(true) }
+    }
+
+    /// Replication client that bumps `rollback_generation` *during*
+    /// `replicate_to_follower`, simulating a concurrent rollback that wipes
+    /// state out from under an in-flight `write()`. The first replicate call
+    /// runs the bump; subsequent calls are passthrough so any test that wants
+    /// a recovery write after the bump can still get one.
+    struct BumpGenerationDuringReplicateClient {
+        shard_mem_cache: RefCell<Option<Rc<RefCell<MemCache>>>>,
+        bumped: Cell<bool>,
+    }
+
+    impl BumpGenerationDuringReplicateClient {
+        fn new() -> Self {
+            Self {
+                shard_mem_cache: RefCell::new(None),
+                bumped: Cell::new(false),
+            }
+        }
+
+        fn attach(&self, mc: Rc<RefCell<MemCache>>) {
+            *self.shard_mem_cache.borrow_mut() = Some(mc);
+        }
+    }
+
+    impl ReplicationClient for BumpGenerationDuringReplicateClient {
+        fn set_follower_address(&self, _: Option<String>) {}
+        fn set_follower_reachable(&self, _: bool) {}
+        fn is_follower_reachable(&self) -> bool { true }
+        fn current_heartbeat_started_at_unix_ms(&self) -> Option<u64> { None }
+        fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
+        fn reset_heartbeat_state(&self) {}
+
+        async fn replicate_to_follower(&self, _: Vec<celeriant_msg::request::requests::ReplicationBatchItem>, _: u64) -> Result<(), ReplicateToFollowerError> {
+            if !self.bumped.get() {
+                if let Some(mc) = self.shard_mem_cache.borrow().as_ref() {
+                    // Mid-replicate concurrent rollback: bumps rollback_generation
+                    // and wipes pending state, mirroring what happens when a
+                    // different replication cycle fails while ours is in flight.
+                    mc.borrow_mut().execute_replication_rollback();
+                }
+                self.bumped.set(true);
+            }
+            Ok(())
+        }
+
+        async fn replicate_to_s3(&self, _: Vec<celeriant_msg::request::requests::ReplicationBatchItem>) -> Result<(), ReplicateToS3Error> {
+            Ok(())
+        }
+
+        async fn send_heartbeat(&self, unix_epoch_now_ms: u64, _: u64) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
+            Ok(celeriant_msg::response::responses::HeartbeatResult::Ack { follower_timestamp_ms: unix_epoch_now_ms + 10, follower_can_accept_tcp_replication: true })
+        }
+
+        async fn send_kick(&self) -> Result<bool, crate::error::send_heartbeat_error::SendHeartbeatError> { Ok(true) }
+    }
+
+    /// Regression for the rollback-vs-in-flight-future false-ack documented in
+    /// `docs/missing-data-progress.md` ("residual mechanism" section). A write's
+    /// `replicate_durable` can return `Ok` via `NoCaptureRaceButOk` even when a
+    /// concurrent rollback wiped the data the future thought it had committed.
+    /// The `rollback_generation` snapshot/check in `write()` turns the silent
+    /// false-ack into a transient `ReplicationError::RollbackInProgress`, so the
+    /// client retries with the same client_seq and idempotency handles the rest.
+    #[test]
+    fn write_returns_err_when_rollback_crosses_replicate() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let client = BumpGenerationDuringReplicateClient::new();
+            let shard = ShardWal::open(
+                test_config(&dir),
+                ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 0 }, 500, now_ms() + 10_000),
+                client,
+                StubS3Downloader,
+            ).await.unwrap();
+            shard.replication_client.attach(shard.shard_mem_cache.clone());
+
+            let agg = key(1, 1, 1);
+            let result = process(&shard, write_req(agg.clone(), events(1))).await;
+
+            assert!(
+                matches!(result, Err(ShardError::Write(ShardWriteError::ReplicationError(ReplicationError::RollbackInProgress)))),
+                "write that crossed a rollback must return RollbackInProgress, got {:?}",
+                result,
+            );
+
+            shard.close().await;
+        });
     }
 
     #[test]

@@ -692,7 +692,7 @@ mod tests {
                     LogSegmentsCache::ready_up(dir, 4 * 1024 * 1024, 4, 0).await.unwrap()
                 );
                 let smc = Rc::new(RefCell::new(
-                    MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
+                    MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
                 ));
                 let watched = Rc::new(AggregateWatchers::new());
                 let log_segment = lsc.active();
@@ -732,7 +732,7 @@ mod tests {
                     LogSegmentsCache::ready_up(dir, 4 * 1024 * 1024, 4, 0).await.unwrap()
                 );
                 let smc = Rc::new(RefCell::new(
-                    MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
+                    MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
                 ));
                 let watched = Rc::new(AggregateWatchers::new());
                 let log_segment = lsc.active();
@@ -777,7 +777,7 @@ mod tests {
                     LogSegmentsCache::ready_up(dir, 4 * 1024 * 1024, 4, 0).await.unwrap()
                 );
                 let smc = Rc::new(RefCell::new(
-                    MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
+                    MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
                 ));
                 let watched = Rc::new(AggregateWatchers::new());
                 let log_segment = lsc.active();
@@ -833,7 +833,7 @@ mod tests {
                 LogSegmentsCache::ready_up(dir, 4 * 1024 * 1024, 4, 0).await.unwrap()
             );
             let smc = Rc::new(RefCell::new(
-                MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
+                MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
             ));
             let watched = Rc::new(AggregateWatchers::new());
             let log_segment = lsc.active();
@@ -866,7 +866,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
 
             let smc = Rc::new(RefCell::new(
-                MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
+                MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
             ));
 
             // No writes → empty segment summary → no file should be created

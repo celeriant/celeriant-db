@@ -369,7 +369,7 @@ async fn run_s3_fallback<R: ReplicationClient + 'static>(
         return Ok(());
     }
 
-    let s3_budget = acquire_lease_budget(node_status, "s3_fallback", shard_id)?;
+    let _ = acquire_lease_budget(node_status, "s3_fallback", shard_id)?;
     metrics::counter!("celeriant_replication_s3_fallbacks_total", &[("shard_id", shard_id.to_string())]).increment(1);
 
     let items: Vec<ReplicationBatchItem> = snapshot.iter()
@@ -388,12 +388,9 @@ async fn run_s3_fallback<R: ReplicationClient + 'static>(
 
     debug!(shard_id, batch_count = items.len(), first_wal, last_wal, workset_size_bytes, "S3 fallback: uploading batch");
     let s3_start = Instant::now();
-    let upload = with_budget(s3_budget, replication_client.replicate_to_s3(items))
-        .await
-        .ok_or_else(|| {
-            metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "s3_fallback".to_string()), ("shard_id", shard_id.to_string())]).increment(1);
-            ReplicationError::BudgetExhausted
-        })?;
+    // No with_budget here, just complete it if we get to this step
+    // Safe for other node even if we are outside leadership term
+    let upload = replication_client.replicate_to_s3(items).await;
     upload.map_err(|e| {
         error!(shard_id, error = ?e, "S3 fallback upload failed");
         ReplicationError::ReplicateToS3Error(e)
@@ -489,16 +486,12 @@ async fn single_send<R: ReplicationClient + 'static>(
         return Err(ReplicationError::LeaderFenced);
     }
 
-    let tcp_budget = acquire_lease_budget(node_status, "replicate", shard_id)?;
+    // Pre-flight lease check; bail if already fenced before starting the TCP send.
+    let _ = acquire_lease_budget(node_status, "replicate", shard_id)?;
     let tcp_start = Instant::now();
     debug!(shard_id, batch_count = items.len(), "TCP replication attempt starting");
-    let send = with_budget(tcp_budget, replication_client.replicate_to_follower(items, leader_confirmed_wal_seq))
-        .await
-        .ok_or_else(|| {
-            metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "replicate".to_string()), ("shard_id", shard_id.to_string())]).increment(1);
-            replication_client.set_follower_reachable(false);
-            ReplicationError::BudgetExhausted
-        })?;
+    // Save as s3 replication, no with_budget
+    let send = replication_client.replicate_to_follower(items, leader_confirmed_wal_seq).await;
 
     let err = match send {
         Ok(()) => return Ok(SingleSendOutcome::Ok),
@@ -1045,7 +1038,7 @@ mod tests {
     }
 
     fn fresh_memcache() -> MemCache {
-        MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
+        MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
     }
 
     /// Builds `kinds.len()` PendingCacheItems chained from `start_tip` at wal=`start_wal`.
@@ -1601,44 +1594,6 @@ mod tests {
     }
 
     // --- BudgetExhausted re-queue (no rollback) ---
-
-    /// BudgetExhausted must re-queue the snapshot for retry, NOT rollback. Rollback
-    /// re-fsyncs with fresh server_ts and would race any in-flight S3 PUT with a
-    /// different payload, wedging catchup on "no common ancestor".
-    #[test]
-    fn budget_exhausted_returns_snapshot_to_pending_queue() {
-        glommio_test!({
-            let h = Harness::new().await;
-            // Leader with ~50ms of lease budget, in a far-future lease window so
-            // is_leader() stays true throughout. with_budget loses the race against
-            // the mock's 500ms tcp pre-delay → ReplicationError::BudgetExhausted.
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-            let far_future = 1_000_000_000u64;
-            h.node_status.set(ValidatedNodeStatus::create_custom_status(
-                celeriant_distributed::node_status::NodeStatus::Leader { lease_epoch: 1 },
-                far_future - 50,
-                now + far_future,
-            ));
-
-            let (mock, tcp_calls, s3_calls) = MockClient::build();
-            let client = Rc::new(mock.with_tcp_delay(Duration::from_millis(500)));
-            let captured = make_captured(&[2, 1]);
-
-            let result = h.commit(client, captured, u64::MAX).await;
-            assert!(matches!(result, Err(ReplicationError::BudgetExhausted)), "got {result:?}");
-            assert_eq!(tcp_calls.borrow().len(), 0, "tcp body cancelled before pushing call record");
-            assert!(s3_calls.borrow().is_empty(), "must not reach S3 fallback");
-            assert_eq!(
-                h.smc.borrow().pending_replication_count(),
-                2,
-                "both PCDs must be returned to pending queue",
-            );
-            assert!(h.last_rollback_at.get().is_none(), "BudgetExhausted must not trigger rollback");
-
-            h.close().await;
-        });
-    }
 
     // --- commit_pcd metablock-kind routing ---
 

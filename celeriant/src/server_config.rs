@@ -536,6 +536,14 @@ pub struct ServerConfig {
 
     #[arg(
         long,
+        default_value_t = crate::memory_budget::DEFAULT_RECENT_WRITE_CACHE_RATIO,
+        env = "CELERIANT_RECENT_WRITE_CACHE_RATIO",
+        help = "Fraction of per-shard memory budget for the recent-write cache. Lowering it lets the other three caches absorb the freed share. Range [0.0, 1.0]; default 0.73."
+    )]
+    pub recent_write_cache_ratio: f64,
+
+    #[arg(
+        long,
         default_value_t = true,
         env = "CELERIANT_METRICS_ENABLED",
         help = "Enable Prometheus metrics and health HTTP endpoint"
@@ -563,11 +571,17 @@ impl ServerConfig {
     /// Computes memory budget and validates configuration.
     /// Returns ShardMemoryBudget or error message.
     pub fn compute_memory_budget(&self, num_shards: u32) -> Result<crate::memory_budget::ShardMemoryBudget, String> {
-        // Validate memory_consumption_percent
         if self.memory_consumption_percent < 1 || self.memory_consumption_percent > 95 {
             return Err(format!(
                 "memory_consumption_percent must be in range 1-95, got {}",
                 self.memory_consumption_percent
+            ));
+        }
+
+        if !(0.0..=1.0).contains(&self.recent_write_cache_ratio) {
+            return Err(format!(
+                "recent_write_cache_ratio must be in range [0.0, 1.0], got {}",
+                self.recent_write_cache_ratio
             ));
         }
 
@@ -580,8 +594,7 @@ impl ServerConfig {
 
         let per_shard_budget = total_budget / num_shards as u64;
 
-        // Warn if per-shard budget is very small
-        const MIN_RECOMMENDED_BUDGET: u64 = 100 * 1024 * 1024; // 100 MB
+        const MIN_RECOMMENDED_BUDGET: u64 = 100 * 1024 * 1024;
         if per_shard_budget < MIN_RECOMMENDED_BUDGET {
             tracing::warn!(
                 "Per-shard memory budget is only {} MB (< 100 MB) - caches will be very small",
@@ -589,7 +602,11 @@ impl ServerConfig {
             );
         }
 
-        Ok(crate::memory_budget::compute_shard_budgets(total_budget, num_shards))
+        Ok(crate::memory_budget::compute_shard_budgets(
+            total_budget,
+            num_shards,
+            self.recent_write_cache_ratio,
+        ))
     }
 
     pub fn to_sidecar_config(&self, num_shards: u32, node_id: u128) -> SidecarConfig {
@@ -774,7 +791,6 @@ impl ServerConfig {
             list_page_size: self.list_page_size as usize,
             list_max_concurrent: self.list_max_concurrent,
             read_max_concurrent: self.read_max_concurrent,
-            list_wal_seq_cache_bytes: memory_budget.list_wal_seq_cache_bytes,
             schema_cache_bytes: memory_budget.schema_cache_bytes,
             max_schema_size_bytes: self.max_schema_size_bytes,
             max_clock_drift_ms: self.max_clock_drift_ms,
@@ -917,6 +933,7 @@ impl ServerConfig {
         check_field!(cache_warmup_max_secs);
         check_field!(memory_consumption_percent);
         check_field!(memory_budget_bytes);
+        check_field!(recent_write_cache_ratio);
         check_field!(metrics_enabled);
         check_field!(metrics_port);
 
@@ -1012,6 +1029,7 @@ impl Default for ServerConfig {
             cache_warmup_max_secs: None,
             memory_consumption_percent: 80,
             memory_budget_bytes: None,
+            recent_write_cache_ratio: crate::memory_budget::DEFAULT_RECENT_WRITE_CACHE_RATIO,
             metrics_enabled: true,
             metrics_port: 9090,
         }

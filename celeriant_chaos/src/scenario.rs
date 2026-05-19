@@ -51,6 +51,11 @@ pub struct ScenarioReport {
     /// aggregate_versions). Set only when the headline audit found gaps.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deep_audit: Option<DeepAuditReport>,
+    /// Per-entry disk-truth verification. SSH'ing to both data nodes and running
+    /// `celeriant-wal-inspect`. `actually_missing` is the trustworthy
+    /// loss count; `audit_overreported` is the audit's noise floor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_truth: Option<Vec<crate::disk_truth::DiskTruthEntry>>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -250,6 +255,33 @@ pub async fn tear_down_and_evaluate_with_audit(
     deep_audit: Option<DeepAuditReport>,
     run_dir: &PathBuf,
 ) -> Result<ScenarioReport, String> {
+    // BEFORE stopping services, run disk-truth verification on flagged
+    // aggregates. Services still up so wal-inspect reads consistent state.
+    let disk_truth_report: Option<Vec<crate::disk_truth::DiskTruthEntry>> =
+        deep_audit.as_ref().and_then(|da| {
+            let real_entries: Vec<_> = da.entries.iter()
+                .filter(|e| !e.missing_seqs.is_empty())
+                .cloned()
+                .collect();
+            if real_entries.is_empty() {
+                None
+            } else {
+                println!("[{scenario_name}] disk-truth: verifying {} flagged aggregates via wal-inspect on both nodes", real_entries.len());
+                let verified = crate::disk_truth::verify_against_disk_truth(
+                    &cfg.leader_host,
+                    &cfg.follower_host,
+                    &real_entries,
+                );
+                let truly_missing: u64 = verified.iter().map(|v| v.actually_missing.len() as u64).sum();
+                let overreported: u64 = verified.iter().map(|v| v.audit_overreported.len() as u64).sum();
+                println!(
+                    "[{scenario_name}] disk-truth: {} aggregates checked, audit overreported {} seqs, actually missing {} seqs",
+                    verified.len(), overreported, truly_missing
+                );
+                Some(verified)
+            }
+        });
+
     let executor = ActionExecutor::new(cfg);
 
     // Give the scraper one more tick before stopping it.
@@ -306,6 +338,7 @@ pub async fn tear_down_and_evaluate_with_audit(
         idempotent_counters,
         integrity,
         deep_audit,
+        disk_truth: disk_truth_report,
     })
 }
 
@@ -3105,6 +3138,7 @@ pub async fn run_bench_load_sweep(
         idempotent_counters: None,
         integrity: None,
         deep_audit: None,
+        disk_truth: None,
     };
     Ok(report)
 }

@@ -58,10 +58,6 @@ pub struct ShardMemCache<V: Validate> {
     /// This is unbounded as we expect quick flush to disk
     pending_append_queue: Vec<ShardLogQueueItem>,
 
-    /// LRU cache mapping wal_seq -> position in log files
-    /// Used to optimize list pagination by avoiding full scans
-    wal_seq_positions: LruCache<u64, WalSeqPosition>,
-
     /// LRU cache of compiled schemas (Validated/CompilationFailed only).
     schema_cache: LruCache<SchemaKey, CachedSchema<V>>,
 
@@ -102,6 +98,9 @@ pub struct ShardMemCache<V: Validate> {
     /// Flag set when replication rollback occurs, cleared by following leader
     /// Used to distinguish "empty queue due to rollback" from "empty queue due to race".
     replication_rollback_occurred: bool,
+
+    /// Monotonically increasing counter bumped on every fsync or replication rollback
+    rollback_generation: u64,
 
     /// Running segment summary: per-aggregate stats accumulated since last rotation
     segment_summary: HashMap<AggregateKey, SegmentAggregateEntry>,
@@ -151,7 +150,6 @@ impl<V: Validate> ShardMemCache<V> {
         self.aggregate_recent_writes.clear();
         self.cache_eviction_queue.clear();
         self.cache_current_bytes = 0;
-        self.wal_seq_positions.clear();
     }
 
     /// Returns (is_loaded, status)
@@ -447,6 +445,12 @@ impl<V: Validate> ShardMemCache<V> {
             self.pending_append_bytes = 0;
             self.fsync_rollback_occurred = true;
         }
+        self.rollback_generation = self.rollback_generation.wrapping_add(1);
+    }
+
+    /// Snapshot for in-flight `write()` futures to detect "a rollback crossed me".
+    pub fn rollback_generation(&self) -> u64 {
+        self.rollback_generation
     }
 
     pub fn is_aggregate_snapshot_cache_full(&self, cache_path: CachePath) -> bool {
@@ -774,43 +778,6 @@ impl<V: Validate> ShardMemCache<V> {
         }
     }
 
-    /// Cache a WAL sequence position for list pagination optimization
-    pub fn cache_wal_seq_position(&mut self, wal_seq: u64, log_id: u64, metablock_absolute_pos: u64) {
-        self.wal_seq_positions.put(
-            wal_seq,
-            WalSeqPosition {
-                log_id,
-                metablock_absolute_pos,
-            },
-        );
-    }
-
-    /// Get cached position for a WAL sequence, if available
-    pub fn get_wal_seq_position(&mut self, wal_seq: u64) -> Option<WalSeqPosition> {
-        self.wal_seq_positions.get(&wal_seq).cloned()
-    }
-
-    /// Find the nearest cached position at or before the given WAL sequence
-    pub fn find_nearest_wal_seq_position(&mut self, target_wal_seq: u64) -> Option<(u64, WalSeqPosition)> {
-        // Peek through cache to find nearest position <= target
-        // This is O(n) but cache is bounded and small
-        let mut best: Option<(u64, WalSeqPosition)> = None;
-
-        for (&wal_seq, pos) in self.wal_seq_positions.iter() {
-            if wal_seq <= target_wal_seq {
-                match &best {
-                    None => best = Some((wal_seq, pos.clone())),
-                    Some((best_idx, _)) if wal_seq > *best_idx => {
-                        best = Some((wal_seq, pos.clone()));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        best
-    }
-
     /// Get cached schema (Validated/CompilationFailed) for a schema key.
     pub fn schema_cache_get(&mut self, key: &SchemaKey) -> Option<&CachedSchema<V>> {
         self.schema_cache.get(key)
@@ -944,13 +911,11 @@ impl<V: Validate> ShardMemCache<V> {
         recent_write_cache_bytes: u64,
         aggregate_write_snapshots_cache_bytes: u64,
         aggregate_client_snapshots_cache_bytes: u64,
-        list_wal_seq_cache_bytes: u64,
         schema_cache_bytes: u64,
         internode_max_request_size: u64,
     ) -> Self {
         let aggregate_cap = NonZeroUsize::new((aggregate_write_snapshots_cache_bytes / 112) as usize).unwrap_or(NonZeroUsize::new(10_000).unwrap());
         let client_cap = NonZeroUsize::new((aggregate_client_snapshots_cache_bytes / 128) as usize).unwrap_or(NonZeroUsize::new(100_000).unwrap());
-        let wal_seq_cap = NonZeroUsize::new((list_wal_seq_cache_bytes / 24) as usize).unwrap_or(NonZeroUsize::new(1_000).unwrap());
         let schema_half = schema_cache_bytes / 2;
         // Validated/CompilationFailed entries: ~100 bytes each (SchemaKey 56 + validator ref + LRU overhead)
         let schema_cap = NonZeroUsize::new((schema_half / 100) as usize).unwrap_or(NonZeroUsize::new(1_000).unwrap());
@@ -967,7 +932,6 @@ impl<V: Validate> ShardMemCache<V> {
             aggregate_write_snapshots: LruCache::new(aggregate_cap),
             aggregate_read_snapshots: LruCache::new(aggregate_cap),
             aggregate_write_client_snapshots: LruCache::new(client_cap),
-            wal_seq_positions: LruCache::new(wal_seq_cap),
             schema_cache: LruCache::new(schema_cap),
             no_schema_cache: LruCache::new(no_schema_cap),
             pending_schema_registrations: HashSet::new(),
@@ -977,6 +941,7 @@ impl<V: Validate> ShardMemCache<V> {
             internode_max_request_size,
             fsync_rollback_occurred: false,
             replication_rollback_occurred: false,
+            rollback_generation: 0,
             segment_summary: HashMap::new(),
             segment_summary_orgs: HashSet::new(),
             segment_summary_types: HashSet::new(),
@@ -1161,13 +1126,6 @@ pub struct EventIndexes {
     pub aggregate_version: u64,
     pub min_aggregate_version: u64,
     pub event_seq: u64,
-}
-
-/// Cached position for a WAL sequence, used to optimize list pagination
-#[derive(Clone, Debug)]
-pub struct WalSeqPosition {
-    pub log_id: u64,
-    pub metablock_absolute_pos: u64,
 }
 
 /// Inserts into the cache. If `low_priority` is true, only inserts when there's

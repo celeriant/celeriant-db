@@ -3,7 +3,6 @@ use std::rc::Rc;
 
 use tracing::debug;
 
-use celeriant_disk::files::rwlock_timeout::with_budget;
 use celeriant_distributed::validated_node_status::ValidatedNodeStatus;
 use celeriant_msg::request::requests::ReplicationBatchItem;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
@@ -69,24 +68,19 @@ pub(crate) async fn replicate_follower_catchup<R: ReplicationClient + 'static>(
         }
 
         let end_idx = batch_end_index(&items[sent..], max_request_size);
-        let budget = match node_status.get().current_budget() {
+        // Pre-flight lease check; bail if fenced or zero remaining before starting.
+        match node_status.get().current_budget() {
             None => return Err(ReplicationError::LeaderFenced),
             Some(b) if b.is_zero() => {
                 metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "catchup".to_string()), ("shard_id", shard_id.to_string())]).increment(1);
                 return Err(ReplicationError::BudgetExhausted);
             }
-            Some(b) => b,
-        };
+            Some(_) => {}
+        }
 
         let chunk = items[sent..sent + end_idx].to_vec();
         let leader_confirmed_wal_seq = current_leader_confirmed_wal_seq(log_segments_cache);
-        let send_result = with_budget(budget, replication_client.replicate_to_follower(chunk, leader_confirmed_wal_seq))
-            .await
-            .ok_or_else(|| {
-                metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "catchup".to_string()), ("shard_id", shard_id.to_string())]).increment(1);
-                replication_client.set_follower_reachable(false);
-                ReplicationError::BudgetExhausted
-            })?;
+        let send_result = replication_client.replicate_to_follower(chunk, leader_confirmed_wal_seq).await;
 
         match send_result {
             Ok(()) => {

@@ -1470,7 +1470,6 @@ mod tests {
             list_page_size: 100,
             list_max_concurrent: 16,
             read_max_concurrent: 64,
-            list_wal_seq_cache_bytes: 1024,
             schema_cache_bytes: 4_194_304, // 4MB
             max_schema_size_bytes: 16384,
             replication_delay: Duration::from_millis(20),

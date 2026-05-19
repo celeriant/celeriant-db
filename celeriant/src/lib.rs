@@ -237,12 +237,14 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
         );
     }
 
+    let pct = |bytes: u64| -> f64 {
+        if per_shard_budget == 0 { 0.0 } else { bytes as f64 / per_shard_budget as f64 * 100.0 }
+    };
     info!("Per-shard allocation:");
-    info!("  recent_write_cache:          {:4} MB (71.5%)", memory_budget.recent_write_cache_bytes / (1024 * 1024));
-    info!("  aggregate_snapshots:         {:4} MB  (9.0%)", memory_budget.aggregate_snapshots_cache_bytes / (1024 * 1024));
-    info!("  client_idempotency_snapshots:{:4} MB  (9.0%)", memory_budget.aggregate_client_snapshots_cache_bytes / (1024 * 1024));
-    info!("  schema_cache:                {:4} MB  (9.0%)", memory_budget.schema_cache_bytes / (1024 * 1024));
-    info!("  wal_seq_positions:         {:4} MB  (1.5%)", memory_budget.list_wal_seq_cache_bytes / (1024 * 1024));
+    info!("  recent_write_cache:          {:4} MB ({:.1}%)", memory_budget.recent_write_cache_bytes / (1024 * 1024), pct(memory_budget.recent_write_cache_bytes));
+    info!("  aggregate_snapshots:         {:4} MB  ({:.1}%)", memory_budget.aggregate_snapshots_cache_bytes / (1024 * 1024), pct(memory_budget.aggregate_snapshots_cache_bytes));
+    info!("  client_idempotency_snapshots:{:4} MB  ({:.1}%)", memory_budget.aggregate_client_snapshots_cache_bytes / (1024 * 1024), pct(memory_budget.aggregate_client_snapshots_cache_bytes));
+    info!("  schema_cache:                {:4} MB  ({:.1}%)", memory_budget.schema_cache_bytes / (1024 * 1024), pct(memory_budget.schema_cache_bytes));
 
     // Build TLS config if enabled, and verify kernel kTLS support.
     let tls_config = match server_config.build_tls_config() {
