@@ -34,6 +34,16 @@ pub struct ShardLogHeader {
     /// may have rolled back data above its confirmed point) can catch up. Zero means no
     /// pending promotion upload.
     pub last_received_replication_wal_seq: u64,
+
+    /// Highest wal_seq this node acked to a client while it was leader. Catchup
+    /// refuses to truncate at or below this value, because that data is owed to
+    /// whoever wrote it. Combined at the refusal site with
+    /// last_received_replication_wal_seq so we also cover acks made by other
+    /// leaders while we were following them.
+    ///
+    /// Persisted on the next regular header fsync. If we crash between the bump
+    /// and that fsync, we lose it and might allow a truncate we'd otherwise refuse.
+    pub last_self_acked_wal_seq: u64,
 }
 
 impl ShardLogHeader {
@@ -46,6 +56,7 @@ impl ShardLogHeader {
     const WIRE_SIZE_TIP_HASH: usize = 32;
     const WIRE_SIZE_AGGREGATE_BLOOM: usize = AGGREGATE_BLOOM_BYTES;
     const WIRE_SIZE_LAST_RECEIVED_REPLICATION_WAL_SEQ: usize = 8;
+    const WIRE_SIZE_LAST_SELF_ACKED_WAL_SEQ: usize = 8;
 
     pub const OFFSET_METABLOCKS_POSITION: usize = 0;
 
@@ -64,10 +75,13 @@ impl ShardLogHeader {
     pub const OFFSET_LAST_RECEIVED_REPLICATION_WAL_SEQ: usize =
         Self::OFFSET_AGGREGATE_BLOOM + Self::WIRE_SIZE_AGGREGATE_BLOOM;
 
+    pub const OFFSET_LAST_SELF_ACKED_WAL_SEQ: usize =
+        Self::OFFSET_LAST_RECEIVED_REPLICATION_WAL_SEQ + Self::WIRE_SIZE_LAST_RECEIVED_REPLICATION_WAL_SEQ;
+
     /// Total wire size of ShardLogHeader
     pub const WIRE_SIZE_TOTAL: usize =
-        Self::OFFSET_LAST_RECEIVED_REPLICATION_WAL_SEQ + Self::WIRE_SIZE_LAST_RECEIVED_REPLICATION_WAL_SEQ;
-        
+        Self::OFFSET_LAST_SELF_ACKED_WAL_SEQ + Self::WIRE_SIZE_LAST_SELF_ACKED_WAL_SEQ;
+
     pub fn new(file_len: u64) -> Self {
         Self {
             metablocks_position: HEADER_BLOCK_SIZE_BYTES as u64,
@@ -76,6 +90,7 @@ impl ShardLogHeader {
             tip_hash: GENESIS_HASH,
             aggregate_bloom: vec![],
             last_received_replication_wal_seq: 0,
+            last_self_acked_wal_seq: 0,
         }
     }
 
@@ -145,6 +160,7 @@ mod tests {
             tip_hash: GENESIS_HASH,
             aggregate_bloom: vec![],
             last_received_replication_wal_seq: 0,
+            last_self_acked_wal_seq: 0,
         };
 
         assert_eq!(header.available_space(), 0); // saturating_sub prevents underflow

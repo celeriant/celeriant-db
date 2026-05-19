@@ -1090,7 +1090,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             correlation_id: trim_request.correlation_id,
         })
     }
-    
+
     pub async fn delete(&self, delete_request: DeleteRequest) -> Result<SuccessResponse, ShardDeleteError> {
 
         let lease_epoch = match self.node_status.get().effective_node_status() {
@@ -1283,8 +1283,6 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             }
         }
 
-        let rollback_gen_at_start = self.shard_mem_cache.borrow().rollback_generation();
-
         // Idempotency / OCC / recreate-not-allowed rejections validate against the WRITE cache
         let mut retried_for_visibility_gap = false;
         loop {
@@ -1329,9 +1327,6 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             "Write request accepted",
         );
         let rollback_gen_at_submit = self.shard_mem_cache.borrow().rollback_generation();
-        if rollback_gen_at_submit != rollback_gen_at_start {
-            metrics::counter!("celeriant_write_validate_loop_crossed_rollback_total", &self.metrics_shard_label).increment(1);
-        }
         self.append_prepared_writes_to_queue(prepared_writes);
 
         // Wait on disk write, it's batched for performance
@@ -1340,7 +1335,6 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let fsync_ms = fsync_start.elapsed().as_millis() as u64;
 
         if self.shard_mem_cache.borrow().rollback_generation() != rollback_gen_at_submit {
-            metrics::counter!("celeriant_write_rolled_back_pre_replicate_total", &self.metrics_shard_label).increment(1);
             return Err(ShardWriteError::ReplicationError(ReplicationError::RollbackInProgress));
         }
 
@@ -1351,7 +1345,6 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let repl_ms = repl_start.elapsed().as_millis() as u64;
 
         if self.shard_mem_cache.borrow().rollback_generation() != rollback_gen_at_submit {
-            metrics::counter!("celeriant_write_rolled_back_during_replicate_total", &self.metrics_shard_label).increment(1);
             return Err(ShardWriteError::ReplicationError(ReplicationError::RollbackInProgress));
         }
 
@@ -2184,10 +2177,6 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         if !self.node_status.get().raw().is_leader()
             && self.shard_mem_cache.borrow().pending_replication_bytes() == 0
         {
-            metrics::counter!(
-                "celeriant_replicate_durable_short_circuit_total",
-                &self.metrics_shard_label,
-            ).increment(1);
             return Ok(());
         }
         Box::pin(self.replicate_durable_leader()).await
@@ -2687,10 +2676,12 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let mut disk_kept: VecDeque<EventBatchFromLogSegmentFile> = VecDeque::new();
         let mut disk_cumulative: u64 = 0;
 
+        let scanner_start_pos = last_known.metablock_absolute_pos.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64);
+
         let mut scanner = ReverseMetablockScanner::new(
             &self.log_segments_cache,
             last_known.log_id,
-            Some(last_known.metablock_absolute_pos.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64)),
+            Some(scanner_start_pos),
             self.config.read_max_chunk_size,
         )
         .with_bloom_filter(aggregate_key);

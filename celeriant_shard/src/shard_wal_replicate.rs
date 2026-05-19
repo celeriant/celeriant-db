@@ -177,6 +177,17 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient + 'sta
 
     log_replication_outcome(initial_batch_count, &details, start, shard_id);
 
+    // Bump the ack barrier before we return Ok to the client. Piggybacks on the
+    // next header fsync. See truncate_wal for the refusal side.
+    let acked_wal = current_leader_confirmed_wal_seq(&log_segments_cache);
+    if acked_wal > 0 {
+        let active = log_segments_cache.active();
+        let mut meta = active.metadata.borrow_mut();
+        if acked_wal > meta.last_self_acked_wal_seq {
+            meta.last_self_acked_wal_seq = acked_wal;
+        }
+    }
+
     metrics::histogram!("celeriant_replication_duration_seconds", &shard_label).record(start.elapsed().as_secs_f64());
     metrics::histogram!("celeriant_replication_batch_size", &shard_label).record(initial_batch_count as f64);
     Ok(())
@@ -1077,6 +1088,7 @@ mod tests {
                 read: None,
                 datablocks_carry_over: None,
                 last_received_replication_wal_seq: 0,
+                last_self_acked_wal_seq: 0,
             },
             pending_queue: items,
         }

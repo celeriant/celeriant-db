@@ -135,8 +135,13 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                 continue;
             };
 
-            // Filter out anything that is self - node_id uploaded
+            // Skip our own uploads. Removing this filter caused a truncate
+            // versus self-apply loop in chaos.
             if source_node_id == node_id {
+                metrics::counter!(
+                    "celeriant_s3_catchup_self_uploads_seen_total",
+                    "shard_id" => shard_id.to_string()
+                ).increment(1);
                 continue;
             }
 
@@ -715,11 +720,130 @@ async fn truncate_wal(
     divergent_wal_seq: u64,
     divergent_entry_position: u64,
 ) -> Result<u64, ShardFsyncError> {
+    // Ack barrier: refuse to truncate at or below the cluster-acked watermark.
+    // Two signals max'd:
+    //   - last_self_acked_wal_seq: this node's own acks as leader.
+    //   - last_received_replication_wal_seq - 1: the leader's confirmed wal_seq
+    //     at the time of the last TCP batch we received as follower (the field
+    //     stores leader_confirmed + 1 as the promotion-batch floor).
+    let (last_self_acked, last_received_minus_one) = {
+        let active = log_segments_cache.active();
+        let meta = active.metadata.borrow();
+        (meta.last_self_acked_wal_seq, meta.last_received_replication_wal_seq.saturating_sub(1))
+    };
+    let barrier = last_self_acked.max(last_received_minus_one);
+    if barrier >= divergent_wal_seq {
+        metrics::counter!("celeriant_truncate_refused_due_to_ack_barrier_total").increment(1);
+        if last_received_minus_one > last_self_acked {
+            metrics::counter!("celeriant_truncate_refused_by_follower_signal_total").increment(1);
+        }
+        let would_lose = barrier - divergent_wal_seq.saturating_sub(1);
+        tracing::error!(
+            divergent_wal_seq,
+            divergent_log_id,
+            divergent_entry_position,
+            last_self_acked,
+            last_received_minus_one,
+            barrier,
+            would_lose_wal_seqs = would_lose,
+            "truncate_wal refused. Would drop wal_seqs the cluster previously acked. \
+             Staying in catching-up state; the cluster's authoritative chain has overwritten \
+             a range this node either self-acked or received via TCP replication from another \
+             leader. Operator intervention required: investigate the divergent leadership cycle."
+        );
+        return Err(ShardFsyncError::MetablockSerialisationError(format!(
+            "ack barrier blocked truncate at wal_seq={divergent_wal_seq} \
+             (last_self_acked={last_self_acked}, last_received_minus_one={last_received_minus_one})"
+        )));
+    }
+
     // Step 1: Acquire rollback lock to block concurrent writes
     let _fsync_gate = fsync_coordinator
         .acquire_rollback_lock()
         .await
         .ok_or(ShardFsyncError::WriteLockTimeout)?;
+
+    // Alarm: wiping bytes past the read cursor means client-acked data is
+    // being dropped. Counter must stay 0 in production.
+    {
+        let active_for_check = log_segments_cache.active();
+        if divergent_log_id == log_segments_cache.active_log_id() {
+            let (read_pos, write_pos) = {
+                let metadata = active_for_check.metadata.borrow();
+                let read_pos = metadata.read.as_ref().map(|r| r.metablocks_position).unwrap_or(0);
+                let write_pos = metadata.write.metablocks_position;
+                (read_pos, write_pos)
+            };
+            if read_pos > divergent_entry_position {
+                let committed_bytes_truncated = read_pos.saturating_sub(divergent_entry_position);
+                metrics::counter!(
+                    "celeriant_truncate_dropped_committed_bytes_total",
+                    "shard_id" => active_for_check.metadata.borrow().log_id.to_string()
+                ).increment(committed_bytes_truncated);
+                metrics::counter!(
+                    "celeriant_truncate_dropped_committed_metablocks_events_total"
+                ).increment(1);
+                tracing::error!(
+                    log_id = active_for_check.metadata.borrow().log_id,
+                    divergent_wal_seq,
+                    divergent_entry_position,
+                    read_pos,
+                    write_pos,
+                    committed_bytes_truncated,
+                    "truncate_wal: dropping committed metablocks; these may have been acked to clients (false ack)"
+                );
+            }
+        } else {
+            // Sealed-segment ancestor: anything in the active log past the header is being thrown away.
+            let (active_read_pos, active_write_pos, active_log_id_now) = {
+                let metadata = active_for_check.metadata.borrow();
+                let read_pos = metadata.read.as_ref().map(|r| r.metablocks_position).unwrap_or(HEADER_BLOCK_SIZE_BYTES as u64);
+                (read_pos, metadata.write.metablocks_position, metadata.log_id)
+            };
+            if active_read_pos > HEADER_BLOCK_SIZE_BYTES as u64 {
+                let committed_bytes_truncated = active_read_pos.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64);
+                metrics::counter!(
+                    "celeriant_truncate_dropped_committed_bytes_total",
+                    "shard_id" => active_log_id_now.to_string()
+                ).increment(committed_bytes_truncated);
+                metrics::counter!(
+                    "celeriant_truncate_dropped_committed_metablocks_events_total"
+                ).increment(1);
+                tracing::error!(
+                    active_log_id_now,
+                    divergent_log_id,
+                    divergent_wal_seq,
+                    active_read_pos,
+                    active_write_pos,
+                    committed_bytes_truncated,
+                    "truncate_wal: sealed-ancestor truncation drops committed metablocks in active segment (false ack candidate)"
+                );
+            }
+        }
+    }
+
+    // Alarm: truncate is dropping wal_seqs this node acked as leader (false ack).
+    {
+        let last_self_acked = log_segments_cache.active().metadata.borrow().last_self_acked_wal_seq;
+        let new_wal_seq_after_truncate = divergent_wal_seq.saturating_sub(1);
+        if last_self_acked > new_wal_seq_after_truncate {
+            let lost = last_self_acked - new_wal_seq_after_truncate;
+            metrics::counter!(
+                "celeriant_truncate_dropped_self_acked_events_total"
+            ).increment(1);
+            metrics::counter!(
+                "celeriant_truncate_dropped_self_acked_wal_seqs_total"
+            ).increment(lost);
+            tracing::error!(
+                divergent_wal_seq,
+                divergent_entry_position,
+                new_wal_seq_after_truncate,
+                last_self_acked,
+                lost_self_acked_wal_seqs = lost,
+                "truncate_wal: dropping wal_seqs this node acked as leader (false ack, durability contract violated)"
+            );
+        }
+    }
 
     // Step 2: Clear all caches (including read snapshots and recent writes)
     shard_mem_cache.borrow_mut().clear_all_caches();

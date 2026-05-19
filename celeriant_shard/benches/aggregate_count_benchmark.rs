@@ -79,7 +79,6 @@ fn create_config(shard_dir: PathBuf) -> InternalShardConfig {
         list_page_size: 20000,
         list_max_concurrent: 16,
         read_max_concurrent: 64,
-        list_wal_seq_cache_bytes: 12 * 1024 * 1024,
         schema_cache_bytes: 4 * 1024 * 1024,
         max_schema_size_bytes: 16384,
         max_catchup_gap_bytes: Some(104_857_600),

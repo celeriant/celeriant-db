@@ -19,6 +19,8 @@ pub struct LogSegmentFileMetadata {
     /// batch received via TCP replication while follower (monotonic max). On promotion to
     /// leader, entries from this index onward are uploaded to S3.
     pub last_received_replication_wal_seq: u64,
+    /// See ShardLogHeader::last_self_acked_wal_seq.
+    pub last_self_acked_wal_seq: u64,
 }
 
 impl LogSegmentFileMetadata {
@@ -34,12 +36,13 @@ impl LogSegmentFileMetadata {
             read: if advance_read { Some(LogSegmentCursor::from_shard_log_header(log_id, shard_log_header)) } else { None },
             datablocks_carry_over,
             last_received_replication_wal_seq: shard_log_header.last_received_replication_wal_seq,
+            last_self_acked_wal_seq: shard_log_header.last_self_acked_wal_seq,
         }
     }
 
     #[must_use]
     pub fn to_shard_log_header(&self) -> ShardLogHeader {
-        self.write.to_shard_log_header(self.last_received_replication_wal_seq)
+        self.write.to_shard_log_header(self.last_received_replication_wal_seq, self.last_self_acked_wal_seq)
     }
 
     /// Advance visible position after successful replication (write -> read)
@@ -77,6 +80,7 @@ mod tests {
             tip_hash: [0u8; 32],
             aggregate_bloom: AggregateKeyBloom::new().to_bytes(),
             last_received_replication_wal_seq: 0,
+            last_self_acked_wal_seq: 0,
         }
     }
 

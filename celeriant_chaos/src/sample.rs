@@ -42,46 +42,26 @@ pub struct NodeSample {
     /// Used to characterise the cache miss path during/after rollback.
     pub cache_client_scan_not_found_total: u64,
     pub cache_client_scan_found_total: u64,
-    /// `replicate_durable` returned `Ok` without doing any work because
-    /// status was non-leader AND pending was empty. For a true follower this
-    /// is correct; for a writer whose lease expired mid-write, this is a
-    /// false ack (`docs/missing-data.md`). Non-zero deltas on a node that
-    /// was leader at any point in the bench window are the smoking gun.
-    pub replicate_durable_short_circuit_total: u64,
-    /// `commit_fsync_with_rollback` took the non-leader branch (broadcast
-    /// only, no `push_pending_replication`). True followers should hit this
-    /// once per incoming batch; a writer's fsync hitting it is the false-ack
-    /// signature.
-    pub fsync_commit_non_leader_branch_total: u64,
-    /// fsync coordinator capture outcomes — distinguishes whether a writer's
-    /// sync_durable actually fsynced (captured), short-circuited because
-    /// someone else took the queue (no_capture_race), or saw a fsync rollback
-    /// flag (failed_rollback).
-    pub fsync_capture_captured_total: u64,
-    pub fsync_capture_no_capture_race_total: u64,
-    pub fsync_capture_failed_rollback_total: u64,
-    /// `write()` futures that were turned into `RollbackInProgress` because a
-    /// rollback bumped `rollback_generation` between the pre-`sync_durable`
-    /// snapshot and the post-`sync_durable` check. Closes the false-ack
-    /// window where `pending_*` queues were wiped before fsync ran.
-    pub write_rolled_back_pre_replicate_total: u64,
-    /// Same idea, but the generation bumped during `replicate_durable`. Catches
-    /// the `NoCaptureRaceButOk` false-ack path where the replication
-    /// coordinator returned `Ok` because someone else popped our entries.
-    pub write_rolled_back_during_replicate_total: u64,
-    /// Pure instrumentation: counts `write()` futures whose validate loop was
-    /// crossed by a rollback (gen at start ≠ gen at submit). Tells us how
-    /// often the validate-phase race fires; doesn't change behaviour.
-    pub write_validate_loop_crossed_rollback_total: u64,
-    /// `aggregate_details` (used by the headline integrity audit) returned a
-    /// `max_aggregate_version` that was lower than the highest version present
-    /// in `aggregate_recent_writes` visible at the read cursor. Smoking gun
-    /// for the snapshot-staleness false-positive rate described in task #23.
-    pub aggregate_details_snapshot_lag_total: u64,
-    /// Hits in the recent-writes cache during `read()`. When the cache is
-    /// disabled via `recent_write_cache_ratio = 0.0` this must stay at 0 —
-    /// non-zero means the diagnostic isolation didn't fully take.
-    pub cache_recent_write_hits_total: u64,
+    /// truncate_wal dropped a committed metablock. Bytes past the read cursor
+    /// that may have been acked to a client; each event is a likely false ack.
+    pub truncate_dropped_committed_events_total: u64,
+    /// Total bytes of committed metablocks dropped by truncate_wal.
+    pub truncate_dropped_committed_bytes_total: u64,
+    /// truncate_wal dropped wal_seqs this node acked as leader. Non-zero means
+    /// real data loss.
+    pub truncate_dropped_self_acked_events_total: u64,
+    /// Sum of wal_seqs dropped across truncate_dropped_self_acked events.
+    pub truncate_dropped_self_acked_wal_seqs_total: u64,
+    /// S3 catchup skipped a batch this node uploaded. Counts how often the
+    /// self-filter fires.
+    pub s3_catchup_self_uploads_seen_total: u64,
+    /// truncate_wal refused to truncate because divergent_wal_seq was at or
+    /// below the cluster-wide ack barrier.
+    pub truncate_refused_due_to_ack_barrier_total: u64,
+    /// Subset of truncate_refused_due_to_ack_barrier where the follower signal
+    /// (last_received_replication_wal_seq - 1) was the deciding blocker, i.e.
+    /// it exceeded this node's last_self_acked.
+    pub truncate_refused_by_follower_signal_total: u64,
 }
 
 impl NodeSample {
@@ -107,16 +87,13 @@ impl NodeSample {
             writes_accepted_no_prior_client_seq_total: 0,
             cache_client_scan_not_found_total: 0,
             cache_client_scan_found_total: 0,
-            replicate_durable_short_circuit_total: 0,
-            fsync_commit_non_leader_branch_total: 0,
-            fsync_capture_captured_total: 0,
-            fsync_capture_no_capture_race_total: 0,
-            fsync_capture_failed_rollback_total: 0,
-            write_rolled_back_pre_replicate_total: 0,
-            write_rolled_back_during_replicate_total: 0,
-            write_validate_loop_crossed_rollback_total: 0,
-            aggregate_details_snapshot_lag_total: 0,
-            cache_recent_write_hits_total: 0,
+            truncate_dropped_committed_events_total: 0,
+            truncate_dropped_committed_bytes_total: 0,
+            truncate_dropped_self_acked_events_total: 0,
+            truncate_dropped_self_acked_wal_seqs_total: 0,
+            s3_catchup_self_uploads_seen_total: 0,
+            truncate_refused_due_to_ack_barrier_total: 0,
+            truncate_refused_by_follower_signal_total: 0,
         }
     }
 }
@@ -146,16 +123,13 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         "celeriant_writes_accepted_no_prior_client_seq_total",
         "celeriant_cache_aggregate_client_scan_not_found_total",
         "celeriant_cache_aggregate_client_scan_found_total",
-        "celeriant_replicate_durable_short_circuit_total",
-        "celeriant_fsync_commit_non_leader_branch_total",
-        "celeriant_fsync_capture_captured_total",
-        "celeriant_fsync_capture_no_capture_race_total",
-        "celeriant_fsync_capture_failed_rollback_total",
-        "celeriant_write_rolled_back_pre_replicate_total",
-        "celeriant_write_rolled_back_during_replicate_total",
-        "celeriant_write_validate_loop_crossed_rollback_total",
-        "celeriant_aggregate_details_snapshot_lag_total",
-        "celeriant_cache_recent_write_hits_total",
+        "celeriant_truncate_dropped_committed_metablocks_events_total",
+        "celeriant_truncate_dropped_committed_bytes_total",
+        "celeriant_truncate_dropped_self_acked_events_total",
+        "celeriant_truncate_dropped_self_acked_wal_seqs_total",
+        "celeriant_s3_catchup_self_uploads_seen_total",
+        "celeriant_truncate_refused_due_to_ack_barrier_total",
+        "celeriant_truncate_refused_by_follower_signal_total",
     ];
 
     for line in body.lines() {
@@ -223,16 +197,13 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         writes_accepted_no_prior_client_seq_total: get("celeriant_writes_accepted_no_prior_client_seq_total"),
         cache_client_scan_not_found_total: get("celeriant_cache_aggregate_client_scan_not_found_total"),
         cache_client_scan_found_total: get("celeriant_cache_aggregate_client_scan_found_total"),
-        replicate_durable_short_circuit_total: get("celeriant_replicate_durable_short_circuit_total"),
-        fsync_commit_non_leader_branch_total: get("celeriant_fsync_commit_non_leader_branch_total"),
-        fsync_capture_captured_total: get("celeriant_fsync_capture_captured_total"),
-        fsync_capture_no_capture_race_total: get("celeriant_fsync_capture_no_capture_race_total"),
-        fsync_capture_failed_rollback_total: get("celeriant_fsync_capture_failed_rollback_total"),
-        write_rolled_back_pre_replicate_total: get("celeriant_write_rolled_back_pre_replicate_total"),
-        write_rolled_back_during_replicate_total: get("celeriant_write_rolled_back_during_replicate_total"),
-        write_validate_loop_crossed_rollback_total: get("celeriant_write_validate_loop_crossed_rollback_total"),
-        aggregate_details_snapshot_lag_total: get("celeriant_aggregate_details_snapshot_lag_total"),
-        cache_recent_write_hits_total: get("celeriant_cache_recent_write_hits_total"),
+        truncate_dropped_committed_events_total: get("celeriant_truncate_dropped_committed_metablocks_events_total"),
+        truncate_dropped_committed_bytes_total: get("celeriant_truncate_dropped_committed_bytes_total"),
+        truncate_dropped_self_acked_events_total: get("celeriant_truncate_dropped_self_acked_events_total"),
+        truncate_dropped_self_acked_wal_seqs_total: get("celeriant_truncate_dropped_self_acked_wal_seqs_total"),
+        s3_catchup_self_uploads_seen_total: get("celeriant_s3_catchup_self_uploads_seen_total"),
+        truncate_refused_due_to_ack_barrier_total: get("celeriant_truncate_refused_due_to_ack_barrier_total"),
+        truncate_refused_by_follower_signal_total: get("celeriant_truncate_refused_by_follower_signal_total"),
     }
 }
 
