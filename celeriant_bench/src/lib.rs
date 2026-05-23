@@ -388,6 +388,15 @@ pub async fn run_benchmark_idempotent(
                         replication_retries.fetch_add(1, Ordering::Relaxed);
                         sleep_with_backoff(&mut backoff_ms, BACKOFF_INITIAL_MS, BACKOFF_MAX_MS, id as u64, current_seq).await;
                     }
+                    Err(ClientError::Server(ServerError::Write {
+                        kind: WriteError::InflightDuplicateWrite { .. }, ..
+                    })) => {
+                        // Not an ack. Retry with the same client_seq until replication
+                        // completes or the write rolls back.
+                        total_err.fetch_add(1, Ordering::Relaxed);
+                        replication_retries.fetch_add(1, Ordering::Relaxed);
+                        sleep_with_backoff(&mut backoff_ms, BACKOFF_INITIAL_MS, BACKOFF_MAX_MS, id as u64, current_seq).await;
+                    }
                     Err(e) => {
                         total_err.fetch_add(1, Ordering::Relaxed);
                         // Transport/transient failures retry with the same
@@ -681,6 +690,8 @@ pub struct DeepAuditReport {
     pub total_duplicate_occurrences: u64,
     pub aggregates_unreadable: u64,
     pub entries: Vec<DeepAuditEntry>,
+    /// Error strings from the first few unreadable cases.
+    pub unreadable_errors_sample: Vec<String>,
 }
 
 /// Re-read each acknowledged task's aggregate event-by-event to surface the
@@ -701,6 +712,11 @@ pub async fn deep_audit_failing_aggregates(
     use celeriant_msg::request::read_filters::ReadFilters;
     use tokio::sync::Semaphore;
 
+    // Retry transient read timeouts; the cluster may still be settling post-chaos.
+    const READ_MAX_ATTEMPTS: u32 = 6;
+    const READ_BACKOFF_INITIAL_MS: u64 = 100;
+    const READ_BACKOFF_MAX_MS: u64 = 2_000;
+
     let semaphore = Arc::new(Semaphore::new(max_in_flight.max(1)));
     let mut handles = Vec::with_capacity(failing.len().min(max_inspect));
 
@@ -713,33 +729,59 @@ pub async fn deep_audit_failing_aggregates(
         let permit = Arc::clone(&semaphore);
         handles.push(tokio::spawn(async move {
             let _p = permit.acquire_owned().await.expect("semaphore closed");
-            let iter_res = pool.read_all(ack.aggregate_key.clone(), Some(ReadFilters::new(1))).await;
-            let iter = match iter_res {
-                Ok(it) => it,
-                Err(_) => return (ack, Err(())),
-            };
-            let batches = match iter.collect().await {
-                Ok(b) => b,
-                Err(_) => return (ack, Err(())),
-            };
-            (ack, Ok(batches))
+            let mut backoff_ms: u64 = READ_BACKOFF_INITIAL_MS;
+            let mut last_err: String = String::new();
+            for attempt in 1..=READ_MAX_ATTEMPTS {
+                let iter_res = pool.read_all(ack.aggregate_key.clone(), Some(ReadFilters::new(1))).await;
+                let iter = match iter_res {
+                    Ok(it) => it,
+                    Err(e) => {
+                        last_err = format!("read_all open: {e:?}");
+                        if attempt == READ_MAX_ATTEMPTS { break; }
+                        let jitter = (ack.client_id as u64).wrapping_mul(2654435761) % 1000;
+                        let sleep_ms = backoff_ms / 2 + (backoff_ms * jitter) / 1000;
+                        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(READ_BACKOFF_MAX_MS);
+                        continue;
+                    }
+                };
+                match iter.collect().await {
+                    Ok(b) => return (ack, Ok(b)),
+                    Err(e) => {
+                        last_err = format!("read_all collect: {e:?}");
+                        if attempt == READ_MAX_ATTEMPTS { break; }
+                        let jitter = (ack.client_id as u64).wrapping_mul(2654435761) % 1000;
+                        let sleep_ms = backoff_ms / 2 + (backoff_ms * jitter) / 1000;
+                        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(READ_BACKOFF_MAX_MS);
+                    }
+                }
+            }
+            (ack, Err(last_err))
         }));
     }
 
     let mut report = DeepAuditReport::default();
+    const MAX_ERROR_SAMPLES: usize = 8;
     for handle in handles {
         let (ack, batches) = match handle.await {
             Ok(t) => t,
-            Err(_) => {
+            Err(e) => {
                 report.aggregates_unreadable += 1;
+                if report.unreadable_errors_sample.len() < MAX_ERROR_SAMPLES {
+                    report.unreadable_errors_sample.push(format!("join: {e:?}"));
+                }
                 continue;
             }
         };
         report.aggregates_inspected += 1;
         let batches = match batches {
             Ok(b) => b,
-            Err(_) => {
+            Err(err_string) => {
                 report.aggregates_unreadable += 1;
+                if report.unreadable_errors_sample.len() < MAX_ERROR_SAMPLES {
+                    report.unreadable_errors_sample.push(format!("{} {}", ack.aggregate_key, err_string));
+                }
                 continue;
             }
         };

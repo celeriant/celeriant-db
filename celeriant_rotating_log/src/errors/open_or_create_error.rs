@@ -50,6 +50,14 @@ pub enum OpenOrCreateError {
         path: String,
         source: String,
     },
+    /// Filesystem returned ENOSPC during create+preallocate of a new segment.
+    /// Surface to the writer so the shard stays alive (existing reads keep
+    /// working); writes that need rotation fail until disk space is recovered.
+    OutOfSpace {
+        log_id: u64,
+        path: String,
+        preallocate_bytes: u64,
+    },
 }
 
 impl fmt::Display for OpenOrCreateError {
@@ -81,6 +89,9 @@ impl fmt::Display for OpenOrCreateError {
             }
             Self::RotationTargetUnsafe { log_id, path, source } => {
                 write!(f, "Rotation target unsafe to overwrite: log_id={log_id}, path={path}, source={source}")
+            }
+            Self::OutOfSpace { log_id, path, preallocate_bytes } => {
+                write!(f, "Out of disk space rotating log: log_id={log_id}, path={path}, preallocate_bytes={preallocate_bytes}")
             }
         }
     }

@@ -105,25 +105,34 @@ update-service: ## Refresh the systemd unit + promtail config on data nodes (re-
 	done
 	@printf "$(GREEN)Service config refreshed on all data nodes.$(RESET)\n"
 
-build: ## Cross-compile Celeriant for ARM64
+build: ## Cross-compile Celeriant + celeriant-wal-inspect for ARM64
 	@printf "$(BOLD)>>> Cross-compiling for $(CARGO_TARGET)$(RESET)\n"
 	cd $(PROJECT_ROOT) && \
 		CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-		cargo build --release --target $(CARGO_TARGET) -p celeriant
-	@printf "$(GREEN)Build complete: $(PROJECT_ROOT)/$(CELERIANT_BINARY)$(RESET)\n"
+		cargo build --release --target $(CARGO_TARGET) -p celeriant -p celeriant_wal_inspect
+	@printf "$(GREEN)Build complete:$(RESET)\n"
+	@printf "  $(PROJECT_ROOT)/$(CELERIANT_BINARY)\n"
+	@printf "  $(PROJECT_ROOT)/$(WAL_INSPECT_BINARY)\n"
 
-ship: ## Ship binary to data nodes (without restarting)
+ship: ## Ship binaries (celeriant + celeriant-wal-inspect) to data nodes (without restarting)
 	@BINARY="$(PROJECT_ROOT)/$(CELERIANT_BINARY)"; \
+	WAL_INSPECT="$(PROJECT_ROOT)/$(WAL_INSPECT_BINARY)"; \
 	if [ ! -f "$$BINARY" ]; then \
 		printf "$(RED)Binary not found at $$BINARY — run 'make build' first$(RESET)\n"; \
+		exit 1; \
+	fi; \
+	if [ ! -f "$$WAL_INSPECT" ]; then \
+		printf "$(RED)wal-inspect binary not found at $$WAL_INSPECT — run 'make build' first$(RESET)\n"; \
 		exit 1; \
 	fi; \
 	for HOST in $(DATA_NODES); do \
 		printf "$(BOLD)>>> Shipping to $$HOST$(RESET)\n"; \
 		scp "$$BINARY" $$HOST:/tmp/celeriant; \
-		ssh $$HOST 'sudo mv /tmp/celeriant $(REMOTE_BIN) && sudo chmod +x $(REMOTE_BIN)'; \
+		scp "$$WAL_INSPECT" $$HOST:/tmp/celeriant-wal-inspect; \
+		ssh $$HOST 'sudo mv /tmp/celeriant $(REMOTE_BIN) && sudo chmod +x $(REMOTE_BIN) && \
+		            sudo mv /tmp/celeriant-wal-inspect $(REMOTE_WAL_INSPECT_BIN) && sudo chmod +x $(REMOTE_WAL_INSPECT_BIN)'; \
 	done
-	@printf "$(GREEN)Binary deployed to all nodes.$(RESET)\n"
+	@printf "$(GREEN)Binaries deployed to all nodes.$(RESET)\n"
 
 # ---------------------------------------------------------------------------
 # Service management

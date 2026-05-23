@@ -68,19 +68,27 @@ fn read_header(file: &mut File, position: u64) -> Option<ShardLogHeader> {
 
 fn print_header_block(label: &str, hdr: &ShardLogHeader) {
     println!("{label}:");
-    println!("  metablocks_position           = {}", hdr.metablocks_position);
-    println!("  datablocks_position           = {}", hdr.datablocks_position);
-    println!("  wal_seq                     = {}", hdr.wal_seq);
-    println!("  tip_hash                      = {}", hex32(&hdr.tip_hash));
+    println!("  write_metablocks_position     = {}", hdr.write.metablocks_position);
+    println!("  write_datablocks_position     = {}", hdr.write.datablocks_position);
+    println!("  write_wal_seq                 = {}", hdr.write.wal_seq);
+    println!("  write_tip_hash                = {}", hex32(&hdr.write.tip_hash));
+    println!("  read_metablocks_position      = {}", hdr.read.metablocks_position);
+    println!("  read_wal_seq                  = {}", hdr.read.wal_seq);
+    println!("  read_tip_hash                 = {}", hex32(&hdr.read.tip_hash));
     println!(
         "  last_received_repl_wal_seq  = {}",
         hdr.last_received_replication_wal_seq
     );
+    println!(
+        "  last_self_acked_wal_seq     = {}",
+        hdr.last_self_acked_wal_seq
+    );
     let n_meta = (hdr
+        .write
         .metablocks_position
         .saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64))
         / FIXED_BLOCK_SIZE_BYTES as u64;
-    println!("  metablock_count               = {}", n_meta);
+    println!("  metablock_count (write)       = {}", n_meta);
 }
 
 fn print_metablock(mb: &Metablock, file_offset: u64) {
@@ -147,7 +155,7 @@ fn cmd_wal(file: &mut File, file_len: u64, target: u64) -> std::io::Result<()> {
     let hdr = read_header(file, 0)
         .or_else(|| read_header(file, file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64)));
     let metablocks_end = match hdr {
-        Some(h) => h.metablocks_position,
+        Some(h) => h.write.metablocks_position,
         None => {
             eprintln!("ERROR: both headers corrupt; cannot determine metablock region");
             return Ok(());
@@ -177,7 +185,7 @@ fn cmd_range(file: &mut File, file_len: u64, start: u64, end: u64) -> std::io::R
     let hdr = read_header(file, 0)
         .or_else(|| read_header(file, file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64)));
     let metablocks_end = match hdr {
-        Some(h) => h.metablocks_position,
+        Some(h) => h.write.metablocks_position,
         None => {
             eprintln!("ERROR: both headers corrupt; cannot determine metablock region");
             return Ok(());
@@ -210,7 +218,7 @@ fn cmd_client(
     let hdr = read_header(file, 0)
         .or_else(|| read_header(file, file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64)));
     let (metablocks_end, read_metablocks_pos) = match hdr {
-        Some(h) => (h.metablocks_position, h.metablocks_position),
+        Some(h) => (h.write.metablocks_position, h.read.metablocks_position),
         None => {
             eprintln!("ERROR: both headers corrupt; cannot determine metablock region");
             return Ok(());
@@ -342,7 +350,7 @@ fn cmd_bounds(file: &mut File, file_len: u64) -> std::io::Result<()> {
     let hdr = read_header(file, 0)
         .or_else(|| read_header(file, file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64)));
     let metablocks_end = match hdr {
-        Some(h) => h.metablocks_position,
+        Some(h) => h.write.metablocks_position,
         None => {
             eprintln!("ERROR: both headers corrupt");
             return Ok(());

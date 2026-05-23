@@ -13,6 +13,7 @@ pub mod compaction_restart;
 pub mod compaction_standalone;
 pub mod connection_test;
 pub mod debug_follower_pressure;
+pub mod stale_lease_restart_split_brain;
 pub mod edge_concurrent_heartbeat_replication_s3;
 pub mod edge_corrupted_s3_batch;
 pub mod edge_s3_batch_boundary_contiguity;
@@ -44,7 +45,6 @@ pub mod metamorphic_divergence_recovery_parity;
 pub mod metamorphic_follower_crash_catchup_parity;
 pub mod metamorphic_leader_follower_parity;
 pub mod metamorphic_post_failover_parity;
-pub mod metamorphic_rollback_parity;
 pub mod metamorphic_standalone_vs_cluster;
 pub mod mtls_test;
 pub mod multi_shard_watch_test;
@@ -101,6 +101,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
+use tokio::sync::Notify;
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_msg::{
@@ -976,6 +977,8 @@ pub struct TcpProxy {
     listen_port: u16,
     blocked: Arc<AtomicBool>,
     throttle_ms: Arc<AtomicU64>,
+    /// Notified when block() is called; wakes any forwarding tasks blocked in read().
+    kill_notify: Arc<Notify>,
 }
 
 impl TcpProxy {
@@ -985,6 +988,8 @@ impl TcpProxy {
         let blocked_clone = blocked.clone();
         let throttle_ms = Arc::new(AtomicU64::new(0));
         let throttle_clone = throttle_ms.clone();
+        let kill_notify = Arc::new(Notify::new());
+        let kill_notify_clone = kill_notify.clone();
 
         let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", listen_port)).await?;
 
@@ -1003,6 +1008,7 @@ impl TcpProxy {
                 let target = target_address.clone();
                 let blocked_inner = blocked_clone.clone();
                 let throttle_inner = throttle_clone.clone();
+                let kill_notify_inner = kill_notify_clone.clone();
 
                 let _ = client.set_nodelay(true);
                 tokio::spawn(async move {
@@ -1021,22 +1027,27 @@ impl TcpProxy {
                     let blocked_b = blocked_inner;
                     let throttle_a = throttle_inner.clone();
                     let throttle_b = throttle_inner;
+                    let kill_a = kill_notify_inner.clone();
+                    let kill_b = kill_notify_inner;
 
                     let client_to_server = tokio::spawn(async move {
                         let mut buf = [0u8; 8192];
                         loop {
                             if blocked_a.load(Ordering::Relaxed) { break; }
-                            match tokio::io::AsyncReadExt::read(&mut client_read, &mut buf).await {
-                                Ok(0) | Err(_) => break,
-                                Ok(n) => {
-                                    if tokio::io::AsyncWriteExt::write_all(&mut server_write, &buf[..n]).await.is_err() {
-                                        break;
-                                    }
-                                    let delay = throttle_a.load(Ordering::Relaxed);
-                                    if delay > 0 {
-                                        tokio::time::sleep(Duration::from_millis(delay)).await;
-                                    }
-                                }
+                            let read_fut = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf);
+                            let n = tokio::select! {
+                                _ = kill_a.notified() => break,
+                                result = read_fut => match result {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => n,
+                                },
+                            };
+                            if tokio::io::AsyncWriteExt::write_all(&mut server_write, &buf[..n]).await.is_err() {
+                                break;
+                            }
+                            let delay = throttle_a.load(Ordering::Relaxed);
+                            if delay > 0 {
+                                tokio::time::sleep(Duration::from_millis(delay)).await;
                             }
                         }
                     });
@@ -1045,17 +1056,20 @@ impl TcpProxy {
                         let mut buf = [0u8; 8192];
                         loop {
                             if blocked_b.load(Ordering::Relaxed) { break; }
-                            match tokio::io::AsyncReadExt::read(&mut server_read, &mut buf).await {
-                                Ok(0) | Err(_) => break,
-                                Ok(n) => {
-                                    if tokio::io::AsyncWriteExt::write_all(&mut client_write, &buf[..n]).await.is_err() {
-                                        break;
-                                    }
-                                    let delay = throttle_b.load(Ordering::Relaxed);
-                                    if delay > 0 {
-                                        tokio::time::sleep(Duration::from_millis(delay)).await;
-                                    }
-                                }
+                            let read_fut = tokio::io::AsyncReadExt::read(&mut server_read, &mut buf);
+                            let n = tokio::select! {
+                                _ = kill_b.notified() => break,
+                                result = read_fut => match result {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => n,
+                                },
+                            };
+                            if tokio::io::AsyncWriteExt::write_all(&mut client_write, &buf[..n]).await.is_err() {
+                                break;
+                            }
+                            let delay = throttle_b.load(Ordering::Relaxed);
+                            if delay > 0 {
+                                tokio::time::sleep(Duration::from_millis(delay)).await;
                             }
                         }
                     });
@@ -1065,13 +1079,14 @@ impl TcpProxy {
             }
         });
 
-        Ok(Self { listen_port, blocked, throttle_ms })
+        Ok(Self { listen_port, blocked, throttle_ms, kill_notify })
     }
 
-    /// Block all traffic through the proxy (existing connections are dropped).
+    /// Block new connections and wake every forwarding task currently waiting in read().
     pub fn block(&self) {
         self.blocked.store(true, Ordering::Relaxed);
-        println!("  TcpProxy on port {}: BLOCKED", self.listen_port);
+        self.kill_notify.notify_waiters();
+        println!("  TcpProxy on port {}: BLOCKED (existing connections killed)", self.listen_port);
     }
 
     /// Unblock traffic (new connections will be accepted and forwarded).

@@ -173,11 +173,11 @@ pub fn run_all(data: &RunData, expect: &ScenarioExpectations) -> Vec<CheckResult
         check_bench_errors(data, expect),
         check_bench_throughput_floor(data),
         check_wal_seq_advanced(data),
-        // Orphan-snapshot detector. Any non-zero value means some fsynced
-        // PCDs were popped from `pending_replication_batches` after a
-        // rollback flag was set, then dropped without being committed or
-        // re-queued. See `docs/missing-data.md`.
+        // Fsynced PCDs popped after rollback then dropped without commit or re-queue.
         check_counter("NoCaptureDroppedItems", data, |s| s.capture_dropped_items_total, 0),
+        // Truncate dropped wal_seqs this node acked as leader. Should be impossible
+        // unless the ack barrier was bypassed.
+        check_counter("NoTruncateDroppedSelfAcked", data, |s| s.truncate_dropped_self_acked_events_total, 0),
     ];
     if expect.require_leader_retained {
         out.push(check_leader_retained(data));

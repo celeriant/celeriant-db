@@ -24,6 +24,23 @@ use std::{
     num::NonZeroUsize,
 };
 
+/// Result of `get_client_seq_entry`. The variant gates the OCC decision: a queue
+/// entry is by definition not yet fsynced, while an LRU entry may be durable
+/// (wal_seq=0 disk-scan or wal_seq <= read cursor) or in-flight (wal_seq > read cursor).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientSeqStatus {
+    InflightInQueue { client_seq: u64 },
+    Fsynced { client_seq: u64, wal_seq: u64 },
+}
+
+impl ClientSeqStatus {
+    pub fn client_seq(self) -> u64 {
+        match self {
+            Self::InflightInQueue { client_seq } | Self::Fsynced { client_seq, .. } => client_seq,
+        }
+    }
+}
+
 pub struct ShardMemCache<V: Validate> {
     recent_write_cache_bytes: u64,
 
@@ -47,7 +64,8 @@ pub struct ShardMemCache<V: Validate> {
 
     /// LRU cache of client event sequences committed to file
     /// Missing here does not mean client hasn't written to aggregate, just not in cache
-    aggregate_write_client_snapshots: LruCache<AggregateClientKey, u64>,
+    /// Stores (client_seq, wal_seq). wal_seq=0 means loaded from disk (always durable).
+    aggregate_write_client_snapshots: LruCache<AggregateClientKey, (u64, u64)>,
 
     /// Indexes representing the in-memory positions of the next write for each aggregate
     /// These are writes yet to be written to disk
@@ -133,8 +151,8 @@ impl<V: Validate> ShardMemCache<V> {
         }
 
         // Check LRU cache
-        if let Some(&client_seq) = self.aggregate_write_client_snapshots.get(&aggregate_client_key) {
-            // 0 is sentinel for "checked but client never wrote"
+        if let Some(&(client_seq, _wal_seq)) = self.aggregate_write_client_snapshots.get(&aggregate_client_key) {
+            // client_seq=0 is sentinel for "checked but client never wrote"
             let result = if client_seq == 0 { None } else { Some(client_seq) };
             return (true, result);
         }
@@ -465,6 +483,14 @@ impl<V: Validate> ShardMemCache<V> {
         self.aggregate_write_client_snapshots.len() == self.aggregate_write_client_snapshots.cap().get()
     }
 
+    pub fn aggregate_write_client_snapshots_len(&self) -> usize {
+        self.aggregate_write_client_snapshots.len()
+    }
+
+    pub fn aggregate_write_snapshots_len(&self) -> usize {
+        self.aggregate_write_snapshots.len()
+    }
+
     pub fn is_aggregate_snapshot_full_or_contains(&self, aggregate_key: &AggregateKey, cache_path: CachePath) -> bool {
         let cache = match cache_path {
             CachePath::Read => &self.aggregate_read_snapshots,
@@ -493,10 +519,11 @@ impl<V: Validate> ShardMemCache<V> {
     }
 
     pub fn put_aggregate_client_into_cache(&mut self, aggregate_client_key: AggregateClientKey, last_client_seq: u64, low_priority: bool) {
+        // wal_seq=0: data came from disk scan, always considered durable
         put_with_priority(
             &mut self.aggregate_write_client_snapshots,
             aggregate_client_key,
-            last_client_seq,
+            (last_client_seq, 0u64),
             low_priority,
         );
     }
@@ -570,7 +597,8 @@ impl<V: Validate> ShardMemCache<V> {
 
         if cache_path == CachePath::Write {
             let client_key = AggregateClientKey::new(aggregate_key, client_id);
-            put_with_priority(&mut self.aggregate_write_client_snapshots, client_key, last_client_seq, low_priority);
+            // wal_seq=0: data came from disk scan, always considered durable
+            put_with_priority(&mut self.aggregate_write_client_snapshots, client_key, (last_client_seq, 0u64), low_priority);
         }
     }
 
@@ -674,15 +702,17 @@ impl<V: Validate> ShardMemCache<V> {
                 }
             }
 
-            // Update client event sequences LRU
+            // Tag each (client_seq, wal_seq) so the OCC check can distinguish inflight
+            // (wal_seq > read cursor) from durable.
+            let batch_wal_seq = queue_positions.wal_seq;
             for (client_id, client_seq) in queue_positions.client_seqes {
                 let client_key = AggregateClientKey::new(key.clone(), client_id);
                 if let Some(existing) = self.aggregate_write_client_snapshots.get_mut(&client_key) {
-                    if client_seq > *existing {
-                        *existing = client_seq;
+                    if client_seq > existing.0 {
+                        *existing = (client_seq, batch_wal_seq);
                     }
                 } else {
-                    self.aggregate_write_client_snapshots.put(client_key, client_seq);
+                    self.aggregate_write_client_snapshots.put(client_key, (client_seq, batch_wal_seq));
                 }
             }
 
@@ -701,19 +731,24 @@ impl<V: Validate> ShardMemCache<V> {
         }
     }
 
-    /// Get the latest event index for a client within an aggregate
-    /// Preference the queue first, then fallback to file if no queued items for client
-    pub fn get_client_seq(&mut self, aggregate_key: &AggregateKey, client_id: u128) -> Option<u64> {
-        // Check queue first
+    /// Latest client_seq state for (aggregate, client). The variant distinguishes
+    /// a pre-fsync queue entry (always in-flight) from an LRU entry (wal_seq decides
+    /// in-flight vs durable; wal_seq=0 in the LRU means disk-scan-loaded and durable).
+    pub fn get_client_seq_entry(&mut self, aggregate_key: &AggregateKey, client_id: u128) -> Option<ClientSeqStatus> {
         if let Some(queue_pos) = self.aggregate_queue_positions.get(aggregate_key) {
-            if let Some(&idx) = queue_pos.client_seqes.get(&client_id) {
-                return Some(idx);
+            if let Some(&client_seq) = queue_pos.client_seqes.get(&client_id) {
+                return Some(ClientSeqStatus::InflightInQueue { client_seq });
             }
         }
 
-        // Fall back to file LRU (peek to avoid promoting on read)
         let client_key = AggregateClientKey::new(aggregate_key.clone(), client_id);
-        self.aggregate_write_client_snapshots.get(&client_key).copied().filter(|&idx| idx > 0) // 0 is sentinel for "checked but not found"
+        self.aggregate_write_client_snapshots.get(&client_key).copied()
+            .filter(|&(client_seq, _)| client_seq > 0)
+            .map(|(client_seq, wal_seq)| ClientSeqStatus::Fsynced { client_seq, wal_seq })
+    }
+
+    pub fn get_client_seq(&mut self, aggregate_key: &AggregateKey, client_id: u128) -> Option<u64> {
+        self.get_client_seq_entry(aggregate_key, client_id).map(|s| s.client_seq())
     }
 
     /// The log file and position of the last known written metablock for an aggregate
@@ -834,7 +869,11 @@ impl<V: Validate> ShardMemCache<V> {
     /// Take all pending batches for replication
     pub fn take_pending_replication(&mut self) -> Vec<PendingCommitData> {
         self.pending_replication_bytes = 0;
-        std::mem::take(&mut self.pending_replication_batches)
+        let drained = std::mem::take(&mut self.pending_replication_batches);
+        if !drained.is_empty() {
+            metrics::counter!("celeriant_take_pending_replication_dropped_batches").increment(drained.len() as u64);
+        }
+        drained
     }
 
     /// Return batches to the front of the pending queue after a failed replication
@@ -897,6 +936,27 @@ impl<V: Validate> ShardMemCache<V> {
 
     pub fn clear_aggregate_write_client_snapshots_for_test(&mut self) {
         self.aggregate_write_client_snapshots.clear();
+    }
+
+    /// Cull-side clear. Drains pending_replication and clears the OCC/idempotency
+    /// LRUs that point at the discarded speculative tail. Leaves aggregate_queue_positions,
+    /// schema caches, and rollback_generation alone (those belong to a real rollback).
+    pub fn clear_speculative_write_caches_for_cull(&mut self) -> usize {
+        let drained = std::mem::take(&mut self.pending_replication_batches).len();
+        self.pending_replication_bytes = 0;
+        self.aggregate_write_snapshots.clear();
+        self.aggregate_write_client_snapshots.clear();
+        drained
+    }
+
+    pub fn put_aggregate_write_client_snapshot_for_test(&mut self, aggregate_key: AggregateKey, client_id: u128, client_seq: u64, wal_seq: u64) {
+        let key = AggregateClientKey::new(aggregate_key, client_id);
+        self.aggregate_write_client_snapshots.put(key, (client_seq, wal_seq));
+    }
+
+    pub fn put_aggregate_queue_client_seq_for_test(&mut self, aggregate_key: AggregateKey, client_id: u128, client_seq: u64) {
+        let q = self.aggregate_queue_positions.entry(aggregate_key).or_insert_with(QueueAggregatePositions::default);
+        q.client_seqes.insert(client_id, client_seq);
     }
 
     /// Copy a single aggregate's write snapshot to read snapshot.

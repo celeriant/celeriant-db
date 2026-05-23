@@ -4,7 +4,7 @@ use crate::mem_snapshot_aggregate::{AggregateStatus, MemSnapshotAggregate};
 use crate::pending_commit_data::PendingCommitData;
 use crate::shard_log_queue_item::ShardLogQueueItem;
 use crate::cached_schema::Validate;
-use crate::shard_mem_cache::ShardMemCache;
+use crate::shard_mem_cache::{ClientSeqStatus, ShardMemCache};
 use celeriant_distributed::node_status::NodeStatus;
 use celeriant_rotating_log::log_segment_file::log_segment_file_metadata::LogSegmentFileMetadata;
 use celeriant_wal::aggregate_client_key::AggregateClientKey;
@@ -19,7 +19,7 @@ use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_wal::metablocks::metablock_soft_delete::MetablockSoftDelete;
 use celeriant_wal::metablocks::metablock_soft_trim::MetablockSoftTrim;
 use celeriant_wal::schema_key::SchemaKey;
-use celeriant_wal::shard_log_header::ShardLogHeader;
+use celeriant_wal::shard_log_header::{HeaderCursor, ShardLogHeader};
 
 // ── Helpers ──
 
@@ -116,14 +116,18 @@ fn queue_write(cache: &mut ShardMemCache<StubValidator>, key: &AggregateKey, eve
 }
 
 fn test_pending_commit_data() -> PendingCommitData {
-    let header = ShardLogHeader {
+    let cursor = HeaderCursor {
         metablocks_position: HEADER_BLOCK_SIZE_BYTES as u64,
         datablocks_position: 4 * 1024 * 1024 - HEADER_BLOCK_SIZE_BYTES as u64,
         wal_seq: 0,
-        aggregate_bloom: vec![0u64; 4],
         tip_hash: GENESIS_HASH,
+    };
+    let header = ShardLogHeader {
+        write: cursor.clone(),
+        aggregate_bloom: vec![0u64; 4],
         last_received_replication_wal_seq: 0,
         last_self_acked_wal_seq: 0,
+        read: cursor,
     };
     PendingCommitData {
         log_metadata: LogSegmentFileMetadata::new(1, 4 * 1024 * 1024, None, &header, true),
@@ -1386,6 +1390,165 @@ fn clear_all_caches_clears_everything() {
     assert_eq!(writes.len(), 0, "aggregate_recent_writes should be empty");
     let (loaded, _) = c.aggregate_client_load_status(&k2, &ck);
     assert!(!loaded, "aggregate_client_snapshots should be empty");
+}
+
+// ── OCC: wal_seq-qualified client_seq cache ──
+
+#[test]
+fn get_client_seq_entry_returns_inflight_in_queue() {
+    let mut c = cache();
+    let k = agg(1, 1, 1);
+
+    queue_write(&mut c, &k, 1, 1, 100, 42);
+
+    assert_eq!(c.get_client_seq_entry(&k, 100), Some(ClientSeqStatus::InflightInQueue { client_seq: 42 }));
+}
+
+#[test]
+fn get_client_seq_entry_returns_fsynced_with_wal_seq_zero_for_disk_scan() {
+    let mut c = cache();
+    let k = agg(1, 1, 1);
+    let ck = client_key(&k, 100);
+
+    c.put_aggregate_client_into_cache(ck, 42, false);
+
+    assert_eq!(c.get_client_seq_entry(&k, 100), Some(ClientSeqStatus::Fsynced { client_seq: 42, wal_seq: 0 }));
+}
+
+#[test]
+fn get_client_seq_entry_returns_none_for_unknown_client() {
+    let mut c = cache();
+    let k = agg(1, 1, 1);
+
+    assert_eq!(c.get_client_seq_entry(&k, 100), None);
+}
+
+#[test]
+fn get_client_seq_entry_propagates_wal_seq_from_queue_to_lru_on_commit() {
+    let mut c = cache();
+    let k = agg(1, 1, 1);
+
+    queue_write(&mut c, &k, 1, 1, 100, 42);
+    let mut snapshot = c.take_sync_positions_snapshot();
+    snapshot.aggregate_queue_positions.get_mut(&k).unwrap().wal_seq = 137;
+    c.commit_sync_positions_snapshot(NodeStatus::Standalone, snapshot);
+
+    assert_eq!(c.get_client_seq_entry(&k, 100), Some(ClientSeqStatus::Fsynced { client_seq: 42, wal_seq: 137 }));
+}
+
+#[test]
+fn get_client_seq_entry_queue_wins_over_lru() {
+    let mut c = cache();
+    let k = agg(1, 1, 1);
+    let ck = client_key(&k, 100);
+
+    c.put_aggregate_client_into_cache(ck, 5, false);
+    queue_write(&mut c, &k, 1, 1, 100, 10);
+
+    assert_eq!(c.get_client_seq_entry(&k, 100), Some(ClientSeqStatus::InflightInQueue { client_seq: 10 }));
+}
+
+#[test]
+fn commit_lru_max_wins_updates_wal_seq_alongside_client_seq() {
+    let mut c = cache();
+    let k = agg(1, 1, 1);
+
+    queue_write(&mut c, &k, 1, 1, 100, 5);
+    let mut s1 = c.take_sync_positions_snapshot();
+    s1.aggregate_queue_positions.get_mut(&k).unwrap().wal_seq = 10;
+    c.commit_sync_positions_snapshot(NodeStatus::Standalone, s1);
+
+    queue_write(&mut c, &k, 2, 2, 100, 8);
+    let mut s2 = c.take_sync_positions_snapshot();
+    s2.aggregate_queue_positions.get_mut(&k).unwrap().wal_seq = 20;
+    c.commit_sync_positions_snapshot(NodeStatus::Standalone, s2);
+
+    assert_eq!(c.get_client_seq_entry(&k, 100), Some(ClientSeqStatus::Fsynced { client_seq: 8, wal_seq: 20 }));
+}
+
+#[test]
+fn commit_lru_lower_client_seq_does_not_overwrite_wal_seq() {
+    let mut c = cache();
+    let k = agg(1, 1, 1);
+
+    queue_write(&mut c, &k, 1, 1, 100, 50);
+    let mut s1 = c.take_sync_positions_snapshot();
+    s1.aggregate_queue_positions.get_mut(&k).unwrap().wal_seq = 100;
+    c.commit_sync_positions_snapshot(NodeStatus::Standalone, s1);
+
+    queue_write(&mut c, &k, 2, 2, 100, 30);
+    let mut s2 = c.take_sync_positions_snapshot();
+    s2.aggregate_queue_positions.get_mut(&k).unwrap().wal_seq = 200;
+    c.commit_sync_positions_snapshot(NodeStatus::Standalone, s2);
+
+    assert_eq!(c.get_client_seq_entry(&k, 100), Some(ClientSeqStatus::Fsynced { client_seq: 50, wal_seq: 100 }));
+}
+
+// ── Cull: speculative tail surgical clear ──
+
+#[test]
+fn cull_drains_pending_replication_and_clears_write_lrus() {
+    let mut c = cache();
+    let k = agg(1, 1, 1);
+
+    queue_write(&mut c, &k, 5, 1, 100, 42);
+    sync_and_commit_leader(&mut c);
+    c.push_pending_replication(test_pending_commit_data());
+    c.push_pending_replication(test_pending_commit_data());
+
+    let drained = c.clear_speculative_write_caches_for_cull();
+
+    assert_eq!(drained, 2);
+    assert!(c.peek_pending_replication().is_none());
+    assert_eq!(c.aggregate_write_snapshots_len(), 0);
+    assert_eq!(c.aggregate_write_client_snapshots_len(), 0);
+}
+
+#[test]
+fn cull_preserves_queue_positions_and_schema_state() {
+    let mut c = cache();
+    let k = agg(1, 1, 1);
+
+    queue_write(&mut c, &k, 5, 1, 100, 42);
+    c.schema_cache_insert(sk(1, 0), stub_cached_schema());
+    c.no_schema_cache_insert(sk(2, 0));
+    c.schema_mark_pending(sk(3, 0));
+
+    c.clear_speculative_write_caches_for_cull();
+
+    let indexes = c.get_write_event_seqes(&k);
+    assert_eq!(indexes.aggregate_version, 1);
+    assert_eq!(indexes.event_seq, 5);
+
+    assert!(c.schema_cache_has_schema(&sk(1, 0)));
+    assert!(c.schema_cache_contains(&sk(2, 0)));
+    assert!(c.schema_is_pending(&sk(3, 0)));
+}
+
+#[test]
+fn cull_does_not_bump_rollback_generation() {
+    let mut c = cache();
+    let before = c.rollback_generation();
+
+    c.push_pending_replication(test_pending_commit_data());
+    c.clear_speculative_write_caches_for_cull();
+
+    assert_eq!(c.rollback_generation(), before);
+}
+
+#[test]
+fn cull_returns_zero_on_empty_and_leaves_read_snapshots_alone() {
+    let mut c = cache();
+    let k = agg(1, 1, 1);
+    let snap = MemSnapshotAggregate::found(1, 512, 10, 3, 1);
+    c.put_aggregate_into_cache(k.clone(), snap, 100, 42, false, CachePath::Read);
+
+    let drained = c.clear_speculative_write_caches_for_cull();
+
+    assert_eq!(drained, 0);
+    let (loaded, status) = c.aggregate_load_status(&k, CachePath::Read);
+    assert!(loaded);
+    assert_eq!(status, AggregateStatus::Found);
 }
 
 // ── UniqueSchemaKeys ──

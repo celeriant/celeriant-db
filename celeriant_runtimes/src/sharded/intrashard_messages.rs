@@ -18,6 +18,7 @@ pub enum IntrashardMessages {
         request: ClusterRequest,
         message_version: u32,
     },
+    CullSpeculativeTail,
     EnterS3Catchup,
     S3CatchupComplete {
         shard_id: usize,

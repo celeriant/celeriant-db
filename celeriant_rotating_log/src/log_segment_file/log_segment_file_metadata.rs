@@ -1,4 +1,6 @@
-use celeriant_wal::{shard_log_header::ShardLogHeader};
+use celeriant_wal::{constants::HEADER_BLOCK_SIZE_BYTES, shard_log_header::ShardLogHeader};
+#[cfg(test)]
+use celeriant_wal::shard_log_header::HeaderCursor;
 
 use crate::log_segment_file::log_segment_cursor::LogSegmentCursor;
 
@@ -10,8 +12,8 @@ pub struct LogSegmentFileMetadata {
     pub file_len: u64,
     /// Writer's view - most recent writes (not yet replicated)
     pub write: LogSegmentCursor,
-    /// Reader's view - replicated and visible to readers
-    /// May be none if the read position is still on the previous log segment file
+    /// Reader's view: replicated and visible. `None` until first replication advances
+    /// into this segment (post-rotation gap). Zero in the persisted header maps to None.
     pub read: Option<LogSegmentCursor>,
     /// Used in write path as datablock file writes are not Direct I/O aligned
     pub datablocks_carry_over: Option<Vec<u8>>,
@@ -28,12 +30,19 @@ impl LogSegmentFileMetadata {
         self.write.datablocks_position.saturating_sub(self.write.metablocks_position)
     }
 
+    /// `advance_read=true` restores read from the header (None if zero sentinel).
+    /// `advance_read=false` forces read=None; used during rotation for a fresh segment.
     pub fn new(log_id: u64, file_len: u64, datablocks_carry_over: Option<Vec<u8>>, shard_log_header: &ShardLogHeader, advance_read: bool) -> Self {
+        let read = if advance_read && shard_log_header.read.metablocks_position >= HEADER_BLOCK_SIZE_BYTES as u64 {
+            Some(LogSegmentCursor::from_shard_log_header_read(log_id, shard_log_header))
+        } else {
+            None
+        };
         LogSegmentFileMetadata {
             log_id,
             file_len,
-            write: LogSegmentCursor::from_shard_log_header(log_id, shard_log_header),
-            read: if advance_read { Some(LogSegmentCursor::from_shard_log_header(log_id, shard_log_header)) } else { None },
+            write: LogSegmentCursor::from_shard_log_header_write(log_id, shard_log_header),
+            read,
             datablocks_carry_over,
             last_received_replication_wal_seq: shard_log_header.last_received_replication_wal_seq,
             last_self_acked_wal_seq: shard_log_header.last_self_acked_wal_seq,
@@ -42,7 +51,11 @@ impl LogSegmentFileMetadata {
 
     #[must_use]
     pub fn to_shard_log_header(&self) -> ShardLogHeader {
-        self.write.to_shard_log_header(self.last_received_replication_wal_seq, self.last_self_acked_wal_seq)
+        self.write.to_shard_log_header(
+            self.read.as_ref(),
+            self.last_received_replication_wal_seq,
+            self.last_self_acked_wal_seq,
+        )
     }
 
     /// Advance visible position after successful replication (write -> read)
@@ -71,16 +84,41 @@ impl LogSegmentFileMetadata {
 mod tests {
     use super::*;
     use crate::log_segment_file::aggregate_key_bloom::AggregateKeyBloom;
+    use celeriant_wal::constants::GENESIS_HASH;
 
     fn make_header(meta_pos: u64, data_pos: u64, wal_idx: u64) -> ShardLogHeader {
         ShardLogHeader {
-            metablocks_position: meta_pos,
-            datablocks_position: data_pos,
-            wal_seq: wal_idx,
-            tip_hash: [0u8; 32],
+            write: HeaderCursor {
+                metablocks_position: meta_pos,
+                datablocks_position: data_pos,
+                wal_seq: wal_idx,
+                tip_hash: [0u8; 32],
+            },
             aggregate_bloom: AggregateKeyBloom::new().to_bytes(),
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
+            // read defaults to zero sentinel (not advanced)
+            read: HeaderCursor::genesis(),
+        }
+    }
+
+    fn make_header_with_read(meta_pos: u64, data_pos: u64, wal_idx: u64, read_meta: u64, read_data: u64, read_wal: u64) -> ShardLogHeader {
+        ShardLogHeader {
+            write: HeaderCursor {
+                metablocks_position: meta_pos,
+                datablocks_position: data_pos,
+                wal_seq: wal_idx,
+                tip_hash: [0u8; 32],
+            },
+            aggregate_bloom: AggregateKeyBloom::new().to_bytes(),
+            last_received_replication_wal_seq: 0,
+            last_self_acked_wal_seq: 0,
+            read: HeaderCursor {
+                metablocks_position: read_meta,
+                datablocks_position: read_data,
+                wal_seq: read_wal,
+                tip_hash: GENESIS_HASH,
+            },
         }
     }
 
@@ -106,15 +144,45 @@ mod tests {
     }
 
     #[test]
-    fn new_with_advance_read() {
+    fn new_with_advance_read_but_sentinel_gives_none() {
+        // read_metablocks_position == 0 is the sentinel; advance_read=true still gives None
         let meta = LogSegmentFileMetadata::new(5, 2000, None, &make_header(50, 1950, 10), true);
+        assert!(meta.read.is_none());
+    }
+
+    #[test]
+    fn new_with_advance_read_and_valid_read_cursor() {
+        // read_metablocks_position >= HEADER_BLOCK_SIZE_BYTES means read was advanced
+        let header = make_header_with_read(50, 1950, 10, HEADER_BLOCK_SIZE_BYTES as u64, 1900, 5);
+        let meta = LogSegmentFileMetadata::new(5, 2000, None, &header, true);
         assert!(meta.read.is_some());
-        assert_eq!(meta.read.unwrap().wal_seq, 10);
+        assert_eq!(meta.read.unwrap().wal_seq, 5);
+        assert_eq!(meta.write.wal_seq, 10);
+    }
+
+    #[test]
+    fn read_behind_write_preserved_on_load() {
+        // Simulates restart after leader crash with write=10, read=5
+        let header = make_header_with_read(
+            HEADER_BLOCK_SIZE_BYTES as u64 + 10 * 512,
+            1_000_000 - HEADER_BLOCK_SIZE_BYTES as u64,
+            10,
+            HEADER_BLOCK_SIZE_BYTES as u64 + 5 * 512,
+            1_000_000 - HEADER_BLOCK_SIZE_BYTES as u64,
+            5,
+        );
+        let meta = LogSegmentFileMetadata::new(1, 1_000_000, None, &header, true);
+        assert_eq!(meta.write.wal_seq, 10);
+        assert_eq!(meta.read.as_ref().unwrap().wal_seq, 5);
     }
 
     #[test]
     fn advance_visible_position_copies_write() {
-        let mut meta = LogSegmentFileMetadata::new(1, 1000, None, &make_header(100, 900, 5), false);
+        let header = make_header_with_read(
+            HEADER_BLOCK_SIZE_BYTES as u64, 900, 5,
+            HEADER_BLOCK_SIZE_BYTES as u64, 900, 5,
+        );
+        let mut meta = LogSegmentFileMetadata::new(1, 1000, None, &header, true);
         meta.write.wal_seq = 15;
         meta.advance_visible_position();
         assert_eq!(meta.read.unwrap().wal_seq, 15);
@@ -128,14 +196,50 @@ mod tests {
 
     #[test]
     fn is_pending_when_write_ahead() {
-        let mut meta = LogSegmentFileMetadata::new(1, 1000, None, &make_header(100, 900, 5), true);
+        let header = make_header_with_read(
+            HEADER_BLOCK_SIZE_BYTES as u64, 900, 10,
+            HEADER_BLOCK_SIZE_BYTES as u64, 900, 5,
+        );
+        let mut meta = LogSegmentFileMetadata::new(1, 1000, None, &header, true);
         meta.write.wal_seq = 10;
         assert!(meta.is_pending_advance());
     }
 
     #[test]
     fn not_pending_when_synced() {
-        let meta = LogSegmentFileMetadata::new(1, 1000, None, &make_header(100, 900, 5), true);
+        let header = make_header_with_read(
+            HEADER_BLOCK_SIZE_BYTES as u64, 900, 5,
+            HEADER_BLOCK_SIZE_BYTES as u64, 900, 5,
+        );
+        let meta = LogSegmentFileMetadata::new(1, 1000, None, &header, true);
         assert!(!meta.is_pending_advance());
+    }
+
+    #[test]
+    fn to_shard_log_header_roundtrip_with_read_gap() {
+        // write=10, read=5 should survive a header roundtrip
+        let header = make_header_with_read(
+            HEADER_BLOCK_SIZE_BYTES as u64 + 5120,
+            900_000,
+            10,
+            HEADER_BLOCK_SIZE_BYTES as u64 + 2560,
+            900_000,
+            5,
+        );
+        let meta = LogSegmentFileMetadata::new(1, 1_000_000, None, &header, true);
+        let serialized = meta.to_shard_log_header();
+        let restored = LogSegmentFileMetadata::new(1, 1_000_000, None, &serialized, true);
+        assert_eq!(restored.write.wal_seq, 10);
+        assert_eq!(restored.read.as_ref().unwrap().wal_seq, 5);
+    }
+
+    #[test]
+    fn to_shard_log_header_none_read_writes_sentinel() {
+        let meta = LogSegmentFileMetadata::new(1, 1000, None, &make_header(100, 900, 5), false);
+        let serialized = meta.to_shard_log_header();
+        assert_eq!(serialized.read.metablocks_position, 0);
+        // Restoring with advance_read=true should give None (sentinel preserved)
+        let restored = LogSegmentFileMetadata::new(1, 1000, None, &serialized, true);
+        assert!(restored.read.is_none());
     }
 }

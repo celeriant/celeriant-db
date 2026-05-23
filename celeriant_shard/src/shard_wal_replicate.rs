@@ -8,9 +8,6 @@ use celeriant_disk::files::rwlock_timeout::with_budget;
 use celeriant_distributed::validated_node_status::{ValidatedNodeStatus, set_node_status_and_metric};
 use celeriant_msg::request::requests::ReplicationBatchItem;
 use celeriant_wire::codec::compression::DictCodec;
-use celeriant_rotating_log::log_segment_file::aggregate_key_bloom::AggregateKeyBloom;
-use celeriant_rotating_log::log_segment_file::log_segment_file::{read_datablocks_carry_over_bytes, write_dual_shard_log_header};
-use celeriant_wal::shard_log_header::ShardLogHeader;
 use celeriant_memcache::cache_path::CachePath;
 use celeriant_memcache::pending_commit_data::PendingCommitData;
 use celeriant_memcache::shard_mem_cache::ShardMemCache;
@@ -18,16 +15,15 @@ use crate::schema_validator::CompiledValidator;
 
 type MemCache = ShardMemCache<CompiledValidator>;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
-use celeriant_wal::constants::{FIRST_AGGREGATE_VERSION, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES};
+use celeriant_wal::constants::FIRST_AGGREGATE_VERSION;
 use celeriant_wal::segment_summary::SegmentSummaryPayload;
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
 
 use crate::amortisation::coordinator::{CaptureResult, Coordinator};
 use crate::intra_batch_chain::validate_intra_batch_chain;
-use crate::shard_wal_sync::write_segment_summary_sidecar_from_payload;
+use crate::shard_wal_sync::{sync_header_only, write_segment_summary_sidecar_from_payload};
 use crate::error::replication_error::ReplicationError;
-use crate::error::replication_rollback_failure::ReplicationRollbackFailure;
 use crate::error::replication_to_follower_error::ReplicateToFollowerError;
 use crate::error::replication_to_s3_error::ReplicateToS3Error;
 use crate::error::shard_fsync_error::ShardFsyncError;
@@ -120,14 +116,13 @@ enum SingleSendOutcome {
     WalSeqMismatch { max_follower_wal_seq: u64 },
 }
 
-pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient + 'static>(
+pub(crate) async fn commit_replication<R: ReplicationClient + 'static>(
     replication_client: Rc<R>,
     fsync_coordinator: Rc<Coordinator<ShardFsyncError>>,
     log_segments_cache: Rc<LogSegmentsCache>,
     shard_mem_cache: Rc<RefCell<MemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
     node_status: Rc<Cell<ValidatedNodeStatus>>,
-    last_rollback_at: Rc<Cell<Option<Instant>>>,
     replication_captured_data: ReplicationCapturedData,
     trigger: ReplicationTrigger,
     max_catchup_gap_bytes: Option<u64>,
@@ -142,12 +137,55 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient + 'sta
     let ReplicationCapturedData { mut replication_snapshot } = replication_captured_data;
     let initial_batch_count: usize = replication_snapshot.iter().map(|c| c.pending_queue.len()).sum();
 
-    let outcome = replicate_loop(
-        &replication_client, &log_segments_cache, &shard_mem_cache, &watched_aggregates, &node_status,
-        &mut replication_snapshot,
-        max_catchup_gap_bytes, max_request_size, read_max_chunk_size, max_clock_drift_ms, shard_id,
-        &dict_codec,
-    ).await;
+    // Writer's await stays pending while we retry transient failures in place.
+    const INITIAL_BACKOFF_MS: u64 = 50;
+    const MAX_BACKOFF_MS: u64 = 500;
+    const HARD_TIMEOUT: Duration = Duration::from_secs(30);
+
+    let mut attempt: u32 = 0;
+    let details = loop {
+        if !node_status.get().is_leader() {
+            warn!(shard_id, attempt, "leader fenced during replication retry");
+            metrics::counter!("celeriant_replication_spin_fenced_total", &shard_label).increment(1);
+            shard_mem_cache.borrow_mut().return_to_pending_replication(replication_snapshot);
+            return Err(ReplicationError::LeaderFenced);
+        }
+
+        if start.elapsed() > HARD_TIMEOUT {
+            warn!(shard_id, attempt, elapsed_ms = start.elapsed().as_millis() as u64, "replication spin hard timeout");
+            metrics::counter!("celeriant_replication_spin_timeout_total", &shard_label).increment(1);
+            shard_mem_cache.borrow_mut().return_to_pending_replication(replication_snapshot);
+            return Err(ReplicationError::LeaderFenced);
+        }
+
+        let outcome = replicate_loop(
+            &replication_client, &log_segments_cache, &shard_mem_cache, &watched_aggregates, &node_status,
+            &mut replication_snapshot,
+            max_catchup_gap_bytes, max_request_size, read_max_chunk_size, max_clock_drift_ms, shard_id,
+            &dict_codec,
+        ).await;
+
+        match outcome {
+            Ok(d) => break d,
+            Err(e) => {
+                if matches!(trigger, ReplicationTrigger::Probe) {
+                    return Err(e);
+                }
+                if is_terminal_replication_error(&e) {
+                    warn!(shard_id, attempt, error = ?e, "terminal replication error, returning snapshot to pending");
+                    metrics::counter!("celeriant_replication_spin_terminal_total", &shard_label).increment(1);
+                    shard_mem_cache.borrow_mut().return_to_pending_replication(replication_snapshot);
+                    return Err(e);
+                }
+                attempt += 1;
+                metrics::counter!("celeriant_replication_spin_retry_total", &shard_label).increment(1);
+                let backoff_shift = attempt.saturating_sub(1).min(3);
+                let delay_ms = (INITIAL_BACKOFF_MS << backoff_shift).min(MAX_BACKOFF_MS);
+                debug!(shard_id, attempt, error = ?e, delay_ms, "replication transient failure, backing off");
+                glommio::timer::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+    };
 
     // Sweep memcache for any rotated-and-sealed segments whose read cursor has now caught up
     let sealed_ready = collect_eligible_sealed_summaries(&log_segments_cache, &shard_mem_cache);
@@ -157,40 +195,78 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient + 'sta
         }
     }
 
-    let details = match outcome {
-        Ok(d) => d,
-        Err(e) => {
-            if matches!(trigger, ReplicationTrigger::Probe) {
-                return Err(e);
-            }
-            // BudgetExhausted: PUT may be on the wire; rollback would re-fsync with fresh
-            // server_ts and race S3 with a different payload. Re-queue for idempotent retry.
-            if matches!(e, ReplicationError::BudgetExhausted) {
-                warn!(shard_id, trigger = ?trigger, snapshot_pcds = replication_snapshot.len(), "BudgetExhausted — returning snapshot to pending queue for retry");
-                metrics::counter!("celeriant_replication_snapshot_returned_to_queue_total", &[("shard_id", shard_id.to_string())]).increment(1);
-                shard_mem_cache.borrow_mut().return_to_pending_replication(replication_snapshot);
-                return Err(e);
-            }
-            return finish_with_rollback(&fsync_coordinator, &log_segments_cache, &shard_mem_cache, &last_rollback_at, replication_snapshot, e, shard_id).await;
-        }
-    };
-
     log_replication_outcome(initial_batch_count, &details, start, shard_id);
 
-    // Bump the ack barrier before we return Ok to the client. Piggybacks on the
-    // next header fsync. See truncate_wal for the refusal side.
+    // Local-only lease check. Sufficient when heartbeats are healthy; degraded-mode
+    // dual-ack against a fenced peer is not covered here.
+    if !node_status.get().is_leader() {
+        warn!(shard_id, "Lease lost during in-flight replication; refusing to self-ack");
+        shard_mem_cache.borrow_mut().return_to_pending_replication(replication_snapshot);
+        return Err(ReplicationError::LeaderFenced);
+    }
+
+    // Bump last_self_acked and fsync the header (coalesced via sync_gate).
     let acked_wal = current_leader_confirmed_wal_seq(&log_segments_cache);
-    if acked_wal > 0 {
+    let bumped = if acked_wal > 0 {
         let active = log_segments_cache.active();
         let mut meta = active.metadata.borrow_mut();
         if acked_wal > meta.last_self_acked_wal_seq {
             meta.last_self_acked_wal_seq = acked_wal;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if bumped {
+        let active = log_segments_cache.active();
+        let fsync_start = Instant::now();
+        let result = fsync_coordinator
+            .request_sync(
+                Some(Duration::from_millis(1)),
+                ShardFsyncError::WriteLockTimeout,
+                || async move { sync_header_only(active).await },
+            )
+            .await;
+        metrics::histogram!("celeriant_barrier_sync_fsync_seconds", &shard_label)
+            .record(fsync_start.elapsed().as_secs_f64());
+        metrics::counter!("celeriant_barrier_sync_fsync_total", &shard_label).increment(1);
+        if let Err(e) = result {
+            warn!(shard_id, error = ?e, "barrier sync fsync failed; barrier bump remains in-memory only");
+            metrics::counter!("celeriant_barrier_sync_fsync_failed_total", &shard_label).increment(1);
         }
     }
 
     metrics::histogram!("celeriant_replication_duration_seconds", &shard_label).record(start.elapsed().as_secs_f64());
     metrics::histogram!("celeriant_replication_batch_size", &shard_label).record(initial_batch_count as f64);
     Ok(())
+}
+
+fn is_terminal_replication_error(e: &ReplicationError) -> bool {
+    use ReplicationError as RE;
+    match e {
+        RE::LeaderFenced => true,
+        RE::BudgetExhausted => true,
+        RE::RollbackInProgress => true,
+        RE::RollbackFailed(_) => true,
+        RE::ReplicateToS3Error(s3) => {
+            use ReplicateToS3Error as S3E;
+            matches!(
+                s3,
+                S3E::S3NotConfigured
+                    | S3E::SerializationFailed(_)
+                    | S3E::BatchNotContiguous { .. }
+                    | S3E::LeaseIndexInconsistent { .. }
+                    | S3E::IntraBatchChainBreak(_)
+            )
+        }
+        // Transient
+        RE::ReplicationClientLockTimeoutError => false,
+        RE::GateTimeout => false,
+        RE::ExtendedCatchupFailure(_) => false,
+    }
 }
 
 async fn replicate_loop<R: ReplicationClient + 'static>(
@@ -383,13 +459,7 @@ async fn run_s3_fallback<R: ReplicationClient + 'static>(
     let _ = acquire_lease_budget(node_status, "s3_fallback", shard_id)?;
     metrics::counter!("celeriant_replication_s3_fallbacks_total", &[("shard_id", shard_id.to_string())]).increment(1);
 
-    let items: Vec<ReplicationBatchItem> = snapshot.iter()
-        .flat_map(|pcd| pcd.pending_queue.iter())
-        .map(|item| ReplicationBatchItem {
-            metablock: item.metablock.clone(),
-            datablock: item.datablock.clone(),
-        })
-        .collect();
+    let items = snapshot_to_batch_items(snapshot);
 
     let workset_size_bytes: u64 = items.iter().map(|c| c.size_bytes()).sum();
     let first_wal = items.first().map(|b| b.metablock.wal_seq).unwrap_or(0);
@@ -413,8 +483,12 @@ async fn run_s3_fallback<R: ReplicationClient + 'static>(
     }
     spawn_kick(replication_client, node_status, shard_id);
 
-    // S3 owns durability for the entire workset now. Commit every PCD in order so that read
-    // cursors advance and downstream consumers see the new visible state.
+    // Mirror of the post-publish lease check above; orphan upload is dedup'd by catchup.
+    if !node_status.get().is_leader() {
+        warn!(shard_id, "Lease lost during S3 fallback upload; not committing PCDs");
+        return Err(ReplicationError::LeaderFenced);
+    }
+
     let pcds = std::mem::take(snapshot);
     for pcd in pcds {
         commit_pcd(log_segments_cache, shard_mem_cache, watched_aggregates, pcd);
@@ -422,10 +496,8 @@ async fn run_s3_fallback<R: ReplicationClient + 'static>(
     Ok(())
 }
 
-/// Try to ship the whole snapshot in one TCP request. On `WalSeqMismatch`,
-/// invoke catchup once and retry; a second mismatch (or any other failure)
-/// signals fallback to S3. The leader's commit step happens in `replicate_loop`
-/// after this returns `Sent`.
+/// One TCP send of the whole snapshot. WalSeqMismatch triggers a single catchup retry;
+/// any second failure bails to S3 fallback. Commit happens in `replicate_loop` on Sent.
 async fn tcp_send_snapshot<R: ReplicationClient + 'static>(
     replication_client: &Rc<R>,
     log_segments_cache: &Rc<LogSegmentsCache>,
@@ -440,13 +512,7 @@ async fn tcp_send_snapshot<R: ReplicationClient + 'static>(
 ) -> Result<SnapshotSendOutcome, ReplicationError> {
     debug_assert!(!snapshot.is_empty());
 
-    let items: Vec<ReplicationBatchItem> = snapshot.iter()
-        .flat_map(|pcd| pcd.pending_queue.iter())
-        .map(|item| ReplicationBatchItem {
-            metablock: item.metablock.clone(),
-            datablock: item.datablock.clone(),
-        })
-        .collect();
+    let items = snapshot_to_batch_items(snapshot);
     let leader_first_wal = items.first().map(|i| i.metablock.wal_seq).unwrap_or(0);
 
     let leader_confirmed_wal_seq = current_leader_confirmed_wal_seq(log_segments_cache);
@@ -598,6 +664,16 @@ fn acquire_lease_budget(
     }
 }
 
+fn snapshot_to_batch_items(snapshot: &[PendingCommitData]) -> Vec<ReplicationBatchItem> {
+    snapshot.iter()
+        .flat_map(|pcd| pcd.pending_queue.iter())
+        .map(|item| ReplicationBatchItem {
+            metablock: item.metablock.clone(),
+            datablock: item.datablock.clone(),
+        })
+        .collect()
+}
+
 fn validate_chain_or_err(
     batches: &[ReplicationBatchItem],
     shard_id: u32,
@@ -672,19 +748,6 @@ fn log_replication_outcome(initial_batch_count: usize, details: &ReplicationDeta
     } else {
         debug!(shard_id, batch_count = initial_batch_count, path, duration_ms = commit_ms, "Replication batch committed");
     }
-}
-
-async fn finish_with_rollback(
-    fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
-    log_segments_cache: &Rc<LogSegmentsCache>,
-    shard_mem_cache: &Rc<RefCell<MemCache>>,
-    last_rollback_at: &Rc<Cell<Option<Instant>>>,
-    snapshot: Vec<PendingCommitData>,
-    err: ReplicationError,
-    shard_id: u32,
-) -> Result<(), ReplicationError> {
-    rollback_or_panic(fsync_coordinator, log_segments_cache, shard_mem_cache, last_rollback_at, snapshot, shard_id).await;
-    Err(err)
 }
 
 /// Advance the read cursor in-memory, update caches, broadcast watch events
@@ -785,201 +848,6 @@ fn collect_eligible_sealed_summaries(
         }
     }
     ready
-}
-
-/// Roll back the WAL write cursor or terminate the process.
-///
-/// Replication rollback exists because the local fsync advanced `write.wal_seq`
-/// for entries that ultimately could not be durably committed (replication and S3
-/// fallback both failed).
-async fn rollback_or_panic(
-    fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
-    log_segments_cache: &Rc<LogSegmentsCache>,
-    shard_mem_cache: &Rc<RefCell<MemCache>>,
-    last_rollback_at: &Rc<Cell<Option<Instant>>>,
-    replication_snapshot: Vec<PendingCommitData>,
-    shard_id: u32,
-) {
-    last_rollback_at.set(Some(Instant::now()));
-
-    const MAX_IO_ATTEMPTS: u32 = 3;
-    let mut io_attempts: u32 = 0;
-    let mut total_attempts: u32 = 0;
-    let shard_label = [("shard_id", shard_id.to_string())];
-
-    loop {
-        total_attempts += 1;
-        match rollback_replicate(fsync_coordinator, log_segments_cache, shard_mem_cache, &replication_snapshot, shard_id).await {
-            Ok(()) => {
-                if total_attempts > 1 {
-                    warn!(shard_id, total_attempts, "Replication rollback succeeded after retries");
-                    metrics::counter!("celeriant_replication_rollback_retries_total", &shard_label).increment((total_attempts - 1) as u64);
-                }
-                return;
-            }
-            Err(ReplicationRollbackFailure::LogSegmentFileUnavailable { log_id }) => {
-                warn!(shard_id, log_id, "Replication rollback skipped: active segment closing (process shutting down)");
-                return;
-            }
-            Err(e @ ReplicationRollbackFailure::FsyncAmortisedBatchLockTimeout)
-            | Err(e @ ReplicationRollbackFailure::WriteLockTimeout { .. }) => {
-                warn!(shard_id, attempt = total_attempts, error = ?e, "Replication rollback contended on lock, retrying");
-                metrics::counter!("celeriant_replication_rollback_lock_timeout_total", &shard_label).increment(1);
-                glommio::timer::sleep(Duration::from_millis(50)).await;
-            }
-            Err(e) => {
-                io_attempts += 1;
-                error!(shard_id, io_attempt = io_attempts, error = ?e, "Replication rollback I/O failure");
-                metrics::counter!("celeriant_replication_rollback_io_error_total", &shard_label).increment(1);
-                if io_attempts >= MAX_IO_ATTEMPTS {
-                    panic!(
-                        "Replication rollback failed irrecoverably on shard {shard_id} after {io_attempts} I/O retries: {e:?} — WAL durability invariant breached, aborting so the boot path can re-validate on-disk state"
-                    );
-                }
-                glommio::timer::sleep(Duration::from_millis(100 * io_attempts as u64)).await;
-            }
-        }
-    }
-}
-
-async fn rollback_replicate(
-    fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
-    log_segments_cache: &Rc<LogSegmentsCache>,
-    shard_mem_cache: &Rc<RefCell<MemCache>>,
-    replication_snapshot: &[PendingCommitData],
-    shard_id: u32,
-) -> Result<(), ReplicationRollbackFailure> {
-    let batches_to_rollback = replication_snapshot.len();
-    let (write_wal_before, write_tip_before, read_wal_before) = {
-        let active = log_segments_cache.active();
-        let m = active.metadata.borrow();
-        let read_wal = m.read.as_ref().map(|r| r.wal_seq).unwrap_or(0);
-        (m.write.wal_seq, m.write.tip_hash, read_wal)
-    };
-    error!(
-        shard_id, batches_to_rollback,
-        write_wal_before, read_wal_before, write_tip_before = ?write_tip_before,
-        "Replication failed to both follower and S3, rolling back"
-    );
-    metrics::counter!("celeriant_replication_rollbacks_total").increment(1);
-    // In replication rollback, we modify the write positions in the file header
-    // So we must drain and block any more writes to disk until rollback completes
-    let _fsync_gate = fsync_coordinator
-        .acquire_rollback_lock()
-        .await
-        .ok_or(ReplicationRollbackFailure::FsyncAmortisedBatchLockTimeout)?;
-
-    // We nuke all the in-memory caches at this step at let everything rebuild naturally
-    // this failure mode is rare - follower and S3 must both be down
-    shard_mem_cache.borrow_mut().execute_replication_rollback();
-    info!(shard_id, "Replication rollback: pending_replication_batches cleared");
-
-    // PCDs land in fsync order, log_ids only advance across rotations, so consecutive
-    // dedup is sufficient AND preserves chronological order
-    let mut log_ids: Vec<u64> = replication_snapshot.iter().map(|c| c.log_id()).collect();
-    log_ids.dedup();
-
-    let mut trailing_shard_log_header: Option<ShardLogHeader> = None;
-
-    // Rollback each log segment file. Normally only one file, but could be two files if a rotation occurred
-    // Failure to rollback of a file stops entire process
-    for log_id in log_ids {
-        if let Some(log_segment) = log_segments_cache.get_if_cached(log_id) {
-            let predecessor_cursor: Option<(u64, [u8; 32])> = if trailing_shard_log_header.is_none() && log_id > 1 {
-                log_segments_cache.get_if_cached(log_id - 1).map(|pred| {
-                    let m = pred.metadata.borrow();
-                    (m.write.wal_seq, m.write.tip_hash)
-                })
-            } else {
-                None
-            };
-
-            let (header, header_end_start_pos) = {
-                let mut metadata = log_segment.metadata.borrow_mut();
-                let shard_log_header_end_pos = metadata.file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64);
-
-                // This is actually a valid scenario - we have *just* rotated a log
-                // while still having uncommitted data in the previous log segment file
-                // *or* this is the first log file ever for this shard and we have to rollback the first batch
-                if metadata.read.is_none() {
-                    // Segment was never replicated (e.g. freshly rotated on a leader).
-                    // Reset write cursor to empty state; nothing to roll back to.
-                    metadata.write.datablocks_position = shard_log_header_end_pos;
-                    metadata.write.metablocks_position = HEADER_BLOCK_SIZE_BYTES as u64;
-                    metadata.write.aggregate_key_bloom = AggregateKeyBloom::new();
-
-                    if let Some(trailing_shard_log_header) = trailing_shard_log_header {
-                        metadata.write.wal_seq = trailing_shard_log_header.wal_seq;
-                        metadata.write.tip_hash = trailing_shard_log_header.tip_hash;
-                    } else if let Some((pred_wal_seq, pred_tip_hash)) = predecessor_cursor {
-                        metadata.write.wal_seq = pred_wal_seq;
-                        metadata.write.tip_hash = pred_tip_hash;
-                    } else {
-                        if log_id > 1 {
-                            error!(shard_id, log_id, "Rollback predecessor not in cache; wal_seq reset to 0 — probe will skip this shard until fresh write");
-                        }
-                        metadata.write.wal_seq = 0;
-                        metadata.write.tip_hash = GENESIS_HASH;
-                    }
-                } else {
-                    // Roll write cursor back to last replicated position.
-                    metadata.write = metadata.read.as_ref().unwrap().clone();
-                }
-
-                (metadata.to_shard_log_header(), shard_log_header_end_pos)
-            };
-
-            let dma_file_writer = log_segment
-                .lock_writer("rollback_replicate")
-                .await
-                .map_err(|_| ReplicationRollbackFailure::WriteLockTimeout { log_id })?;
-            let dma_file_writer = dma_file_writer
-                .as_ref()
-                .ok_or_else(|| ReplicationRollbackFailure::LogSegmentFileUnavailable { log_id })?;
-
-            write_dual_shard_log_header(dma_file_writer, header_end_start_pos, &header)
-                .await
-                .map_err(|source| ReplicationRollbackFailure::WriteDualHeaderError { log_id, source })?;
-
-            dma_file_writer
-                .fdatasync()
-                .await
-                .map_err(|_| ReplicationRollbackFailure::HeaderFsyncFailed { log_id })?;
-
-            // Now that the write position has changed for datablocks, we need to prepare a new datablocks carry over bytes for the next write
-            let mut metadata = log_segment.metadata.borrow_mut();
-            metadata.datablocks_carry_over = read_datablocks_carry_over_bytes(&dma_file_writer, metadata.write.datablocks_position)
-                .await
-                .map_err(|e| ReplicationRollbackFailure::UnableToReadDatablocksCarryOver {
-                    log_id,
-                    source: e.to_string(),
-                })?;
-
-            // Critical we keep this to handle rollback of now-empty-shard log segment files
-            trailing_shard_log_header = Some(header);
-        }
-    }
-
-    // Resync celeriant_wal_seq gauge to the rolled-back active write cursor.
-    // The fsync path is the only other writer of this gauge, so without this
-    // line the gauge stays pinned to the pre-rollback high-water mark until
-    // the next fresh write. That stale value makes EventualConvergence look
-    // like a stuck-follower bug when the cluster has actually converged.
-    let (active_wal_seq, write_tip_after) = {
-        let active = log_segments_cache.active();
-        let m = active.metadata.borrow();
-        (m.write.wal_seq, m.write.tip_hash)
-    };
-    metrics::gauge!("celeriant_wal_seq", &[("shard_id", shard_id.to_string())]).set(active_wal_seq as f64);
-    info!(
-        shard_id,
-        write_wal_after = active_wal_seq,
-        write_tip_after = ?write_tip_after,
-        invariant_holds = active_wal_seq == read_wal_before,
-        "Replication rollback complete"
-    );
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1117,6 +985,19 @@ mod tests {
         }
     }
 
+    /// Post-fsync flavour: aligns log_id and stamps write.wal_seq so commit_pcd
+    /// actually advances read.wal_seq. Without this the barrier-bump path is a no-op.
+    fn make_captured_post_fsync(pcd_sizes: &[usize], active_log_id: u64) -> ReplicationCapturedData {
+        let mut data = make_captured(pcd_sizes);
+        for pcd in &mut data.replication_snapshot {
+            pcd.log_metadata.log_id = active_log_id;
+            if let Some(last) = pcd.pending_queue.last() {
+                pcd.log_metadata.write.wal_seq = last.metablock.wal_seq;
+            }
+        }
+        data
+    }
+
     /// Write metablocks at the given WAL sequencees into the active segment and advance the read
     /// cursor so `ReverseMetablockScanner` sees them as committed. Datablocks set to `None`
     /// to keep the post-scan datablock fetch a no-op.
@@ -1202,12 +1083,6 @@ mod tests {
             self
         }
 
-        /// Sleep this long before the TCP responder fires, so `with_budget` can race
-        /// the future against the lease timer.
-        fn with_tcp_delay(self, d: Duration) -> Self {
-            self.tcp_pre_delay.set(Some(d));
-            self
-        }
     }
 
     impl ReplicationClient for MockClient {
@@ -1254,7 +1129,6 @@ mod tests {
         smc: Rc<RefCell<MemCache>>,
         node_status: Rc<Cell<ValidatedNodeStatus>>,
         coordinator: Rc<Coordinator<ShardFsyncError>>,
-        last_rollback_at: Rc<Cell<Option<Instant>>>,
         watched: Rc<AggregateWatchers>,
     }
 
@@ -1268,7 +1142,6 @@ mod tests {
                 smc: Rc::new(RefCell::new(fresh_memcache())),
                 node_status: Rc::new(Cell::new(leader_status())),
                 coordinator: Rc::new(Coordinator::new()),
-                last_rollback_at: Rc::new(Cell::new(None)),
                 watched: Rc::new(AggregateWatchers::new()),
             }
         }
@@ -1289,14 +1162,13 @@ mod tests {
             trigger: ReplicationTrigger,
             max_request_size: u64,
         ) -> Result<(), ReplicationError> {
-            commit_replication_with_rollback(
+            commit_replication(
                 client,
                 self.coordinator.clone(),
                 self.lsc.clone(),
                 self.smc.clone(),
                 self.watched.clone(),
                 self.node_status.clone(),
-                self.last_rollback_at.clone(),
                 captured,
                 trigger,
                 None,
@@ -1466,6 +1338,213 @@ mod tests {
             );
 
             h.close().await;
+        });
+    }
+
+    /// Spin loop retries on transient S3 errors and eventually succeeds.
+    /// Follower unreachable so we go straight to S3; S3 returns S3Unavailable
+    /// 3 times then Ok. Writer sees Ok, S3 was called 4 times.
+    #[test]
+    fn spin_loop_retries_transient_s3_until_success() {
+        glommio_test!({
+            let h = Harness::new().await;
+            let (mock, _tcp_calls, s3_calls) = MockClient::build();
+            let s3_responses: Vec<Result<(), ReplicateToS3Error>> = vec![
+                Err(ReplicateToS3Error::S3Unavailable),
+                Err(ReplicateToS3Error::S3Unavailable),
+                Err(ReplicateToS3Error::S3Unavailable),
+                Ok(()),
+            ];
+            let mut iter = s3_responses.into_iter();
+            let client = Rc::new(
+                mock.unreachable()
+                    .with_s3(move |_| iter.next().unwrap_or(Ok(()))),
+            );
+            let result = h.commit(client, make_captured(&[3]), u64::MAX).await;
+            assert!(result.is_ok(), "expected Ok after spin-retry, got {result:?}");
+            assert_eq!(
+                s3_calls.borrow().len(), 4,
+                "expected 4 S3 attempts (3 transient + 1 success), got {:?}", s3_calls.borrow()
+            );
+            h.close().await;
+        });
+    }
+
+    /// Terminal S3 error (chain break) returns immediately, no retries.
+    #[test]
+    fn spin_loop_does_not_retry_terminal_s3_error() {
+        glommio_test!({
+            let h = Harness::new().await;
+            let (mock, _tcp_calls, s3_calls) = MockClient::build();
+            let client = Rc::new(
+                mock.unreachable()
+                    .with_s3(|_| Err(ReplicateToS3Error::S3NotConfigured)),
+            );
+            let result = h.commit(client, make_captured(&[2]), u64::MAX).await;
+            assert!(
+                matches!(result, Err(ReplicationError::ReplicateToS3Error(ReplicateToS3Error::S3NotConfigured))),
+                "expected S3NotConfigured terminal, got {result:?}"
+            );
+            assert_eq!(
+                s3_calls.borrow().len(), 1,
+                "terminal error must not retry, got {} attempts", s3_calls.borrow().len()
+            );
+            h.close().await;
+        });
+    }
+
+    /// Probe trigger must not spin; probes are best-effort drift detection.
+    #[test]
+    fn spin_loop_does_not_retry_on_probe_trigger() {
+        glommio_test!({
+            let h = Harness::new().await;
+            let (mock, _tcp_calls, s3_calls) = MockClient::build();
+            let client = Rc::new(
+                mock.unreachable()
+                    .with_s3(|_| Err(ReplicateToS3Error::S3Unavailable)),
+            );
+            let result = h.commit_with_trigger(
+                client, make_captured(&[1]), ReplicationTrigger::Probe, u64::MAX,
+            ).await;
+            assert!(result.is_err(), "probe should fail without spinning, got {result:?}");
+            assert_eq!(
+                s3_calls.borrow().len(), 1,
+                "probe must do exactly one attempt, got {}", s3_calls.borrow().len()
+            );
+            h.close().await;
+        });
+    }
+
+    #[test]
+    fn post_publish_lease_loss_via_tcp_does_not_bump_last_self_acked() {
+        glommio_test!({
+            let h = Harness::new().await;
+            let (mock, _tcp_calls, _s3_calls) = MockClient::build();
+
+            let node_status_for_mock = h.node_status.clone();
+            let client = Rc::new(mock.with_tcp(move |_| {
+                node_status_for_mock.set(ValidatedNodeStatus::create_fenced());
+                Ok(())
+            }));
+
+            let result = h.commit(client, make_captured_post_fsync(&[3], h.lsc.active_log_id()), u64::MAX).await;
+            let last_self_acked = h.lsc.active().metadata.borrow().last_self_acked_wal_seq;
+
+            assert!(
+                matches!(result, Err(ReplicationError::LeaderFenced)),
+                "lease lost during publish must fence (no client Ok), got {result:?}",
+            );
+            assert_eq!(
+                last_self_acked, 0,
+                "last_self_acked_wal_seq must NOT bump after post-publish fence; bumping is the dual-ack source",
+            );
+            h.close().await;
+        });
+    }
+
+    #[test]
+    fn post_publish_lease_loss_via_s3_fallback_does_not_bump_last_self_acked() {
+        glommio_test!({
+            let h = Harness::new().await;
+            let (mock, _tcp_calls, _s3_calls) = MockClient::build();
+
+            let node_status_for_mock = h.node_status.clone();
+            let client = Rc::new(
+                mock.unreachable()
+                    .with_s3(move |_| {
+                        node_status_for_mock.set(ValidatedNodeStatus::create_fenced());
+                        Ok(())
+                    }),
+            );
+
+            let result = h.commit(client, make_captured_post_fsync(&[2], h.lsc.active_log_id()), u64::MAX).await;
+            let last_self_acked = h.lsc.active().metadata.borrow().last_self_acked_wal_seq;
+
+            assert!(
+                matches!(result, Err(ReplicationError::LeaderFenced)),
+                "lease lost during S3 fallback must fence (no client Ok), got {result:?}",
+            );
+            assert_eq!(
+                last_self_acked, 0,
+                "last_self_acked_wal_seq must NOT bump after post-publish fence on S3 path",
+            );
+            h.close().await;
+        });
+    }
+
+    #[test]
+    fn successful_publish_under_stable_lease_bumps_last_self_acked() {
+        glommio_test!({
+            let h = Harness::new().await;
+            let (mock, _tcp_calls, _s3_calls) = MockClient::build();
+            let client = Rc::new(mock);
+
+            let result = h.commit(client, make_captured_post_fsync(&[3], h.lsc.active_log_id()), u64::MAX).await;
+            let last_self_acked = h.lsc.active().metadata.borrow().last_self_acked_wal_seq;
+
+            assert!(result.is_ok(), "stable-lease happy path must succeed, got {result:?}");
+            assert_eq!(
+                last_self_acked, 3,
+                "last_self_acked_wal_seq must bump to highest wal_seq in captured (3), got {last_self_acked}",
+            );
+            h.close().await;
+        });
+    }
+
+    #[test]
+    fn read_cursor_persisted_separately_from_write_cursor() {
+        use celeriant_rotating_log::log_segment_file::log_segment_file::LogSegmentFile;
+        use celeriant_rotating_log::log_segment_file::log_segment_file::write_dual_shard_log_header;
+        use celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES as HDR;
+
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            const FILE_SIZE: u64 = 4 * 1024 * 1024;
+
+            let file = LogSegmentFile::open_or_create_first_file_for_shard(
+                &dir, FILE_SIZE, 1, true,
+            ).await.unwrap();
+
+            // Leader wrote up to wal_seq=10 but only replicated wal_seq=5.
+            {
+                let mut meta = file.metadata.borrow_mut();
+                meta.write.wal_seq = 10;
+                meta.write.metablocks_position = HDR as u64 + 10 * 512;
+                meta.read = Some({
+                    let mut r = meta.write.clone();
+                    r.wal_seq = 5;
+                    r.metablocks_position = HDR as u64 + 5 * 512;
+                    r
+                });
+            }
+
+            {
+                let meta = file.metadata.borrow();
+                let header = meta.to_shard_log_header();
+                let header_end_pos = FILE_SIZE - HDR as u64;
+                let writer = file.lock_writer("test_persist").await.unwrap();
+                let dma = writer.as_ref().unwrap();
+                write_dual_shard_log_header(dma, header_end_pos, &header).await.unwrap();
+                dma.fdatasync().await.unwrap();
+            }
+
+            file.close().await;
+
+            let reopened = LogSegmentFile::open_or_create_first_file_for_shard(
+                &dir, FILE_SIZE, 1, true,
+            ).await.unwrap();
+
+            let meta = reopened.metadata.borrow();
+
+            assert_eq!(meta.write.wal_seq, 10, "write.wal_seq must be 10 after restart");
+            assert!(meta.read.is_some(), "read cursor must be Some after restart");
+            assert_eq!(
+                meta.read.as_ref().unwrap().wal_seq, 5,
+                "read.wal_seq must survive at 5, not collapse to write=10"
+            );
+
+            reopened.close().await;
         });
     }
 
@@ -1799,75 +1878,6 @@ mod tests {
             assert!(result.is_ok(), "case (b) falls through to S3; got {result:?}");
             assert_eq!(*s3_calls.borrow(), vec![1], "case (b) reaches S3 fallback");
             assert!(h.node_status.get().is_leader(), "leadership stays on case (b)");
-            h.close().await;
-        });
-    }
-
-    /// Regression test for the fresh-rotation rollback bug:
-    /// when the only log_id in the rollback batch is a segment with `read=None` and no predecessor
-    /// was in the same batch, wal_seq must be recovered from the predecessor in the cache —
-    /// NOT reset to 0.
-    #[test]
-    fn rollback_fresh_rotation_preserves_wal_seq_from_predecessor() {
-        glommio_test!({
-            let h = Harness::new().await;
-
-            // Seed predecessor (log_id=1) with a known replicated position.
-            let predecessor_wal_seq: u64 = 260_000;
-            let predecessor_tip: [u8; 32] = [0xAA; 32];
-            {
-                let seg1 = h.lsc.get_if_cached(1).expect("log_id=1 must be active initially");
-                let mut m = seg1.metadata.borrow_mut();
-                m.write.wal_seq = predecessor_wal_seq;
-                m.write.tip_hash = predecessor_tip;
-                // Mark as replicated so rotation is valid.
-                m.read = Some(m.write.clone());
-            }
-
-            // Rotate: log_id=1 moves to LRU, log_id=2 becomes active (read=None).
-            h.lsc.rotate_to_next_log().await.unwrap();
-            assert_eq!(h.lsc.active_log_id(), 2);
-
-            // Confirm log_id=2 starts with read=None and wal_seq from predecessor cursor.
-            {
-                let seg2 = h.lsc.active();
-                let m = seg2.metadata.borrow();
-                assert!(m.read.is_none(), "fresh segment must have read=None");
-            }
-
-            // Build a PCD whose log_id matches the active segment so rollback processes it.
-            let (items, _) = chained_items(vec![event_kind(); 3], predecessor_wal_seq + 1, predecessor_tip);
-            let captured = ReplicationCapturedData {
-                replication_snapshot: vec![make_pcd_for_log(items, 2)],
-            };
-
-            // Trigger rollback: follower unreachable + S3 fails.
-            let (mock, _tcp, _s3) = MockClient::build();
-            let client = Rc::new(
-                mock.unreachable()
-                    .with_s3(|_| Err(ReplicateToS3Error::S3Unavailable)),
-            );
-
-            // Rollback must succeed (no panic / Err from the rollback path itself).
-            let result = h.commit(client, captured, u64::MAX).await;
-            // Expect an error from the replication (both paths failed), but rollback itself ran.
-            assert!(
-                matches!(result, Err(ReplicationError::RollbackFailed(_)) | Err(ReplicationError::ReplicateToS3Error(_))),
-                "unexpected result: {result:?}",
-            );
-
-            // The critical assertion: wal_seq must not have been zeroed.
-            let seg2 = h.lsc.active();
-            let m = seg2.metadata.borrow();
-            assert_eq!(
-                m.write.wal_seq, predecessor_wal_seq,
-                "rollback of fresh segment must restore predecessor wal_seq, not zero it",
-            );
-            assert_eq!(
-                m.write.tip_hash, predecessor_tip,
-                "rollback of fresh segment must restore predecessor tip_hash, not GENESIS_HASH",
-            );
-
             h.close().await;
         });
     }

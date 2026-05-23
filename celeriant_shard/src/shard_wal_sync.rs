@@ -117,7 +117,7 @@ pub(crate) async fn commit_fsync_with_rollback(
 
     let active_log_segment = log_segments_cache.active();
 
-    match sync(active_log_segment.clone(), &mut captured.sync_positions_snapshot).await {
+    match sync(active_log_segment.clone(), &mut captured.sync_positions_snapshot, node_status).await {
         Ok(updated_log_segment_file_metadata) => {
             let wal_seq = updated_log_segment_file_metadata.write.wal_seq;
             commit_sync(
@@ -152,9 +152,8 @@ fn commit_sync(
     mut new_metadata: LogSegmentFileMetadata,
     dict_codec: &DictCodec,
 ) {
+    // Non-leader: advance read = write here. Leader: read stays behind until commit_pcd.
     if !node_status.is_leader() {
-        // Currently single node mode or is follower
-        // Data is durable, so we can advance visible position
         new_metadata.advance_visible_position();
     }
 
@@ -326,6 +325,7 @@ fn rollback_sync(shard_mem_cache: Rc<RefCell<MemCache>>) {
 pub(crate) async fn sync(
     log_segment_file: Rc<LogSegmentFile>,
     sync_positions_snapshot: &mut SyncPositionsSnapshot,
+    node_status: NodeStatus,
 ) -> Result<LogSegmentFileMetadata, ShardFsyncError> {
     let mut log_segment_file_metadata = log_segment_file.metadata.borrow().clone();
 
@@ -414,6 +414,7 @@ pub(crate) async fn sync(
             if let Some(aggregate_positions) = sync_positions_snapshot.aggregate_queue_positions.get_mut(&event_batch.aggregate_key) {
                 aggregate_positions.log_id = log_segment_file_metadata.log_id;
                 aggregate_positions.metablock_absolute_pos = metablock_absolute_pos;
+                aggregate_positions.wal_seq = item.metablock.wal_seq;
             }
         }
 
@@ -462,7 +463,11 @@ pub(crate) async fn sync(
     log_segment_file_metadata.datablocks_carry_over = datablocks_carry_over;
     log_segment_file_metadata.write.datablocks_position = new_datablocks_position;
 
-    // Write header
+    // Non-leader: pre-advance read so the persisted header matches the final state
+    // rather than lagging by one fsync.
+    if !node_status.is_leader() {
+        log_segment_file_metadata.advance_visible_position();
+    }
     let header_end_start_pos = log_segment_file_metadata.file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64);
     let header = log_segment_file_metadata.to_shard_log_header();
     write_dual_shard_log_header(&dma_file_writer, header_end_start_pos, &header).await
@@ -472,6 +477,32 @@ pub(crate) async fn sync(
         .map_err(|e| ShardFsyncError::FDataSyncError(e.to_string()))?;
 
     Ok(log_segment_file_metadata)
+}
+
+/// Dual-header write + fdatasync, no metablocks/datablocks. Used by replication commit
+/// to make `last_self_acked_wal_seq` durable before client Ok.
+///
+/// Caller MUST serialize via the fsync coordinator (request_sync / acquire_rollback_lock);
+/// the DMA lock here only covers file-level write ordering.
+pub(crate) async fn sync_header_only(
+    log_segment_file: Rc<LogSegmentFile>,
+) -> Result<(), ShardFsyncError> {
+    let dma_file_writer = log_segment_file.lock_writer("sync_header_only").await
+        .map_err(|_| ShardFsyncError::WriteLockTimeout)?;
+    let dma_file_writer = dma_file_writer
+        .as_ref()
+        .ok_or_else(|| ShardFsyncError::ActiveWriteFileUnavailable)?;
+
+    let metadata = log_segment_file.metadata.borrow().clone();
+    let header_end_start_pos = metadata.file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64);
+    let header = metadata.to_shard_log_header();
+    write_dual_shard_log_header(dma_file_writer, header_end_start_pos, &header).await
+        .map_err(ShardFsyncError::LogSegmentFileHeaderWriteFailure)?;
+
+    dma_file_writer.fdatasync().await
+        .map_err(|e| ShardFsyncError::FDataSyncError(e.to_string()))?;
+
+    Ok(())
 }
 
 /// Hash chain: blake3(previous_hash || metablock_bytes), skipping the CRC (which covers

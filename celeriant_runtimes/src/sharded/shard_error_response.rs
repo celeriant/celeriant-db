@@ -108,6 +108,10 @@ fn write_error(e: ShardWriteError) -> (u32, String) {
             WRITE_CLIENT_IDEMPOTENCY_VIOLATION,
             format!(r#"{{"last_client_seq":{},"attempted_client_seq":{}}}"#, last_client_seq, attempted_client_seq),
         ),
+        ShardWriteError::InflightDuplicateWrite { last_client_seq, attempted_client_seq } => (
+            WRITE_INFLIGHT_DUPLICATE,
+            format!(r#"{{"last_client_seq":{},"attempted_client_seq":{}}}"#, last_client_seq, attempted_client_seq),
+        ),
         ShardWriteError::OptimisticConcurrencyViolation { expected_version, current_aggregate_version } => (
             WRITE_OPTIMISTIC_CONCURRENCY_VIOLATION,
             format!(r#"{{"expected_version":{},"current_aggregate_version":{}}}"#, expected_version, current_aggregate_version),
@@ -296,6 +300,8 @@ fn fsync_message(e: ShardFsyncError) -> String {
         ShardFsyncError::WriteDatablocksError(msg) => format!(r#"{{"detail":{}}}"#, json_string(&msg)),
         ShardFsyncError::SegmentSummarySidecarWriteError(msg) => format!(r#"{{"detail":{}}}"#, json_string(&msg)),
         ShardFsyncError::BudgetExhausted => r#"{"detail":"BudgetExhausted"}"#.into(),
+        ShardFsyncError::TruncateRefusedByAckBarrier { divergent_wal_seq, barrier } =>
+            format!(r#"{{"divergent_wal_seq":{},"barrier":{}}}"#, divergent_wal_seq, barrier),
     }
 }
 

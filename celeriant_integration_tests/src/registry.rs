@@ -417,13 +417,6 @@ pub fn all_tests() -> &'static [TestEntry] {
             distributed: true,
         },
         TestEntry {
-            name: "metamorphic_rollback_parity",
-            description: "Leader and follower byte-identical after rollback fires (both replication paths dead) and cluster heals",
-            estimated_secs: 90,
-            categories: &[Metamorphic, Replication],
-            distributed: true,
-        },
-        TestEntry {
             name: "metamorphic_divergence_recovery_parity",
             description: "Old leader with divergent WAL truncates + S3-catches-up when rejoining, ends byte-identical with new leader",
             estimated_secs: 130,
@@ -541,6 +534,14 @@ pub fn all_tests() -> &'static [TestEntry] {
             description: "Leader crash with unreplicated writes, follower diverges, auto-heal via S3 truncation",
             estimated_secs: 54,
             categories: &[Edge],
+            distributed: true,
+        },
+        // ── Bug Reproducers ──
+        TestEntry {
+            name: "stale_lease_restart_split_brain",
+            description: "Stale-lease restart split-brain: HB-Ack `continue` skips S3 renewal, restarting follower CAS-steals stale lease then split brain",
+            estimated_secs: 30,
+            categories: &[Correctness, Election, Fencing],
             distributed: true,
         },
         // ── Correctness (Pilot Phase 1) ──

@@ -9,12 +9,12 @@ use celeriant_rotating_log::log_segment_file::log_segment_file::{read_datablocks
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
 use celeriant_wal::compression_type::CompressionType;
-use celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES;
+use celeriant_wal::constants::{FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK};
 use celeriant_wire::codec::compression::DictCodec;
 use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
 use celeriant_wal::s3::fallback_batch::FallbackBatch;
 use celeriant_wire::disk::serialised_datablock::{CompressionPolicy, SerialisedDatablock};
-use celeriant_wire::disk::versioned_block::{deserialise_fallback_batch, deserialise_metablock};
+use celeriant_wire::disk::versioned_block::{deserialise_fallback_batch, deserialise_metablock, serialize_versioned_message};
 
 use crate::schema_validator::CompiledValidator;
 use celeriant_memcache::shard_log_queue_item::ShardLogQueueItem;
@@ -28,7 +28,7 @@ use crate::error::apply_batch_error::ApplyBatchError;
 use crate::error::s3_catchup_error::S3CatchupError;
 use crate::error::shard_fsync_error::ShardFsyncError;
 use crate::s3_downloader::{S3Downloader};
-use crate::shard_wal_sync::{capture_fsync_snapshot, commit_fsync_with_rollback};
+use crate::shard_wal_sync::{capture_fsync_snapshot, commit_fsync_with_rollback, compute_entry_hash};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatchupCompletion {
@@ -536,7 +536,22 @@ async fn find_divergence_from_batch(
     let mut set = HashSet::with_capacity(1);
     set.insert(candidate_hash);
     // Single-batch fast path: no floor available, miss falls through to find_divergence_via_s3.
-    scan_local_metablocks_for_hashes(log_segments_cache, &set, 0).await
+    let (hash, log_id, wal_seq, position) = scan_local_metablocks_for_hashes(log_segments_cache, &set, 0).await?;
+
+    // Walk the batch forward, advancing past any byte-identical prefix.
+    let metablock_refs: Vec<&_> = batch_items.iter().map(|i| &i.metablock).collect();
+    let refined = refine_divergence_by_byte_match(
+        log_segments_cache, &metablock_refs, hash, log_id, wal_seq, position,
+    ).await;
+    if refined.2 != wal_seq {
+        tracing::info!(
+            from_wal_seq = wal_seq,
+            to_wal_seq = refined.2,
+            advanced = refined.2 - wal_seq,
+            "find_divergence_from_batch: refined divergent_wal_seq past byte-identical prefix"
+        );
+    }
+    Ok(refined)
 }
 
 /// Fallback: download earlier S3 batches in parallel, scan local WAL once against
@@ -630,9 +645,9 @@ async fn find_divergence_via_s3<D: S3Downloader + 'static>(
     // A candidate hash at batch start S can only match local wal_seq = S, so floor at min - 1.
     let min_candidate_start = hash_to_batch_path.values().map(|(_, s)| *s).min().unwrap_or(0);
     let scan_floor_wal_seq = min_candidate_start.saturating_sub(1);
-    let result = scan_local_metablocks_for_hashes(log_segments_cache, &candidate_hashes, scan_floor_wal_seq).await;
+    let mut result = scan_local_metablocks_for_hashes(log_segments_cache, &candidate_hashes, scan_floor_wal_seq).await;
 
-    if let Ok((hash, log_id, wal_seq, position)) = &result {
+    if let Ok((hash, log_id, wal_seq, position)) = result.as_ref() {
         let path = hash_to_batch_path.get(hash).map(|(p, _)| p.as_str()).unwrap_or("<unknown>");
         let batch_start_wal = hash_to_batch_path.get(hash).map(|(_, s)| *s).unwrap_or(0);
         tracing::info!(
@@ -647,6 +662,37 @@ async fn find_divergence_via_s3<D: S3Downloader + 'static>(
             "find_divergence_via_s3: ancestor found"
         );
         metrics::counter!("celeriant_s3_catchup_via_s3_step_total", "outcome" => "match").increment(1);
+
+        // Refine past byte-identical prefix in the matched batch (TCP-replicated overlap).
+        let matched_path = hash_to_batch_path.get(hash).map(|(p, _)| p.clone());
+        let (h, lid, ws, pos) = (*hash, *log_id, *wal_seq, *position);
+        if let Some(path) = matched_path {
+            match downloader.download(&path).await {
+                Ok(data) => match deserialise_fallback_batch(&data) {
+                    Ok(batch) => {
+                        let metablock_refs: Vec<&_> = batch.items.iter().map(|fi| &fi.metablock).collect();
+                        let refined = refine_divergence_by_byte_match(
+                            log_segments_cache, &metablock_refs, h, lid, ws, pos,
+                        ).await;
+                        if refined.2 != ws {
+                            tracing::info!(
+                                from_wal_seq = ws,
+                                to_wal_seq = refined.2,
+                                advanced = refined.2 - ws,
+                                "find_divergence_via_s3: refined divergent_wal_seq past byte-identical prefix"
+                            );
+                        }
+                        result = Ok(refined);
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %path, error = ?e, "find_divergence_via_s3: refinement download deserialise failed; using conservative divergent_wal_seq");
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(path = %path, error = ?e, "find_divergence_via_s3: refinement download failed; using conservative divergent_wal_seq");
+                }
+            }
+        }
     } else {
         tracing::warn!(
             earlier_total_unfiltered,
@@ -703,6 +749,148 @@ async fn scan_local_metablocks_for_hashes(
     }
 }
 
+/// Advance divergent_wal_seq past byte-identical prefix in the matched S3 batch.
+/// `find_divergence_*` returns the START of the matched batch (conservative), but
+/// the local node often has TCP-replicated copies of the early items. Truncating
+/// at the conservative point can trip the ack barrier. Falls back to the input
+/// (always safe) on any error or chain mismatch.
+async fn refine_divergence_by_byte_match(
+    log_segments_cache: &Rc<LogSegmentsCache>,
+    matched_batch_metablocks: &[&celeriant_wal::metablocks::metablock::Metablock],
+    initial_ancestor_hash: [u8; 32],
+    initial_ancestor_log_id: u64,
+    initial_divergent_wal_seq: u64,
+    initial_divergent_position: u64,
+) -> ([u8; 32], u64, u64, u64) {
+    let fallback = (
+        initial_ancestor_hash,
+        initial_ancestor_log_id,
+        initial_divergent_wal_seq,
+        initial_divergent_position,
+    );
+
+    let Some(start_idx) = matched_batch_metablocks
+        .iter()
+        .position(|m| m.wal_seq == initial_divergent_wal_seq)
+    else {
+        return fallback;
+    };
+
+    // Only walk within the active segment; sealed-segment crossing is out of scope.
+    if initial_ancestor_log_id != log_segments_cache.active_log_id() {
+        return fallback;
+    }
+
+    let active = log_segments_cache.active();
+    let (metablocks_end, current_wal_seq) = {
+        let meta = active.metadata.borrow();
+        (meta.write.metablocks_position, meta.write.wal_seq)
+    };
+
+    let reader_guard = match active.lock_reader("refine_divergence_by_byte_match").await {
+        Ok(g) => g,
+        Err(_) => return fallback,
+    };
+    let Some(dma_file) = reader_guard.as_ref() else {
+        return fallback;
+    };
+
+    let mut ancestor_hash = initial_ancestor_hash;
+    let log_id = initial_ancestor_log_id;
+    let mut wal_seq = initial_divergent_wal_seq;
+    let mut position = initial_divergent_position;
+    let mut advanced = 0u64;
+
+    // Compare body bytes only. Skip the versioned header, previous_tip_hash
+    // (chain-derived), and datablock_position (node-local).
+    use celeriant_wal::metablocks::metablock::Metablock as Mb;
+    const HEADER_SIZE: usize = celeriant_wire::disk::versioned_block::HEADER_SIZE;
+    const CONTENT_START: usize = HEADER_SIZE;
+    const PREV_HASH_START: usize = HEADER_SIZE + Mb::OFFSET_PREVIOUS_TIP_HASH;
+    const DATABLOCK_POS_END: usize = HEADER_SIZE + Mb::OFFSET_DATABLOCK_POSITION + Mb::WIRE_SIZE_DATABLOCK_POSITION;
+
+    for batch_metablock in &matched_batch_metablocks[start_idx..] {
+        let batch_metablock = *batch_metablock;
+        if batch_metablock.wal_seq != wal_seq {
+            break;
+        }
+
+        // Chain match must precede the bound check; otherwise an early break can
+        // leave us partially advanced and stuck in a no-op truncate retry loop.
+        if batch_metablock.previous_tip_hash != ancestor_hash {
+            return fallback;
+        }
+
+        if position + FIXED_BLOCK_SIZE_BYTES as u64 > metablocks_end {
+            break;
+        }
+        if wal_seq > current_wal_seq {
+            break;
+        }
+
+        let buf = match dma_file.read_at(position, FIXED_BLOCK_SIZE_BYTES).await {
+            Ok(b) => b,
+            Err(_) => break,
+        };
+        let (chunks, _) = (*buf).as_chunks::<FIXED_BLOCK_SIZE_BYTES>();
+        let Some(local_block) = chunks.first() else { break };
+
+        let mut batch_block = [0u8; FIXED_BLOCK_SIZE_BYTES];
+        if serialize_versioned_message(batch_metablock, WIRE_VERSION_WAL_METABLOCK, &mut batch_block).is_err() {
+            break;
+        }
+
+        let content_match = local_block[CONTENT_START..PREV_HASH_START]
+            == batch_block[CONTENT_START..PREV_HASH_START]
+            && local_block[DATABLOCK_POS_END..] == batch_block[DATABLOCK_POS_END..];
+        if !content_match {
+            break;
+        }
+
+        ancestor_hash = compute_entry_hash(&ancestor_hash, local_block);
+        wal_seq += 1;
+        position += FIXED_BLOCK_SIZE_BYTES as u64;
+        advanced += 1;
+    }
+
+    // Advancing past local's current_wal_seq leaves nothing to truncate;
+    // fall back so truncate at least drops the original divergent wal_seq.
+    if wal_seq > current_wal_seq {
+        return fallback;
+    }
+
+    if advanced > 0 {
+        metrics::counter!("celeriant_truncate_divergence_advanced_total").increment(1);
+        metrics::counter!("celeriant_truncate_divergence_advanced_wal_seqs_total").increment(advanced);
+    }
+
+    (ancestor_hash, log_id, wal_seq, position)
+}
+
+/// Emit an alarm (counter + error log) when a truncate is dropping wal_seqs this
+/// node acked to a client as leader. Doesn't change control flow; truncate proceeds.
+fn alarm_if_truncate_drops_self_acked(
+    log_segments_cache: &Rc<LogSegmentsCache>,
+    divergent_wal_seq: u64,
+    divergent_entry_position: u64,
+) {
+    let last_self_acked = log_segments_cache.active().metadata.borrow().last_self_acked_wal_seq;
+    let new_wal_seq_after_truncate = divergent_wal_seq.saturating_sub(1);
+    if last_self_acked > new_wal_seq_after_truncate {
+        let lost = last_self_acked - new_wal_seq_after_truncate;
+        metrics::counter!("celeriant_truncate_dropped_self_acked_events_total").increment(1);
+        metrics::counter!("celeriant_truncate_dropped_self_acked_wal_seqs_total").increment(lost);
+        tracing::error!(
+            divergent_wal_seq,
+            divergent_entry_position,
+            new_wal_seq_after_truncate,
+            last_self_acked,
+            lost_self_acked_wal_seqs = lost,
+            "truncate_wal: dropping wal_seqs this node acked as leader (false ack, durability contract violated)"
+        );
+    }
+}
+
 /// Truncate the WAL to the common ancestor when divergent entries are detected.
 /// Uses the already-known divergent entry position from the caller to avoid re-scanning.
 ///
@@ -720,41 +908,31 @@ async fn truncate_wal(
     divergent_wal_seq: u64,
     divergent_entry_position: u64,
 ) -> Result<u64, ShardFsyncError> {
-    // Ack barrier: refuse to truncate at or below the cluster-acked watermark.
-    // Two signals max'd:
-    //   - last_self_acked_wal_seq: this node's own acks as leader.
-    //   - last_received_replication_wal_seq - 1: the leader's confirmed wal_seq
-    //     at the time of the last TCP batch we received as follower (the field
-    //     stores leader_confirmed + 1 as the promotion-batch floor).
-    let (last_self_acked, last_received_minus_one) = {
-        let active = log_segments_cache.active();
-        let meta = active.metadata.borrow();
-        (meta.last_self_acked_wal_seq, meta.last_received_replication_wal_seq.saturating_sub(1))
-    };
-    let barrier = last_self_acked.max(last_received_minus_one);
+    // Ack barrier: only refuse truncates that would drop wal_seqs this node returned Ok
+    // for as leader. last_received_replication_wal_seq and read.wal_seq are intentionally
+    // NOT in the barrier: they bump on receive/apply paths that don't reflect what
+    // bytes are actually on disk.
+    let last_self_acked = log_segments_cache.active().metadata.borrow().last_self_acked_wal_seq;
+    let barrier = last_self_acked;
     if barrier >= divergent_wal_seq {
         metrics::counter!("celeriant_truncate_refused_due_to_ack_barrier_total").increment(1);
-        if last_received_minus_one > last_self_acked {
-            metrics::counter!("celeriant_truncate_refused_by_follower_signal_total").increment(1);
-        }
         let would_lose = barrier - divergent_wal_seq.saturating_sub(1);
         tracing::error!(
             divergent_wal_seq,
             divergent_log_id,
             divergent_entry_position,
             last_self_acked,
-            last_received_minus_one,
             barrier,
             would_lose_wal_seqs = would_lose,
-            "truncate_wal refused. Would drop wal_seqs the cluster previously acked. \
-             Staying in catching-up state; the cluster's authoritative chain has overwritten \
-             a range this node either self-acked or received via TCP replication from another \
-             leader. Operator intervention required: investigate the divergent leadership cycle."
+            "truncate_wal refused. Would drop wal_seqs this node acked as leader. \
+             Staying in catching-up state; the cluster's authoritative chain disagrees \
+             with this node's local chain at self-acked wal_seqs. Operator intervention \
+             required: investigate the divergent leadership cycle."
         );
-        return Err(ShardFsyncError::MetablockSerialisationError(format!(
-            "ack barrier blocked truncate at wal_seq={divergent_wal_seq} \
-             (last_self_acked={last_self_acked}, last_received_minus_one={last_received_minus_one})"
-        )));
+        return Err(ShardFsyncError::TruncateRefusedByAckBarrier {
+            divergent_wal_seq,
+            barrier,
+        });
     }
 
     // Step 1: Acquire rollback lock to block concurrent writes
@@ -763,87 +941,7 @@ async fn truncate_wal(
         .await
         .ok_or(ShardFsyncError::WriteLockTimeout)?;
 
-    // Alarm: wiping bytes past the read cursor means client-acked data is
-    // being dropped. Counter must stay 0 in production.
-    {
-        let active_for_check = log_segments_cache.active();
-        if divergent_log_id == log_segments_cache.active_log_id() {
-            let (read_pos, write_pos) = {
-                let metadata = active_for_check.metadata.borrow();
-                let read_pos = metadata.read.as_ref().map(|r| r.metablocks_position).unwrap_or(0);
-                let write_pos = metadata.write.metablocks_position;
-                (read_pos, write_pos)
-            };
-            if read_pos > divergent_entry_position {
-                let committed_bytes_truncated = read_pos.saturating_sub(divergent_entry_position);
-                metrics::counter!(
-                    "celeriant_truncate_dropped_committed_bytes_total",
-                    "shard_id" => active_for_check.metadata.borrow().log_id.to_string()
-                ).increment(committed_bytes_truncated);
-                metrics::counter!(
-                    "celeriant_truncate_dropped_committed_metablocks_events_total"
-                ).increment(1);
-                tracing::error!(
-                    log_id = active_for_check.metadata.borrow().log_id,
-                    divergent_wal_seq,
-                    divergent_entry_position,
-                    read_pos,
-                    write_pos,
-                    committed_bytes_truncated,
-                    "truncate_wal: dropping committed metablocks; these may have been acked to clients (false ack)"
-                );
-            }
-        } else {
-            // Sealed-segment ancestor: anything in the active log past the header is being thrown away.
-            let (active_read_pos, active_write_pos, active_log_id_now) = {
-                let metadata = active_for_check.metadata.borrow();
-                let read_pos = metadata.read.as_ref().map(|r| r.metablocks_position).unwrap_or(HEADER_BLOCK_SIZE_BYTES as u64);
-                (read_pos, metadata.write.metablocks_position, metadata.log_id)
-            };
-            if active_read_pos > HEADER_BLOCK_SIZE_BYTES as u64 {
-                let committed_bytes_truncated = active_read_pos.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64);
-                metrics::counter!(
-                    "celeriant_truncate_dropped_committed_bytes_total",
-                    "shard_id" => active_log_id_now.to_string()
-                ).increment(committed_bytes_truncated);
-                metrics::counter!(
-                    "celeriant_truncate_dropped_committed_metablocks_events_total"
-                ).increment(1);
-                tracing::error!(
-                    active_log_id_now,
-                    divergent_log_id,
-                    divergent_wal_seq,
-                    active_read_pos,
-                    active_write_pos,
-                    committed_bytes_truncated,
-                    "truncate_wal: sealed-ancestor truncation drops committed metablocks in active segment (false ack candidate)"
-                );
-            }
-        }
-    }
-
-    // Alarm: truncate is dropping wal_seqs this node acked as leader (false ack).
-    {
-        let last_self_acked = log_segments_cache.active().metadata.borrow().last_self_acked_wal_seq;
-        let new_wal_seq_after_truncate = divergent_wal_seq.saturating_sub(1);
-        if last_self_acked > new_wal_seq_after_truncate {
-            let lost = last_self_acked - new_wal_seq_after_truncate;
-            metrics::counter!(
-                "celeriant_truncate_dropped_self_acked_events_total"
-            ).increment(1);
-            metrics::counter!(
-                "celeriant_truncate_dropped_self_acked_wal_seqs_total"
-            ).increment(lost);
-            tracing::error!(
-                divergent_wal_seq,
-                divergent_entry_position,
-                new_wal_seq_after_truncate,
-                last_self_acked,
-                lost_self_acked_wal_seqs = lost,
-                "truncate_wal: dropping wal_seqs this node acked as leader (false ack, durability contract violated)"
-            );
-        }
-    }
+    alarm_if_truncate_drops_self_acked(log_segments_cache, divergent_wal_seq, divergent_entry_position);
 
     // Step 2: Clear all caches (including read snapshots and recent writes)
     shard_mem_cache.borrow_mut().clear_all_caches();
@@ -1162,6 +1260,49 @@ mod tests {
             self.catchup(&dl, 0, 10).await.unwrap();
             prev
         }
+    }
+
+    fn pos_at(wal_seq: u64) -> u64 {
+        HEADER_BLOCK_SIZE_BYTES as u64 + (wal_seq - 1) * FIXED_BLOCK_SIZE_BYTES as u64
+    }
+
+    fn test_metablock_for_agg(wal_seq: u64, prev: [u8; 32], agg: AggregateKey) -> Metablock {
+        let mut mb = Metablock::default_inline_event_batch_metadata(agg);
+        mb.wal_seq = wal_seq;
+        mb.previous_tip_hash = prev;
+        mb
+    }
+
+    /// Apply 1..=end one wal_seq at a time, returning tips[i] = tip after wal_seq=i+1.
+    async fn seed_capturing_tips(tc: &TestComponents, end: u64) -> Vec<[u8; 32]> {
+        let dl = Rc::new(MockDownloader::new());
+        let mut tips = Vec::with_capacity(end as usize);
+        for wal_seq in 1..=end {
+            let prev = *tips.last().unwrap_or(&GENESIS_HASH);
+            let (p, d) = make_fallback_batch(0, wal_seq, wal_seq, prev);
+            dl.insert(p, d);
+            tc.catchup(&dl, 0, 10).await.unwrap();
+            tips.push(tc.tip_hash());
+        }
+        tips
+    }
+
+    /// Local at wal_seq=6; S3 holds a 6..=8 chain anchored at tip_after_5, which
+    /// trips TipHashMismatch on local's wal_seq=7 expectation and drives
+    /// truncate_wal at divergent_wal_seq=6. Returns the prepped downloader.
+    async fn divergence_at_6(tc: &TestComponents) -> Rc<MockDownloader> {
+        let dl = Rc::new(MockDownloader::new());
+        let (p, d) = make_fallback_batch(0, 1, 5, GENESIS_HASH);
+        dl.insert(p, d);
+        tc.catchup(&dl, 0, 10).await.unwrap();
+        let tip_after_5 = tc.tip_hash();
+        let (p, d) = make_fallback_batch(0, 6, 6, tip_after_5);
+        dl.insert(p, d);
+        tc.catchup(&dl, 0, 10).await.unwrap();
+        dl.objects.borrow_mut().clear();
+        let (p, d) = make_fallback_batch(0, 6, 8, tip_after_5);
+        dl.insert(p, d);
+        dl
     }
 
     /// After find_divergence_via_s3 truncates, drop the stale trigger and plant a fresh
@@ -1654,6 +1795,38 @@ mod tests {
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
             assert_eq!(tc.wal_seq(), 14);
             assert_eq!(result.completion, CatchupCompletion::Caught);
+
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn truncate_refused_when_follower_signal_covers_divergent_wal_seq() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let tip_5 = tc.seed_chain(6).await;
+            assert_eq!(tc.wal_seq(), 6);
+
+            tc.log_segments_cache.active().metadata.borrow_mut().last_self_acked_wal_seq = 6;
+
+            // Divergent chain 6..=8 anchored at tip_5; divergent_wal_seq=6 = barrier, refused.
+            let dl = Rc::new(MockDownloader::new());
+            let (path, data) = make_fallback_batch(0, 6, 8, tip_5);
+            dl.insert(path, data);
+
+            let result = tc.catchup(&dl, 0, 10).await;
+            assert!(
+                result.is_err(),
+                "catchup should err due to ack barrier refusal, got {:?}", result.as_ref().map(|r| &r.completion),
+            );
+            let err = result.unwrap_err();
+            assert!(
+                matches!(err, S3CatchupError::TruncationFailed(ShardFsyncError::TruncateRefusedByAckBarrier { .. })),
+                "expected TruncateRefusedByAckBarrier, got: {err:?}",
+            );
+            assert!(err.is_retriable(), "barrier refusal must be retriable (not fatal): {err:?}");
+            assert_eq!(tc.wal_seq(), 6, "wal_seq must not regress under barrier refusal");
 
             tc.close().await;
         });
@@ -2390,6 +2563,40 @@ mod tests {
     }
 
     #[test]
+    fn catchup_with_speculative_tail_misses_peer_batches_if_not_culled_first() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = Rc::new(MockDownloader::new());
+
+            // Speculative tail: write=200, peer batch covers 1..5.
+            {
+                let active = tc.log_segments_cache.active();
+                let mut meta = active.metadata.borrow_mut();
+                meta.write.wal_seq = 200;
+            }
+
+            let (path, data) = make_fallback_batch(0, 1, 5, GENESIS_HASH);
+            dl.insert(path, data);
+
+            tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_seq(), 200, "without cull, speculative write suppresses peer batch");
+
+            // Simulate cull_speculative_tail_for_promotion (TestComponents has no read cursor).
+            {
+                let active = tc.log_segments_cache.active();
+                let mut meta = active.metadata.borrow_mut();
+                meta.write.wal_seq = 0;
+            }
+
+            tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_seq(), 5, "after cull, peer batch must be applied");
+
+            tc.close().await;
+        });
+    }
+
+    #[test]
     fn duplicate_start_picks_winner_and_applies() {
         // Two batches at start=48 (pre-rollback and post-rollback generations).
         // The one with higher upload_sequence is authoritative; the other is stale
@@ -2415,6 +2622,108 @@ mod tests {
             tc.catchup(&dl, 0, 10).await.unwrap();
             assert_eq!(tc.wal_seq(), 60, "winner (seq=2, end=60) should be applied, not stale (seq=1, end=52)");
 
+            tc.close().await;
+        });
+    }
+
+    // ── Ack barrier ──
+
+    #[test]
+    fn truncate_succeeds_when_last_self_acked_below_divergent() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = divergence_at_6(&tc).await;
+            tc.log_segments_cache.active().metadata.borrow_mut().last_self_acked_wal_seq = 3;
+
+            tc.catchup(&dl, 0, 10).await.unwrap();
+
+            assert_eq!(tc.wal_seq(), 8);
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn truncate_barrier_ignores_last_received_replication_wal_seq() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = divergence_at_6(&tc).await;
+            {
+                let active = tc.log_segments_cache.active();
+                let mut meta = active.metadata.borrow_mut();
+                meta.last_self_acked_wal_seq = 3;
+                meta.last_received_replication_wal_seq = 99;
+            }
+
+            tc.catchup(&dl, 0, 10).await.unwrap();
+
+            assert_eq!(tc.wal_seq(), 8);
+            tc.close().await;
+        });
+    }
+
+    // ── refine_divergence_by_byte_match ──
+
+    #[test]
+    fn refine_advances_through_byte_identical_prefix() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let tips = seed_capturing_tips(&tc, 8).await;
+            let log_id = tc.log_segments_cache.active_log_id();
+
+            // Batch entries 5,6 byte-match local; entry 7 uses a different
+            // aggregate_key so its body differs from local's wal_seq=7.
+            let mb5 = test_metablock(5, tips[3]);
+            let mb6 = test_metablock(6, tips[4]);
+            let mb7 = test_metablock_for_agg(7, tips[5], AggregateKey::new(2, 2, 2));
+            let batch: Vec<&Metablock> = vec![&mb5, &mb6, &mb7];
+
+            let result = refine_divergence_by_byte_match(
+                &tc.log_segments_cache, &batch, tips[3], log_id, 5, pos_at(5),
+            ).await;
+
+            assert_eq!(result, (tips[5], log_id, 7, pos_at(7)));
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn refine_falls_back_on_chain_mismatch() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let tips = seed_capturing_tips(&tc, 6).await;
+            let log_id = tc.log_segments_cache.active_log_id();
+
+            // batch[0].previous_tip_hash deliberately doesn't match the ancestor we pass.
+            let mb5 = test_metablock(5, [0xCC; 32]);
+            let batch: Vec<&Metablock> = vec![&mb5];
+
+            let result = refine_divergence_by_byte_match(
+                &tc.log_segments_cache, &batch, tips[3], log_id, 5, pos_at(5),
+            ).await;
+
+            assert_eq!(result, (tips[3], log_id, 5, pos_at(5)));
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn refine_falls_back_on_sealed_segment_crossing() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let foreign_log_id = tc.log_segments_cache.active_log_id().wrapping_add(1);
+            let mb = test_metablock(5, [0; 32]);
+            let batch: Vec<&Metablock> = vec![&mb];
+
+            let result = refine_divergence_by_byte_match(
+                &tc.log_segments_cache, &batch, [0xAA; 32], foreign_log_id, 5, 999,
+            ).await;
+
+            assert_eq!(result, ([0xAA; 32], foreign_log_id, 5, 999));
             tc.close().await;
         });
     }

@@ -53,10 +53,21 @@ pub enum ShardFsyncError {
 
     /// Leader's lease budget was exhausted before fdatasync completed; write not acked.
     BudgetExhausted,
+
+    /// truncate_wal refused because the divergent wal_seq is at or below the
+    /// cluster-wide ack barrier. The catchup driver should stay in
+    /// catching-up state and retry; do NOT shut down the shard. Operator
+    /// alarm should fire on the truncate_refused_due_to_ack_barrier_total
+    /// counter incrementing repeatedly.
+    TruncateRefusedByAckBarrier { divergent_wal_seq: u64, barrier: u64 },
 }
 
 impl ShardFsyncError {
     pub fn is_retriable(&self) -> bool {
-        matches!(self, Self::RollbackInvalidatedWrites | Self::WriteLockTimeout)
+        matches!(self,
+            Self::RollbackInvalidatedWrites
+            | Self::WriteLockTimeout
+            | Self::TruncateRefusedByAckBarrier { .. }
+        )
     }
 }

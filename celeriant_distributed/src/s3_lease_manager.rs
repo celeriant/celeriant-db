@@ -133,6 +133,17 @@ impl<S: LeaseStore> S3LeaseManager<S> {
         Ok(membership.and_then(|mwe| mwe.membership.peer_of(self.config.node_id).cloned()))
     }
 
+    /// Read-only peek of `cluster/lease.json` (no CAS). Used by the post-catchup
+    /// boot-grace decision to distinguish a fresh cluster (no lease yet) from an
+    /// expired lease held by another node.
+    pub async fn peek_lease(&self) -> Result<Option<Lease>, LeaseStoreError> {
+        Ok(self.store.get_lease().await?.map(|lwe| lwe.lease))
+    }
+
+    pub fn node_id(&self) -> u128 {
+        self.config.node_id
+    }
+
     async fn become_follower(&self, lease: &Lease) -> Result<ElectionOutcome, LeaseStoreError> {
         let peer_info = self.discover_peer().await.ok().flatten();
         Ok(ElectionOutcome {

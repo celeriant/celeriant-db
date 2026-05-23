@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use celeriant_distributed::{lease_store::LeaseStore, node_status_logic::compute_new_ttl, s3_lease_manager::{ElectionOutcome, S3LeaseManager}, validated_node_status::{self, ValidatedNodeStatus, set_node_status_and_metric}};
+use celeriant_distributed::{lease_store::LeaseStore, node_status_logic::{compute_new_ttl, decide_post_catchup_action, PostCatchupAction}, s3_lease_manager::{ElectionOutcome, S3LeaseManager}, validated_node_status::{self, ValidatedNodeStatus, set_node_status_and_metric}};
 use celeriant_msg::response::responses::HeartbeatResult;
 use celeriant_shard::{error::send_heartbeat_error::SendHeartbeatError, replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::ShardWal, shard_wal_s3_catchup::CatchupCompletion};
 use glommio::{
@@ -521,30 +521,48 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
     let became_leader = !is_currently_leader && outcome.status.is_leader();
     let became_follower_from_leader_or_fenced = is_currently_leader && !outcome.status.is_leader();
 
-    let needs_catchup = became_leader
-        || became_follower_from_leader_or_fenced
-        || lease_changed_hands;
+    let needs_cull = became_leader || became_follower_from_leader_or_fenced;
+    let needs_catchup = became_leader || lease_changed_hands;
 
-    if needs_catchup {
+    if needs_cull || needs_catchup {
         if outcome.status.is_leader() && lease_changed_hands {
             info!(previous_lease_epoch, new_lease_epoch, "Lease changed hands during partition — running S3 catchup");
         } else if outcome.status.is_leader() {
             info!("Starting post-election S3 catchup");
-        } else if became_follower_from_leader_or_fenced {
+        } else if became_follower_from_leader_or_fenced && lease_changed_hands {
             info!(previous_lease_epoch, new_lease_epoch, "Lost leadership / fenced — running S3 catchup before becoming follower");
+        } else if became_follower_from_leader_or_fenced {
+            info!("Self-fenced; culling speculative tail without catchup (lease has not changed hands yet)");
         } else {
             info!(previous_lease_epoch, new_lease_epoch, "Lease epoch advanced while non-leader — running S3 catchup");
         }
-        if !run_s3_catchup(ctx, &rx).await {
-            return Err(celeriant_distributed::lease_store::LeaseStoreError::Unavailable { message: "Could not catch up WAL via S3".to_string() });
+
+        // Queues are FIFO; broadcasting cull first means any following EnterS3Catchup
+        // arrives after the cull lands.
+        if needs_cull {
+            let shard_count = ctx.config.num_shards as usize;
+            for peer in 1..shard_count {
+                if let Err(e) = try_send_with_retry(ctx.intrashard_sender.as_ref(), peer, IntrashardMessages::CullSpeculativeTail, 10).await {
+                    panic!("Failed to send CullSpeculativeTail to shard {peer} after retries: {e:?}");
+                }
+            }
+            if let Err(e) = ctx.shard_wal.cull_speculative_tail_for_promotion().await {
+                return Err(celeriant_distributed::lease_store::LeaseStoreError::Unavailable {
+                    message: format!("pre-catchup speculative tail cull failed: {e:?}"),
+                });
+            }
         }
 
-        // Upload the last TCP-replicated batch to S3 before accepting writes.
-        // Covers the partition scenario where the old leader rolled back this batch
-        // but we (the follower) kept it — without this, S3 would have a gap.
-        if became_leader {
-            if let Err(e) = ctx.shard_wal.upload_s3_promotion_batch().await {
-                tracing::warn!(error = ?e, "Failed to upload promotion batch to S3 — old leader may not be able to catch up via S3");
+        if needs_catchup {
+            if !run_s3_catchup(ctx, &rx).await {
+                return Err(celeriant_distributed::lease_store::LeaseStoreError::Unavailable { message: "Could not catch up WAL via S3".to_string() });
+            }
+
+            // Close any gap in S3 left by the old leader rolling back a batch we kept.
+            if became_leader {
+                if let Err(e) = ctx.shard_wal.upload_s3_promotion_batch().await {
+                    tracing::warn!(error = ?e, "Failed to upload promotion batch to S3; old leader may not be able to catch up via S3");
+                }
             }
         }
     }
@@ -913,11 +931,63 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                     panic!("S3 catchup failed with fatal error");
                 }
 
-                // WAL is caught up — now determine our role via S3 election
-                if let Err(e) = set_node_role_via_s3(&lease_manager, &ctx, &rx, "post_catchup").await {
-                    panic!("Post-catchup election failed after retries: {e}");
+                // Wait briefly only when another node's expired lease.bin is in S3, so
+                // we can defer to its heartbeat if it's actually alive. 5s allows ~10 HB
+                // attempts at the 500ms interval.
+                const BOOT_GRACE_MAX_MS: u64 = 5_000;
+                let status_now = ctx.shard_wal.node_status.get();
+                let now_ms = validated_node_status::unix_epoch_now_ms();
+                let self_node_id = lease_manager.node_id();
+                let needs_boot_grace = match lease_manager.peek_lease().await {
+                    Ok(Some(lease)) => lease.leader_node_id != self_node_id && lease.is_expired(now_ms),
+                    _ => false,
+                };
+                let boot_grace_ms = if needs_boot_grace {
+                    (ctx.config.heartbeat_lease_duration.as_millis() as u64).min(BOOT_GRACE_MAX_MS)
+                } else {
+                    0
+                };
+                let action = decide_post_catchup_action(
+                    status_now.raw(),
+                    status_now.lease_expires_at_ms(),
+                    now_ms,
+                    boot_grace_ms,
+                );
+
+                match action {
+                    PostCatchupAction::StayFollower { .. } => {
+                        info!("Post-catchup: lease alive (heartbeat received during catchup); not challenging");
+                    }
+                    PostCatchupAction::BootWaitThenReevaluate { wait_ms } => {
+                        info!(wait_ms, "Post-catchup boot-grace wait before challenging");
+                        // 100ms slices so we exit early if a heartbeat flips us to follower.
+                        let start = std::time::Instant::now();
+                        let total = Duration::from_millis(wait_ms);
+                        loop {
+                            let remaining = total.saturating_sub(start.elapsed());
+                            if remaining.is_zero() { break; }
+                            glommio::timer::sleep(Duration::from_millis(100).min(remaining)).await;
+                            if !ctx.shard_wal.node_status.get().raw().is_catching_up() {
+                                break;
+                            }
+                        }
+                        if ctx.shard_wal.node_status.get().raw().is_catching_up() {
+                            info!("Boot-grace wait elapsed without heartbeat; challenging via CAS");
+                            if let Err(e) = set_node_role_via_s3(&lease_manager, &ctx, &rx, "post_catchup").await {
+                                panic!("Post-catchup election failed after retries: {e}");
+                            }
+                            last_s3_lease_write_at_ms = Some(validated_node_status::unix_epoch_now_ms());
+                        } else {
+                            info!("Heartbeat arrived during boot-grace wait; following established leader");
+                        }
+                    }
+                    PostCatchupAction::ChallengeViaCAS => {
+                        if let Err(e) = set_node_role_via_s3(&lease_manager, &ctx, &rx, "post_catchup").await {
+                            panic!("Post-catchup election failed after retries: {e}");
+                        }
+                        last_s3_lease_write_at_ms = Some(validated_node_status::unix_epoch_now_ms());
+                    }
                 }
-                last_s3_lease_write_at_ms = Some(validated_node_status::unix_epoch_now_ms());
 
                 continue;
             }
@@ -974,6 +1044,11 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
                 message_version,
                 ctx.clone(),
             );
+        }
+        IntrashardMessages::CullSpeculativeTail => {
+            if let Err(e) = ctx.shard_wal.cull_speculative_tail_for_promotion().await {
+                tracing::warn!(shard_id = ctx.current_shard_id, error = ?e, "CullSpeculativeTail fsync failed — catchup may miss peer S3 batches");
+            }
         }
         IntrashardMessages::EnterS3Catchup => handle_enter_s3_catchup(ctx.clone()),
         IntrashardMessages::S3CatchupComplete { shard_id, result } => {

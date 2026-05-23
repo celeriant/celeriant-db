@@ -225,6 +225,22 @@ reaches `Leader` or `Standalone`.
 **Standalone mode** bypasses the boot orchestrator entirely. The node starts in
 `Standalone` state and accepts writes immediately. No S3, no replication.
 
+### Post-Catchup Boot Grace
+
+A fast restart can land back up in milliseconds. `lease.bin` is only renewed on
+heartbeat failure, so an active leader's lease in S3 can be wall-clock-expired while
+the leader is healthy and writing. A naive challenge would race the leader's
+preemptive renewal and trigger a split-brain CAS.
+
+After S3 catchup completes, before challenging for leadership, peek `cluster/lease.json`.
+If another node holds the lease (even if S3 says expired), wait up to
+`min(heartbeat_lease_duration_ms, 5000ms)` for an incoming heartbeat. Three outcomes:
+- Heartbeat arrives confirming a live peer. Defer to it, become Follower.
+- Wait elapses with no heartbeat. Challenge via CAS.
+- Lease is held by us (last leader was us) or no lease exists. Proceed immediately.
+
+`peek_lease` is a single S3 GET, only on boot. No per-write S3 cost.
+
 ### Post-Election Processing
 
 When `set_node_role_via_s3` completes, it performs these steps in order:
@@ -320,9 +336,11 @@ flowchart LR
     subgraph "Phase 4: Replicate"
         R[Coordinator batches]
         R --> R1{TCP to follower?}
-        R1 -->|Success| R2[Commit: advance read cursor]
+        R1 -->|Success| R2[Commit: advance read, bump last_self_acked, fsync header]
         R1 -->|Fail| R3[S3 fallback + kick]
-        R3 -->|Fail| R4[Rollback]
+        R3 -->|Success| R2
+        R3 -->|Fail| R4[Spin: backoff + retry, 30s hard cap]
+        R4 --> R1
     end
     V --> A --> F --> R
 ```
@@ -385,13 +403,20 @@ follower or uploaded to S3.
 ### Commit
 
 After successful replication (TCP or S3), the commit phase makes data visible
-to readers. Steps in order:
+to readers and pushes the ack horizon out to clients. Steps in order:
 
-1. **Advance read cursor per-segment:** For each batch, copy the write cursor
+1. **Bump `last_self_acked_wal_seq` and synchronously fsync the header.** This is the
+   ack barrier the S3 catchup truncate path consults. Coalesced via `sync_gate` with
+   concurrent fsyncs. Ok is returned to the client only after this fsync completes,
+   so a crash post-Ok still has the bumped value durable. Without this, a leadership
+   transition after shutdown could let catchup truncate below the ack horizon and
+   drop wal_seqs the cluster acknowledged.
+
+2. **Advance read cursor per-segment:** For each batch, copy the write cursor
    to the read cursor: `metadata.read = Some(commit_data.log_metadata.write.clone())`.
    Only updates cached log segments.
 
-2. **Update caches per-item:** For each metablock in the batch:
+3. **Update caches per-item:** For each metablock in the batch:
    - `EventBatchMetadata`: update segment summary, commit position to read snapshot,
      cache recent write with metablock and datablock data
    - `SoftTrim`: update aggregate min aggregate version on both write and read paths
@@ -399,11 +424,11 @@ to readers. Steps in order:
    - `SchemaRegistration`: follower compiles and caches the schema on fsync
      (leader caches at write time). Both nodes have schemas available for reads.
 
-3. **Finalize sealed segments:** If a non-active log segment is now fully replicated
+4. **Finalize sealed segments:** If a non-active log segment is now fully replicated
    (`read.wal_seq == write.wal_seq`), extract its sealed segment summary from
    memcache for sidecar file write. This is best-effort (errors logged, not fatal).
 
-4. **Broadcast watch events:** Events are collected during step 2 and broadcast
+5. **Broadcast watch events:** Events are collected during step 3 and broadcast
    in fixed order: Create, Write, Delete, Trim. Watch events only fire after
    durable replication on the leader (or after fsync on non-leader).
 
@@ -453,12 +478,14 @@ sequenceDiagram
     L->>L: commit_replication (advance read cursor, notify watchers)
 ```
 
-**Mid-commit fencing:** The commit loop re-checks `is_leader()` on every iteration
-and once more before the final `commit_replication`. Pipeline stalls (S3 upload,
-retry backoff, catchup fetch) routinely exceed the ~1s lease TTL. If the lease expired
-mid-pipeline, the loop rolls back local WAL and returns `LeaderFenced` instead of
-committing with an expired lease (which would be silent ACK forgery if a new leader
-has already taken over).
+**Mid-spin fencing:** The spin loop re-checks `is_leader()` at the top of every
+iteration and after each successful replicate before bumping `last_self_acked_wal_seq`.
+Pipeline stalls (S3 upload, retry backoff, catchup fetch) routinely exceed the ~1s
+lease TTL. If the lease expired mid-pipeline, the loop returns `LeaderFenced` and
+leaves the captured snapshot in pending. No rollback. A new leader's cull or the
+next replication trigger resolves the orphan. The post-publish check closes the
+in-process leg of dual-ack where a fence flipped between TCP success and
+`last_self_acked` bump.
 
 **Follower validation on receive:**
 1. WAL sequence continuity: `current + 1 == batch[0].wal_seq`
@@ -558,40 +585,42 @@ straight to S3 fallback without attempting TCP replication that would be rejecte
 2. Deduplicate: same start index, keep largest end index
 3. Validate inter-batch contiguity: `batch[i].end + 1 == batch[i+1].start`
 4. For each batch: download, skip already-applied entries, apply, fsync, delete from S3
-5. On `TipHashMismatch`: find divergence point, truncate local WAL, retry
+5. On `TipHashMismatch`: find divergence point. `find_divergence_via_s3` returns the
+   start of the matched S3 batch (conservative; that batch often contains entries this
+   node already has byte-identically from prior TCP replication). A byte-match walk
+   then advances `divergent_wal_seq` past any byte-identical prefix. Truncate proceeds
+   only if `divergent_wal_seq > last_self_acked_wal_seq` (the ack barrier). Below the
+   barrier means the truncate would drop a wal_seq this node returned Ok to a client
+   for: refuse with `TruncateRefusedByAckBarrier`, retriable so the shard catchup
+   driver keeps retrying instead of crashing.
 6. On `WalSeqMismatch` (batch starts ahead): defer to TCP replication
 
 ---
 
-## Rollback
+## Replication Failure Handling
 
-Rollback fires when both TCP and S3 replication fail. The leader cannot durably
-replicate the batch, so it rewinds to the last replicated state.
+TCP and S3 fallback both fail? The writer's await stays pending. Replication spins
+in-place: 50ms backoff capped at 500ms, hard timeout 30s, `is_leader()` re-checked
+on every iteration.
 
-```mermaid
-flowchart TD
-    A[TCP replication failed] --> B[S3 fallback failed]
-    B --> C[Acquire fsync rollback lock]
-    C --> D[In-flight fsync completes first]
-    D --> E[Wipe memcache: write snapshots, client snapshots, pending queues]
-    E --> F[For each log segment in snapshot]
-    F --> G[Reset write cursor = read cursor]
-    G --> H[Rewrite dual headers at new positions]
-    H --> I[fdatasync]
-    I --> J[Re-read datablocks carry-over bytes]
-    J --> K[Release lock, new writes resume]
-```
+Three terminal outcomes:
+- A retry succeeds. Write returns Ok normally.
+- Hard timeout elapses. Writer gets `ReplicationError::LeaderFenced`.
+- Lease lapses mid-spin. Writer gets `LeaderFenced`. The captured snapshot stays in
+  `pending_replication_batches` for the next replication trigger.
 
-**Key properties:**
-- Rollback lock blocks all new writers. In-flight fsyncs complete before lock is granted.
-- Write cursor resets to read cursor (or file start if segment never replicated).
-- Dual headers are rewritten and fsynced before lock release. Rollback is durable.
-- After rollback, writes are rejected with `ReplicationBackpressure` for
-  `replication_rollback_cooldown` (default 500ms). This gives the pending queue time to
-  drain via TCP/S3 before accepting new load, preventing the rollback → rewrite → rollback
-  storm that produces overlapping S3 batch generations under sigstop_leader.
-- Rollback flags (`fsync_rollback_occurred`, `replication_rollback_occurred`) are set
-  and consumed once by the next capture phase.
+No rollback. No cursor rewind. Pending data sits until either the spin completes, or
+a role transition cull sweeps it. Holding the writer's await blocking on the snapshot
+in pending is what prevents silent loss when a writer disconnects mid-retry; the old
+rollback-then-return-Err path could lose the snapshot if no later writer triggered the
+next replication cycle.
+
+`is_terminal_replication_error` lists what bails out immediately: auth failures,
+serialization errors, malformed batches. Everything else spins.
+
+Idle clusters need a kick. A 5s periodic reachability probe in the heartbeat loop
+fires `probe_replicate` when the follower is reachable, so any tail that didn't land
+before writers paused drains without waiting on the next client write.
 
 ---
 
@@ -610,13 +639,24 @@ follower but was rolled back by the leader and never uploaded to S3.
 7. S3 has X+1, X+2... but NOT X
 8. Old leader rejoins, enters S3 catchup: gap at X
 
-**Fix:** On promotion to leader, upload the last TCP-received batch to S3 before
-accepting writes. The field `last_received_replication_wal_seq` tracks which
-batch needs uploading.
+**Fix:** Two steps run on promotion, before accepting writes:
 
-**Limitation:** Only fires on leadership change. If the original leader stays
-leader, the gap between TCP-replicated and S3-uploaded entries is not backfilled.
-The follower handles this via `WalSeqMismatch` deferral to TCP replication.
+1. **Cull speculative tail.** If `read.wal_seq < write.wal_seq`, the node has an
+   unreplicated tail from a prior leadership stint. Rewind `write` to `read`, drain
+   pending PCDs that reference the discarded range, clear the OCC and aggregate write
+   LRUs (surgical: queue positions, schema cache, and rollback_generation are left
+   alone). Fsync the header. A `CullSpeculativeTail` intrashard message broadcasts
+   to non-coordinator shards before S3 catchup runs, since catchup's apply filter
+   starts at `write + 1` and would otherwise skip peer batches in the `[read+1, write]`
+   range.
+
+2. **Upload promotion batch.** The last TCP-received batch (tracked via
+   `last_received_replication_wal_seq`) goes to S3 so a partitioned old leader can
+   catch up via S3 catchup on reconnect.
+
+**Limitation:** Only fires on leadership change. If the original leader stays leader,
+the gap between TCP-replicated and S3-uploaded entries is not backfilled. The follower
+handles this via `WalSeqMismatch` deferral to TCP replication.
 
 ---
 
@@ -631,7 +671,7 @@ In a healthy two-node cluster where both nodes are reachable and clocks are
 within drift tolerance, **S3 is never touched**. No lease renewal, no fallback
 replication, no S3 reads. All coordination flows over TCP heartbeats (shard 0),
 all data flows over TCP replication (all shards). The chaos baseline enforces
-this via `NoS3Fallbacks`, `NoRollbacks`, and `NoHeartbeatFailures`.
+this via `NoS3Fallbacks` and `NoHeartbeatFailures`.
 
 S3 activates only on failure: follower unreachable (TCP replication fails →
 S3 fallback), lease renewal needed (heartbeat fails → S3 CAS), or node restart
@@ -918,7 +958,7 @@ to TCP replication.
 
 ## Split-Brain Prevention
 
-Three overlapping mechanisms prevent two nodes from writing simultaneously:
+Four overlapping mechanisms prevent two nodes from writing simultaneously:
 
 **1. Asymmetric TTL decay (leader self-fences early):**
 Every shard checks `effective_node_status()` before accepting a write. The leader
@@ -936,6 +976,21 @@ Every write path checks `effective_node_status()` synchronously before entering
 the pipeline. Once fenced, new writes are immediately rejected with
 `ShardCannotAcceptWrites`. In-flight writes that already passed the gate but
 haven't replicated yet will be rejected by the follower's `lease_epoch` check.
+
+**4. Post-publish lease check:**
+After a successful replicate (TCP or S3) and before bumping `last_self_acked_wal_seq`,
+the leader re-reads `node_status` and refuses the bump if it has fenced. Local atomic
+read, no S3 round-trip per write. Closes the in-process leg of dual-ack where the
+fence flipped between TCP success and the ack bump. Cross-node degraded-mode dual-ack
+(local HB-extended TTL drifting above S3-confirmed expiry) is bounded geometrically by
+requiring `heartbeat_lease_duration_ms` << `s3_lease_duration_ms` in deployment config.
+
+**5. Ack barrier on S3 catchup truncate:**
+S3 catchup refuses to truncate at any wal_seq <= `last_self_acked_wal_seq`. Even if a
+new leader's chain diverges, the old leader's local can't be silently rewritten over
+its own client acks. The barrier is the last line of defence when the other four miss
+something; refusal is loud (`TruncateRefusedByAckBarrier`) and retriable so the node
+stays alive in catching-up state until operator intervention.
 
 **Historical failure mode (fixed):** S3 fallback upload storms during follower
 outages saturated MinIO, preventing shard 0 from renewing the S3 lease. The leader's
@@ -958,25 +1013,11 @@ The `lease_epoch` check on the follower is the last line of defence in this case
    historical TCP-only entries. Under what conditions does this create an
    unrecoverable gap?
 
-2. **Rollback + immediate S3 success:** If the leader rolls back batch Y, then
-   immediately writes new entries Z that successfully go to S3, does the
-   follower's local WAL (which has the rolled-back Y) correctly handle the
-   hash chain divergence when catching up?
-
-3. **Multiple rapid rollbacks:** Under sustained dual failure (TCP + S3 both
-   flaky), can multiple rollback cycles create a WAL state on the leader that
-   diverges significantly from the follower's state? How far can the WAL
-   positions drift? *Partially mitigated:* `replication_rollback_cooldown` (500ms)
-   now rejects new writes after each rollback, breaking the tight rollback → rewrite
-   → rollback loop that produced overlapping S3 batch generations under sigstop_leader.
-   The underlying divergence question remains open — cooldown bounds the rate, not
-   the eventual drift.
-
-4. **Promotion batch upload failure:** If `upload_s3_promotion_batch` fails
+2. **Promotion batch upload failure:** If `upload_s3_promotion_batch` fails
    (S3 temporarily unavailable), the new leader proceeds without uploading.
    The old leader can only catch up via TCP. What if TCP catchup also fails
    (entries compacted away)?
 
-5. **Coordinator shard isolation:** With `reserve_coordinator_shard`, shard 0
+3. **Coordinator shard isolation:** With `reserve_coordinator_shard`, shard 0
    has no write load. But schema registration still routes to shard 0. Under
    what schema write patterns could shard 0 become a bottleneck?

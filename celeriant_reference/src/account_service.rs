@@ -292,6 +292,14 @@ impl AccountService {
                     continue;
                 }
                 Err(ClientError::Server(ServerError::Write {
+                    kind: WriteError::InflightDuplicateWrite { .. }, ..
+                })) if attempt < MAX_RETRIES => {
+                    // Prior attempt fsynced but not yet durable; treating it as success
+                    // would be a false ack if it later rolls back. Hold client_seq and retry.
+                    tracing::debug!("Inflight duplicate on deposit for {account_id:x}, attempt {attempt}");
+                    continue;
+                }
+                Err(ClientError::Server(ServerError::Write {
                     kind: WriteError::ClientIdempotencyViolation { .. }, ..
                 })) => {
                     // Prior attempt with the same client_seq already landed.
@@ -407,6 +415,12 @@ impl AccountService {
                 }
                 Err(ClientError::RequestTimeout) if attempt < MAX_RETRIES => {
                     tracing::warn!("Timeout on withdraw for {account_id:x}, attempt {attempt}");
+                    continue;
+                }
+                Err(ClientError::Server(ServerError::Write {
+                    kind: WriteError::InflightDuplicateWrite { .. }, ..
+                })) if attempt < MAX_RETRIES => {
+                    tracing::debug!("Inflight duplicate on withdraw for {account_id:x}, attempt {attempt}");
                     continue;
                 }
                 Err(ClientError::Server(ServerError::Write {
@@ -561,6 +575,12 @@ impl AccountService {
                 }
                 Err(ClientError::RequestTimeout) if attempt < MAX_RETRIES => {
                     tracing::warn!("Timeout on transfer, attempt {attempt}");
+                    continue;
+                }
+                Err(ClientError::Server(ServerError::Write {
+                    kind: WriteError::InflightDuplicateWrite { .. }, ..
+                })) if attempt < MAX_RETRIES => {
+                    tracing::debug!("Inflight duplicate on transfer, attempt {attempt}");
                     continue;
                 }
                 Err(ClientError::Server(ServerError::Write {

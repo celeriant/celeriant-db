@@ -39,6 +39,11 @@ pub enum WriteError {
     FsyncError,
     CacheAggregateClientError,
     AggregateExistsCacheError,
+    /// Write is fsynced but replication is not yet confirmed; client should retry.
+    InflightDuplicateWrite {
+        last_client_seq: Option<u64>,
+        attempted_client_seq: Option<u64>,
+    },
 }
 
 #[derive(Debug)]
@@ -161,6 +166,13 @@ impl From<ErrorResponse> for ServerError {
             WRITE_FSYNC_ERROR => ServerError::Write { kind: WriteError::FsyncError, error_message: msg },
             WRITE_CACHE_AGGREGATE_CLIENT_ERROR => ServerError::Write { kind: WriteError::CacheAggregateClientError, error_message: msg },
             WRITE_AGGREGATE_EXISTS_CACHE_ERROR => ServerError::Write { kind: WriteError::AggregateExistsCacheError, error_message: msg },
+            WRITE_INFLIGHT_DUPLICATE => ServerError::Write {
+                kind: WriteError::InflightDuplicateWrite {
+                    last_client_seq: parse_u64_field(&msg, "last_client_seq"),
+                    attempted_client_seq: parse_u64_field(&msg, "attempted_client_seq"),
+                },
+                error_message: msg,
+            },
 
             REGISTER_SCHEMA_ALREADY_EXISTS => ServerError::Schema { kind: SchemaError::AlreadyExists, error_message: msg },
             REGISTER_SCHEMA_INVALID => ServerError::Schema { kind: SchemaError::Invalid, error_message: msg },
@@ -256,6 +268,7 @@ impl std::fmt::Display for WriteError {
             WriteError::FsyncError => write!(f, "fsync error"),
             WriteError::CacheAggregateClientError => write!(f, "cache aggregate client error"),
             WriteError::AggregateExistsCacheError => write!(f, "aggregate exists cache error"),
+            WriteError::InflightDuplicateWrite { .. } => write!(f, "inflight duplicate write"),
         }
     }
 }

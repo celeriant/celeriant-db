@@ -18,7 +18,7 @@ use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::constants::{self, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, MIN_WRITE_ALIGNMENT, WIRE_VERSION_WAL_METABLOCK};
 use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
-use celeriant_wal::shard_log_header::ShardLogHeader;
+use celeriant_wal::shard_log_header::{HeaderCursor, ShardLogHeader};
 use celeriant_wire::disk::versioned_block::{deserialise_metablock, serialize_versioned_message};
 
 use crate::error::compaction_error::CompactionError;
@@ -673,14 +673,19 @@ async fn build_compacted_file(
     // fully replicated before compaction (enforced by the is_pending_advance guard), so
     // the hash chain and wal_seq represent already-verified state. The compacted content
     // no longer chains to this tip_hash — correctness is maintained by metablocks_position.
-    let header = ShardLogHeader {
+    // Compaction only runs on fully-replicated segments, so read == write.
+    let cursor = HeaderCursor {
         metablocks_position: final_metablocks_position,
         datablocks_position: final_datablocks_position,
         wal_seq: original_wal_seq,
         tip_hash: original_tip_hash,
+    };
+    let header = ShardLogHeader {
+        write: cursor.clone(),
         aggregate_bloom: bloom.to_bytes(),
         last_received_replication_wal_seq: original_last_received_replication_wal_seq,
         last_self_acked_wal_seq: original_last_self_acked_wal_seq,
+        read: cursor,
     };
 
     write_dual_shard_log_header(&new_file, tail_header_pos, &header)

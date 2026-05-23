@@ -75,7 +75,6 @@ fn register_metric_descriptions() {
     describe_gauge!("celeriant_replication_queue_high_water_bytes", "Replication queue threshold for S3 fallback");
     describe_gauge!("celeriant_replication_follower_pressured", "1 when follower is falling behind (S3 fallback imminent)");
     describe_counter!("celeriant_replication_s3_fallbacks_total", "Replication S3 fallbacks");
-    describe_counter!("celeriant_replication_rollbacks_total", "Replication rollbacks");
     describe_counter!("celeriant_replication_rollback_retries_total", "Replication rollback retry attempts");
     describe_counter!("celeriant_replication_rollback_io_error_total", "Replication rollback I/O failures");
     describe_counter!("celeriant_replication_rollback_lock_timeout_total", "Replication rollback aborted: could not acquire lock");

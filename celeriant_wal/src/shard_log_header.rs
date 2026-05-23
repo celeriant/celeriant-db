@@ -3,29 +3,62 @@ use deepsize::DeepSizeOf;
 
 use crate::constants::{AGGREGATE_BLOOM_BYTES, EntryHashBytes, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES};
 
+/// Position + sequence + hash snapshot for either the write cursor or the read cursor
+/// in a log segment header. Two of these are nested in [`ShardLogHeader`]; on the wire
+/// bincode encodes the inner fields inline (no tag/length prefix), so the layout is
+/// byte-identical to the previous flat representation.
+#[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
+pub struct HeaderCursor {
+    /// End of the last metablock entry (metablocks grow from start of file)
+    pub metablocks_position: u64,
+    /// Start of the most recent datablocks (datablocks grow from end of file)
+    pub datablocks_position: u64,
+    /// Shard-global WAL sequence at this cursor
+    pub wal_seq: u64,
+    /// Blake3 hash chain tip at this cursor
+    pub tip_hash: EntryHashBytes,
+}
+
+impl HeaderCursor {
+    const WIRE_SIZE_METABLOCKS_POSITION: usize = 8;
+    const WIRE_SIZE_DATABLOCKS_POSITION: usize = 8;
+    const WIRE_SIZE_WAL_SEQ: usize = 8;
+    const WIRE_SIZE_TIP_HASH: usize = 32;
+
+    pub const OFFSET_METABLOCKS_POSITION: usize = 0;
+    pub const OFFSET_DATABLOCKS_POSITION: usize =
+        Self::OFFSET_METABLOCKS_POSITION + Self::WIRE_SIZE_METABLOCKS_POSITION;
+    pub const OFFSET_WAL_SEQ: usize =
+        Self::OFFSET_DATABLOCKS_POSITION + Self::WIRE_SIZE_DATABLOCKS_POSITION;
+    pub const OFFSET_TIP_HASH: usize =
+        Self::OFFSET_WAL_SEQ + Self::WIRE_SIZE_WAL_SEQ;
+
+    pub const WIRE_SIZE_TOTAL: usize =
+        Self::OFFSET_TIP_HASH + Self::WIRE_SIZE_TIP_HASH;
+
+    pub fn genesis() -> Self {
+        Self {
+            metablocks_position: 0,
+            datablocks_position: 0,
+            wal_seq: 0,
+            tip_hash: GENESIS_HASH,
+        }
+    }
+}
+
 /// The header is written at the start and end of the fixed size log segment file.
 /// Writing both, protected by crc checks, allows recovery on torn writes.
 /// Header uses HEADER_BLOCK_SIZE_BYTES (512KB) to accommodate the bloom filter.
 #[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
 pub struct ShardLogHeader {
-    /// A metablock is 512 byte fixed size, written from the start of the file
-    /// This position indicates the end of the last written metablock entry
-    pub metablocks_position: u64,
-
-    /// The position where new variable length payloads can be written to
-    /// Note that event batches are written to end of the file
-    /// so this position indicates the start of the most recently written batches
-    pub datablocks_position: u64,
-
-    /// Shard-global WAL sequence representing the last written metablock
-    pub wal_seq: u64,
-
-    /// Blake3 hash of last metablock entry
-    pub tip_hash: EntryHashBytes,
+    /// Writer's view: most recently written metablocks (may not yet be replicated).
+    pub write: HeaderCursor,
 
     /// Bloom filter for aggregate keys written to this log segment.
     /// Used to quickly skip log segments during aggregate existence checks.
     /// A "definitely not in set" result means no metablocks for that aggregate exist.
+    /// The read cursor's covered range is always a subset of the write cursor's range,
+    /// so this write-cursor bloom is a valid superset filter for reads too.
     pub aggregate_bloom: Vec<u64>,
 
     /// Promotion-batch floor: `leader_confirmed_wal_seq + 1` from the highest-confirmed
@@ -44,33 +77,28 @@ pub struct ShardLogHeader {
     /// Persisted on the next regular header fsync. If we crash between the bump
     /// and that fsync, we lose it and might allow a truncate we'd otherwise refuse.
     pub last_self_acked_wal_seq: u64,
+
+    /// Reader's view: end of last replicated/confirmed metablock. A zero
+    /// `metablocks_position` is the sentinel meaning "read has not advanced to this
+    /// segment yet" (used after segment rotation, before first replication on the new
+    /// segment).
+    pub read: HeaderCursor,
 }
 
 impl ShardLogHeader {
-    // Wire format layout (bincode fixed-int encoding)
+    // Wire format layout (bincode fixed-int encoding, nested structs encoded inline).
     // Update these if field order or types change!
 
-    const WIRE_SIZE_METABLOCKS_POSITION: usize = 8;
-    const WIRE_SIZE_DATABLOCKS_POSITION: usize = 8;
-    const WIRE_SIZE_WAL_SEQ: usize = 8;
-    const WIRE_SIZE_TIP_HASH: usize = 32;
+    const WIRE_SIZE_WRITE_CURSOR: usize = HeaderCursor::WIRE_SIZE_TOTAL;
     const WIRE_SIZE_AGGREGATE_BLOOM: usize = AGGREGATE_BLOOM_BYTES;
     const WIRE_SIZE_LAST_RECEIVED_REPLICATION_WAL_SEQ: usize = 8;
     const WIRE_SIZE_LAST_SELF_ACKED_WAL_SEQ: usize = 8;
+    const WIRE_SIZE_READ_CURSOR: usize = HeaderCursor::WIRE_SIZE_TOTAL;
 
-    pub const OFFSET_METABLOCKS_POSITION: usize = 0;
-
-    pub const OFFSET_DATABLOCKS_POSITION: usize =
-        Self::OFFSET_METABLOCKS_POSITION + Self::WIRE_SIZE_METABLOCKS_POSITION;
-
-    pub const OFFSET_WAL_SEQ: usize =
-        Self::OFFSET_DATABLOCKS_POSITION + Self::WIRE_SIZE_DATABLOCKS_POSITION;
-
-    pub const OFFSET_TIP_HASH: usize =
-        Self::OFFSET_WAL_SEQ + Self::WIRE_SIZE_WAL_SEQ;
+    pub const OFFSET_WRITE_CURSOR: usize = 0;
 
     pub const OFFSET_AGGREGATE_BLOOM: usize =
-        Self::OFFSET_TIP_HASH + Self::WIRE_SIZE_TIP_HASH;
+        Self::OFFSET_WRITE_CURSOR + Self::WIRE_SIZE_WRITE_CURSOR;
 
     pub const OFFSET_LAST_RECEIVED_REPLICATION_WAL_SEQ: usize =
         Self::OFFSET_AGGREGATE_BLOOM + Self::WIRE_SIZE_AGGREGATE_BLOOM;
@@ -78,24 +106,33 @@ impl ShardLogHeader {
     pub const OFFSET_LAST_SELF_ACKED_WAL_SEQ: usize =
         Self::OFFSET_LAST_RECEIVED_REPLICATION_WAL_SEQ + Self::WIRE_SIZE_LAST_RECEIVED_REPLICATION_WAL_SEQ;
 
-    /// Total wire size of ShardLogHeader
-    pub const WIRE_SIZE_TOTAL: usize =
+    pub const OFFSET_READ_CURSOR: usize =
         Self::OFFSET_LAST_SELF_ACKED_WAL_SEQ + Self::WIRE_SIZE_LAST_SELF_ACKED_WAL_SEQ;
 
+    /// Total wire size of ShardLogHeader
+    pub const WIRE_SIZE_TOTAL: usize =
+        Self::OFFSET_READ_CURSOR + Self::WIRE_SIZE_READ_CURSOR;
+
     pub fn new(file_len: u64) -> Self {
-        Self {
-            metablocks_position: HEADER_BLOCK_SIZE_BYTES as u64,
-            datablocks_position: file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64),
+        let metablocks_position = HEADER_BLOCK_SIZE_BYTES as u64;
+        let datablocks_position = file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64);
+        let cursor = HeaderCursor {
+            metablocks_position,
+            datablocks_position,
             wal_seq: 0,
             tip_hash: GENESIS_HASH,
+        };
+        Self {
+            write: cursor.clone(),
             aggregate_bloom: vec![],
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
+            read: cursor,
         }
     }
 
     pub fn available_space(&self) -> u64 {
-        self.datablocks_position.saturating_sub(self.metablocks_position)
+        self.write.datablocks_position.saturating_sub(self.write.metablocks_position)
     }
 
     pub fn has_space_for(&self, metablock_size: u64, datablock_size: u64) -> bool {
@@ -107,10 +144,12 @@ impl ShardLogHeader {
         metablock_size: u64,
         datablock_size: u64,
     ) {
-        self.metablocks_position = self
+        self.write.metablocks_position = self
+            .write
             .metablocks_position
             .saturating_add(metablock_size);
-        self.datablocks_position = self
+        self.write.datablocks_position = self
+            .write
             .datablocks_position
             .saturating_sub(datablock_size);
     }
@@ -127,9 +166,9 @@ mod tests {
     fn test_new_initializes_positions_correctly() {
         let header = ShardLogHeader::new(TEST_FILE_LEN);
 
-        assert_eq!(header.metablocks_position, HEADER_BLOCK_SIZE_BYTES as u64);
+        assert_eq!(header.write.metablocks_position, HEADER_BLOCK_SIZE_BYTES as u64);
         assert_eq!(
-            header.datablocks_position,
+            header.write.datablocks_position,
             TEST_FILE_LEN - HEADER_BLOCK_SIZE_BYTES as u64
         );
     }
@@ -139,8 +178,8 @@ mod tests {
         let small_file_len = (HEADER_BLOCK_SIZE_BYTES / 2) as u64;
         let header = ShardLogHeader::new(small_file_len);
 
-        assert_eq!(header.metablocks_position, HEADER_BLOCK_SIZE_BYTES as u64);
-        assert_eq!(header.datablocks_position, 0); // saturating_sub prevents underflow
+        assert_eq!(header.write.metablocks_position, HEADER_BLOCK_SIZE_BYTES as u64);
+        assert_eq!(header.write.datablocks_position, 0); // saturating_sub prevents underflow
     }
 
     #[test]
@@ -154,13 +193,16 @@ mod tests {
     #[test]
     fn test_available_space_when_positions_overlap() {
         let header = ShardLogHeader {
-            metablocks_position: 1000,
-            datablocks_position: 500,
-            wal_seq: 0,
-            tip_hash: GENESIS_HASH,
+            write: HeaderCursor {
+                metablocks_position: 1000,
+                datablocks_position: 500,
+                wal_seq: 0,
+                tip_hash: GENESIS_HASH,
+            },
             aggregate_bloom: vec![],
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
+            read: HeaderCursor::genesis(),
         };
 
         assert_eq!(header.available_space(), 0); // saturating_sub prevents underflow
@@ -190,13 +232,13 @@ mod tests {
     #[test]
     fn test_append_event_batches_updates_positions() {
         let mut header = ShardLogHeader::new(TEST_FILE_LEN);
-        let initial_meta = header.metablocks_position;
-        let initial_data = header.datablocks_position;
+        let initial_meta = header.write.metablocks_position;
+        let initial_data = header.write.datablocks_position;
 
         header.append_event_batches(512, 1024);
 
-        assert_eq!(header.metablocks_position, initial_meta + 512);
-        assert_eq!(header.datablocks_position, initial_data - 1024);
+        assert_eq!(header.write.metablocks_position, initial_meta + 512);
+        assert_eq!(header.write.datablocks_position, initial_data - 1024);
     }
 
     #[test]
@@ -207,11 +249,11 @@ mod tests {
         header.append_event_batches(150, 300);
 
         assert_eq!(
-            header.metablocks_position,
+            header.write.metablocks_position,
             HEADER_BLOCK_SIZE_BYTES as u64 + 250
         );
         assert_eq!(
-            header.datablocks_position,
+            header.write.datablocks_position,
             TEST_FILE_LEN - HEADER_BLOCK_SIZE_BYTES as u64 - 500
         );
     }

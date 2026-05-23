@@ -155,34 +155,35 @@ cargo add celeriant_client_tokio
 ```
 
 ```rust
-use celeriant_client_tokio::{CeleriantClient, json_event, from_json};
+use celeriant_client_tokio::{CeleriantPool, PoolOptions, from_json, json_event};
 use celeriant_msg::request::read_filters::ReadFilters;
 use celeriant_msg::request::requests::ReadRequest;
-use celeriant_wal::AggregateKey;
-use serde::{Serialize, Deserialize};
+use celeriant_wal::aggregate_key::AggregateKey;
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
-struct OrderPlaced { order_id: u64, amount: f64 }
+struct OrderPlaced { order_id: u64, amount_cents: u64 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = CeleriantClient::connect("localhost:10000").await?;
+    let pool = CeleriantPool::new(PoolOptions::new("localhost:10000"));
 
     let key = AggregateKey::new(1, 1, 1001);
 
     // Write
-    let events = vec![json_event(1, &OrderPlaced { order_id: 42, amount: 99.95 })?];
-    client.write_events(key.clone(), events).await?;
+    let order_event = OrderPlaced { order_id: 42, amount_cents: 9995 };
+    let events = vec![json_event(1, &order_event)?];
+    pool.write_events(key.clone(), events).await?;
 
     // Read
-    let response = client.read(ReadRequest {
+    let response = pool.read(ReadRequest {
         correlation_id: None,
         aggregate_key: key,
         filters: ReadFilters::new(1),
     }).await?;
 
     let order: OrderPlaced = from_json(&response.event_batches[0].events[0])?;
-    println!("order_id={}, amount={}", order.order_id, order.amount);
+    println!("order_id={}, amount_cents={}", order.order_id, order.amount_cents);
     Ok(())
 }
 ```

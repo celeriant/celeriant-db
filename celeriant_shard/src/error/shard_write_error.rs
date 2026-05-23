@@ -12,8 +12,15 @@ pub enum ShardWriteError {
         client_seq: u64,
     },
 
-    /// Client already wrote an event with this or higher client_seq.
+    /// Client already wrote an event with this or higher client_seq, and it is durable.
     ClientIdempotencyViolation {
+        last_client_seq: u64,
+        attempted_client_seq: u64,
+    },
+
+    /// Client is retrying a write that is fsynced but not yet replicated.
+    /// Transient; retry after replication completes or the write is rolled back.
+    InflightDuplicateWrite {
         last_client_seq: u64,
         attempted_client_seq: u64,
     },
@@ -67,6 +74,7 @@ impl ShardWriteError {
             Self::EmptyEventsList => "empty_events_list",
             Self::ZeroEventType { .. } => "zero_event_type",
             Self::ClientIdempotencyViolation { .. } => "client_idempotency_violation",
+            Self::InflightDuplicateWrite { .. } => "inflight_duplicate_write",
             Self::OptimisticConcurrencyViolation { .. } => "optimistic_concurrency_violation",
             Self::FailedToSerialiseDatablocks(_) => "serialise_datablocks_failed",
             Self::AggregateNotExists => "aggregate_not_exists",

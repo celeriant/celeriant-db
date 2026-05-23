@@ -144,7 +144,7 @@ pub fn deserialise_shard_log_header(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use celeriant_wal::{aggregate_key::AggregateKey, buffer_read::{read_option_u128_le, read_u64_le, read_u128_le}, constants::{FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES, WIRE_SIZE_ENUM_DISCRIMINANT}, metablocks::metablock_event_batch::MetablockEventBatch, shard_log_header::ShardLogHeader};
+    use celeriant_wal::{aggregate_key::AggregateKey, buffer_read::{read_option_u128_le, read_u64_le, read_u128_le}, constants::{FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES, WIRE_SIZE_ENUM_DISCRIMINANT}, metablocks::metablock_event_batch::MetablockEventBatch, shard_log_header::{HeaderCursor, ShardLogHeader}};
 
     fn indexing_metablock_event_batch() -> Metablock {
         Metablock {
@@ -237,13 +237,16 @@ mod tests {
         // Use larger values that will occupy more bytes in the serialized output
         // to make the off-by-one zeroing bug more apparent
         let header = ShardLogHeader {
-            metablocks_position: 0x1234_5678_9ABC_DEF0,
-            datablocks_position: 0xFEDC_BA98_7654_3210,
-            wal_seq: 0x0FED_CBA9_8765_4321,
+            write: HeaderCursor {
+                metablocks_position: 0x1234_5678_9ABC_DEF0,
+                datablocks_position: 0xFEDC_BA98_7654_3210,
+                wal_seq: 0x0FED_CBA9_8765_4321,
+                tip_hash: GENESIS_HASH,
+            },
             aggregate_bloom: vec![],
-            tip_hash: GENESIS_HASH,
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
+            read: HeaderCursor::genesis(),
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -254,14 +257,14 @@ mod tests {
         // The bug `buffer[len+1..].fill(0)` zeros bytes starting at the wrong offset,
         // corrupting the latter portion of the serialized data (datablocks_position)
         assert_eq!(
-            deserialized.datablocks_position, 
-            header.datablocks_position,
-            "datablocks_position was corrupted - likely due to incorrect zero-fill offset"
+            deserialized.write.datablocks_position,
+            header.write.datablocks_position,
+            "write_datablocks_position was corrupted - likely due to incorrect zero-fill offset"
         );
         assert_eq!(
-            deserialized.wal_seq, 
-            header.wal_seq,
-            "wal_seq was corrupted - likely due to incorrect zero-fill offset"
+            deserialized.write.wal_seq,
+            header.write.wal_seq,
+            "write_wal_seq was corrupted - likely due to incorrect zero-fill offset"
         );
     }
 
@@ -273,14 +276,18 @@ mod tests {
             0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
             0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
         ];
-        let header = ShardLogHeader {
+        let cursor = HeaderCursor {
             metablocks_position: 11,
             datablocks_position: 12,
             wal_seq: 13,
-            aggregate_bloom: vec![],
             tip_hash,
+        };
+        let header = ShardLogHeader {
+            write: cursor.clone(),
+            aggregate_bloom: vec![],
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
+            read: cursor,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -288,22 +295,27 @@ mod tests {
 
         let deserialized = deserialise_shard_log_header(&buffer).unwrap();
 
-        assert_eq!(deserialized.metablocks_position, header.metablocks_position);
-        assert_eq!(deserialized.datablocks_position, header.datablocks_position);
-        assert_eq!(deserialized.wal_seq, header.wal_seq);
-        assert_eq!(deserialized.tip_hash, header.tip_hash);
+        assert_eq!(deserialized.write.metablocks_position, header.write.metablocks_position);
+        assert_eq!(deserialized.write.datablocks_position, header.write.datablocks_position);
+        assert_eq!(deserialized.write.wal_seq, header.write.wal_seq);
+        assert_eq!(deserialized.write.tip_hash, header.write.tip_hash);
+        assert_eq!(deserialized.read.wal_seq, header.read.wal_seq);
+        assert_eq!(deserialized.read.tip_hash, header.read.tip_hash);
     }
 
     #[test]
     fn crc_mismatch_detected_for_header() {
         let header = ShardLogHeader {
-            metablocks_position: 11,
-            datablocks_position: 12,
-            wal_seq: 13,
+            write: HeaderCursor {
+                metablocks_position: 11,
+                datablocks_position: 12,
+                wal_seq: 13,
+                tip_hash: GENESIS_HASH,
+            },
             aggregate_bloom: vec![],
-            tip_hash: GENESIS_HASH,
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
+            read: HeaderCursor::genesis(),
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -319,13 +331,16 @@ mod tests {
     #[test]
     fn crc_covers_payload_data() {
         let header = ShardLogHeader {
-            metablocks_position: 0x1111_1111_1111_1111,
-            datablocks_position: 0x2222_2222_2222_2222,
-            wal_seq: 0x3333_3333_3333_3333,
+            write: HeaderCursor {
+                metablocks_position: 0x1111_1111_1111_1111,
+                datablocks_position: 0x2222_2222_2222_2222,
+                wal_seq: 0x3333_3333_3333_3333,
+                tip_hash: GENESIS_HASH,
+            },
             aggregate_bloom: vec![],
-            tip_hash: GENESIS_HASH,
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
+            read: HeaderCursor::genesis(),
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -344,13 +359,16 @@ mod tests {
     #[test]
     fn crc_covers_version_field() {
         let header = ShardLogHeader {
-            metablocks_position: 11,
-            datablocks_position: 12,
-            wal_seq: 13,
+            write: HeaderCursor {
+                metablocks_position: 11,
+                datablocks_position: 12,
+                wal_seq: 13,
+                tip_hash: GENESIS_HASH,
+            },
             aggregate_bloom: vec![],
-            tip_hash: GENESIS_HASH,
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
+            read: HeaderCursor::genesis(),
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -369,13 +387,16 @@ mod tests {
     #[test]
     fn crc_does_not_cover_itself() {
         let header = ShardLogHeader {
-            metablocks_position: 11,
-            datablocks_position: 12,
-            wal_seq: 13,
+            write: HeaderCursor {
+                metablocks_position: 11,
+                datablocks_position: 12,
+                wal_seq: 13,
+                tip_hash: GENESIS_HASH,
+            },
             aggregate_bloom: vec![],
-            tip_hash: GENESIS_HASH,
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
+            read: HeaderCursor::genesis(),
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -394,13 +415,16 @@ mod tests {
     #[test]
     fn unsupported_version_rejected_for_header() {
         let header = ShardLogHeader {
-            metablocks_position: 11,
-            datablocks_position: 12,
-            wal_seq: 13,
+            write: HeaderCursor {
+                metablocks_position: 11,
+                datablocks_position: 12,
+                wal_seq: 13,
+                tip_hash: GENESIS_HASH,
+            },
             aggregate_bloom: vec![],
-            tip_hash: GENESIS_HASH,
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
+            read: HeaderCursor::genesis(),
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -421,13 +445,16 @@ mod tests {
     #[test]
     fn version_written_as_little_endian() {
         let header = ShardLogHeader {
-            metablocks_position: 11,
-            datablocks_position: 12,
-            wal_seq: 13,
+            write: HeaderCursor {
+                metablocks_position: 11,
+                datablocks_position: 12,
+                wal_seq: 13,
+                tip_hash: GENESIS_HASH,
+            },
             aggregate_bloom: vec![],
-            tip_hash: GENESIS_HASH,
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
+            read: HeaderCursor::genesis(),
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];

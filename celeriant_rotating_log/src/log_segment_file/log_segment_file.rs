@@ -3,7 +3,7 @@ use std::{cell::RefCell, path::{Path, PathBuf}, rc::Rc};
 use celeriant_disk::files::{open_dma_files::{create_file_dma, existing_file_dma}, rwlock_timeout::{LockTimeoutError, read_with_timeout, write_with_timeout}};
 use celeriant_wal::{
     constants::{AGGREGATE_BLOOM_BYTES, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_SHARD_LOG_HEADER},
-    shard_log_header::ShardLogHeader,
+    shard_log_header::{HeaderCursor, ShardLogHeader},
 };
 use celeriant_wire::disk::{
     versioned_block::{deserialise_shard_log_header, serialize_versioned_message},
@@ -64,7 +64,8 @@ impl LogSegmentFile {
     pub async fn rotate(&self, shard_dir: &PathBuf, preallocate_bytes: u64) -> Result<Self, OpenOrCreateError> {
         let (new_log_id, wal_seq, tip_hash, last_received_replication_wal_seq, last_self_acked_wal_seq) = {
             let meta = self.metadata.borrow();
-            (meta.log_id + 1, meta.write.wal_seq, meta.write.tip_hash, meta.last_received_replication_wal_seq, meta.last_self_acked_wal_seq)
+            (meta.log_id + 1, meta.write.wal_seq, meta.write.tip_hash,
+             meta.last_received_replication_wal_seq, meta.last_self_acked_wal_seq)
         };
 
         let log_path = shard_dir.join(log_file_name(new_log_id));
@@ -125,11 +126,18 @@ impl LogSegmentFile {
                 };
                 if let Some(io_err) = io_err {
                     if io_err.kind() == std::io::ErrorKind::StorageFull {
-                        panic!(
-                            "rotation failed: ENOSPC on {} (preallocate {} bytes) — physical NVMe is not resizable, requires operator intervention",
-                            log_path.display(),
-                            preallocate_bytes
+                        tracing::error!(
+                            new_log_id,
+                            path = %log_path.display(),
+                            preallocate_bytes,
+                            "Rotation failed: ENOSPC during create+preallocate. Shard stays alive but writes that need rotation will fail until disk space is recovered."
                         );
+                        metrics::counter!("celeriant_rotation_out_of_space_total").increment(1);
+                        return Err(OpenOrCreateError::OutOfSpace {
+                            log_id: new_log_id,
+                            path: log_path.to_string_lossy().into_owned(),
+                            preallocate_bytes,
+                        });
                     }
                 }
                 return Err(OpenOrCreateError::UnableToCreateLogSegmentFile {
@@ -211,7 +219,7 @@ async fn build_log_segment(
         source: e.to_string(),
     })?;
 
-    let datablocks_carry_over = read_datablocks_carry_over_bytes(&reader, header.datablocks_position).await
+    let datablocks_carry_over = read_datablocks_carry_over_bytes(&reader, header.write.datablocks_position).await
         .map_err(|source| OpenOrCreateError::LogSegmentFileReadError {
             log_id,
             source: source.to_string(),
@@ -235,6 +243,14 @@ async fn load_existing_file(
     advance_read: bool,
 ) -> Result<LogSegmentFile, OpenOrCreateError> {
     let header = load_header_detecting_corruption(&mut writer, file_len, log_id).await?;
+    tracing::info!(
+        log_id,
+        write_wal_seq = header.write.wal_seq,
+        read_wal_seq = header.read.wal_seq,
+        last_self_acked_wal_seq = header.last_self_acked_wal_seq,
+        last_received_replication_wal_seq = header.last_received_replication_wal_seq,
+        "log segment opened — persisted cursor and barrier values"
+    );
     build_log_segment(log_id, log_path, writer, file_len, &header, advance_read).await
 }
 
@@ -250,7 +266,7 @@ async fn create_new_file(
     last_received_replication_wal_seq: u64,
     last_self_acked_wal_seq: u64,
 ) -> Result<LogSegmentFile, OpenOrCreateError> {
-    let header = setup_new_file(&mut writer, log_id, dir_path, file_len, wal_seq, tip_hash, last_received_replication_wal_seq, last_self_acked_wal_seq).await?;
+    let header = setup_new_file(&mut writer, log_id, dir_path, file_len, wal_seq, tip_hash, last_received_replication_wal_seq, last_self_acked_wal_seq, advance_read).await?;
     build_log_segment(log_id, log_path, writer, file_len, &header, advance_read).await
 }
 
@@ -321,18 +337,35 @@ async fn load_header_detecting_corruption(dma_file: &mut DmaFile, file_len: u64,
 /// Setup a new file, writing the header to the start and end of the file
 /// Assumes the file already is preallocated to file_len. Will fsync the
 /// file and fsync the parent directory.
-async fn setup_new_file(dma_file: &mut DmaFile, log_id: u64, dir_path: &PathBuf, file_len: u64, wal_seq: u64, tip_hash: [u8; 32], last_received_replication_wal_seq: u64, last_self_acked_wal_seq: u64) -> Result<ShardLogHeader, OpenOrCreateError> {
-    let header = ShardLogHeader {
+async fn setup_new_file(dma_file: &mut DmaFile, log_id: u64, dir_path: &PathBuf, file_len: u64, wal_seq: u64, tip_hash: [u8; 32], last_received_replication_wal_seq: u64, last_self_acked_wal_seq: u64, advance_read: bool) -> Result<ShardLogHeader, OpenOrCreateError> {
+    let write = HeaderCursor {
         metablocks_position: HEADER_BLOCK_SIZE_BYTES as u64,
         datablocks_position: file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64),
         wal_seq,
-        aggregate_bloom: vec![0u64; AGGREGATE_BLOOM_BYTES / 8],
         tip_hash,
+    };
+    // For new files with advance_read=true (first shard startup), persist read == write so
+    // reload correctly restores read=Some. For rotation (advance_read=false), write the zero
+    // sentinel so reload restores read=None.
+    let read = if advance_read {
+        write.clone()
+    } else {
+        HeaderCursor {
+            metablocks_position: 0,
+            datablocks_position: 0,
+            wal_seq: 0,
+            tip_hash: GENESIS_HASH,
+        }
+    };
+    let header = ShardLogHeader {
+        write,
+        aggregate_bloom: vec![0u64; AGGREGATE_BLOOM_BYTES / 8],
         last_received_replication_wal_seq,
         last_self_acked_wal_seq,
+        read,
     };
 
-    write_dual_shard_log_header(dma_file, header.datablocks_position, &header)
+    write_dual_shard_log_header(dma_file, header.write.datablocks_position, &header)
         .await
         .map_err(|source| OpenOrCreateError::LogSegmentFileHeaderWriteFailure { log_id, source })?;
 

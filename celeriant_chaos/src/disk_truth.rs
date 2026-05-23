@@ -32,42 +32,71 @@ pub struct DiskTruthEntry {
     pub follower_summary: String,
 }
 
+const DISK_TRUTH_WORKERS: usize = 16;
+
 /// Run wal-inspect on both nodes for each entry, reclassify against disk.
-/// Returns empty vec on SSH failure for an entry (verification skipped, not
-/// fatal).
+/// SSH failures for an entry produce an empty DiskTruthEntry with a "no-batches"
+/// summary; the entry stays in the report.
 pub fn verify_against_disk_truth(
     leader_host: &str,
     follower_host: &str,
     entries: &[DeepAuditEntry],
 ) -> Vec<DiskTruthEntry> {
-    let mut out = Vec::with_capacity(entries.len());
-    for e in entries {
-        let Some((org, type_id, agg_id)) = parse_agg_key(&e.aggregate_key_str) else {
-            continue;
-        };
-        let leader = scan_node(leader_host, org, type_id, agg_id, e.client_id);
-        let follower = scan_node(follower_host, org, type_id, agg_id, e.client_id);
+    use std::sync::Mutex;
 
-        let union: std::collections::BTreeSet<u64> = leader.seqs.union(&follower.seqs).copied().collect();
+    let work: Vec<&DeepAuditEntry> = entries
+        .iter()
+        .filter(|e| parse_agg_key(&e.aggregate_key_str).is_some())
+        .collect();
 
-        let actually_missing: Vec<u64> = (1..=e.max_acked).filter(|s| !union.contains(s)).collect();
-        let audit_overreported: Vec<u64> = e.missing_seqs.iter()
-            .filter(|s| union.contains(s))
-            .copied()
-            .collect();
-
-        out.push(DiskTruthEntry {
-            aggregate_key_str: e.aggregate_key_str.clone(),
-            client_id: e.client_id,
-            max_acked: e.max_acked,
-            audit_missing: e.missing_seqs.clone(),
-            actually_missing,
-            audit_overreported,
-            leader_summary: leader.summary,
-            follower_summary: follower.summary,
-        });
+    if work.is_empty() {
+        return Vec::new();
     }
-    out
+
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: Mutex<Vec<Option<DiskTruthEntry>>> = Mutex::new((0..work.len()).map(|_| None).collect());
+
+    std::thread::scope(|scope| {
+        for _ in 0..DISK_TRUTH_WORKERS.min(work.len()) {
+            scope.spawn(|| loop {
+                let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if idx >= work.len() {
+                    return;
+                }
+                let e = work[idx];
+                let entry = verify_one_entry(leader_host, follower_host, e);
+                results.lock().unwrap()[idx] = Some(entry);
+            });
+        }
+    });
+
+    results.into_inner().unwrap().into_iter().flatten().collect()
+}
+
+fn verify_one_entry(leader_host: &str, follower_host: &str, e: &DeepAuditEntry) -> DiskTruthEntry {
+    let (org, type_id, agg_id) = parse_agg_key(&e.aggregate_key_str).expect("filtered above");
+    let leader = scan_node(leader_host, org, type_id, agg_id, e.client_id);
+    let follower = scan_node(follower_host, org, type_id, agg_id, e.client_id);
+
+    let union: std::collections::BTreeSet<u64> = leader.seqs.union(&follower.seqs).copied().collect();
+    let actually_missing: Vec<u64> = (1..=e.max_acked).filter(|s| !union.contains(s)).collect();
+    let audit_overreported: Vec<u64> = e
+        .missing_seqs
+        .iter()
+        .filter(|s| union.contains(s))
+        .copied()
+        .collect();
+
+    DiskTruthEntry {
+        aggregate_key_str: e.aggregate_key_str.clone(),
+        client_id: e.client_id,
+        max_acked: e.max_acked,
+        audit_missing: e.missing_seqs.clone(),
+        actually_missing,
+        audit_overreported,
+        leader_summary: leader.summary,
+        follower_summary: follower.summary,
+    }
 }
 
 #[derive(Default)]

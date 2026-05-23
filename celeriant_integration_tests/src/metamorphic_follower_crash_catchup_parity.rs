@@ -22,7 +22,7 @@
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{
     metamorphic_common::{diff_aggregate, format_key, response_digest, DiffMode},
-    poll_event_count, read_all_batches, s3_cluster_config, scrape_counter,
+    poll_event_count, read_all_batches, s3_cluster_config,
     wait_for_election_and_replication, write_event, MinioContainer, TestServer,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
@@ -67,14 +67,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Waiting for election + replication connection...");
     wait_for_election_and_replication().await;
-
-    // Baseline rollback counter on the leader. No leader-side replication
-    // rollback should fire anywhere in this scenario (SIGKILL -> S3 fallback
-    // -> boot catchup -> resumed TCP is all clean-path), so the delta at the
-    // end must be zero.
-    let rollbacks_before =
-        scrape_counter("127.0.0.1", metrics_port, "celeriant_replication_rollbacks_total").await?;
-    println!("  leader rollbacks_total baseline = {}", rollbacks_before);
 
     let keys: Vec<AggregateKey> = (0..AGGREGATE_COUNT)
         .map(|shard_id| AggregateKey::new(1, shard_id, 1))
@@ -193,26 +185,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ).into());
     }
 
-    // Clean-path invariant: no leader-side replication rollback during this
-    // scenario. Phase B's writes all take the S3 fallback path (intentional,
-    // not a rollback), Phase D uses TCP replication once the follower is back.
-    // If this counter increments, something in the pipeline is wrongly
-    // treating a transient failure as "both paths dead".
-    let rollbacks_after =
-        scrape_counter("127.0.0.1", metrics_port, "celeriant_replication_rollbacks_total").await?;
-    let rollback_delta = rollbacks_after.saturating_sub(rollbacks_before);
-    println!(
-        "  leader rollbacks_total: {} -> {} (delta = {})",
-        rollbacks_before, rollbacks_after, rollback_delta
-    );
-    if rollback_delta != 0 {
-        return Err(format!(
-            "leader rollback counter incremented by {} during a clean follower-crash + catchup cycle — \
-             unexpected rollback in the replication pipeline.",
-            rollback_delta
-        ).into());
-    }
-
-    println!("\n=== PASS: leader and follower are byte-identical after S3 boot catchup + TCP resume; no leader rollbacks ===");
+    println!("\n=== PASS: leader and follower are byte-identical after S3 boot catchup + TCP resume ===");
     Ok(())
 }

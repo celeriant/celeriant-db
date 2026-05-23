@@ -20,7 +20,6 @@ pub struct NodeSample {
     pub leader_elections_total: u64,
     pub heartbeat_failures_total: u64,
     pub s3_fallbacks_total: u64,
-    pub rollbacks_total: u64,
     pub shard_panics_total: u64,
     pub node_starts_total: u64,
     /// Sum of `celeriant_client_connections_active` across all shards.
@@ -47,6 +46,9 @@ pub struct NodeSample {
     pub truncate_dropped_committed_events_total: u64,
     /// Total bytes of committed metablocks dropped by truncate_wal.
     pub truncate_dropped_committed_bytes_total: u64,
+    /// Replication failure returned the snapshot to pending instead of rolling back
+    /// the write cursor. Prevents divergent S3 chains.
+    pub replication_rollback_deferred_total: u64,
     /// truncate_wal dropped wal_seqs this node acked as leader. Non-zero means
     /// real data loss.
     pub truncate_dropped_self_acked_events_total: u64,
@@ -55,13 +57,24 @@ pub struct NodeSample {
     /// S3 catchup skipped a batch this node uploaded. Counts how often the
     /// self-filter fires.
     pub s3_catchup_self_uploads_seen_total: u64,
-    /// truncate_wal refused to truncate because divergent_wal_seq was at or
-    /// below the cluster-wide ack barrier.
+    /// truncate_wal refused because divergent_wal_seq is at or below last_self_acked.
     pub truncate_refused_due_to_ack_barrier_total: u64,
-    /// Subset of truncate_refused_due_to_ack_barrier where the follower signal
-    /// (last_received_replication_wal_seq - 1) was the deciding blocker, i.e.
-    /// it exceeded this node's last_self_acked.
-    pub truncate_refused_by_follower_signal_total: u64,
+    /// Size of the OCC/idempotency LRU at cull time.
+    pub cull_stale_client_seq_lru: u64,
+    pub cull_stale_agg_lru: u64,
+    pub client_idempotency_violations_total: u64,
+    /// Same client_seq retried while the original is fsynced-but-not-yet-replicated.
+    pub client_idempotency_inflight_total: u64,
+    /// Batches dropped from pending_replication on cull.
+    pub take_pending_replication_dropped_batches: u64,
+    /// find_divergence advanced past byte-identical prefix of the matched S3 batch.
+    pub truncate_divergence_advanced_total: u64,
+    pub truncate_divergence_advanced_wal_seqs_total: u64,
+    /// Sealed-segment read skipped because the bloom filter said not-present.
+    pub read_bloom_short_circuit_total: u64,
+    /// Header-only fsync at replication commit, persisting last_self_acked_wal_seq.
+    pub barrier_sync_fsync_total: u64,
+    pub barrier_sync_fsync_failed_total: u64,
 }
 
 impl NodeSample {
@@ -78,7 +91,6 @@ impl NodeSample {
             leader_elections_total: 0,
             heartbeat_failures_total: 0,
             s3_fallbacks_total: 0,
-            rollbacks_total: 0,
             shard_panics_total: 0,
             node_starts_total: 0,
             client_connections_active: 0,
@@ -89,11 +101,21 @@ impl NodeSample {
             cache_client_scan_found_total: 0,
             truncate_dropped_committed_events_total: 0,
             truncate_dropped_committed_bytes_total: 0,
+            replication_rollback_deferred_total: 0,
             truncate_dropped_self_acked_events_total: 0,
             truncate_dropped_self_acked_wal_seqs_total: 0,
             s3_catchup_self_uploads_seen_total: 0,
             truncate_refused_due_to_ack_barrier_total: 0,
-            truncate_refused_by_follower_signal_total: 0,
+            cull_stale_client_seq_lru: 0,
+            cull_stale_agg_lru: 0,
+            client_idempotency_violations_total: 0,
+            client_idempotency_inflight_total: 0,
+            take_pending_replication_dropped_batches: 0,
+            truncate_divergence_advanced_total: 0,
+            truncate_divergence_advanced_wal_seqs_total: 0,
+            read_bloom_short_circuit_total: 0,
+            barrier_sync_fsync_total: 0,
+            barrier_sync_fsync_failed_total: 0,
         }
     }
 }
@@ -115,7 +137,6 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         "celeriant_leader_elections_total",
         "celeriant_heartbeat_failures_total",
         "celeriant_replication_s3_fallbacks_total",
-        "celeriant_replication_rollbacks_total",
         "celeriant_shard_panics_total",
         "celeriant_node_starts_total",
         "celeriant_replication_capture_dropped_items_total",
@@ -125,11 +146,21 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         "celeriant_cache_aggregate_client_scan_found_total",
         "celeriant_truncate_dropped_committed_metablocks_events_total",
         "celeriant_truncate_dropped_committed_bytes_total",
+        "celeriant_replication_rollback_deferred_total",
         "celeriant_truncate_dropped_self_acked_events_total",
         "celeriant_truncate_dropped_self_acked_wal_seqs_total",
         "celeriant_s3_catchup_self_uploads_seen_total",
         "celeriant_truncate_refused_due_to_ack_barrier_total",
-        "celeriant_truncate_refused_by_follower_signal_total",
+        "celeriant_cull_stale_client_seq_lru",
+        "celeriant_cull_stale_agg_lru",
+        "celeriant_client_idempotency_violations_total",
+        "celeriant_client_idempotency_inflight_total",
+        "celeriant_take_pending_replication_dropped_batches",
+        "celeriant_truncate_divergence_advanced_total",
+        "celeriant_truncate_divergence_advanced_wal_seqs_total",
+        "celeriant_read_bloom_short_circuit_total",
+        "celeriant_barrier_sync_fsync_total",
+        "celeriant_barrier_sync_fsync_failed_total",
     ];
 
     for line in body.lines() {
@@ -188,7 +219,6 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         leader_elections_total: get("celeriant_leader_elections_total"),
         heartbeat_failures_total: get("celeriant_heartbeat_failures_total"),
         s3_fallbacks_total: get("celeriant_replication_s3_fallbacks_total"),
-        rollbacks_total: get("celeriant_replication_rollbacks_total"),
         shard_panics_total: get("celeriant_shard_panics_total"),
         node_starts_total: get("celeriant_node_starts_total"),
         client_connections_active,
@@ -199,11 +229,21 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         cache_client_scan_found_total: get("celeriant_cache_aggregate_client_scan_found_total"),
         truncate_dropped_committed_events_total: get("celeriant_truncate_dropped_committed_metablocks_events_total"),
         truncate_dropped_committed_bytes_total: get("celeriant_truncate_dropped_committed_bytes_total"),
+        replication_rollback_deferred_total: get("celeriant_replication_rollback_deferred_total"),
         truncate_dropped_self_acked_events_total: get("celeriant_truncate_dropped_self_acked_events_total"),
         truncate_dropped_self_acked_wal_seqs_total: get("celeriant_truncate_dropped_self_acked_wal_seqs_total"),
         s3_catchup_self_uploads_seen_total: get("celeriant_s3_catchup_self_uploads_seen_total"),
         truncate_refused_due_to_ack_barrier_total: get("celeriant_truncate_refused_due_to_ack_barrier_total"),
-        truncate_refused_by_follower_signal_total: get("celeriant_truncate_refused_by_follower_signal_total"),
+        cull_stale_client_seq_lru: get("celeriant_cull_stale_client_seq_lru"),
+        cull_stale_agg_lru: get("celeriant_cull_stale_agg_lru"),
+        client_idempotency_violations_total: get("celeriant_client_idempotency_violations_total"),
+        client_idempotency_inflight_total: get("celeriant_client_idempotency_inflight_total"),
+        take_pending_replication_dropped_batches: get("celeriant_take_pending_replication_dropped_batches"),
+        truncate_divergence_advanced_total: get("celeriant_truncate_divergence_advanced_total"),
+        truncate_divergence_advanced_wal_seqs_total: get("celeriant_truncate_divergence_advanced_wal_seqs_total"),
+        read_bloom_short_circuit_total: get("celeriant_read_bloom_short_circuit_total"),
+        barrier_sync_fsync_total: get("celeriant_barrier_sync_fsync_total"),
+        barrier_sync_fsync_failed_total: get("celeriant_barrier_sync_fsync_failed_total"),
     }
 }
 

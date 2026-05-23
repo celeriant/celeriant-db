@@ -36,6 +36,8 @@ pub const WRITE_AGGREGATE_EXISTS_CACHE_ERROR: u32 = 2010;
 /// Returned when a write is sent to a non-leader node.
 pub const WRITE_NOT_LEADER: u32 = 2011;
 pub const WRITE_REPLICATION_BACKPRESSURE: u32 = 2012;
+/// Write is fsynced but replication is not yet confirmed; client should retry.
+pub const WRITE_INFLIGHT_DUPLICATE: u32 = 2013;
 pub const REGISTER_SCHEMA_ALREADY_EXISTS: u32 = 2020;
 pub const REGISTER_SCHEMA_INVALID: u32 = 2021;
 pub const WRITE_SCHEMA_VALIDATION_FAILED: u32 = 2022;
