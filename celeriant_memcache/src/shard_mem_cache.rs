@@ -938,6 +938,14 @@ impl<V: Validate> ShardMemCache<V> {
         self.aggregate_write_client_snapshots.clear();
     }
 
+    pub fn aggregate_read_snapshots_len(&self) -> usize {
+        self.aggregate_read_snapshots.len()
+    }
+
+    pub fn aggregate_recent_writes_len(&self) -> usize {
+        self.aggregate_recent_writes.len()
+    }
+
     /// Cull-side clear. Drains pending_replication and clears the OCC/idempotency
     /// LRUs that point at the discarded speculative tail. Leaves aggregate_queue_positions,
     /// schema caches, and rollback_generation alone (those belong to a real rollback).

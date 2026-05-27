@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::time::Duration;
 
 use celeriant_distributed::node_status::NodeStatus;
 use celeriant_distributed::paths::{fallback_shard_prefix, parse_fallback_path};
@@ -80,6 +81,104 @@ struct CatchupCandidate {
     size: u64,
     start_wal_seq: u64,
     end_wal_seq: u64,
+}
+
+// Bounded settle window for the promotion-catchup drain barrier.
+//
+// After winning the S3 lease (CAS), the predecessor is fenced for future uploads.
+// However, uploads that were in-flight BEFORE the CAS may still land or become
+// list-visible after our final list. The drain re-lists up to this many times
+// with a short sleep between each, waiting for S3 list visibility to stabilise.
+//
+// Production: DRAIN_MAX_ROUNDS × DRAIN_SETTLE_INTERVAL = 5 × 500ms = 2.5s maximum wait.
+// Justified by: S3 PUT round-trip is typically <1s; predecessor is fenced so
+// its pre-fence set is finite and drains quickly. The wait is one-shot per
+// catchup completion, not a hot path.
+//
+// In tests the interval is collapsed to 1ms so the drain logic is exercised
+// without adding seconds to every test that applies a batch.
+#[cfg(not(test))]
+const DRAIN_MAX_ROUNDS: u32 = 5;
+#[cfg(test)]
+const DRAIN_MAX_ROUNDS: u32 = 3;
+
+#[cfg(not(test))]
+const DRAIN_SETTLE_INTERVAL: Duration = Duration::from_millis(500);
+#[cfg(test)]
+const DRAIN_SETTLE_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Re-list S3 up to `DRAIN_MAX_ROUNDS` times with `DRAIN_SETTLE_INTERVAL` sleep
+/// between attempts, looking for late-landing covering files not yet in `applied_paths`.
+///
+/// Returns `true` if at least one new covering candidate was found (caller should
+/// continue the main loop to apply it). Returns `false` if the settle window passed
+/// with no new covering candidates (safe to declare `Caught`).
+///
+/// Logs and counts each late file caught. Also logs the drain outcome summary.
+async fn drain_settle_barrier<D: S3Downloader + 'static>(
+    downloader: &Rc<D>,
+    prefix: &str,
+    shard_id: u32,
+    node_id: u128,
+    peer_node_id: Option<u128>,
+    next_wal_seq: u64,
+    applied_paths: &HashSet<String>,
+) -> Result<bool, S3CatchupError> {
+    let mut late_files_caught: u32 = 0;
+
+    for round in 0..DRAIN_MAX_ROUNDS {
+        glommio::timer::sleep(DRAIN_SETTLE_INTERVAL).await;
+
+        let objects = downloader.list_objects(prefix).await?;
+
+        for obj in &objects {
+            let Some((_sid, _start, end_wal_seq, source_node_id)) = parse_fallback_path(&obj.path) else {
+                continue;
+            };
+            if source_node_id == node_id {
+                continue;
+            }
+            if let Some(peer) = peer_node_id {
+                if source_node_id != peer {
+                    continue;
+                }
+            }
+            if end_wal_seq >= next_wal_seq && !applied_paths.contains(&obj.path) {
+                tracing::warn!(
+                    shard_id,
+                    path = %obj.path,
+                    late_wal_seq = end_wal_seq,
+                    drain_round = round,
+                    "promotion catchup drain caught a late predecessor S3 file"
+                );
+                metrics::counter!(
+                    "celeriant_catchup_drain_late_files_total",
+                    "shard_id" => shard_id.to_string()
+                ).increment(1);
+                late_files_caught += 1;
+            }
+        }
+
+        if late_files_caught > 0 {
+            tracing::info!(
+                shard_id,
+                drain_rounds = round + 1,
+                late_files_caught,
+                next_wal_seq,
+                "promotion catchup drain: late files found, continuing catchup"
+            );
+            return Ok(true);
+        }
+    }
+
+    tracing::info!(
+        shard_id,
+        drain_rounds = DRAIN_MAX_ROUNDS,
+        late_files_caught = 0u32,
+        next_wal_seq,
+        "promotion catchup drain: settle window stable, declaring Caught"
+    );
+    Ok(false)
 }
 
 /// A batch is contiguous when every adjacent pair of items differs by exactly one in wal_seq.
@@ -168,6 +267,20 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
             .sum();
 
         if !first_iteration && max_catchup_gap_bytes.map_or(true, |cap| remaining_bytes < cap) {
+            // Run the drain barrier before declaring Caught, but only if we applied
+            // at least one batch this invocation. If batches_applied==0, there are no
+            // predecessor uploads to drain (no predecessor chain was established with us).
+            if result.batches_applied > 0 {
+                // A predecessor's in-flight uploads may still be landing / becoming
+                // list-visible after our final list. The predecessor is fenced (we won the
+                // CAS), so this set is finite and drains within the settle window.
+                let late_found = drain_settle_barrier(downloader, &prefix, shard_id, node_id, peer_node_id, next_wal_seq, &applied_paths).await?;
+                if late_found {
+                    // Late files found — outer loop re-lists and applies them.
+                    first_iteration = true;
+                    continue;
+                }
+            }
             result.completion = CatchupCompletion::Caught;
             break;
         }
@@ -223,6 +336,21 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
             for (batch, cand) in downloaded {
                 let start = cand.start_wal_seq;
                 let key = (batch.lease_epoch, batch.upload_sequence);
+                // Same-epoch batches at one start must be byte-identical, which is what lets the
+                // restart-resettable upload_sequence be a safe within-epoch tiebreaker. Divergent
+                // content at the same epoch means a re-author fork slipped the cull-skip; surface it.
+                if let Some((existing, _)) = by_start.get(&start) {
+                    if same_epoch_content_divergence(existing, &batch) {
+                        tracing::error!(
+                            shard_id, start, lease_epoch = batch.lease_epoch,
+                            "same-(lease_epoch,wal_seq) S3 batches with divergent content — content-immutability invariant violated (cull-skip regression?)"
+                        );
+                        metrics::counter!(
+                            "celeriant_s3_catchup_same_epoch_divergence_total",
+                            "shard_id" => shard_id.to_string()
+                        ).increment(1);
+                    }
+                }
                 let replace = match by_start.get(&start) {
                     Some((prev, _)) => key > (prev.lease_epoch, prev.upload_sequence),
                     None => true,
@@ -385,7 +513,18 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
             // TCP replication can bridge it once we exit catchup. Otherwise
             // leave the default Retry; leader is likely still uploading.
             if max_catchup_gap_bytes.map_or(true, |cap| remaining_bytes < cap) {
+                // Run the drain barrier before declaring Caught, but only if we applied
+                // at least one batch this invocation (same rationale as the pre-inner-loop
+                // check above: zero applied means no predecessor stream to drain).
+                if result.batches_applied > 0 {
+                    let late_found = drain_settle_barrier(downloader, &prefix, shard_id, node_id, peer_node_id, next_wal_seq, &applied_paths).await?;
+                    if late_found {
+                        first_iteration = true;
+                        continue;
+                    }
+                }
                 result.completion = CatchupCompletion::Caught;
+                break;
             }
             break;
         }
@@ -515,6 +654,21 @@ async fn sync_applied_batch(
             move |captured| commit_fsync_with_rollback(NodeStatus::Standalone, lsc, smc, wa, captured, shard_id, dict_codec),
         )
         .await
+}
+
+/// Two same-start batches sharing a lease epoch must agree over their overlap.
+/// Returns true only if the chains actually diverge there — a same-epoch re-author
+/// fork. A different extent is not divergence: a shorter batch can be a clean prefix
+/// of a longer retry. Items are contiguous from the shared start, so zipping lines
+/// up matching seqs.
+fn same_epoch_content_divergence(a: &FallbackBatch, b: &FallbackBatch) -> bool {
+    if a.lease_epoch != b.lease_epoch {
+        return false;
+    }
+    a.items.iter().zip(b.items.iter()).any(|(ia, ib)| {
+        ia.metablock.wal_seq != ib.metablock.wal_seq
+            || ia.metablock.previous_tip_hash != ib.metablock.previous_tip_hash
+    })
 }
 
 /// Find the common ancestor using the already-downloaded batch from catchup_round.
@@ -694,15 +848,71 @@ async fn find_divergence_via_s3<D: S3Downloader + 'static>(
             }
         }
     } else {
-        tracing::warn!(
-            earlier_total_unfiltered,
-            earlier_total_after_peer_filter,
-            tried,
-            candidates = candidate_hashes.len(),
-            current_wal_seq,
-            "find_divergence_via_s3: no candidate hash matched any local metablock in unconfirmed suffix"
-        );
-        metrics::counter!("celeriant_s3_catchup_via_s3_exhausted_total").increment(1);
+        // No local metablock chained onto any S3 batch start, so the speculative tail
+        // (read, write] forked from the committed chain. If an authoritative batch starts
+        // at read+1 and chains onto the read tip, then read IS the common ancestor; reframe
+        // divergence there. Require a real read cursor first: a None read's zero sentinel
+        // would false-match a genesis batch (prev == GENESIS_HASH == [0;32], start == 1).
+        let read_cursor = {
+            let active = log_segments_cache.active();
+            let m = active.metadata.borrow();
+            m.read.as_ref().map(|r| (r.wal_seq, r.tip_hash, r.log_id, r.metablocks_position))
+        };
+        let anchor_at_read = read_cursor.and_then(|(read_wal, read_tip, read_log_id, read_position)| {
+            hash_to_batch_path
+                .iter()
+                .find(|(h, (_, start))| **h == read_tip && *start == read_wal + 1)
+                .map(|(_, (path, _))| (path.clone(), read_tip, read_log_id, read_wal, read_position))
+        });
+
+        match anchor_at_read {
+            Some((anchor_path, read_tip, read_log_id, read_wal, read_position)) => {
+                // Refine past any byte-identical prefix. truncate_wal stays ack-barrier gated.
+                match downloader.download(&anchor_path).await {
+                    Ok(data) => match deserialise_fallback_batch(&data) {
+                        Ok(batch) => {
+                            let metablock_refs: Vec<&_> = batch.items.iter().map(|fi| &fi.metablock).collect();
+                            let refined = refine_divergence_by_byte_match(
+                                log_segments_cache, &metablock_refs, read_tip, read_log_id, read_wal + 1, read_position,
+                            ).await;
+                            tracing::warn!(
+                                read_wal,
+                                divergent_wal_seq = refined.2,
+                                anchor_path = %anchor_path,
+                                "find_divergence_via_s3: reframed divergence at read cursor (authority chains onto read tip)"
+                            );
+                            metrics::counter!("celeriant_s3_catchup_reframed_at_read_total").increment(1);
+                            result = Ok(refined);
+                        }
+                        Err(e) => {
+                            tracing::warn!(anchor_path = %anchor_path, error = ?e, "find_divergence_via_s3: read-reframe anchor deserialise failed");
+                            metrics::counter!("celeriant_s3_catchup_via_s3_exhausted_total").increment(1);
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(anchor_path = %anchor_path, error = ?e, "find_divergence_via_s3: read-reframe anchor download failed");
+                        metrics::counter!("celeriant_s3_catchup_via_s3_exhausted_total").increment(1);
+                    }
+                }
+            }
+            None => {
+                // No S3 batch anchors the divergence: either no read cursor, or no batch
+                // chains onto the read tip (a coverage hole, or divergence below read). Once
+                // the read+1 reframe above handles the recoverable cases, this is the
+                // genuinely unreconcilable residue — not safe to truncate, so the caller
+                // retries (and stays in catching-up). Worth a loud diagnostic if it ever fires.
+                let (read_wal, read_tip) = read_cursor.map(|(w, t, _, _)| (w, t)).unwrap_or((0, [0u8; 32]));
+                tracing::warn!(
+                    current_wal_seq,
+                    read_wal,
+                    read_tip = %hex_short(&read_tip),
+                    min_candidate_start,
+                    "find_divergence_via_s3: no S3 batch anchors the catchup divergence \
+                     (no read anchor / coverage hole / divergence below read) — cannot reconcile, retrying"
+                );
+                metrics::counter!("celeriant_s3_catchup_via_s3_exhausted_total").increment(1);
+            }
+        }
     }
 
     result
@@ -1090,6 +1300,49 @@ mod tests {
         }
         let path = fallback_batch_path(shard_id, start, end, node_id);
         (path, serialize_fallback_batch(&batch))
+    }
+
+    fn build_batch(start: u64, prevs: &[[u8; 32]], lease_epoch: u64) -> FallbackBatch {
+        let mut b = FallbackBatch::new(start, start + prevs.len() as u64 - 1, 0, 0, 0, lease_epoch);
+        for (i, &prev) in prevs.iter().enumerate() {
+            let mut mb = test_metablock(start + i as u64, prev);
+            mb.lease_epoch = lease_epoch;
+            b.push_item(FallbackItem { metablock: mb, datablock: None });
+        }
+        b
+    }
+
+    /// The content-immutability-per-epoch detector flags a same-epoch chain that
+    /// diverges within the overlap, but treats a matching prefix (a fence-and-retry
+    /// re-upload with a different extent) as fine, and never flags a cross-epoch
+    /// re-author.
+    #[test]
+    fn same_epoch_content_divergence_flags_only_real_forks() {
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        // identical -> not flagged (the normal dedup tiebreak case)
+        assert!(!same_epoch_content_divergence(&build_batch(3, &[a, a, a], 1), &build_batch(3, &[a, a, a], 1)));
+        // divergent from the start -> flagged
+        assert!(same_epoch_content_divergence(&build_batch(3, &[a, a, a], 1), &build_batch(3, &[b, b, b], 1)));
+        // different extent, matching prefix -> NOT flagged (regression: a shorter
+        // batch is a clean prefix of the retry; the old extent check false-fired here)
+        assert!(!same_epoch_content_divergence(&build_batch(3, &[a, a, a], 1), &build_batch(3, &[a, a, a, a, a], 1)));
+        // divergence only after a common prefix -> flagged
+        assert!(same_epoch_content_divergence(&build_batch(3, &[a, a, b], 1), &build_batch(3, &[a, a, a], 1)));
+        // different epoch -> not flagged; lease_epoch legitimately decides the dedup
+        assert!(!same_epoch_content_divergence(&build_batch(3, &[a, a, a], 1), &build_batch(3, &[b, b, b], 2)));
+    }
+
+    /// Degenerate inputs must not panic or false-fire: an empty batch has no
+    /// overlap to disagree on, so it is never a divergence.
+    #[test]
+    fn same_epoch_content_divergence_handles_empty_overlap() {
+        let a = [1u8; 32];
+        let empty = build_batch(3, &[], 1);
+        let full = build_batch(3, &[a, a], 1);
+        assert!(!same_epoch_content_divergence(&empty, &full));
+        assert!(!same_epoch_content_divergence(&full, &empty));
+        assert!(!same_epoch_content_divergence(&empty, &empty));
     }
 
     // ── Mock S3Downloader ──
@@ -2596,6 +2849,122 @@ mod tests {
         });
     }
 
+    /// Cross-epoch catchup liveness wedge. A demoted ex-leader holds an un-acked speculative
+    /// tail (read, write] that forked from the committed chain — its entries don't chain onto
+    /// the read tip. Authority arrives at read+1 with a divergent body, which both
+    /// find_divergence_from_batch and the reverse scan miss, so pre-reframe the node wedges
+    /// at "no common ancestor". The reframe anchors at read, truncates the tail, applies
+    /// authority.
+    ///
+    /// The forked tip is the crux: a natural (matching) tail chains onto the read tip and
+    /// self-heals via the existing scan, so this test would false-pass without it.
+    #[test]
+    fn catchup_reframes_forked_speculative_tail_at_read_cursor() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+
+            // Local: committed [1..5] + un-acked speculative tail [6..8] (write = 8).
+            seed_capturing_tips(&tc, 8).await;
+            assert_eq!(tc.wal_seq(), 8);
+
+            // Read cursor at 5, but its tip is the authoritative tip the forked tail never
+            // chained onto. Sentinel models that disagreement.
+            let read_tip = [0x5A; 32];
+            {
+                let active = tc.log_segments_cache.active();
+                let mut m = active.metadata.borrow_mut();
+                let read = m.read.as_mut().expect("seed advanced the read cursor");
+                read.wal_seq = 5;
+                read.tip_hash = read_tip;
+                read.metablocks_position = pos_at(6);
+            }
+
+            // Authority covering the tail and extending past write, anchored at the read tip,
+            // divergent body (lease_epoch 3 vs the local tail's 0).
+            let dl = Rc::new(MockDownloader::new());
+            let (p, d) = make_fallback_batch_with_lease_seq(0, 6, 10, read_tip, 0, 1, 3);
+            dl.insert(p, d);
+
+            let result = tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_seq(), 10, "reframe must truncate the forked tail to read and apply authority");
+            assert_eq!(result.completion, CatchupCompletion::Caught);
+
+            tc.close().await;
+        });
+    }
+
+    /// The reframe stays behind the ack barrier: a divergence at/below last_self_acked_wal_seq
+    /// is refused, not truncated. Same shape as the wedge above, barrier set at read+1.
+    #[test]
+    fn reframe_truncate_stays_ack_barrier_gated() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+
+            seed_capturing_tips(&tc, 8).await;
+
+            let read_tip = [0x5A; 32];
+            {
+                let active = tc.log_segments_cache.active();
+                let mut m = active.metadata.borrow_mut();
+                let read = m.read.as_mut().expect("seed advanced the read cursor");
+                read.wal_seq = 5;
+                read.tip_hash = read_tip;
+                read.metablocks_position = pos_at(6);
+                // Barrier at/above the reframe divergence (read+1 = 6): refuse.
+                m.last_self_acked_wal_seq = 6;
+            }
+
+            let dl = Rc::new(MockDownloader::new());
+            let (p, d) = make_fallback_batch_with_lease_seq(0, 6, 10, read_tip, 0, 1, 3);
+            dl.insert(p, d);
+
+            let err = tc.catchup(&dl, 0, 10).await.unwrap_err();
+            assert!(
+                matches!(err, S3CatchupError::TruncationFailed(ShardFsyncError::TruncateRefusedByAckBarrier { .. })),
+                "expected ack-barrier refusal under the reframe, got {err:?}",
+            );
+            assert_eq!(tc.wal_seq(), 8, "barrier refusal must not regress write");
+
+            tc.close().await;
+        });
+    }
+
+    /// The reframe must not fire when no batch chains onto the read tip. A forked tail whose
+    /// authority doesn't anchor at read+1 stays a no-truncate Retry, guarding over-firing.
+    #[test]
+    fn reframe_does_not_fire_without_read_anchor() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+
+            seed_capturing_tips(&tc, 8).await;
+
+            let read_tip = [0x5A; 32];
+            {
+                let active = tc.log_segments_cache.active();
+                let mut m = active.metadata.borrow_mut();
+                let read = m.read.as_mut().expect("seed advanced the read cursor");
+                read.wal_seq = 5;
+                read.tip_hash = read_tip;
+                read.metablocks_position = pos_at(6);
+            }
+
+            // Authority covers [6..10] but does NOT chain onto our read tip (prev != read_tip),
+            // so nothing anchors at read+1.
+            let dl = Rc::new(MockDownloader::new());
+            let (p, d) = make_fallback_batch_with_lease_seq(0, 6, 10, [0xC3; 32], 0, 1, 3);
+            dl.insert(p, d);
+
+            let result = tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(result.completion, CatchupCompletion::Retry, "no read-anchor: must stay conservative Retry");
+            assert_eq!(tc.wal_seq(), 8, "no truncate without a read-anchor");
+
+            tc.close().await;
+        });
+    }
+
     #[test]
     fn duplicate_start_picks_winner_and_applies() {
         // Two batches at start=48 (pre-rollback and post-rollback generations).
@@ -2725,6 +3094,77 @@ mod tests {
 
             assert_eq!(result, ([0xAA; 32], foreign_log_id, 5, 999));
             tc.close().await;
+        });
+    }
+
+    // ── Drain barrier tests ──
+
+    /// A predecessor's S3 upload lands AFTER our final list but BEFORE serving.
+    /// The drain barrier must detect it and cause it to be applied before declaring Caught.
+    ///
+    /// List call index map for this scenario:
+    ///   0 — outer iteration 1: finds batch 1..=3, inner loop applies it
+    ///   1 — outer iteration 2: finds batch 1..=3 only (end=3 < next=4); enters drain
+    ///   2 — drain round 0: nothing new
+    ///   3 — drain round 1: hook injects batch 4..=5 → drain returns true
+    ///   4 — outer iteration 3: finds batches 1..=3 and 4..=5; applies 4..=5
+    ///   5 — outer iteration 4: nothing covering next=6; enters drain; settle window cleans → Caught
+    ///
+    /// Without the barrier, the old code would have declared Caught at list call 1,
+    /// missing batch 4..=5 entirely (final wal_seq=3 instead of 5).
+    #[test]
+    fn drain_barrier_catches_late_landing_predecessor_file() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = Rc::new(MockDownloader::new());
+
+            // Predecessor's batch 1..=3 is already visible.
+            let (path, data) = make_fallback_batch(0, 1, 3, GENESIS_HASH);
+            dl.insert(path, data);
+
+            // Simulate a late-landing predecessor upload: batch 4..=5 becomes
+            // list-visible only during drain round 1 (list call 3).
+            let lsc = tc.log_segments_cache.clone();
+            dl.on_list(3, move |dl| {
+                let tip = lsc.active().metadata.borrow().write.tip_hash;
+                let (path, data) = make_fallback_batch(0, 4, 5, tip);
+                dl.insert(path, data);
+            });
+
+            let result = tc.catchup(&dl, 0, 10).await.unwrap();
+
+            // The drain barrier must have caught the late file and applied it.
+            assert_eq!(
+                tc.wal_seq(), 5,
+                "drain barrier must apply the late-landing batch 4..=5"
+            );
+            assert_eq!(result.completion, CatchupCompletion::Caught);
+            // At minimum: batch 1..=3 and batch 4..=5
+            assert!(
+                result.batches_applied >= 2,
+                "expected at least 2 batches applied, got {}", result.batches_applied
+            );
+        });
+    }
+
+    /// When the drain window passes with no new covering files, Caught is declared
+    /// immediately (no regression on the common / no-late-files path).
+    #[test]
+    fn drain_barrier_stable_window_declares_caught() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = Rc::new(MockDownloader::new());
+
+            let (path, data) = make_fallback_batch(0, 1, 3, GENESIS_HASH);
+            dl.insert(path, data);
+
+            // No late injections — drain rounds all return empty.
+            let result = tc.catchup(&dl, 0, 10).await.unwrap();
+
+            assert_eq!(tc.wal_seq(), 3);
+            assert_eq!(result.completion, CatchupCompletion::Caught);
         });
     }
 }

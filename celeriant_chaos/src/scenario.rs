@@ -34,6 +34,9 @@ pub struct ScenarioReport {
     pub bench: BenchmarkSummary,
     pub checks: Vec<CheckResult>,
     pub samples: Vec<NodeSample>,
+    pub bench_window_start_ms: u64,
+    pub bench_actual_end_ms: u64,
+    pub bench_window_end_ms: u64,
     /// Paths (relative to the run directory) to per-host journalctl dumps,
     /// fetched only when the scenario failed.
     pub log_files: Vec<String>,
@@ -380,6 +383,9 @@ pub async fn tear_down_and_evaluate_with_audit(
         bench: BenchmarkSummary::from(&bench_result),
         checks,
         samples,
+        bench_window_start_ms,
+        bench_actual_end_ms,
+        bench_window_end_ms,
         log_files,
         idempotent_counters,
         integrity,
@@ -1054,8 +1060,8 @@ pub async fn run_leader_sigkill(
         bench_result.p99_ms,
     );
 
-    println!("[{SCEN}] settle 15s for catchup + role re-stabilisation");
-    sleep(Duration::from_secs(15)).await;
+    println!("[{SCEN}] settle 60s for catchup + role re-stabilisation");
+    sleep(Duration::from_secs(60)).await;
     let bench_window_end_ms = up.elapsed_ms();
 
     // Same envelope as SCEN-4. SIGKILL skips the graceful drain so the new
@@ -1073,6 +1079,9 @@ pub async fn run_leader_sigkill(
         // Same reasoning as SCEN-4 — see run_leader_graceful_stop.
         require_final_leader_write_progress: true,
         assert_eventual_progress: true,
+        // Disk-truth tip-fork detection: catches same-wal_seq divergent-tip forks
+        // that EventualConvergence's number-only comparison silently passes.
+        assert_no_divergent_tips: true,
         // Same failover budget as graceful-stop: SIGKILL doesn't deliver
         // a clean handoff signal but the lease TTL drives recovery in
         // the same timing envelope.
@@ -1212,8 +1221,8 @@ pub async fn run_leader_restart_loop(
         bench_result.p99_ms,
     );
 
-    println!("[{SCEN}] settle 15s for catchup + role re-stabilisation");
-    sleep(Duration::from_secs(15)).await;
+    println!("[{SCEN}] settle 60s for catchup + role re-stabilisation");
+    sleep(Duration::from_secs(60)).await;
     let bench_window_end_ms = up.elapsed_ms();
 
     // Three sequential failovers. Bounds are ~3× the SCEN-4/5 envelope
@@ -3181,6 +3190,9 @@ pub async fn run_bench_load_sweep(
         bench: BenchmarkSummary::from(&last_result),
         checks: vec![CheckResult::pass("BenchLoadSweepCompleted")],
         samples,
+        bench_window_start_ms: 0,
+        bench_actual_end_ms: 0,
+        bench_window_end_ms: 0,
         log_files: vec![],
         idempotent_counters: None,
         integrity: None,

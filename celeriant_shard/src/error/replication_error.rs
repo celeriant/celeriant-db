@@ -10,4 +10,5 @@ pub enum ReplicationError {
     LeaderFenced,
     BudgetExhausted,
     GateTimeout,
+    LeaseUnconfirmed,
 }

@@ -37,4 +37,5 @@ pub struct InternalShardConfig {
     pub heartbeat_starve_threshold: Duration,
     pub wal_compression_level: i32,
     pub dict_bytes: Arc<[u8]>,
+    pub s3_lease_duration_ms: u64,
 }

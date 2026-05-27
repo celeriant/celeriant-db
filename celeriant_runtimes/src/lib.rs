@@ -123,6 +123,9 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                     cache_warmup_max_duration: shard_config.cache_warmup_max_duration.unwrap_or(Duration::MAX),
                     wal_compression_level: shard_config.wal_compression_level,
                     dict_bytes: shard_config.dict_bytes.clone(),
+                    s3_lease_duration_ms: shard_config.replication_config.as_ref()
+                        .map(|c| c.s3_lease_duration.as_millis() as u64)
+                        .unwrap_or(0),
                 };
                 let s3_uploader = SidecarS3Uploader::new(sidecar_senders.clone(), s3_upload_inflight.clone(), shard_config.s3_max_concurrent_fallback_uploads);
                 let replication_client_config = shard_config.tls_config.as_ref()

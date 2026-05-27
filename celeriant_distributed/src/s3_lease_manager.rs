@@ -14,6 +14,11 @@ const MEMBERSHIP_CAS_MAX_RETRIES: u32 = 5;
 pub struct ElectionOutcome {
     pub status: ValidatedNodeStatus,
     pub peer_info: Option<NodeInfo>,
+    /// True when this node reclaimed its OWN S3 lease (i.e. the lease already
+    /// named this node as leader, so no leadership transfer occurred).
+    /// Restart-proof: derived from the durable S3 lease holder, not in-memory epoch.
+    /// False on genesis acquire, promote-over-peer, or any follower outcome.
+    pub reacquired_own_lease: bool,
 }
 
 pub struct S3LeaseManager<S: LeaseStore> {
@@ -72,7 +77,7 @@ impl<S: LeaseStore> S3LeaseManager<S> {
                     self.config.s3_lease_duration.as_millis() as u64,
                 );
                 match self.store.put_lease_create_only(&lease).await {
-                    Ok(_) => self.become_leader(&lease).await,
+                    Ok(_) => self.become_leader(&lease, false).await,
                     Err(LeaseStoreError::AlreadyExists) => {
                         let lwe = self.store.get_lease().await?.ok_or_else(|| {
                             LeaseStoreError::Unavailable {
@@ -103,7 +108,8 @@ impl<S: LeaseStore> S3LeaseManager<S> {
                     "Election: existing lease found — racing CAS"
                 );
                 let duration_ms = self.config.s3_lease_duration.as_millis() as u64;
-                let next = if lwe.lease.leader_node_id == self.config.node_id {
+                let is_own_lease = lwe.lease.leader_node_id == self.config.node_id;
+                let next = if is_own_lease {
                     lwe.lease.renew(now, duration_ms)
                 } else {
                     lwe.lease.promote(self.config.node_id, now, duration_ms)
@@ -113,7 +119,7 @@ impl<S: LeaseStore> S3LeaseManager<S> {
                     .put_lease_conditional(&next, &lwe.etag)
                     .await
                 {
-                    Ok(_) => self.become_leader(&next).await,
+                    Ok(_) => self.become_leader(&next, is_own_lease).await,
                     Err(LeaseStoreError::PreconditionFailed) => {
                         let new_lwe = self.store.get_lease().await?.ok_or_else(|| {
                             LeaseStoreError::Unavailable {
@@ -153,10 +159,11 @@ impl<S: LeaseStore> S3LeaseManager<S> {
                 lease.expires_at_ms,
             ),
             peer_info,
+            reacquired_own_lease: false,
         })
     }
 
-    async fn become_leader(&self, lease: &Lease) -> Result<ElectionOutcome, LeaseStoreError> {
+    async fn become_leader(&self, lease: &Lease, reacquired_own_lease: bool) -> Result<ElectionOutcome, LeaseStoreError> {
         let peer_info = self.discover_peer().await.ok().flatten();
         Ok(ElectionOutcome {
             status: ValidatedNodeStatus::create_custom_status(
@@ -165,6 +172,7 @@ impl<S: LeaseStore> S3LeaseManager<S> {
                 lease.expires_at_ms,
             ),
             peer_info,
+            reacquired_own_lease,
         })
     }
 }
@@ -544,6 +552,55 @@ mod tests {
         assert_eq!(peer.as_ref().unwrap().node_id, 1);
         assert_eq!(peer.as_ref().unwrap().client_address, "127.0.0.1:10001");
         assert_eq!(peer.as_ref().unwrap().replication_address, "127.0.0.1:11001");
+    }
+
+    #[test]
+    fn test_restart_self_reclaim_sets_reacquired_own_lease() {
+        let store = MockLeaseStore::new();
+        let now = validated_node_status::unix_epoch_now_ms();
+
+        // S3 lease is held by THIS node (node 1), not yet expired.
+        store.push_get_lease(Ok(Some(make_lease_with_etag(1, 1, now, 10000))));
+        store.push_put_lease_conditional(Ok("etag2".into()));
+        store.push_get_membership(Ok(None));
+
+        let manager = S3LeaseManager::new(store, test_config(1));
+        let outcome = block_on(manager.run_election_to_acquire_s3_lease()).unwrap();
+
+        assert!(matches!(outcome.status.raw(), NodeStatus::Leader { lease_epoch: 1 }));
+        assert!(outcome.reacquired_own_lease, "self-reclaim must set reacquired_own_lease=true");
+    }
+
+    #[test]
+    fn test_promote_over_peer_clears_reacquired_own_lease() {
+        let store = MockLeaseStore::new();
+        let now = validated_node_status::unix_epoch_now_ms();
+
+        // Peer (node 2) held the lease but it expired.
+        store.push_get_lease(Ok(Some(make_lease_with_etag(2, 3, now - 10000, 5000))));
+        store.push_put_lease_conditional(Ok("etag2".into()));
+        store.push_get_membership(Ok(Some(membership_with_etag(both_nodes_membership()))));
+
+        let manager = S3LeaseManager::new(store, test_config(1));
+        let outcome = block_on(manager.run_election_to_acquire_s3_lease()).unwrap();
+
+        assert!(matches!(outcome.status.raw(), NodeStatus::Leader { lease_epoch: 4 }));
+        assert!(!outcome.reacquired_own_lease, "promote-over-peer must set reacquired_own_lease=false");
+    }
+
+    /// Genesis acquire (fresh cluster, no prior lease): reacquired_own_lease=false.
+    #[test]
+    fn test_genesis_acquire_clears_reacquired_own_lease() {
+        let store = MockLeaseStore::new();
+        store.push_get_lease(Ok(None));
+        store.push_put_lease_create_only(Ok("etag1".into()));
+        store.push_get_membership(Ok(None));
+
+        let manager = S3LeaseManager::new(store, test_config(1));
+        let outcome = block_on(manager.run_election_to_acquire_s3_lease()).unwrap();
+
+        assert!(matches!(outcome.status.raw(), NodeStatus::Leader { lease_epoch: 1 }));
+        assert!(!outcome.reacquired_own_lease, "genesis acquire must set reacquired_own_lease=false");
     }
 }
 

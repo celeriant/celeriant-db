@@ -18,13 +18,18 @@ pub enum IntrashardMessages {
         request: ClusterRequest,
         message_version: u32,
     },
-    CullSpeculativeTail,
+    CullSpeculativeTail { rewind_to_ack_barrier: bool },
+    RenewS3LeaseNow { requesting_shard: usize },
     EnterS3Catchup,
     S3CatchupComplete {
         shard_id: usize,
         result: Result<S3CatchupResult, S3CatchupError>
     },
-    StatusUpdate { status: ValidatedNodeStatus },
+    StatusUpdate {
+        status: ValidatedNodeStatus,
+        cas_confirmed_at_ms: Option<u64>,
+        leader_changed_hands: bool,
+    },
     UpdatePeerNodeId { peer_node_id: Option<u128> },
     UpdateFollower { replication_address: Option<String>, peer_node_id: Option<u128> },
     FollowerReachable { reachable: bool, was_reachable: bool },

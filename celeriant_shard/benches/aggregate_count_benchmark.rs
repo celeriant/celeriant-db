@@ -91,6 +91,7 @@ fn create_config(shard_dir: PathBuf) -> InternalShardConfig {
         cache_warmup_max_duration: Duration::MAX,
         wal_compression_level: 3,
         dict_bytes: std::sync::Arc::from(celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES),
+        s3_lease_duration_ms: 0,
     }
 }
 

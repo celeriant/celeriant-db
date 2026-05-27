@@ -15,11 +15,22 @@ pub struct NodeSample {
     /// Sum of `celeriant_node_role` across all label sets. Expected 0 or 1.
     pub node_role: f64,
     pub wal_seq_max: u64,
+    /// Per-shard wal_seq from `celeriant_wal_seq{shard_id="N"}`. Label key is "shard_id".
+    #[serde(default)]
+    pub wal_seq_by_shard: BTreeMap<u32, u64>,
     pub writes_total: u64,
     pub write_errors_total: u64,
     pub leader_elections_total: u64,
     pub heartbeat_failures_total: u64,
     pub s3_fallbacks_total: u64,
+    /// On-demand S3 lease renewals (sum across result=renewed|superseded). >0 proves the
+    /// demand-driven renewal fired: a data shard nudged shard 0 to re-CAS lease.json.
+    #[serde(default)]
+    pub s3_lease_on_demand_renewal_total: u64,
+    /// S3-fallback uploads refused at the full-lease gate (stale CAS confirmation). >0
+    /// means a shard hit the hard refuse and spin-waited for the green light.
+    #[serde(default)]
+    pub s3_fallback_lease_unconfirmed_total: u64,
     pub shard_panics_total: u64,
     pub node_starts_total: u64,
     /// Sum of `celeriant_client_connections_active` across all shards.
@@ -59,6 +70,10 @@ pub struct NodeSample {
     pub s3_catchup_self_uploads_seen_total: u64,
     /// truncate_wal refused because divergent_wal_seq is at or below last_self_acked.
     pub truncate_refused_due_to_ack_barrier_total: u64,
+    /// Catchup saw two same-(lease_epoch) S3 batches at one start with divergent
+    /// content — the content-immutability invariant violated (cull-skip regressed).
+    /// MUST stay 0.
+    pub s3_catchup_same_epoch_divergence_total: u64,
     /// Size of the OCC/idempotency LRU at cull time.
     pub cull_stale_client_seq_lru: u64,
     pub cull_stale_agg_lru: u64,
@@ -86,11 +101,14 @@ impl NodeSample {
             error: Some(error),
             node_role: 0.0,
             wal_seq_max: 0,
+            wal_seq_by_shard: BTreeMap::new(),
             writes_total: 0,
             write_errors_total: 0,
             leader_elections_total: 0,
             heartbeat_failures_total: 0,
             s3_fallbacks_total: 0,
+            s3_lease_on_demand_renewal_total: 0,
+            s3_fallback_lease_unconfirmed_total: 0,
             shard_panics_total: 0,
             node_starts_total: 0,
             client_connections_active: 0,
@@ -106,6 +124,7 @@ impl NodeSample {
             truncate_dropped_self_acked_wal_seqs_total: 0,
             s3_catchup_self_uploads_seen_total: 0,
             truncate_refused_due_to_ack_barrier_total: 0,
+            s3_catchup_same_epoch_divergence_total: 0,
             cull_stale_client_seq_lru: 0,
             cull_stale_agg_lru: 0,
             client_idempotency_violations_total: 0,
@@ -129,6 +148,7 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
     let mut sums: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut node_role = 0.0_f64;
     let mut wal_seq_max: u64 = 0;
+    let mut wal_seq_by_shard: BTreeMap<u32, u64> = BTreeMap::new();
     let mut client_connections_active: u64 = 0;
 
     const COUNTERS: &[&str] = &[
@@ -137,6 +157,8 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         "celeriant_leader_elections_total",
         "celeriant_heartbeat_failures_total",
         "celeriant_replication_s3_fallbacks_total",
+        "celeriant_s3_lease_on_demand_renewal_total",
+        "celeriant_s3_fallback_lease_unconfirmed_total",
         "celeriant_shard_panics_total",
         "celeriant_node_starts_total",
         "celeriant_replication_capture_dropped_items_total",
@@ -151,6 +173,7 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         "celeriant_truncate_dropped_self_acked_wal_seqs_total",
         "celeriant_s3_catchup_self_uploads_seen_total",
         "celeriant_truncate_refused_due_to_ack_barrier_total",
+        "celeriant_s3_catchup_same_epoch_divergence_total",
         "celeriant_cull_stale_client_seq_lru",
         "celeriant_cull_stale_agg_lru",
         "celeriant_client_idempotency_violations_total",
@@ -189,6 +212,11 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
                 if v > wal_seq_max {
                     wal_seq_max = v;
                 }
+                if let Some(shard_id) = extract_label(name_part, "shard_id")
+                    && let Ok(id) = shard_id.parse::<u32>()
+                {
+                    wal_seq_by_shard.insert(id, v);
+                }
             }
             continue;
         }
@@ -214,11 +242,14 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         error: None,
         node_role,
         wal_seq_max,
+        wal_seq_by_shard,
         writes_total: get("celeriant_writes_total"),
         write_errors_total: get("celeriant_write_errors_total"),
         leader_elections_total: get("celeriant_leader_elections_total"),
         heartbeat_failures_total: get("celeriant_heartbeat_failures_total"),
         s3_fallbacks_total: get("celeriant_replication_s3_fallbacks_total"),
+        s3_lease_on_demand_renewal_total: get("celeriant_s3_lease_on_demand_renewal_total"),
+        s3_fallback_lease_unconfirmed_total: get("celeriant_s3_fallback_lease_unconfirmed_total"),
         shard_panics_total: get("celeriant_shard_panics_total"),
         node_starts_total: get("celeriant_node_starts_total"),
         client_connections_active,
@@ -234,6 +265,7 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         truncate_dropped_self_acked_wal_seqs_total: get("celeriant_truncate_dropped_self_acked_wal_seqs_total"),
         s3_catchup_self_uploads_seen_total: get("celeriant_s3_catchup_self_uploads_seen_total"),
         truncate_refused_due_to_ack_barrier_total: get("celeriant_truncate_refused_due_to_ack_barrier_total"),
+        s3_catchup_same_epoch_divergence_total: get("celeriant_s3_catchup_same_epoch_divergence_total"),
         cull_stale_client_seq_lru: get("celeriant_cull_stale_client_seq_lru"),
         cull_stale_agg_lru: get("celeriant_cull_stale_agg_lru"),
         client_idempotency_violations_total: get("celeriant_client_idempotency_violations_total"),
@@ -245,6 +277,25 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         barrier_sync_fsync_total: get("celeriant_barrier_sync_fsync_total"),
         barrier_sync_fsync_failed_total: get("celeriant_barrier_sync_fsync_failed_total"),
     }
+}
+
+/// Extract the value of `key` from a Prometheus label set, e.g.
+/// `metric{shard_id="3",other="x"}` → `extract_label(..., "shard_id")` → `Some("3")`.
+fn extract_label<'a>(name_part: &'a str, key: &str) -> Option<&'a str> {
+    let start = name_part.find('{')?;
+    let end = name_part.rfind('}')?;
+    let labels = &name_part[start + 1..end];
+    for kv in labels.split(',') {
+        let kv = kv.trim();
+        if let Some(rest) = kv.strip_prefix(key) {
+            if let Some(rest) = rest.strip_prefix("=\"") {
+                if let Some(val) = rest.strip_suffix('"') {
+                    return Some(val);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn split_metric_line(line: &str) -> Option<(&str, &str)> {

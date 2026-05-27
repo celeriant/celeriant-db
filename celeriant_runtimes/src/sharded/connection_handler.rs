@@ -1272,6 +1272,31 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
         });
     }
 
+    // A heartbeat from a higher-epoch peer (req.lease_epoch > local) demotes a non-follower
+    // (Fenced/Leader) to follower. Cull our un-acked speculative tail first, mirroring the
+    // election-path CullSpeculativeTail, or it strands (write>read) and S3 catchup wedges on
+    // no-common-ancestor. A self-reclaim never accepts a peer heartbeat and a steady follower
+    // has no tail, so neither is affected. Cull first so a following EnterS3Catchup lands after.
+    let demoting_to_higher_epoch_peer = !current_status.is_any_follower_state()
+        && raw_status.is_follower()
+        && req.lease_epoch > local_lease_epoch;
+    if demoting_to_higher_epoch_peer {
+        let shard_count = ctx.intrashard_sender.nr_consumers();
+        for peer in 0..shard_count {
+            if peer == ctx.current_shard_id {
+                continue;
+            }
+            let _ = try_send_with_retry(
+                ctx.intrashard_sender.as_ref(), peer,
+                IntrashardMessages::CullSpeculativeTail { rewind_to_ack_barrier: true }, 10,
+            ).await;
+        }
+        if let Err(e) = ctx.shard_wal.cull_speculative_tail_for_promotion(true).await {
+            tracing::warn!(shard_id = ctx.current_shard_id, error = ?e,
+                "heartbeat-demotion cull failed, catchup may wedge on no-common-ancestor");
+        }
+    }
+
     // Extend the lease due to the live heartbeat
     let current_lease_expiry_ms = ctx.shard_wal.node_status.get().lease_expires_at_ms();
     let new_lease_expiry_ms = compute_new_ttl(
@@ -1319,8 +1344,19 @@ async fn handle_kick_follower<R: ReplicationClient + 'static, D: S3Downloader + 
     // Only transition from Follower (already catching up → ignore duplicate kicks)
     if status.raw().is_follower() {
         let leader_lease_epoch = status.raw().lease_epoch_for_logging();
+        // A kick is a liveness signal from the leader: set TTL as if this were a heartbeat so
+        // that decide_post_catchup_action returns StayFollower instead of ChallengeViaCAS.
+        let now_ms = validated_node_status::unix_epoch_now_ms();
+        let current_expiry_ms = status.lease_expires_at_ms();
+        let new_expiry_ms = compute_new_ttl(
+            current_expiry_ms,
+            now_ms,
+            ctx.config.heartbeat_lease_duration.as_millis() as u64,
+        );
         let catching_up = ValidatedNodeStatus::create_custom_status(
-            NodeStatus::FollowerCatchingUp { leader_lease_epoch }, 0,0,
+            NodeStatus::FollowerCatchingUp { leader_lease_epoch },
+            ctx.config.max_clock_drift_ms,
+            new_expiry_ms,
         );
         set_node_status_and_metric(&ctx.shard_wal.node_status, catching_up, ctx.current_shard_id as u32);
         broadcast_status(ctx, catching_up).await;
@@ -1345,7 +1381,10 @@ async fn broadcast_status<R: ReplicationClient + 'static, D: S3Downloader + 'sta
         }
         let _ = try_send_with_retry(
             ctx.intrashard_sender.as_ref(), peer,
-            IntrashardMessages::StatusUpdate { status }, 10
+            // These status updates originate from follower-side events (kick, clock-drift fence,
+            // heartbeat receipt). They are not CAS-confirmed leases, so cas_confirmed_at_ms=None.
+            // leader_changed_hands=false: none of these are a peer-takeover promotion.
+            IntrashardMessages::StatusUpdate { status, cas_confirmed_at_ms: None, leader_changed_hands: false }, 10
         ).await;
     }
 }
@@ -1591,6 +1630,43 @@ mod tests {
         });
         let shard = determine_cluster_shard(&request, &config).unwrap();
         assert_eq!(shard, 0, "Heartbeat must always route to shard 0");
+    }
+
+    // Regression: a kick must NOT zero the TTL. Before the fix, handle_kick_follower called
+    // create_custom_status(..., 0, 0), leaving lease_expires_at_ms = 0. decide_post_catchup_action
+    // then returned ChallengeViaCAS immediately even though the leader was live, causing split-brain.
+    #[test]
+    fn kick_must_set_alive_ttl_to_prevent_split_brain() {
+        let now_ms = validated_node_status::unix_epoch_now_ms();
+        let heartbeat_lease_duration_ms = 1_500u64;
+        let max_clock_drift_ms = 500u64;
+
+        // Simulate the FIXED kick handler: extend TTL from current expiry (or 0 if none) by
+        // heartbeat_lease_duration.
+        let current_expiry_ms = 0u64; // follower had no prior TTL
+        let new_expiry_ms = compute_new_ttl(current_expiry_ms, now_ms, heartbeat_lease_duration_ms);
+        let catching_up = ValidatedNodeStatus::create_custom_status(
+            NodeStatus::FollowerCatchingUp { leader_lease_epoch: 7 },
+            max_clock_drift_ms,
+            new_expiry_ms,
+        );
+
+        assert!(
+            catching_up.lease_expires_at_ms() > now_ms,
+            "kick must produce an alive TTL (got {}; now {})", catching_up.lease_expires_at_ms(), now_ms
+        );
+
+        // With the alive TTL, decide_post_catchup_action must defer (StayFollower), not challenge.
+        let action = celeriant_distributed::node_status_logic::decide_post_catchup_action(
+            catching_up.raw(),
+            catching_up.lease_expires_at_ms(),
+            now_ms,
+            heartbeat_lease_duration_ms,
+        );
+        assert!(
+            matches!(action, celeriant_distributed::node_status_logic::PostCatchupAction::StayFollower { .. }),
+            "kicked node with alive TTL must stay follower, got {action:?}"
+        );
     }
 
     #[test]

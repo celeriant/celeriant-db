@@ -46,42 +46,42 @@ impl HeaderCursor {
     }
 }
 
-/// The header is written at the start and end of the fixed size log segment file.
-/// Writing both, protected by crc checks, allows recovery on torn writes.
-/// Header uses HEADER_BLOCK_SIZE_BYTES (512KB) to accommodate the bloom filter.
+/// Written at both the start and end of the fixed-size log segment, each CRC-protected,
+/// so a torn write can be recovered from whichever copy survived. Sized at
+/// HEADER_BLOCK_SIZE_BYTES (512KB) to hold the aggregate bloom filter.
 #[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
 pub struct ShardLogHeader {
-    /// Writer's view: most recently written metablocks (may not yet be replicated).
+    /// Writer's tip: the most recently written metablock. Sits at or ahead of `read`
+    /// (entries here may be written but not yet replicated/confirmed).
     pub write: HeaderCursor,
 
-    /// Bloom filter for aggregate keys written to this log segment.
-    /// Used to quickly skip log segments during aggregate existence checks.
-    /// A "definitely not in set" result means no metablocks for that aggregate exist.
-    /// The read cursor's covered range is always a subset of the write cursor's range,
-    /// so this write-cursor bloom is a valid superset filter for reads too.
+    /// Bloom filter of aggregate keys written to this segment, for fast "aggregate absent"
+    /// checks. A negative result means no metablock for that aggregate exists here. It's
+    /// built over the write range, which always covers the read range, so it's also a
+    /// valid (superset) filter for reads.
     pub aggregate_bloom: Vec<u64>,
 
-    /// Promotion-batch floor: `leader_confirmed_wal_seq + 1` from the highest-confirmed
-    /// batch received via TCP replication while follower (monotonic max). On promotion to
-    /// leader, entries from this index onward are uploaded to S3 so the old leader (which
-    /// may have rolled back data above its confirmed point) can catch up. Zero means no
-    /// pending promotion upload.
+    /// Promotion-upload floor: the first wal_seq we'd push to S3 if we promoted. Set from
+    /// each TCP batch received as follower to `leader_confirmed_wal_seq + 1` (monotonic
+    /// max). On promotion, `[this, write]` is uploaded so a partitioned ex-leader — which
+    /// may have rolled back everything above its confirmed point — can catch up via S3 from
+    /// entries that might otherwise exist only over TCP. 0 means nothing to upload. Persisted
+    /// here so a promote-after-restart still knows the gap.
     pub last_received_replication_wal_seq: u64,
 
-    /// Highest wal_seq this node acked to a client while it was leader. Catchup
-    /// refuses to truncate at or below this value, because that data is owed to
-    /// whoever wrote it. Combined at the refusal site with
-    /// last_received_replication_wal_seq so we also cover acks made by other
-    /// leaders while we were following them.
+    /// Highest wal_seq this node acked to a client while leader. The S3-catchup truncate
+    /// barrier refuses to truncate at or below it — that data is owed to whoever wrote it.
+    /// The barrier uses this value alone; `last_received_replication_wal_seq` and `read` are
+    /// deliberately excluded, since they track receive/apply, not what we promised a client.
     ///
-    /// Persisted on the next regular header fsync. If we crash between the bump
-    /// and that fsync, we lose it and might allow a truncate we'd otherwise refuse.
+    /// Bumped after a confirmed replication, then header-fsynced (coalesced) before the
+    /// client sees Ok, so it survives a crash-after-Ok. If that fsync fails the bump stays
+    /// in-memory only (logged), and a later crash could then permit a truncate we'd refuse.
     pub last_self_acked_wal_seq: u64,
 
-    /// Reader's view: end of last replicated/confirmed metablock. A zero
-    /// `metablocks_position` is the sentinel meaning "read has not advanced to this
-    /// segment yet" (used after segment rotation, before first replication on the new
-    /// segment).
+    /// Reader's tip: end of the last replicated/confirmed metablock — the reader visibility
+    /// horizon. A zero `metablocks_position` is the sentinel for "read hasn't advanced into
+    /// this segment yet" (just after rotation, before its first replication).
     pub read: HeaderCursor,
 }
 
@@ -277,4 +277,5 @@ mod tests {
             HEADER_BLOCK_SIZE_BYTES
         );
     }
+
 }

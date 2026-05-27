@@ -7,6 +7,7 @@ mod report;
 mod sample;
 mod scenario;
 mod scrape;
+mod tip_fork;
 
 use std::path::PathBuf;
 use std::time::Instant;

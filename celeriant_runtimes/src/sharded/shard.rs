@@ -7,7 +7,7 @@ use std::{
 
 use celeriant_distributed::{lease_store::LeaseStore, node_status_logic::{compute_new_ttl, decide_post_catchup_action, PostCatchupAction}, s3_lease_manager::{ElectionOutcome, S3LeaseManager}, validated_node_status::{self, ValidatedNodeStatus, set_node_status_and_metric}};
 use celeriant_msg::response::responses::HeartbeatResult;
-use celeriant_shard::{error::send_heartbeat_error::SendHeartbeatError, replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::ShardWal, shard_wal_s3_catchup::CatchupCompletion};
+use celeriant_shard::{error::send_heartbeat_error::SendHeartbeatError, replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::{LeaseRenewalRequester, ShardWal}, shard_wal_s3_catchup::CatchupCompletion};
 use glommio::{
     channels::{
         channel_mesh::{Receivers, Senders},
@@ -88,6 +88,14 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
             lease_manager: lease_manager.map(Rc::new),
             dict_codec,
         };
+
+        // Wire the out-of-band lease-renewal hook: lets the replication path nudge shard 0
+        // to re-CAS the S3 lease when an S3 fallback would otherwise be gated by a stale
+        // CAS confirmation, instead of relying on the (possibly kernel-stalled) heartbeat loop.
+        ctx.shard_wal.set_lease_renewal_requester(Rc::new(IntrashardLeaseRenewalRequester {
+            sender: ctx.intrashard_sender.clone(),
+            shard_id: current_shard_id,
+        }));
 
         Self {
             intrashard_receivers: receivers,
@@ -485,6 +493,97 @@ where
 /// Reach out to S3 immediately to determine if this node is leader or follower
 /// Ensure we are up-to-date with any replicated S3 entries if we become leader
 /// Ensure all shards are updated with our new status
+/// Bridges the layering gap for the lease-renewal hook: `celeriant_shard` defines the
+/// `LeaseRenewalRequester` trait but has no access to the intra-shard mesh, which lives
+/// here. A data shard's replication path calls `request_renewal()`; this sends a
+/// `RenewS3LeaseNow` to shard 0.
+struct IntrashardLeaseRenewalRequester {
+    sender: Rc<Senders<IntrashardMessages>>,
+    shard_id: usize,
+}
+
+impl LeaseRenewalRequester for IntrashardLeaseRenewalRequester {
+    fn request_renewal(&self) {
+        // Fire-and-forget, best-effort: coalesced on shard 0, and the replication spin loop
+        // re-requests on its next iteration if the queue was momentarily full.
+        let _ = self.sender.try_send_to(0, IntrashardMessages::RenewS3LeaseNow { requesting_shard: self.shard_id });
+    }
+}
+
+/// Out-of-band S3 lease renewal, handled on shard 0 in response to a data shard's
+/// `RenewS3LeaseNow`. The data shard sends this when it must S3-fallback (a durability
+/// ack) but its CAS-confirmed lease has gone stale — rather than wait for the heartbeat
+/// loop (which can stall in the kernel under load) to renew, it pokes shard 0 to re-CAS
+/// `lease.json` here and now, then spin-waits for the broadcast green light.
+///
+/// Single-flight without a lock: the intra-shard handler is strictly sequential, and a
+/// debounce on `s3_cas_confirmed_at_ms` makes a burst from all shards trigger at most one
+/// CAS — the first renews and refreshes everyone; the rest fall through the debounce.
+///
+/// `run_election_to_acquire_s3_lease` renews a self-held lease in place (no epoch bump);
+/// only a peer-held/expired lease promotes. A peer that has superseded us returns a
+/// Follower outcome → we fence immediately to stop acking divergent data (the dual-ack).
+async fn renew_s3_lease_on_demand<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    ctx: &ConnectionContext<R, D, S>,
+    requesting_shard: usize,
+) {
+    let Some(lease_manager) = ctx.lease_manager.clone() else { return; };
+    // Only renew while we still believe we hold leadership; acquiring from a follower/boot
+    // state is the election path's job, not this hook.
+    if !ctx.shard_wal.node_status.get().raw().is_leader() {
+        return;
+    }
+    let lease_duration_ms = match ctx.config.replication_config.as_ref() {
+        Some(rc) => rc.s3_lease_duration.as_millis() as u64,
+        None => return, // no replication config (standalone) — nothing to renew
+    };
+    if lease_duration_ms == 0 {
+        return; // gate disabled (tests / standalone)
+    }
+    // Debounce: a CAS within the last half-lease already refreshed every shard's
+    // confirmation, so coalesce the rest of the burst.
+    let now_ms = validated_node_status::unix_epoch_now_ms();
+    if now_ms.saturating_sub(ctx.shard_wal.s3_cas_confirmed_at_ms.get()) < lease_duration_ms / 2 {
+        return;
+    }
+
+    match retry_s3_operation(ctx.config.s3_retry_max_duration, "on_demand_lease_renewal",
+        || lease_manager.run_election_to_acquire_s3_lease()).await
+    {
+        Ok(outcome) if outcome.status.raw().is_leader() => {
+            // Renewed. Refresh our own CAS signal + TTL, then broadcast the fresh
+            // confirmation so every data shard's fallback gate sees the green light.
+            let confirmed_at = validated_node_status::unix_epoch_now_ms();
+            ctx.shard_wal.s3_cas_confirmed_at_ms.set(confirmed_at);
+            set_node_status_and_metric(&ctx.shard_wal.node_status, outcome.status, ctx.current_shard_id as u32);
+            broadcast_message_to_other_shards(
+                ctx.current_shard_id,
+                IntrashardMessages::StatusUpdate { status: outcome.status, cas_confirmed_at_ms: Some(confirmed_at), leader_changed_hands: false },
+                ctx.intrashard_sender.clone(),
+            ).await;
+            metrics::counter!("celeriant_s3_lease_on_demand_renewal_total", &[("result", "renewed".to_string())]).increment(1);
+            info!(requesting_shard, "On-demand S3 lease renewal: re-CAS confirmed; broadcast green light to all shards");
+        }
+        Ok(outcome) => {
+            // Superseded — a peer holds a higher epoch. Stop acking NOW: adopt the follower
+            // status and broadcast it to fence every shard. The heavier demotion recovery
+            // (speculative-tail cull + catchup) is handled by the orchestrator loop when it
+            // observes the role change.
+            set_node_status_and_metric(&ctx.shard_wal.node_status, outcome.status, ctx.current_shard_id as u32);
+            broadcast_message_to_other_shards(
+                ctx.current_shard_id,
+                IntrashardMessages::StatusUpdate { status: outcome.status, cas_confirmed_at_ms: None, leader_changed_hands: false },
+                ctx.intrashard_sender.clone(),
+            ).await;
+            metrics::counter!("celeriant_s3_lease_on_demand_renewal_total", &[("result", "superseded".to_string())]).increment(1);
+            warn!(requesting_shard, "On-demand S3 lease renewal: superseded by peer — fencing self, refusing further fallback acks");
+        }
+        Err(e) => {
+            warn!(requesting_shard, error = %e, "On-demand S3 lease renewal CAS failed (transient); requesting shard keeps spin-waiting");
+        }
+    }
+}
+
 async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     lease_manager: &S3LeaseManager<S>,
     ctx: &ConnectionContext<R, D, S>,
@@ -521,14 +620,28 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
     let became_leader = !is_currently_leader && outcome.status.is_leader();
     let became_follower_from_leader_or_fenced = is_currently_leader && !outcome.status.is_leader();
 
-    let needs_cull = became_leader || became_follower_from_leader_or_fenced;
-    let needs_catchup = became_leader || lease_changed_hands;
+    // Use the restart-proof signal from S3 to decide whether leadership changed hands.
+    // outcome.reacquired_own_lease is derived from the durable S3 lease holder (not from
+    // the in-memory epoch which is 0 after a restart), so it correctly identifies a
+    // SIGKILL+restart self-reclaim where previous_lease_epoch==0 but no peer held the lease.
+    //
+    // Cull the speculative tail only when leadership genuinely changed hands (peer took over
+    // and may have authored a divergent tail) or on demotion.  Self-reclaim: keep the tail.
+    // Also skip upload_s3_promotion_batch on self-reclaim: no incoming replication means
+    // nothing to bridge, and its idempotent-cull prefix would re-cull the tail we kept.
+    let (needs_cull, leader_changed_hands, needs_catchup) = promotion_cull_flags(
+        became_leader,
+        became_follower_from_leader_or_fenced,
+        outcome.reacquired_own_lease,
+        lease_changed_hands,
+        outcome.status.raw().is_any_follower_state(),
+    );
 
     if needs_cull || needs_catchup {
-        if outcome.status.is_leader() && lease_changed_hands {
+        if outcome.status.is_leader() && leader_changed_hands {
             info!(previous_lease_epoch, new_lease_epoch, "Lease changed hands during partition — running S3 catchup");
         } else if outcome.status.is_leader() {
-            info!("Starting post-election S3 catchup");
+            info!("Self-reclaim: re-acquired own lease, keeping speculative tail, running S3 catchup to confirm no peer batches");
         } else if became_follower_from_leader_or_fenced && lease_changed_hands {
             info!(previous_lease_epoch, new_lease_epoch, "Lost leadership / fenced — running S3 catchup before becoming follower");
         } else if became_follower_from_leader_or_fenced {
@@ -542,11 +655,11 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
         if needs_cull {
             let shard_count = ctx.config.num_shards as usize;
             for peer in 1..shard_count {
-                if let Err(e) = try_send_with_retry(ctx.intrashard_sender.as_ref(), peer, IntrashardMessages::CullSpeculativeTail, 10).await {
+                if let Err(e) = try_send_with_retry(ctx.intrashard_sender.as_ref(), peer, IntrashardMessages::CullSpeculativeTail { rewind_to_ack_barrier: became_follower_from_leader_or_fenced }, 10).await {
                     panic!("Failed to send CullSpeculativeTail to shard {peer} after retries: {e:?}");
                 }
             }
-            if let Err(e) = ctx.shard_wal.cull_speculative_tail_for_promotion().await {
+            if let Err(e) = ctx.shard_wal.cull_speculative_tail_for_promotion(became_follower_from_leader_or_fenced).await {
                 return Err(celeriant_distributed::lease_store::LeaseStoreError::Unavailable {
                     message: format!("pre-catchup speculative tail cull failed: {e:?}"),
                 });
@@ -559,7 +672,11 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
             }
 
             // Close any gap in S3 left by the old leader rolling back a batch we kept.
-            if became_leader {
+            // Skipped on self-reclaim (leader_changed_hands=false): no incoming replication
+            // means last_received_replication_wal_seq=0 and nothing to bridge, but more
+            // importantly upload_s3_promotion_batch's idempotent-cull prefix would re-cull
+            // the speculative tail we deliberately kept.
+            if leader_changed_hands {
                 if let Err(e) = ctx.shard_wal.upload_s3_promotion_batch().await {
                     tracing::warn!(error = ?e, "Failed to upload promotion batch to S3; old leader may not be able to catch up via S3");
                 }
@@ -618,9 +735,14 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
     if role_changed && was_leader && !now_leader {
         ctx.shard_wal.drain_pending_replication_on_role_change().await;
     }
+    // CAS path: record the confirmation timestamp on this shard and broadcast to all
+    // other shards. Data shards unblock their S3 fallback uploads on receipt.
+    // The heartbeat-ack path (cas_confirmed_at_ms: None) must NOT update this cell.
+    let cas_confirmed_at_ms = validated_node_status::unix_epoch_now_ms();
+    ctx.shard_wal.s3_cas_confirmed_at_ms.set(cas_confirmed_at_ms);
     broadcast_message_to_other_shards(
         ctx.current_shard_id,
-        IntrashardMessages::StatusUpdate { status: outcome.status },
+        IntrashardMessages::StatusUpdate { status: outcome.status, cas_confirmed_at_ms: Some(cas_confirmed_at_ms), leader_changed_hands },
         ctx.intrashard_sender.clone(),
     ).await;
 
@@ -808,7 +930,9 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                     let refreshed = ValidatedNodeStatus::create_custom_status(
                         ctx.shard_wal.node_status.get().raw(), ctx.config.max_clock_drift_ms, new_expires_at_ms);
                     set_node_status_and_metric(&ctx.shard_wal.node_status, refreshed, ctx.current_shard_id as u32);
-                    broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::StatusUpdate { status: refreshed }, ctx.intrashard_sender.clone()).await;
+                    // Heartbeat-ack path: cas_confirmed_at_ms=None — does NOT update the CAS signal.
+                    // leader_changed_hands=false: a leader refreshing its own lease is not a promotion.
+                    broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::StatusUpdate { status: refreshed, cas_confirmed_at_ms: None, leader_changed_hands: false }, ctx.intrashard_sender.clone()).await;
                     continue;
                 }
 
@@ -938,22 +1062,22 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                 let status_now = ctx.shard_wal.node_status.get();
                 let now_ms = validated_node_status::unix_epoch_now_ms();
                 let self_node_id = lease_manager.node_id();
-                let needs_boot_grace = match lease_manager.peek_lease().await {
-                    Ok(Some(lease)) => lease.leader_node_id != self_node_id && lease.is_expired(now_ms),
-                    _ => false,
-                };
+                let peeked_lease = lease_manager.peek_lease().await.ok().flatten();
+                let needs_boot_grace = peeked_lease.as_ref().map_or(false, |lease| {
+                    lease.leader_node_id != self_node_id && lease.is_expired(now_ms)
+                });
                 let boot_grace_ms = if needs_boot_grace {
                     (ctx.config.heartbeat_lease_duration.as_millis() as u64).min(BOOT_GRACE_MAX_MS)
                 } else {
                     0
                 };
+                let lease_expires_at_ms = status_now.lease_expires_at_ms();
                 let action = decide_post_catchup_action(
                     status_now.raw(),
-                    status_now.lease_expires_at_ms(),
+                    lease_expires_at_ms,
                     now_ms,
                     boot_grace_ms,
                 );
-
                 match action {
                     PostCatchupAction::StayFollower { .. } => {
                         info!("Post-catchup: lease alive (heartbeat received during catchup); not challenging");
@@ -1045,10 +1169,13 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
                 ctx.clone(),
             );
         }
-        IntrashardMessages::CullSpeculativeTail => {
-            if let Err(e) = ctx.shard_wal.cull_speculative_tail_for_promotion().await {
+        IntrashardMessages::CullSpeculativeTail { rewind_to_ack_barrier } => {
+            if let Err(e) = ctx.shard_wal.cull_speculative_tail_for_promotion(rewind_to_ack_barrier).await {
                 tracing::warn!(shard_id = ctx.current_shard_id, error = ?e, "CullSpeculativeTail fsync failed — catchup may miss peer S3 batches");
             }
+        }
+        IntrashardMessages::RenewS3LeaseNow { requesting_shard } => {
+            renew_s3_lease_on_demand(ctx, requesting_shard).await;
         }
         IntrashardMessages::EnterS3Catchup => handle_enter_s3_catchup(ctx.clone()),
         IntrashardMessages::S3CatchupComplete { shard_id, result } => {
@@ -1056,7 +1183,7 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
                 let _ = tx.try_send(CatchupCompletionMsg { result, shard_id });
             }
         }
-        IntrashardMessages::StatusUpdate { status } => {
+        IntrashardMessages::StatusUpdate { status, cas_confirmed_at_ms, leader_changed_hands } => {
             let previous = ctx.shard_wal.node_status.get();
             let role_changed = !previous.raw().same_role(&status.raw());
             if role_changed {
@@ -1071,19 +1198,32 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
             let was_leader = previous.raw().is_leader();
             let now_leader = status.raw().is_leader();
             set_node_status_and_metric(&ctx.shard_wal.node_status, status, ctx.current_shard_id as u32);
+            if let Some(confirmed_at) = cas_confirmed_at_ms {
+                ctx.shard_wal.s3_cas_confirmed_at_ms.set(confirmed_at);
+            }
             if role_changed && was_leader && !now_leader {
                 ctx.shard_wal.drain_pending_replication_on_role_change().await;
             }
-            // Mirror the lease-handler's promotion-batch upload (shard.rs:530) for
+            // Mirror the lease-handler's promotion-batch upload (shard.rs:579) for
             // shards 1..N which inherit lease via this broadcast. Without this,
             // entries received over TCP from the previous leader (and never
             // uploaded to S3) are stranded on this node's local disk: the old
             // leader rolled them back on resume, S3 has no record, and catchup
             // wedges with `Chain mismatch with no common ancestor`.
-            if role_changed && !was_leader && now_leader {
+            //
+            // Gated on leader_changed_hands to match shard 0's gate: on self-reclaim
+            // the node kept its speculative tail, and upload_s3_promotion_batch's
+            // idempotent re-cull (shard_wal.rs:2644) would rewind write→read and
+            // discard that tail, re-creating the same-seq fork the peer holds.
+            if should_upload_promotion_batch_on_status(role_changed, was_leader, now_leader, leader_changed_hands) {
                 if let Err(e) = ctx.shard_wal.upload_s3_promotion_batch().await {
                     tracing::warn!(shard_id = ctx.current_shard_id, error = ?e, "Failed to upload promotion batch to S3 — old leader may not be able to catch up via S3");
                 }
+            } else if role_changed && !was_leader && now_leader {
+                // Self-reclaim promotion: the gate above skipped the upload. Its re-cull
+                // would have discarded the speculative tail we kept. This line is the
+                // behavioral signal that the data-shard gate fired (anti-stale grep target).
+                info!(shard_id = ctx.current_shard_id, "self-reclaim: keeping speculative tail, skipping data-shard promotion-batch upload");
             }
         }
         IntrashardMessages::UpdatePeerNodeId { peer_node_id } => {
@@ -1103,7 +1243,9 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
             ctx.shard_wal.replication_client.set_follower_reachable(reachable);
             let leader_for_ms = validated_node_status::unix_epoch_now_ms()
                 .saturating_sub(ctx.shard_wal.node_status.get().leader_since_ms());
-            if should_fire_reachability_probe(was_reachable, reachable, ctx.shard_wal.node_status.get().is_leader(), leader_for_ms, MIN_PROBE_AFTER_LEADER_MS) {
+            let is_leader = ctx.shard_wal.node_status.get().is_leader();
+            let transition_probe = should_fire_reachability_probe(was_reachable, reachable, is_leader, leader_for_ms, MIN_PROBE_AFTER_LEADER_MS);
+            if transition_probe {
                 let shard_wal = ctx.shard_wal.clone();
                 glommio::spawn_local(async move {
                     if let Err(e) = shard_wal.probe_replicate().await {
@@ -1186,6 +1328,52 @@ const MIN_PROBE_AFTER_LEADER_MS: u64 = 2000;
 /// no transition triggers the probe, follower stays behind forever).
 const PERIODIC_PROBE_INTERVAL_MS: u64 = 5_000;
 
+/// Compute cull and catchup flags for a role transition.
+///
+/// became_leader: transition from non-leader to leader.
+/// became_follower_from_leader_or_fenced: transition from leader to non-leader.
+/// reacquired_own_lease: from ElectionOutcome, a restart-proof S3 signal.
+/// lease_changed_hands: epoch increased (a peer held the lease in between).
+/// now_following_peer: new status is Follower/FollowerCatchingUp (a confirmed leader
+/// exists), not Fenced.
+///
+/// Returns (needs_cull, leader_changed_hands, needs_catchup).
+fn promotion_cull_flags(
+    became_leader: bool,
+    became_follower_from_leader_or_fenced: bool,
+    reacquired_own_lease: bool,
+    lease_changed_hands: bool,
+    now_following_peer: bool,
+) -> (bool, bool, bool) {
+    let leader_changed_hands = became_leader && !reacquired_own_lease;
+    // Also cull when a higher-epoch peer took the lease while we were already non-leader
+    // (self-fenced before challenging, so became_follower_from_leader_or_fenced is false).
+    // now_following_peer means a peer leads; !reacquired_own_lease means it is not us. A bare
+    // self-fence is excluded so a self-reclaim keeps its tail.
+    let demoted_to_peer = now_following_peer && lease_changed_hands && !reacquired_own_lease;
+    let needs_cull = leader_changed_hands || became_follower_from_leader_or_fenced || demoted_to_peer;
+    let needs_catchup = became_leader || lease_changed_hands;
+    (needs_cull, leader_changed_hands, needs_catchup)
+}
+
+/// Whether a data shard, on receiving a leader-promotion `StatusUpdate`, should
+/// upload its promotion batch to S3. Mirrors shard 0's own gate (the orchestrator
+/// only calls `upload_s3_promotion_batch` when `leader_changed_hands`).
+///
+/// Fires only on a genuine peer-takeover promotion (`!was_leader → now_leader`
+/// with leadership changing hands). On self-reclaim (`leader_changed_hands=false`)
+/// the node deliberately kept its speculative tail; the upload's idempotent
+/// re-cull would rewind `write→read` and discard it, re-creating the same-seq
+/// fork the peer still holds.
+fn should_upload_promotion_batch_on_status(
+    role_changed: bool,
+    was_leader: bool,
+    now_leader: bool,
+    leader_changed_hands: bool,
+) -> bool {
+    role_changed && !was_leader && now_leader && leader_changed_hands
+}
+
 /// Returns true when a reconciliation probe should fire after a reachability update.
 fn should_fire_reachability_probe(
     was_reachable: bool,
@@ -1226,6 +1414,90 @@ mod tests {
                 should_fire_reachability_probe(was, now, leader, leader_for_ms, min_warmup_ms),
                 expected,
                 "was_reachable={was} reachable={now} is_leader={leader} leader_for_ms={leader_for_ms}",
+            );
+        }
+    }
+
+    /// Cull flags truth table for the promotion_cull_flags helper.
+    ///
+    /// Columns: became_leader, became_follower, reacquired_own_lease, lease_changed_hands,
+    ///          now_following_peer
+    /// Expected: (needs_cull, leader_changed_hands, needs_catchup)
+    #[test]
+    fn promotion_cull_flags_truth_table() {
+        // (became_leader, became_follower, reacquired_own_lease, lease_changed_hands,
+        //  now_following_peer, exp_needs_cull, exp_leader_changed_hands, exp_needs_catchup)
+        let cases: &[(bool, bool, bool, bool, bool, bool, bool, bool)] = &[
+            // RESTART self-reclaim: previous_lease_epoch=0 (BootCatchup), S3 lease is ours
+            // (epoch 1). reacquired_own_lease=true, so no cull (keep the tail).
+            (true, false, true, true, false, false, false, true),
+
+            // Warm self-reclaim (no restart): epoch stable, reacquired.
+            (true, false, true, false, false, false, false, true),
+
+            // Promote-over-peer: took over an expired/fenced peer lease.
+            (true, false, false, true, false, true, true, true),
+
+            // Promote-over-peer where epoch didn't change (shouldn't happen; verify).
+            (true, false, false, false, false, true, true, true),
+
+            // Demotion: leader lost lease to peer (Leader to Follower edge observed).
+            (false, true, false, true, true, true, false, true),
+
+            // Demotion: self-fenced (Leader to Fenced, lease not yet taken). Culls; no catchup.
+            (false, true, false, false, false, true, false, false),
+
+            // No role change (already leader, renewals): no cull, no catchup.
+            (false, false, true, false, false, false, false, false),
+
+            // Already non-leader, a higher-epoch peer took the lease and we now follow it
+            // (self-fenced before challenging, so no Leader to Follower edge).
+            // !reacquired_own_lease confirms a peer, so cull the stranded tail.
+            (false, false, false, true, true, true, false, true),
+
+            // Already non-leader, epoch advanced but not following anyone (Fenced): may
+            // self-reclaim, so no cull. Catchup only.
+            (false, false, false, true, false, false, false, true),
+
+            // Non-leader, epoch advanced, but reacquired our own lease: never cull even if
+            // momentarily following.
+            (false, false, true, true, true, false, false, true),
+        ];
+
+        for &(became_leader, became_follower, reacquired, lease_changed, following, exp_cull, exp_lch, exp_catchup) in cases {
+            let (cull, lch, catchup) = promotion_cull_flags(became_leader, became_follower, reacquired, lease_changed, following);
+            assert_eq!(
+                (cull, lch, catchup),
+                (exp_cull, exp_lch, exp_catchup),
+                "became_leader={became_leader} became_follower={became_follower} reacquired={reacquired} lease_changed={lease_changed} following={following}",
+            );
+        }
+    }
+
+    /// A data shard runs its promotion-batch upload (which re-culls the speculative
+    /// tail) ONLY on a genuine peer-takeover promotion — never on self-reclaim,
+    /// where the kept tail would be wrongly discarded into a same-seq fork.
+    ///
+    /// Columns: role_changed, was_leader, now_leader, leader_changed_hands -> expected
+    #[test]
+    fn should_upload_promotion_batch_on_status_truth_table() {
+        let cases: &[(bool, bool, bool, bool, bool)] = &[
+            // Self-reclaim: BootCatchup→Leader, leadership did NOT change hands. SKIP (the bug).
+            (true, false, true, false, false),
+            // Promote-over-peer: Follower→Leader, leadership changed hands. UPLOAD.
+            (true, false, true, true, true),
+            // Heartbeat refresh on an existing leader: no role change. SKIP.
+            (false, true, true, true, false),
+            // Demotion: Leader→Follower. SKIP (now_leader=false).
+            (true, true, false, false, false),
+            // Follower staying follower (heartbeat-ack). SKIP.
+            (false, false, false, false, false),
+        ];
+        for &(role_changed, was_leader, now_leader, lch, expected) in cases {
+            assert_eq!(
+                should_upload_promotion_batch_on_status(role_changed, was_leader, now_leader, lch),
+                expected,
+                "role_changed={role_changed} was_leader={was_leader} now_leader={now_leader} leader_changed_hands={lch}",
             );
         }
     }

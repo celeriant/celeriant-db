@@ -7,9 +7,6 @@
 //! nodes, run `celeriant-wal-inspect` on every shard's WAL files, parse the
 //! per-batch lines to extract the actual on-disk client_seq set, and
 //! reclassify the entry's "missing" against ground truth.
-//!
-//! See `docs/missing-data-progress.md` — the audit-overcounts finding from
-//! the 1779152363 run.
 
 use celeriant_bench::DeepAuditEntry;
 use std::process::{Command, Stdio};
@@ -117,7 +114,7 @@ fn scan_node(host: &str, org: u128, type_id: u128, agg_id: u128, client_id: u128
         // Glob log_*.wal — usually one file but bench can rotate.
         // The shell loop handles missing files (sudo prints to stderr only).
         let cmd = format!(
-            "for f in /var/lib/celeriant/shard_{shard}/log_*.wal; do \
+            "for f in /var/lib/nvme/celeriant-data/shard_{shard}/log_*.wal; do \
                  [ -f \"$f\" ] && sudo /usr/local/bin/celeriant-wal-inspect \"$f\" client {org} {type_id} {agg_id} {client_id} 2>/dev/null; \
              done"
         );

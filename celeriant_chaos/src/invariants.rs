@@ -1,6 +1,7 @@
 use serde::Serialize;
 
 use crate::sample::NodeSample;
+use crate::tip_fork;
 
 /// Result of a single check against the captured run data.
 #[derive(Debug, Clone, Serialize)]
@@ -14,7 +15,10 @@ impl CheckResult {
     pub fn pass(name: &'static str) -> Self {
         Self { name, passed: true, detail: "ok".into() }
     }
-    fn fail(name: &'static str, detail: impl Into<String>) -> Self {
+    pub fn pass_with_detail(name: &'static str, detail: impl Into<String>) -> Self {
+        Self { name, passed: true, detail: detail.into() }
+    }
+    pub fn fail(name: &'static str, detail: impl Into<String>) -> Self {
         Self { name, passed: false, detail: detail.into() }
     }
 }
@@ -86,6 +90,14 @@ pub struct ScenarioExpectations {
     /// is bounded by the scraper interval (500ms at 2Hz). `None` (default)
     /// skips the check.
     pub max_failover_ms: Option<u64>,
+
+    /// If true, run `NoDivergentShardTips`: after StopAll, SSH to both nodes
+    /// and compare write_wal_seq + write_tip_hash for each data shard (1..=3).
+    /// Catches divergent-tip forks where both nodes are at the same wal_seq
+    /// but have different WAL tip hashes — the false-pass case that
+    /// EventualConvergence's number comparison silently passes.
+    /// `false` (default) skips the check (it requires live SSH access).
+    pub assert_no_divergent_tips: bool,
 }
 
 impl Default for ScenarioExpectations {
@@ -104,6 +116,7 @@ impl Default for ScenarioExpectations {
             require_final_leader_write_progress: false,
             require_distinct_leader_hosts: None,
             max_failover_ms: None,
+            assert_no_divergent_tips: false,
         }
     }
 }
@@ -178,6 +191,10 @@ pub fn run_all(data: &RunData, expect: &ScenarioExpectations) -> Vec<CheckResult
         // Truncate dropped wal_seqs this node acked as leader. Should be impossible
         // unless the ack barrier was bypassed.
         check_counter("NoTruncateDroppedSelfAcked", data, |s| s.truncate_dropped_self_acked_events_total, 0),
+        // Two same-(lease_epoch) S3 batches at one start with divergent content:
+        // the content-immutability invariant violated (cull-skip regressed). Should
+        // be impossible.
+        check_counter("NoSameEpochDivergence", data, |s| s.s3_catchup_same_epoch_divergence_total, 0),
     ];
     if expect.require_leader_retained {
         out.push(check_leader_retained(data));
@@ -193,6 +210,9 @@ pub fn run_all(data: &RunData, expect: &ScenarioExpectations) -> Vec<CheckResult
     }
     if let Some(max_ms) = expect.max_failover_ms {
         out.push(check_failover_within_budget(data, max_ms));
+    }
+    if expect.assert_no_divergent_tips {
+        out.push(tip_fork::check_no_divergent_shard_tips(data.leader_host, data.follower_host));
     }
     out
 }
@@ -352,11 +372,16 @@ fn check_leader_retained(data: &RunData) -> CheckResult {
     }
 }
 
-/// PROGRESS check: at the end of the bench+settle window, the lagging
-/// node must either (a) have converged to the leading node's `wal_seq_max`,
-/// or (b) be strictly advancing across the final `PROGRESS_WINDOW_MS`.
-/// A "lagging node frozen at a non-zero diff" is the stuck-state failure
-/// this catches; "still catching up, just slower than settle" passes.
+/// PROGRESS check: at the end of the bench+settle window, every shard present
+/// on both hosts must either (a) have equal wal_seq on both sides, or (b) have
+/// the lower side strictly advancing in the final `PROGRESS_WINDOW_MS`.
+///
+/// The per-shard check catches the Phase 8a failure mode: one shard permanently
+/// forked while other shards pushed both nodes' node-level max to the same
+/// value, masking the stuck shard in the old per-node-max comparison.
+///
+/// The divergent-ahead case is handled symmetrically: the LOWER wal_seq side
+/// is "lagging" regardless of whether it's the leader or the follower.
 fn check_eventual_convergence(data: &RunData) -> CheckResult {
     const NAME: &str = "EventualConvergence";
     /// Window over which we measure progress on the lagging node, in ms.
@@ -366,11 +391,10 @@ fn check_eventual_convergence(data: &RunData) -> CheckResult {
     /// uploaded its trailing batch.
     const PROGRESS_WINDOW_MS: u64 = 10_000;
 
+    let slice = &data.samples[data.bench_start_idx..=data.bench_end_idx];
+
     let last_ok = |host: &str| -> Option<&NodeSample> {
-        data.samples[data.bench_start_idx..=data.bench_end_idx]
-            .iter()
-            .rev()
-            .find(|s| s.host == host && s.ok)
+        slice.iter().rev().find(|s| s.host == host && s.ok)
     };
     let l = match last_ok(data.leader_host) {
         Some(s) => s,
@@ -381,41 +405,99 @@ fn check_eventual_convergence(data: &RunData) -> CheckResult {
         None => return CheckResult::fail(NAME, "missing ok samples for follower host in bench window"),
     };
 
-    if l.wal_seq_max == f.wal_seq_max {
-        return CheckResult::pass(NAME);
-    }
+    // Collect shard ids present on either host at the last ok sample.
+    let mut shard_ids: Vec<u32> = l.wal_seq_by_shard.keys().chain(f.wal_seq_by_shard.keys()).copied().collect();
+    shard_ids.sort_unstable();
+    shard_ids.dedup();
 
-    let (lagging_host, lagging_final) = if l.wal_seq_max < f.wal_seq_max {
-        (data.leader_host, l)
-    } else {
-        (data.follower_host, f)
-    };
-    let window_start_ms = lagging_final.t_ms.saturating_sub(PROGRESS_WINDOW_MS);
-    let lagging_window_first = data.samples[data.bench_start_idx..=data.bench_end_idx]
-        .iter()
-        .find(|s| s.host == lagging_host && s.ok && s.t_ms >= window_start_ms);
-
-    match lagging_window_first {
-        Some(first) if lagging_final.wal_seq_max > first.wal_seq_max => CheckResult::pass(NAME),
-        Some(first) => {
-            let diff = l.wal_seq_max.max(f.wal_seq_max) - l.wal_seq_max.min(f.wal_seq_max);
-            CheckResult::fail(
+    // Fall back to the old node-level comparison when no per-shard data is
+    // available (e.g. reading old JSON artifacts without wal_seq_by_shard).
+    if shard_ids.is_empty() {
+        if l.wal_seq_max == f.wal_seq_max {
+            return CheckResult::pass(NAME);
+        }
+        let (lagging_host, lagging_seq, leading_seq) = if l.wal_seq_max < f.wal_seq_max {
+            (data.leader_host, l.wal_seq_max, f.wal_seq_max)
+        } else {
+            (data.follower_host, f.wal_seq_max, l.wal_seq_max)
+        };
+        let lagging_final_t = if lagging_host == data.leader_host { l.t_ms } else { f.t_ms };
+        let window_start_ms = lagging_final_t.saturating_sub(PROGRESS_WINDOW_MS);
+        let lagging_first = slice.iter().find(|s| s.host == lagging_host && s.ok && s.t_ms >= window_start_ms);
+        return match lagging_first {
+            Some(first) if lagging_seq > first.wal_seq_max => CheckResult::pass(NAME),
+            Some(first) => CheckResult::fail(
                 NAME,
                 format!(
-                    "STUCK: lagging host {} frozen at wal_seq={} for {}ms (diff from peer: {}); leading host {} at wal_seq={}",
-                    lagging_host, lagging_final.wal_seq_max,
-                    lagging_final.t_ms.saturating_sub(first.t_ms),
-                    diff,
-                    if lagging_host == data.leader_host { data.follower_host } else { data.leader_host },
-                    if lagging_host == data.leader_host { f.wal_seq_max } else { l.wal_seq_max },
+                    "STUCK: lagging host {} frozen at wal_seq={} for {}ms (diff from peer: {}); leading host at wal_seq={}",
+                    lagging_host, lagging_seq,
+                    lagging_final_t.saturating_sub(first.t_ms),
+                    leading_seq - lagging_seq,
+                    leading_seq,
                 ),
-            )
-        }
-        None => CheckResult::fail(
-            NAME,
-            format!("no ok samples for lagging host {} in final {}ms window", lagging_host, PROGRESS_WINDOW_MS),
-        ),
+            ),
+            None => CheckResult::fail(
+                NAME,
+                format!("no ok samples for lagging host {} in final {}ms window", lagging_host, PROGRESS_WINDOW_MS),
+            ),
+        };
     }
+
+    // Per-shard check.
+    for shard_id in shard_ids {
+        let l_seq = l.wal_seq_by_shard.get(&shard_id).copied().unwrap_or(0);
+        let f_seq = f.wal_seq_by_shard.get(&shard_id).copied().unwrap_or(0);
+
+        if l_seq == f_seq {
+            continue;
+        }
+
+        // The host with the lower wal_seq for this shard is lagging.
+        let (lagging_host, lagging_seq, leading_seq) = if l_seq < f_seq {
+            (data.leader_host, l_seq, f_seq)
+        } else {
+            (data.follower_host, f_seq, l_seq)
+        };
+
+        let lagging_last_t = if lagging_host == data.leader_host { l.t_ms } else { f.t_ms };
+        let window_start_ms = lagging_last_t.saturating_sub(PROGRESS_WINDOW_MS);
+
+        // Find the lagging host's first ok sample in the progress window for this shard.
+        let lagging_first = slice.iter().find(|s| {
+            s.host == lagging_host && s.ok && s.t_ms >= window_start_ms
+        });
+
+        match lagging_first {
+            Some(first) => {
+                let first_seq = first.wal_seq_by_shard.get(&shard_id).copied().unwrap_or(0);
+                if lagging_seq > first_seq {
+                    // Still advancing — this shard is catching up, not stuck.
+                    continue;
+                }
+                return CheckResult::fail(
+                    NAME,
+                    format!(
+                        "STUCK shard {}: lagging host {} frozen at wal_seq={} for {}ms (diff from peer: {}); peer at wal_seq={}",
+                        shard_id, lagging_host, lagging_seq,
+                        lagging_last_t.saturating_sub(first.t_ms),
+                        leading_seq.saturating_sub(lagging_seq),
+                        leading_seq,
+                    ),
+                );
+            }
+            None => {
+                return CheckResult::fail(
+                    NAME,
+                    format!(
+                        "no ok samples for lagging host {} on shard {} in final {}ms window",
+                        lagging_host, shard_id, PROGRESS_WINDOW_MS,
+                    ),
+                );
+            }
+        }
+    }
+
+    CheckResult::pass(NAME)
 }
 
 /// The host that is leader at the last ok sample of the bench window must
@@ -615,5 +697,138 @@ fn check_wal_seq_advanced(data: &RunData) -> CheckResult {
                 first.wal_seq_max, last.wal_seq_max
             ),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::sample::NodeSample;
+
+    const LEADER: &str = "10.0.0.1";
+    const FOLLOWER: &str = "10.0.0.2";
+
+    fn sample(host: &str, t_ms: u64, shards: &[(u32, u64)]) -> NodeSample {
+        let wal_seq_by_shard: BTreeMap<u32, u64> = shards.iter().copied().collect();
+        let wal_seq_max = wal_seq_by_shard.values().copied().max().unwrap_or(0);
+        NodeSample {
+            host: host.to_string(),
+            t_ms,
+            ok: true,
+            error: None,
+            node_role: if host == LEADER { 1.0 } else { 0.0 },
+            wal_seq_max,
+            wal_seq_by_shard,
+            writes_total: 0,
+            write_errors_total: 0,
+            leader_elections_total: 0,
+            heartbeat_failures_total: 0,
+            s3_fallbacks_total: 0,
+            s3_lease_on_demand_renewal_total: 0,
+            s3_fallback_lease_unconfirmed_total: 0,
+            shard_panics_total: 0,
+            node_starts_total: 0,
+            client_connections_active: 0,
+            capture_dropped_items_total: 0,
+            capture_dropped_bytes_total: 0,
+            writes_accepted_no_prior_client_seq_total: 0,
+            cache_client_scan_not_found_total: 0,
+            cache_client_scan_found_total: 0,
+            truncate_dropped_committed_events_total: 0,
+            truncate_dropped_committed_bytes_total: 0,
+            replication_rollback_deferred_total: 0,
+            truncate_dropped_self_acked_events_total: 0,
+            truncate_dropped_self_acked_wal_seqs_total: 0,
+            s3_catchup_self_uploads_seen_total: 0,
+            truncate_refused_due_to_ack_barrier_total: 0,
+            s3_catchup_same_epoch_divergence_total: 0,
+            cull_stale_client_seq_lru: 0,
+            cull_stale_agg_lru: 0,
+            client_idempotency_violations_total: 0,
+            client_idempotency_inflight_total: 0,
+            take_pending_replication_dropped_batches: 0,
+            truncate_divergence_advanced_total: 0,
+            truncate_divergence_advanced_wal_seqs_total: 0,
+            read_bloom_short_circuit_total: 0,
+            barrier_sync_fsync_total: 0,
+            barrier_sync_fsync_failed_total: 0,
+        }
+    }
+
+    fn run_data<'a>(samples: &'a [NodeSample]) -> RunData<'a> {
+        RunData {
+            samples,
+            leader_host: LEADER,
+            follower_host: FOLLOWER,
+            bench_start_idx: 0,
+            bench_end_idx: samples.len().saturating_sub(1),
+            bench_actual_end_ms: u64::MAX,
+            bench_errors: 0,
+            bench_throughput: 1000.0,
+            throughput_floor: 0.0,
+        }
+    }
+
+    /// Phase 8a failure mode: one shard (shard_3) permanently forked and frozen,
+    /// but other shards pushed both nodes' node-level wal_seq_max to the same value.
+    /// The OLD per-node-max check would have PASSED (wal_seq_max equal on both hosts).
+    /// The NEW per-shard check must FAIL, naming shard_3.
+    #[test]
+    fn forked_shard_masked_by_node_max_fails() {
+        // Both hosts have wal_seq_max == 238594 from shards 1+2.
+        // shard_3: leader=130832, follower=131189 (follower AHEAD — the Phase 8a shape).
+        // Neither is advancing (both frozen in the progress window).
+        let samples = vec![
+            // t=0: first sample establishing shard values
+            sample(LEADER,   0, &[(1, 200000), (2, 238594), (3, 130832)]),
+            sample(FOLLOWER, 0, &[(1, 200000), (2, 238594), (3, 131189)]),
+            // t=15000: final sample, nothing changed on shard_3
+            sample(LEADER,   15_000, &[(1, 200000), (2, 238594), (3, 130832)]),
+            sample(FOLLOWER, 15_000, &[(1, 200000), (2, 238594), (3, 131189)]),
+        ];
+        let data = run_data(&samples);
+        let result = check_eventual_convergence(&data);
+
+        // Confirm the old node-level max would have PASSED (both hosts max == 238594).
+        assert_eq!(samples[2].wal_seq_max, 238594);
+        assert_eq!(samples[3].wal_seq_max, 238594);
+
+        assert!(!result.passed, "expected FAIL but got PASS: {}", result.detail);
+        assert!(result.detail.contains("shard_3") || result.detail.contains("shard 3"),
+            "detail should name the forked shard: {}", result.detail);
+    }
+
+    /// All shards converge — check must PASS.
+    #[test]
+    fn all_shards_converged_passes() {
+        let samples = vec![
+            sample(LEADER,   0,      &[(1, 100000), (2, 200000), (3, 130832)]),
+            sample(FOLLOWER, 0,      &[(1, 100000), (2, 200000), (3, 130000)]),
+            sample(LEADER,   15_000, &[(1, 100000), (2, 200000), (3, 130832)]),
+            sample(FOLLOWER, 15_000, &[(1, 100000), (2, 200000), (3, 130832)]),
+        ];
+        let data = run_data(&samples);
+        let result = check_eventual_convergence(&data);
+        assert!(result.passed, "expected PASS but got FAIL: {}", result.detail);
+    }
+
+    /// One shard is lagging but monotonically advancing in the progress window — PASS.
+    #[test]
+    fn shard_catching_up_passes() {
+        // shard_3: follower at 130000 at t=5000, advancing to 130500 at t=15000.
+        // leader is at 131000 throughout. Not converged but progressing.
+        let samples = vec![
+            sample(LEADER,   0,      &[(1, 100000), (2, 200000), (3, 131000)]),
+            sample(FOLLOWER, 0,      &[(1, 100000), (2, 200000), (3, 129000)]),
+            sample(LEADER,   5_000,  &[(1, 100000), (2, 200000), (3, 131000)]),
+            sample(FOLLOWER, 5_000,  &[(1, 100000), (2, 200000), (3, 130000)]),
+            sample(LEADER,   15_000, &[(1, 100000), (2, 200000), (3, 131000)]),
+            sample(FOLLOWER, 15_000, &[(1, 100000), (2, 200000), (3, 130500)]),
+        ];
+        let data = run_data(&samples);
+        let result = check_eventual_convergence(&data);
+        assert!(result.passed, "expected PASS but got FAIL: {}", result.detail);
     }
 }

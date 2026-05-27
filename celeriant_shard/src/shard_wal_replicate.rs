@@ -22,6 +22,7 @@ use celeriant_watch::aggregate_watchers::AggregateWatchers;
 
 use crate::amortisation::coordinator::{CaptureResult, Coordinator};
 use crate::intra_batch_chain::validate_intra_batch_chain;
+use crate::shard_wal::LeaseRenewalRequester;
 use crate::shard_wal_sync::{sync_header_only, write_segment_summary_sidecar_from_payload};
 use crate::error::replication_error::ReplicationError;
 use crate::error::replication_to_follower_error::ReplicateToFollowerError;
@@ -130,7 +131,10 @@ pub(crate) async fn commit_replication<R: ReplicationClient + 'static>(
     read_max_chunk_size: u64,
     max_clock_drift_ms: u64,
     shard_id: u32,
+    s3_cas_confirmed_at_ms: Rc<Cell<u64>>,
+    s3_lease_duration_ms: u64,
     dict_codec: Rc<DictCodec>,
+    lease_renewal_requester: Option<Rc<dyn LeaseRenewalRequester>>,
 ) -> Result<(), ReplicationError> {
     let start = Instant::now();
     let shard_label = [("shard_id", shard_id.to_string())];
@@ -162,7 +166,9 @@ pub(crate) async fn commit_replication<R: ReplicationClient + 'static>(
             &replication_client, &log_segments_cache, &shard_mem_cache, &watched_aggregates, &node_status,
             &mut replication_snapshot,
             max_catchup_gap_bytes, max_request_size, read_max_chunk_size, max_clock_drift_ms, shard_id,
+            &s3_cas_confirmed_at_ms, s3_lease_duration_ms,
             &dict_codec,
+            lease_renewal_requester.as_ref(),
         ).await;
 
         match outcome {
@@ -266,6 +272,7 @@ fn is_terminal_replication_error(e: &ReplicationError) -> bool {
         RE::ReplicationClientLockTimeoutError => false,
         RE::GateTimeout => false,
         RE::ExtendedCatchupFailure(_) => false,
+        RE::LeaseUnconfirmed => false,
     }
 }
 
@@ -281,7 +288,10 @@ async fn replicate_loop<R: ReplicationClient + 'static>(
     read_max_chunk_size: u64,
     max_clock_drift_ms: u64,
     shard_id: u32,
+    s3_cas_confirmed_at_ms: &Rc<Cell<u64>>,
+    s3_lease_duration_ms: u64,
     dict_codec: &DictCodec,
+    lease_renewal_requester: Option<&Rc<dyn LeaseRenewalRequester>>,
 ) -> Result<ReplicationDetails, ReplicationError> {
     if !node_status.get().is_leader() {
         let snapshot_count = snapshot.len();
@@ -319,7 +329,8 @@ async fn replicate_loop<R: ReplicationClient + 'static>(
     if force_s3 {
         run_s3_fallback(
             replication_client, log_segments_cache, shard_mem_cache, watched_aggregates,
-            node_status, snapshot, shard_id,
+            node_status, snapshot, s3_cas_confirmed_at_ms, s3_lease_duration_ms, shard_id,
+            lease_renewal_requester,
         ).await?;
         return Ok(ReplicationDetails::ReplicatedToS3);
     }
@@ -338,7 +349,8 @@ async fn replicate_loop<R: ReplicationClient + 'static>(
         SnapshotSendOutcome::FallbackToS3 => {
             run_s3_fallback(
                 replication_client, log_segments_cache, shard_mem_cache, watched_aggregates,
-                node_status, snapshot, shard_id,
+                node_status, snapshot, s3_cas_confirmed_at_ms, s3_lease_duration_ms, shard_id,
+                lease_renewal_requester,
             ).await?;
             Ok(ReplicationDetails::ReplicatedToS3)
         }
@@ -443,6 +455,9 @@ async fn run_probe_send<R: ReplicationClient + 'static>(
 /// Drain every remaining PCD into one S3 batch. On success, commit each PCD inline so
 /// the read cursor advances and the PCDs leave the snapshot. On failure, the snapshot is
 /// untouched (caller routes it into rollback).
+///
+/// Upload the pending snapshot as a single S3 fallback batch and commit the PCDs.
+/// Gated on a fresh CAS-confirmed lease (an S3 upload is a durability ack).
 async fn run_s3_fallback<R: ReplicationClient + 'static>(
     replication_client: &Rc<R>,
     log_segments_cache: &Rc<LogSegmentsCache>,
@@ -450,10 +465,45 @@ async fn run_s3_fallback<R: ReplicationClient + 'static>(
     watched_aggregates: &Rc<AggregateWatchers>,
     node_status: &Rc<Cell<ValidatedNodeStatus>>,
     snapshot: &mut Vec<PendingCommitData>,
+    s3_cas_confirmed_at_ms: &Rc<Cell<u64>>,
+    s3_lease_duration_ms: u64,
     shard_id: u32,
+    lease_renewal_requester: Option<&Rc<dyn LeaseRenewalRequester>>,
 ) -> Result<(), ReplicationError> {
     if snapshot.is_empty() {
         return Ok(());
+    }
+
+    // Gate: only upload when we hold a fresh, CAS-confirmed S3 lease. An S3 fallback
+    // upload IS a durability ack, so we must never ack off the heartbeat-extended
+    // local TTL (it has no S3 backing, and heartbeats are exactly what's failing here)
+    // that's the dual-ack split-brain. s3_cas_confirmed_at_ms is set only by the CAS
+    // path (never by heartbeat ack). If s3_lease_duration_ms is 0 the gate is disabled
+    // (standalone / tests that don't inject the signal).
+    //
+    // Renewal is demand-driven and out-of-band: rather than waiting for the heartbeat
+    // loop (which can stall in the kernel under load) to re-CAS the lease, the shard
+    // that needs to fall back pokes shard 0 to renew lease.json now. Two thresholds:
+    //   - half the lease window: proactively nudge a renewal but keep uploading (the
+    //     lease is still valid), so it's refreshed BEFORE it can expire;
+    //   - full lease window: the lease is stale; refuse the upload and spin-wait for
+    //     the green light (fresh CAS confirmation broadcast back from shard 0), or fence
+    //     if shard 0's CAS fails because a peer superseded us.
+    if s3_lease_duration_ms > 0 {
+        let now_ms = celeriant_distributed::validated_node_status::unix_epoch_now_ms();
+        let age_ms = now_ms.saturating_sub(s3_cas_confirmed_at_ms.get());
+        if age_ms >= s3_lease_duration_ms / 2 {
+            if let Some(req) = lease_renewal_requester {
+                req.request_renewal();
+            }
+        }
+        if age_ms >= s3_lease_duration_ms {
+            warn!(shard_id, confirmed_at = s3_cas_confirmed_at_ms.get(), now_ms, s3_lease_duration_ms,
+                "S3 fallback gated: lease not CAS-confirmed within lease window; pushed renewal, spin-waiting for green light");
+            metrics::counter!("celeriant_s3_fallback_lease_unconfirmed_total",
+                &[("shard_id", shard_id.to_string())]).increment(1);
+            return Err(ReplicationError::LeaseUnconfirmed);
+        }
     }
 
     let _ = acquire_lease_budget(node_status, "s3_fallback", shard_id)?;
@@ -461,7 +511,7 @@ async fn run_s3_fallback<R: ReplicationClient + 'static>(
 
     let items = snapshot_to_batch_items(snapshot);
 
-    let workset_size_bytes: u64 = items.iter().map(|c| c.size_bytes()).sum();
+    let workset_size_bytes: u64 = items.iter().map(|c| c.metablock.uncompressed_size).sum();
     let first_wal = items.first().map(|b| b.metablock.wal_seq).unwrap_or(0);
     let last_wal = items.last().map(|b| b.metablock.wal_seq).unwrap_or(0);
 
@@ -1130,6 +1180,12 @@ mod tests {
         node_status: Rc<Cell<ValidatedNodeStatus>>,
         coordinator: Rc<Coordinator<ShardFsyncError>>,
         watched: Rc<AggregateWatchers>,
+        /// Last successful S3 CAS timestamp. Default 0 with s3_lease_duration_ms=0
+        /// means the gate is disabled (backwards-compatible for existing tests).
+        s3_cas_confirmed_at_ms: Rc<Cell<u64>>,
+        /// 0 = gate disabled (standalone / most unit tests). Non-zero enables the
+        /// CAS-freshness gate in run_s3_fallback.
+        s3_lease_duration_ms: u64,
     }
 
     impl Harness {
@@ -1143,7 +1199,17 @@ mod tests {
                 node_status: Rc::new(Cell::new(leader_status())),
                 coordinator: Rc::new(Coordinator::new()),
                 watched: Rc::new(AggregateWatchers::new()),
+                s3_cas_confirmed_at_ms: Rc::new(Cell::new(0)),
+                s3_lease_duration_ms: 0,
             }
+        }
+
+        /// Returns the same Harness but with the S3 lease gate enabled and
+        /// the CAS-confirmed timestamp pre-set to `confirmed_at_ms`.
+        fn with_s3_lease_gate(mut self, s3_lease_duration_ms: u64, confirmed_at_ms: u64) -> Self {
+            self.s3_lease_duration_ms = s3_lease_duration_ms;
+            self.s3_cas_confirmed_at_ms.set(confirmed_at_ms);
+            self
         }
 
         async fn commit<R: ReplicationClient + 'static>(
@@ -1176,7 +1242,10 @@ mod tests {
                 64 * 1024,
                 500,
                 0,
+                self.s3_cas_confirmed_at_ms.clone(),
+                self.s3_lease_duration_ms,
                 test_codec(),
+                None,
             ).await
         }
 
@@ -1878,6 +1947,88 @@ mod tests {
             assert!(result.is_ok(), "case (b) falls through to S3; got {result:?}");
             assert_eq!(*s3_calls.borrow(), vec![1], "case (b) reaches S3 fallback");
             assert!(h.node_status.get().is_leader(), "leadership stays on case (b)");
+            h.close().await;
+        });
+    }
+
+    // --- S3 fallback: CAS-freshness gate (LeaseUnconfirmed) ---
+
+    /// Stale s3_cas_confirmed_at_ms → run_s3_fallback returns LeaseUnconfirmed.
+    /// No S3 upload, no commit_pcd, no last_self_acked bump.
+    /// LeaseUnconfirmed must be classified transient (spin loop retries, not terminal).
+    ///
+    /// We use the Probe trigger because it forwards any error from replicate_loop
+    /// immediately without retrying, letting us observe the transient error directly.
+    #[test]
+    fn s3_fallback_returns_lease_unconfirmed_when_cas_signal_stale() {
+        glommio_test!({
+            let h = Harness::new().await;
+            let s3_lease_duration_ms = 30_000u64;
+            // confirmed_at_ms = 0 → age = now_ms >> s3_lease_duration_ms → stale
+            let h = h.with_s3_lease_gate(s3_lease_duration_ms, 0);
+
+            let (mock, _tcp, s3_calls) = MockClient::build();
+            let client = Rc::new(mock.unreachable()); // force S3 path
+
+            // Probe trigger bypasses the Write-trigger spin loop: any error propagates immediately.
+            // This lets us verify the transient LeaseUnconfirmed error without waiting 30s.
+            let captured = make_captured(&[1]);
+            let result = h.commit_with_trigger(client, captured, ReplicationTrigger::Probe, u64::MAX).await;
+
+            // Must return LeaseUnconfirmed (transient), not BudgetExhausted (terminal).
+            assert!(
+                matches!(result, Err(ReplicationError::LeaseUnconfirmed)),
+                "expected LeaseUnconfirmed, got {result:?}",
+            );
+            // No S3 upload must have occurred.
+            assert!(s3_calls.borrow().is_empty(), "no S3 upload when CAS signal is stale");
+
+            // Confirm it is classified as transient (not terminal).
+            assert!(
+                !is_terminal_replication_error(&ReplicationError::LeaseUnconfirmed),
+                "LeaseUnconfirmed must be transient so the spin loop retries",
+            );
+
+            h.close().await;
+        });
+    }
+
+    /// Fresh s3_cas_confirmed_at_ms → run_s3_fallback proceeds to upload.
+    #[test]
+    fn s3_fallback_proceeds_when_cas_signal_fresh() {
+        glommio_test!({
+            let h = Harness::new().await;
+            let s3_lease_duration_ms = 30_000u64;
+            // confirmed_at_ms = now → age ≈ 0 → fresh
+            let now_ms = celeriant_distributed::validated_node_status::unix_epoch_now_ms();
+            let h = h.with_s3_lease_gate(s3_lease_duration_ms, now_ms);
+
+            let (mock, _tcp, s3_calls) = MockClient::build();
+            let client = Rc::new(mock.unreachable()); // force S3 path
+
+            let result = h.commit(client, make_captured(&[1]), u64::MAX).await;
+            assert!(result.is_ok(), "S3 fallback must succeed with fresh CAS signal; got {result:?}");
+            assert_eq!(s3_calls.borrow().len(), 1, "one S3 upload when CAS signal is fresh");
+            assert_eq!(s3_calls.borrow()[0], 1, "snapshot entry uploaded");
+
+            h.close().await;
+        });
+    }
+
+    /// Gate is disabled when s3_lease_duration_ms = 0 (standalone / test default).
+    /// Existing tests must be unaffected.
+    #[test]
+    fn s3_fallback_gate_disabled_when_duration_zero() {
+        glommio_test!({
+            let h = Harness::new().await; // s3_lease_duration_ms=0, confirmed_at=0 by default
+
+            let (mock, _tcp, s3_calls) = MockClient::build();
+            let client = Rc::new(mock.unreachable()); // force S3 path
+
+            let result = h.commit(client, make_captured(&[1]), u64::MAX).await;
+            assert!(result.is_ok(), "gate disabled (duration=0) must allow upload; got {result:?}");
+            assert_eq!(s3_calls.borrow().len(), 1, "upload proceeds when gate disabled");
+
             h.close().await;
         });
     }

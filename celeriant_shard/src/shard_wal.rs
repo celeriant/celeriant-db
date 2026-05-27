@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,7 +14,7 @@ use celeriant_wire::codec::compression::DictCodec;
 use celeriant_wire::disk::disk_format_error::DiskFormatError;
 use celeriant_wire::disk::metablock_bytes;
 use celeriant_wire::disk::serialised_datablock::{CompressionPolicy, SerialisedDatablock};
-use celeriant_wire::disk::versioned_block::{deserialise_metablock, deserialise_segment_summary};
+use celeriant_wire::disk::versioned_block::{self as versioned_block, deserialise_metablock, deserialise_segment_summary};
 use crate::shard_wal_sync::summary_path;
 use celeriant_memcache::cache_path::CachePath;
 use celeriant_memcache::mem_snapshot_aggregate::{AggregateStatus, MemSnapshotAggregate};
@@ -79,7 +79,7 @@ use crate::shard_wal_compact::{CompactionResult, compact_segment};
 use crate::error::compaction_error::CompactionError;
 use crate::shard_wal_replicate::{capture_replication_snapshot, commit_replication, wal_positions, ReplicationTrigger};
 use crate::shard_wal_s3_catchup::{self, S3CatchupResult, catchup_from_s3};
-use crate::shard_wal_sync::{capture_fsync_snapshot, commit_fsync_with_rollback, sync_header_only};
+use crate::shard_wal_sync::{capture_fsync_snapshot, commit_fsync_with_rollback, compute_entry_hash, sync_header_only};
 
 /// Compile a schema datablock and insert into the cache.
 /// Shared by pre_warm_cache, ensure_schema_cached, and follower replication.
@@ -181,6 +181,28 @@ pub struct ShardWal<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
 
     /// Cached metrics label to avoid per-request String allocation
     metrics_shard_label: [(&'static str, String); 1],
+
+    /// Unix-ms timestamp of the last successful S3 CAS (put_lease_conditional).
+    /// Updated ONLY by the CAS path in shard 0, propagated to all shards via
+    /// StatusUpdate{cas_confirmed_at_ms: Some(_)}. The heartbeat-ack path must
+    /// NOT write this. Used by run_s3_fallback to gate uploads on a fresh lease.
+    pub s3_cas_confirmed_at_ms: Rc<Cell<u64>>,
+
+    /// Out-of-band hook for the replication path to nudge shard 0 to definitively
+    /// renew the S3 lease (CAS `lease.json`) when an S3 fallback would otherwise be
+    /// gated by a stale CAS confirmation. The heartbeat loop can stall in the kernel
+    /// under load, so renewal must not depend on it
+    pub lease_renewal_requester: OnceCell<Rc<dyn LeaseRenewalRequester>>,
+}
+
+/// Lets the replication path (any data shard) ask shard 0 to re-CAS the S3 lease
+/// and broadcast a fresh confirmation, out-of-band from the heartbeat loop.
+/// Implemented in `celeriant_runtimes`, which owns the intra-shard message mesh
+/// (`celeriant_shard` deliberately has no dependency on it).
+pub trait LeaseRenewalRequester {
+    /// Fire-and-forget nudge to shard 0 to renew the S3 lease now. Coalesced on the
+    /// receiving side, so it is safe to call repeatedly while spin-waiting the gate.
+    fn request_renewal(&self);
 }
 
 impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> AggregateReader for ShardWal<R, D> {
@@ -350,7 +372,15 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             last_logged_rollback_at: Cell::new(None),
             last_logged_starve_at: Cell::new(None),
             metrics_shard_label,
+            s3_cas_confirmed_at_ms: Rc::new(Cell::new(0)),
+            lease_renewal_requester: OnceCell::new(),
         })
+    }
+
+    /// Wire the out-of-band lease-renewal hook (called once at startup by the
+    /// runtimes layer, after the intra-shard mesh exists).
+    pub fn set_lease_renewal_requester(&self, requester: Rc<dyn LeaseRenewalRequester>) {
+        let _ = self.lease_renewal_requester.set(requester);
     }
 
     /// Pre-warm aggregate and client caches by reverse-scanning the WAL.
@@ -2301,6 +2331,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let read_max_chunk_size = self.config.read_max_chunk_size;
         let max_clock_drift_ms = self.config.max_clock_drift_ms;
         let shard_id = self.config.shard_id;
+        let s3_cas_confirmed_at_ms = self.s3_cas_confirmed_at_ms.clone();
+        let s3_lease_duration_ms = self.config.s3_lease_duration_ms;
+        let lease_renewal_requester = self.lease_renewal_requester.get().cloned();
 
         let mc_capture = shard_mem_cache.clone();
         let dict_codec = self.dict_codec.clone();
@@ -2309,7 +2342,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 delay,
                 ReplicationError::GateTimeout,
                 move || async move { capture_replication_snapshot(&mc_capture, trigger) },
-                move |captured| commit_replication(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, node_status, captured, trigger, max_catchup_gap_bytes, max_request_size, read_max_chunk_size, max_clock_drift_ms, shard_id, dict_codec),
+                move |captured| commit_replication(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, node_status, captured, trigger, max_catchup_gap_bytes, max_request_size, read_max_chunk_size, max_clock_drift_ms, shard_id, s3_cas_confirmed_at_ms, s3_lease_duration_ms, dict_codec, lease_renewal_requester),
             )
             .await
     }
@@ -2446,30 +2479,88 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     /// Rewind write to read and drop in-flight PCDs that referenced the discarded tail.
     /// Must run before catchup; catchup starts at write+1 and would otherwise skip
     /// peer batches in (read, pre-cull write]. Returns true if anything was culled.
-    pub async fn cull_speculative_tail_for_promotion(&self) -> Result<bool, ShardFsyncError> {
+    ///
+    /// `rewind_to_ack_barrier`: demotion path only. When true, also handles the crash-induced
+    /// case where `read == write` but `last_self_acked < read`; rewinding both cursors down
+    /// to the ack barrier so un-acked speculative data is dropped. Safe because those entries
+    /// were never acked to any client. Must NOT be set on the promotion path.
+    pub async fn cull_speculative_tail_for_promotion(&self, rewind_to_ack_barrier: bool) -> Result<bool, ShardFsyncError> {
         let active = self.log_segments_cache.active();
-        let culled = {
+        // Snapshot the cursors without holding borrow_mut across the async scan.
+        let (write_seq, read_opt, last_acked) = {
+            let meta = active.metadata.borrow();
+            (meta.write.wal_seq, meta.read.clone(), meta.last_self_acked_wal_seq)
+        };
+
+        enum CullTarget {
+            // Rewind write cursor to read (promotion path): read stays, write = read.
+            WriteToRead,
+            // Rewind both cursors to ack barrier (demotion path): write = read = ack_barrier.
+            BothToAckBarrier(celeriant_rotating_log::log_segment_file::log_segment_cursor::LogSegmentCursor),
+        }
+
+        let cull_target = if let Some(ref read) = read_opt {
+            if read.wal_seq < write_seq {
+                // Standard cull: speculative tail above read.
+                tracing::info!(
+                    shard_id = self.config.shard_id,
+                    write_wal_seq = write_seq,
+                    read_wal_seq = read.wal_seq,
+                    last_self_acked_wal_seq = last_acked,
+                    "cull_speculative_tail: rewinding write to read before promotion catchup"
+                );
+                Some(CullTarget::WriteToRead)
+            } else if rewind_to_ack_barrier && last_acked < read.wal_seq {
+                // Demotion cull: read==write but ack barrier is below read.
+                // Drop the un-acked range (last_acked+1 .. read] by scanning backward.
+                let log_id = active.metadata.borrow().log_id;
+                tracing::info!(
+                    shard_id = self.config.shard_id,
+                    read_wal_seq = read.wal_seq,
+                    last_self_acked_wal_seq = last_acked,
+                    "cull_speculative_tail: demotion rewind to ack barrier"
+                );
+                let cursor = self.find_cursor_at_wal_seq(last_acked, read, log_id).await?;
+                Some(CullTarget::BothToAckBarrier(cursor))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let demotion_cull = if let Some(target) = cull_target {
             let mut meta = active.metadata.borrow_mut();
-            match meta.read.clone() {
-                Some(read) if read.wal_seq < meta.write.wal_seq => {
-                    tracing::info!(
-                        shard_id = self.config.shard_id,
-                        write_wal_seq = meta.write.wal_seq,
-                        read_wal_seq = read.wal_seq,
-                        "cull_speculative_tail: rewinding write to read before promotion catchup"
-                    );
-                    meta.write = read;
+            match target {
+                CullTarget::WriteToRead => {
+                    let read = read_opt.as_ref().expect("read must be Some when WriteToRead");
+                    meta.write = read.clone();
+                    // read cursor unchanged: followers still sync from the existing read position.
+                    false
+                }
+                CullTarget::BothToAckBarrier(cursor) => {
+                    meta.write = cursor.clone();
+                    meta.read = Some(cursor);
                     true
                 }
-                _ => false,
             }
+        } else {
+            return Ok(false);
         };
-        if culled {
+
+        {
             let (lru_client_len, lru_agg_len, drained) = {
                 let mut mc = self.shard_mem_cache.borrow_mut();
                 let lru_client_len = mc.aggregate_write_client_snapshots_len();
                 let lru_agg_len = mc.aggregate_write_snapshots_len();
-                let drained = mc.clear_speculative_write_caches_for_cull();
+                // Demotion cull moves the read cursor down: stale read-side caches must also be
+                // cleared. Promotion cull leaves the read cursor unchanged, so read caches remain valid.
+                let drained = if demotion_cull {
+                    mc.clear_all_caches();
+                    0
+                } else {
+                    mc.clear_speculative_write_caches_for_cull()
+                };
                 (lru_client_len, lru_agg_len, drained)
             };
             metrics::counter!("celeriant_cull_stale_client_seq_lru").increment(lru_client_len as u64);
@@ -2492,12 +2583,81 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 )
                 .await?;
         }
-        Ok(culled)
+        Ok(true)
+    }
+
+    /// Backward scan from `read.metablocks_position` to find the cursor state at `target_wal_seq`.
+    /// Returns a cursor whose bloom is inherited from `read` (safe superset; no false negatives).
+    async fn find_cursor_at_wal_seq(
+        &self,
+        target_wal_seq: u64,
+        read: &celeriant_rotating_log::log_segment_file::log_segment_cursor::LogSegmentCursor,
+        log_id: u64,
+    ) -> Result<celeriant_rotating_log::log_segment_file::log_segment_cursor::LogSegmentCursor, ShardFsyncError> {
+        use celeriant_wal::metablocks::metablock::Metablock as Mb;
+
+        if target_wal_seq == 0 {
+            // Genesis: nothing written yet at the ack barrier.
+            let mut cursor = read.clone();
+            cursor.wal_seq = 0;
+            cursor.metablocks_position = celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES as u64;
+            cursor.datablocks_position = read.datablocks_position;
+            cursor.tip_hash = celeriant_wal::constants::GENESIS_HASH;
+            return Ok(cursor);
+        }
+
+        const HDR: usize = versioned_block::HEADER_SIZE;
+        // No metablock_bytes accessor exists for previous_tip_hash or datablock_position; inline offsets.
+        const PREV_HASH_OFF: usize = HDR + Mb::OFFSET_PREVIOUS_TIP_HASH;
+        const DATA_POS_OFF: usize = HDR + Mb::OFFSET_DATABLOCK_POSITION;
+
+        let mut scanner = ReverseMetablockScanner::new(
+            &self.log_segments_cache,
+            log_id,
+            Some(read.metablocks_position),
+            self.config.read_max_chunk_size,
+        );
+
+        type Found = (u64, u64, u64, [u8; 32]); // (found_log_id, metablocks_pos_after, datablocks_pos, tip_hash)
+        let result = scanner
+            .scan::<Found, ShardFsyncError>(|scan_log_id, pos, bytes| {
+                let seq = metablock_bytes::read_wal_seq(bytes);
+                if seq != target_wal_seq {
+                    return Ok(None);
+                }
+                let prev_tip: [u8; 32] = bytes[PREV_HASH_OFF..PREV_HASH_OFF + 32].try_into()
+                    .map_err(|_| ShardFsyncError::MetablockSerialisationError("prev_tip_hash slice error".into()))?;
+                let tip_hash = compute_entry_hash(&prev_tip, bytes);
+                let datablocks_pos = u64::from_le_bytes(
+                    bytes[DATA_POS_OFF..DATA_POS_OFF + 8].try_into()
+                        .map_err(|_| ShardFsyncError::MetablockSerialisationError("datablock_pos slice error".into()))?
+                );
+                let meta_pos_after = pos + FIXED_BLOCK_SIZE_BYTES as u64;
+                Ok(Some((scan_log_id, meta_pos_after, datablocks_pos, tip_hash)))
+            })
+            .await
+            .map_err(|e| ShardFsyncError::MetablockSerialisationError(format!("scan error: {e:?}")))?;
+
+        match result {
+            Some((found_log_id, meta_pos_after, datablocks_pos, tip_hash)) => {
+                let mut cursor = read.clone();
+                cursor.log_id = found_log_id;
+                cursor.wal_seq = target_wal_seq;
+                cursor.metablocks_position = meta_pos_after;
+                cursor.datablocks_position = datablocks_pos;
+                cursor.tip_hash = tip_hash;
+                Ok(cursor)
+            }
+            None => Err(ShardFsyncError::MetablockSerialisationError(format!(
+                "ack-barrier wal_seq {target_wal_seq} not found in WAL (log_id={log_id}, read_pos={})",
+                read.metablocks_position
+            ))),
+        }
     }
 
     pub async fn upload_s3_promotion_batch(&self) -> Result<(), crate::error::replication_to_s3_error::ReplicateToS3Error> {
         // Idempotent re-cull: covers any tail that accumulated since the pre-catchup cull.
-        self.cull_speculative_tail_for_promotion().await
+        self.cull_speculative_tail_for_promotion(false).await
             .map_err(|e| crate::error::replication_to_s3_error::ReplicateToS3Error::SerializationFailed(
                 format!("promotion cull header fsync failed: {e:?}"),
             ))?;
@@ -3156,6 +3316,7 @@ mod tests {
             cache_warmup_max_duration: Duration::MAX,
             wal_compression_level: 3,
             dict_bytes: std::sync::Arc::from(celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES),
+            s3_lease_duration_ms: 0,
         }
     }
 
@@ -4595,6 +4756,300 @@ mod tests {
     }
 
     #[test]
+    fn cull_fires_when_write_ahead_of_read() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let _agg = key(1, 1, 1);
+            let client = CapturingReplicationClient::new();
+            let shard = open_follower_shard_capturing(&dir, client).await;
+
+            // Replicate 3 entries so read = 3.
+            let mut tip = GENESIS_HASH;
+            for seq in 1u64..=3 {
+                let resp = unwrap_replication(
+                    shard.handle_replication_batch(replication_batch_req(vec![replication_item_no_datablock(seq, tip)])).await,
+                );
+                assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+                tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
+            }
+            // Advance write to simulate a speculative tail: read=3, write=5.
+            {
+                let active = shard.log_segments_cache.active();
+                let mut meta = active.metadata.borrow_mut();
+                meta.write.wal_seq = 5;
+                meta.write.metablocks_position = HEADER_BLOCK_SIZE_BYTES as u64 + 5 * 512;
+            }
+
+            let culled = shard.cull_speculative_tail_for_promotion(false).await.unwrap();
+            assert!(culled, "cull must fire when write > read");
+            assert_eq!(
+                shard.log_segments_cache.active().metadata.borrow().write.wal_seq, 3,
+                "cull must rewind write down to read",
+            );
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn cull_noop_when_write_eq_read() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let _agg = key(1, 1, 1);
+            let client = CapturingReplicationClient::new();
+            let shard = open_follower_shard_capturing(&dir, client).await;
+
+            // No speculative tail: write == read (both 0 on a fresh shard).
+            let culled = shard.cull_speculative_tail_for_promotion(false).await.unwrap();
+            assert!(!culled, "cull must be a no-op when write == read");
+
+            shard.close().await;
+        });
+    }
+
+    /// Regression: after a leader SIGKILL failover the demoted ex-leader may have
+    /// `read == write > last_self_acked`. The existing cull (write→read) is a no-op
+    /// because read==write. With `rewind_to_ack_barrier=true` both cursors must
+    /// rewind to `last_self_acked`.
+    #[test]
+    fn demotion_cull_rewinds_to_ack_barrier_when_read_eq_write_above_acked() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let agg = key(1, 1, 1);
+
+            // Write 10 real entries on a standalone shard. Standalone advances read==write
+            // on every fsync, so after this loop read.wal_seq == write.wal_seq == 10.
+            let shard = open_shard(&dir).await;
+            for _ in 0..10 {
+                write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            }
+
+            // Confirm precondition: read == write == 10.
+            {
+                let active = shard.log_segments_cache.active();
+                let meta = active.metadata.borrow();
+                assert_eq!(meta.write.wal_seq, 10);
+                assert_eq!(meta.read.as_ref().unwrap().wal_seq, 10);
+            }
+
+            // Simulate the crash scenario: inject an ack barrier below read.
+            // (In production this happens when the S3 ack fsync loses the race with SIGKILL.)
+            {
+                let active = shard.log_segments_cache.active();
+                active.metadata.borrow_mut().last_self_acked_wal_seq = 5;
+            }
+
+            // Standard cull (promotion path) must be a no-op since read==write.
+            let culled = shard.cull_speculative_tail_for_promotion(false).await.unwrap();
+            assert!(!culled, "standard cull must not fire when read==write (this was the old bug)");
+
+            // Precondition: read caches are populated by the 10 writes above.
+            {
+                let mc = shard.shard_mem_cache.borrow();
+                assert!(mc.aggregate_read_snapshots_len() > 0, "read snapshots must be populated before demotion cull");
+            }
+
+            // Demotion cull must rewind both cursors to last_self_acked==5.
+            let culled = shard.cull_speculative_tail_for_promotion(true).await.unwrap();
+            assert!(culled, "demotion cull must fire when last_self_acked < read");
+
+            let active = shard.log_segments_cache.active();
+            let meta = active.metadata.borrow();
+            assert_eq!(meta.write.wal_seq, 5, "write cursor must rewind to ack barrier");
+            assert_eq!(meta.read.as_ref().unwrap().wal_seq, 5, "read cursor must also rewind to ack barrier");
+            drop(meta);
+
+            // FIX 1: demotion cull must clear read-side caches (read cursor moved down).
+            {
+                let mc = shard.shard_mem_cache.borrow();
+                assert_eq!(mc.aggregate_read_snapshots_len(), 0, "aggregate_read_snapshots must be cleared by demotion cull");
+                assert_eq!(mc.aggregate_recent_writes_len(), 0, "aggregate_recent_writes must be cleared by demotion cull");
+            }
+
+            shard.close().await;
+        });
+    }
+
+    /// Regression: promotion path must NOT rewind read to last_self_acked.
+    /// Phase 9 promotion behavior is unchanged by the demotion fix.
+    #[test]
+    fn promotion_cull_does_not_rewind_read_to_ack_barrier() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let client = CapturingReplicationClient::new();
+            let shard = open_follower_shard_capturing(&dir, client).await;
+
+            // Replicate 5 entries so read=5.
+            let mut tip = GENESIS_HASH;
+            for seq in 1u64..=5 {
+                let resp = unwrap_replication(
+                    shard.handle_replication_batch(replication_batch_req(vec![replication_item_no_datablock(seq, tip)])).await,
+                );
+                assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+                tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
+            }
+
+            // Advance write to simulate a speculative tail: read=5, write=8.
+            {
+                let active = shard.log_segments_cache.active();
+                let mut meta = active.metadata.borrow_mut();
+                meta.write.wal_seq = 8;
+                meta.write.metablocks_position = HEADER_BLOCK_SIZE_BYTES as u64 + 8 * FIXED_BLOCK_SIZE_BYTES as u64;
+                // Inject an ack barrier below read — must be ignored on promotion path.
+                meta.last_self_acked_wal_seq = 3;
+            }
+
+            // Precondition: read caches are populated by the 5 replicated entries.
+            let read_snapshots_before = shard.shard_mem_cache.borrow().aggregate_read_snapshots_len();
+            assert!(read_snapshots_before > 0, "read snapshots must be populated before promotion cull");
+
+            // Promotion cull (rewind_to_ack_barrier=false): write must rewind to read=5,
+            // read must stay at 5, and ack barrier (3) must have no effect.
+            let culled = shard.cull_speculative_tail_for_promotion(false).await.unwrap();
+            assert!(culled, "promotion cull must fire when write > read");
+
+            let active = shard.log_segments_cache.active();
+            let meta = active.metadata.borrow();
+            assert_eq!(meta.write.wal_seq, 5, "write must rewind to read=5");
+            assert_eq!(meta.read.as_ref().unwrap().wal_seq, 5, "read must remain at 5");
+            drop(meta);
+
+            // FIX 1: promotion cull must NOT clear read caches (read cursor unchanged).
+            assert_eq!(
+                shard.shard_mem_cache.borrow().aggregate_read_snapshots_len(),
+                read_snapshots_before,
+                "promotion cull must not clear aggregate_read_snapshots"
+            );
+
+            shard.close().await;
+        });
+    }
+
+    /// Self-reclaim path (lease_changed_hands=false): the caller (set_node_role_via_s3) must NOT
+    /// call cull_speculative_tail_for_promotion. This test verifies the invariant from the caller's
+    /// perspective: a shard with read < write keeps write intact when the cull is skipped.
+    ///
+    /// Regression guard for run 1779618258/shard_2: the old code unconditionally culled on
+    /// became_leader, which zeroed the speculative tail and caused re-authoring the same seqs
+    /// with new content, forking the follower's replicated copy.
+    #[test]
+    fn self_reclaim_keeps_speculative_tail() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let client = CapturingReplicationClient::new();
+            let shard = open_follower_shard_capturing(&dir, client).await;
+
+            // Replicate 5 entries (read = 5) then advance write to simulate a speculative tail.
+            let mut tip = GENESIS_HASH;
+            for seq in 1u64..=5 {
+                let resp = unwrap_replication(
+                    shard.handle_replication_batch(replication_batch_req(vec![replication_item_no_datablock(seq, tip)])).await,
+                );
+                assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+                tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
+            }
+            {
+                let active = shard.log_segments_cache.active();
+                let mut meta = active.metadata.borrow_mut();
+                meta.write.wal_seq = 8;
+                meta.write.metablocks_position = HEADER_BLOCK_SIZE_BYTES as u64 + 8 * FIXED_BLOCK_SIZE_BYTES as u64;
+            }
+
+            // Precondition: read=5, write=8.
+            {
+                let active = shard.log_segments_cache.active();
+                let meta = active.metadata.borrow();
+                assert_eq!(meta.read.as_ref().unwrap().wal_seq, 5);
+                assert_eq!(meta.write.wal_seq, 8);
+            }
+
+            // Self-reclaim: lease_changed_hands=false. The caller skips the cull entirely.
+            // Simulate by NOT calling cull_speculative_tail_for_promotion.
+            // Write must stay at 8 — the tail is the node's own content already replicated.
+            let active = shard.log_segments_cache.active();
+            let meta = active.metadata.borrow();
+            assert_eq!(meta.write.wal_seq, 8, "self-reclaim must keep speculative tail (write unchanged)");
+            assert_eq!(meta.read.as_ref().unwrap().wal_seq, 5, "read unchanged on self-reclaim");
+            drop(meta);
+
+            shard.close().await;
+        });
+    }
+
+    /// Regression guard: when lease_changed_hands=true (a peer was leader), the caller DOES
+    /// call cull_speculative_tail_for_promotion and write must rewind to read.
+    #[test]
+    fn changed_hands_promotion_cull_fires_regression_guard() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let client = CapturingReplicationClient::new();
+            let shard = open_follower_shard_capturing(&dir, client).await;
+
+            // Replicate 4 entries (read = 4) then advance write to 7.
+            let mut tip = GENESIS_HASH;
+            for seq in 1u64..=4 {
+                let resp = unwrap_replication(
+                    shard.handle_replication_batch(replication_batch_req(vec![replication_item_no_datablock(seq, tip)])).await,
+                );
+                assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+                tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
+            }
+            {
+                let active = shard.log_segments_cache.active();
+                let mut meta = active.metadata.borrow_mut();
+                meta.write.wal_seq = 7;
+                meta.write.metablocks_position = HEADER_BLOCK_SIZE_BYTES as u64 + 7 * FIXED_BLOCK_SIZE_BYTES as u64;
+            }
+
+            // lease_changed_hands=true path: caller invokes cull_speculative_tail_for_promotion.
+            let culled = shard.cull_speculative_tail_for_promotion(false).await.unwrap();
+            assert!(culled, "changed-hands promotion must cull speculative tail");
+
+            let active = shard.log_segments_cache.active();
+            let meta = active.metadata.borrow();
+            assert_eq!(meta.write.wal_seq, 4, "write must rewind to read=4 on changed-hands promotion");
+            assert_eq!(meta.read.as_ref().unwrap().wal_seq, 4, "read unchanged by promotion cull");
+            drop(meta);
+
+            shard.close().await;
+        });
+    }
+
+    /// Regression guard: the demotion cull (rewind_to_ack_barrier=true) is a separate code
+    /// path from the self-reclaim fix and must be unaffected. became_follower_from_leader_or_fenced
+    /// always triggers the cull regardless of lease_changed_hands.
+    #[test]
+    fn demotion_cull_unaffected_by_self_reclaim_fix() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let agg = key(1, 1, 1);
+            let shard = open_shard(&dir).await;
+
+            // Write 6 entries (read=write=6 on standalone shard), then push ack barrier below.
+            for _ in 0..6 {
+                write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            }
+            {
+                let active = shard.log_segments_cache.active();
+                active.metadata.borrow_mut().last_self_acked_wal_seq = 3;
+            }
+
+            // became_follower_from_leader_or_fenced always triggers demotion cull.
+            // self-reclaim fix does not gate this path.
+            let culled = shard.cull_speculative_tail_for_promotion(true).await.unwrap();
+            assert!(culled, "demotion cull must fire when last_self_acked < read");
+
+            let active = shard.log_segments_cache.active();
+            let meta = active.metadata.borrow();
+            assert_eq!(meta.write.wal_seq, 3, "demotion cull must rewind write to ack barrier");
+            assert_eq!(meta.read.as_ref().unwrap().wal_seq, 3, "demotion cull must rewind read to ack barrier");
+            drop(meta);
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
     fn cull_then_restart_preserves_post_cull_state() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
@@ -4611,7 +5066,7 @@ mod tests {
                     meta.write.wal_seq = 10;
                     meta.write.metablocks_position = HEADER_BLOCK_SIZE_BYTES as u64 + 10 * FIXED_BLOCK_SIZE_BYTES as u64;
                 }
-                let culled = shard.cull_speculative_tail_for_promotion().await.unwrap();
+                let culled = shard.cull_speculative_tail_for_promotion(false).await.unwrap();
                 assert!(culled, "cull should fire when write > read");
                 shard.close().await;
             }
@@ -4686,6 +5141,37 @@ mod tests {
                 shard.handle_replication_batch(replication_batch_req(vec![replication_item(1, GENESIS_HASH)])).await,
             );
             assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+
+            shard.close().await;
+        });
+    }
+
+    /// A follower must fsync a replicated batch before ACKing it. If the durable fsync
+    /// cannot complete (here the active segment's write file is dropped), the entries are
+    /// applied in memory but handle_replication_batch returns an error, never
+    /// ReplicationResult::Success. A Success would be a false ack: the leader would advance
+    /// read/last_self_acked past bytes not on disk.
+    #[test]
+    fn follower_does_not_ack_when_fsync_fails() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_follower_shard(&dir).await;
+
+            // Make the durable fsync impossible: drop the active segment's writer so
+            // sync() fails with ActiveWriteFileUnavailable.
+            shard.log_segments_cache.active().close().await;
+
+            let result = shard
+                .handle_replication_batch(replication_batch_req(vec![replication_item(1, GENESIS_HASH)]))
+                .await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::error::follower_replication_write_error::FollowerReplicationWriteError::ShardFSyncError(_))
+                ),
+                "fsync failure must surface as an error, never a Success ack; got: {result:?}",
+            );
 
             shard.close().await;
         });

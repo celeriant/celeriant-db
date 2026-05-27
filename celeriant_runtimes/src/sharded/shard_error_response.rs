@@ -271,6 +271,7 @@ fn replication_message(e: ReplicationError) -> String {
         ReplicationError::LeaderFenced => format!(r#"{{"detail":"LeaderFenced"}}"#),
         ReplicationError::BudgetExhausted => format!(r#"{{"detail":"BudgetExhausted"}}"#),
         ReplicationError::GateTimeout => format!(r#"{{"detail":"GateTimeout"}}"#),
+        ReplicationError::LeaseUnconfirmed => format!(r#"{{"detail":"LeaseUnconfirmed"}}"#),
     }
 }
 
