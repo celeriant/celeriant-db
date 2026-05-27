@@ -1559,7 +1559,6 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let found = find_result.unwrap_or(false);
         if !found {
             let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
-            shard_mem_cache.put_aggregate_into_cache_as_not_found(aggregate_key.clone(), CachePath::Write);
             // Sentinel 0 prevents subsequent idempotent writes from this never-before-seen
             // client from re-triggering the WAL scan above. get_client_seq() treats 0 as None.
             shard_mem_cache.put_aggregate_client_into_cache(aggregate_client_key.clone(), 0, false);
@@ -3678,6 +3677,49 @@ mod tests {
                 result,
                 Err(ShardError::Write(ShardWriteError::OptimisticConcurrencyViolation { .. }))
             ));
+
+            shard.close().await;
+        });
+    }
+
+    /// Regression: aggregate_version is per-aggregate and globally monotonic, even
+    /// with idempotency enforced. A distinct client's first write to an existing
+    /// aggregate must not restart the version at 1. (Previously the
+    /// cache_aggregate_client scan miss clobbered the aggregate snapshot to
+    /// NotFound, tripping the "fresh start" branch and producing 1,2,1,2.)
+    #[test]
+    fn idempotency_does_not_reset_aggregate_version_per_client() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 700002, 800002);
+
+            let evt = |seq: u64| vec![DatablockAggregateEvent {
+                client_seq: seq,
+                event_type_major: 1,
+                event_value: Arc::new(vec![seq as u8]),
+                ..Default::default()
+            }];
+
+            // client 111 creates, then appends; client 222's first-ever write to
+            // this aggregate; client 111 again. All with idempotency enforced.
+            write_ok(&shard, write_req_full(agg.clone(), evt(1), true, None, 111, true)).await;
+            write_ok(&shard, write_req_full(agg.clone(), evt(2), false, None, 111, true)).await;
+            write_ok(&shard, write_req_full(agg.clone(), evt(1), false, None, 222, true)).await;
+            write_ok(&shard, write_req_full(agg.clone(), evt(3), false, None, 111, true)).await;
+
+            let read = unwrap_read(process(&shard, read_req(agg.clone())).await);
+            let versions: Vec<u64> = read.event_batches.iter().map(|b| b.aggregate_version).collect();
+            assert_eq!(versions, vec![1, 2, 3, 4], "aggregate_version must be globally monotonic across clients");
+            let clients: Vec<u128> = read.event_batches.iter().map(|b| b.client_id).collect();
+            assert_eq!(clients, vec![111, 111, 222, 111]);
+
+            // Idempotency must still reject a duplicate client_seq for an existing (aggregate, client).
+            let dup = process(&shard, write_req_full(agg, evt(1), false, None, 222, true)).await;
+            assert!(
+                matches!(dup, Err(ShardError::Write(ShardWriteError::ClientIdempotencyViolation { .. }))),
+                "duplicate client_seq must still be rejected, got {dup:?}"
+            );
 
             shard.close().await;
         });
