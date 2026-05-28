@@ -127,4 +127,79 @@ mod tests {
         let bytes = bloom.to_bytes();
         assert!(bytes.iter().all(|&b| b == 0));
     }
+
+    // ── Empirical false-positive characterisation ──────────────────────────
+    //
+    // The segment-gating bloom is what lets a reverse WAL scan skip a sealed
+    // segment without reading its metablock region. Its false-positive rate
+    // therefore decides how much disk a cold/negative lookup actually touches:
+    // every false positive turns a "skip" into a full region scan of that
+    // segment.
+    //
+    // These tests pin the real filter's behaviour (256KB, 10 hashes — see
+    // AGGREGATE_BLOOM_BYTES / AGGREGATE_BLOOM_HASH_COUNT), not the 128-byte
+    // per-batch event-type bloom that some older analysis conflated it with.
+
+    /// Measure the FP rate by inserting `inserted` keys and probing a disjoint
+    /// set of `probes` absent keys. Insert/probe key spaces never overlap.
+    fn measure_fp_rate(inserted: u128, probes: u128) -> f64 {
+        let mut bloom = AggregateKeyBloom::new();
+        for id in 0..inserted {
+            bloom.insert(&AggregateKey::new(1, 1, id));
+        }
+        // Absent probe space, far from inserted ids, also varying org/type so a
+        // structured hash can't accidentally alias the inserted range.
+        let mut false_positives = 0u128;
+        for p in 0..probes {
+            let key = AggregateKey::new(7, 9, 1_000_000_000 + p);
+            if bloom.may_contain(&key) {
+                false_positives += 1;
+            }
+        }
+        let rate = false_positives as f64 / probes as f64;
+        eprintln!(
+            "[bloom-fp] inserted={inserted} probed={probes} false_positives={false_positives} fp_rate={:.4}%",
+            rate * 100.0
+        );
+        rate
+    }
+
+    #[test]
+    fn fp_rate_at_design_capacity_is_under_one_percent() {
+        // constants.rs claims "<1% chance for 200k entries per shard log segment".
+        // Validate empirically with a margin for sampling noise.
+        let fp = measure_fp_rate(200_000, 200_000);
+        assert!(
+            fp < 0.015,
+            "FP rate at 200k design capacity was {:.3}% — expected <1% (allowing 1.5% sample margin)",
+            fp * 100.0
+        );
+    }
+
+    #[test]
+    fn fp_rate_stays_low_well_below_capacity() {
+        // A typical sealed segment holds far fewer than 200k distinct aggregates.
+        // At 50k the filter should be effectively perfect at rejecting absentees.
+        let fp = measure_fp_rate(50_000, 200_000);
+        assert!(
+            fp < 0.001,
+            "FP rate at 50k entries was {:.4}% — expected effectively zero",
+            fp * 100.0
+        );
+    }
+
+    #[test]
+    fn fp_rate_saturates_far_past_capacity() {
+        // The bound is PER SEGMENT. Bounded memory at infinite *global* cardinality
+        // relies on no single segment exceeding ~200k distinct aggregates. Push 5x
+        // past design capacity and confirm the filter degrades to near-useless —
+        // this is the cliff: a segment crammed with >>200k aggregates stops being
+        // skippable and every lookup that hashes into it pays a full region scan.
+        let fp = measure_fp_rate(1_000_000, 100_000);
+        assert!(
+            fp > 0.5,
+            "FP rate at 1M entries (5x capacity) was {:.1}% — expected heavy saturation (>50%)",
+            fp * 100.0
+        );
+    }
 }

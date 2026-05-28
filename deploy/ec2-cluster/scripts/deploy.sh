@@ -52,14 +52,18 @@ ARCH=$(get_output Architecture)
 
 # Collect client IPs as comma-separated (safe for Make/shell sourcing)
 CLIENT_PUBS=""
+CLIENT_PRIVS=""
 for i in $(seq 1 "$CLIENT_COUNT"); do
   if [[ $i -eq 1 ]]; then
     PUB=$(get_output ClientPublicIp)
+    PRIV=$(get_output ClientPrivateIp)
   else
     PUB=$(get_output "Client${i}PublicIp")
+    PRIV=$(get_output "Client${i}PrivateIp")
   fi
-  if [[ -n "$CLIENT_PUBS" ]]; then CLIENT_PUBS="$CLIENT_PUBS,"; fi
+  if [[ -n "$CLIENT_PUBS" ]]; then CLIENT_PUBS="$CLIENT_PUBS,"; CLIENT_PRIVS="$CLIENT_PRIVS,"; fi
   CLIENT_PUBS="$CLIENT_PUBS$PUB"
+  CLIENT_PRIVS="$CLIENT_PRIVS$PRIV"
 done
 
 echo "  Leader:   $LEADER_PUB ($LEADER_IP)"
@@ -77,19 +81,35 @@ TEST_BINARY="$REPO_ROOT/target/release/celeriant-integration-tests"
 CLI_BINARY="$REPO_ROOT/target/release/celeriant_cli"
 if [[ ! -f "$BINARY" ]]; then
   echo "ERROR: Server binary not found at $BINARY"
-  echo "Run: cargo build --release -p celeriant -p celeriant_integration_tests -p celeriant_cli"
+  echo "Build in the amazonlinux:2023 container: make build (x86_64) or make build-arm (ARM)"
   exit 1
 fi
 if [[ ! -f "$TEST_BINARY" ]]; then
   echo "ERROR: Test binary not found at $TEST_BINARY"
-  echo "Run: cargo build --release -p celeriant -p celeriant_integration_tests -p celeriant_cli"
+  echo "Build in the amazonlinux:2023 container: make build (x86_64) or make build-arm (ARM)"
   exit 1
 fi
 if [[ ! -f "$CLI_BINARY" ]]; then
   echo "ERROR: CLI binary not found at $CLI_BINARY"
-  echo "Run: cargo build --release -p celeriant -p celeriant_integration_tests -p celeriant_cli"
+  echo "Build in the amazonlinux:2023 container: make build (x86_64) or make build-arm (ARM)"
   exit 1
 fi
+
+# Guard against host-built binaries. A plain `cargo build` links against your
+# machine's glibc, which is newer than Amazon Linux 2023's 2.34 — the server then
+# fails on boot with "GLIBC_2.XX not found". `make build` / `make build-arm` build
+# inside the amazonlinux:2023 container so the binary links against 2.34.
+if command -v objdump >/dev/null 2>&1; then
+  MAX_GLIBC=$(objdump -T "$BINARY" 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sed 's/GLIBC_//' | sort -V | tail -1)
+  if [[ -n "$MAX_GLIBC" && "$(printf '2.34\n%s\n' "$MAX_GLIBC" | sort -V | tail -1)" != "2.34" ]]; then
+    echo "ERROR: $BINARY links against GLIBC $MAX_GLIBC, but Amazon Linux 2023 has 2.34."
+    echo "       This is a host build and will not run on EC2. Rebuild in the container:"
+    echo "         make build       # x86_64 (c6id, i4i, c7i)"
+    echo "         make build-arm   # ARM64 (i4g, c7g)"
+    exit 1
+  fi
+fi
+
 # Auto-regenerate certs if missing or if SANs don't match current IPs
 NEEDS_CERTS=false
 if [[ ! -f "$CERT_DIR/node.crt" ]]; then
@@ -206,6 +226,7 @@ cat > "$ENV_FILE" <<EOF
 LEADER_PUB=$LEADER_PUB
 FOLLOWER_PUB=$FOLLOWER_PUB
 CLIENT_PUBS=$CLIENT_PUBS
+CLIENT_PRIVS=$CLIENT_PRIVS
 CLIENT_COUNT=$CLIENT_COUNT
 LEADER_IP=$LEADER_IP
 FOLLOWER_IP=$FOLLOWER_IP

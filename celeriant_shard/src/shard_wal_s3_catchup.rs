@@ -108,7 +108,7 @@ const DRAIN_SETTLE_INTERVAL: Duration = Duration::from_millis(500);
 const DRAIN_SETTLE_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Re-list S3 up to `DRAIN_MAX_ROUNDS` times with `DRAIN_SETTLE_INTERVAL` sleep
-/// between attempts, looking for late-landing covering files not yet in `applied_paths`.
+/// between attempts, looking for late-landing covering files not yet in `processed_paths`.
 ///
 /// Returns `true` if at least one new covering candidate was found (caller should
 /// continue the main loop to apply it). Returns `false` if the settle window passed
@@ -122,7 +122,7 @@ async fn drain_settle_barrier<D: S3Downloader + 'static>(
     node_id: u128,
     peer_node_id: Option<u128>,
     next_wal_seq: u64,
-    applied_paths: &HashSet<String>,
+    processed_paths: &HashSet<String>,
 ) -> Result<bool, S3CatchupError> {
     let mut late_files_caught: u32 = 0;
 
@@ -132,7 +132,7 @@ async fn drain_settle_barrier<D: S3Downloader + 'static>(
         let objects = downloader.list_objects(prefix).await?;
 
         for obj in &objects {
-            let Some((_sid, _start, end_wal_seq, source_node_id)) = parse_fallback_path(&obj.path) else {
+            let Some((_sid, start_wal_seq, end_wal_seq, source_node_id)) = parse_fallback_path(&obj.path) else {
                 continue;
             };
             if source_node_id == node_id {
@@ -143,7 +143,10 @@ async fn drain_settle_barrier<D: S3Downloader + 'static>(
                     continue;
                 }
             }
-            if end_wal_seq >= next_wal_seq && !applied_paths.contains(&obj.path) {
+            // Only a file that actually covers the gap can advance us. A file
+            // strictly ahead of an unfilled next_wal_seq is not a bridging
+            // predecessor and must not hold the barrier open.
+            if start_wal_seq <= next_wal_seq && end_wal_seq >= next_wal_seq && !processed_paths.contains(&obj.path) {
                 tracing::warn!(
                     shard_id,
                     path = %obj.path,
@@ -218,7 +221,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
     let prefix = fallback_shard_prefix(shard_id);
 
     let mut first_iteration = true;
-    let mut applied_paths: HashSet<String> = HashSet::new();
+    let mut processed_paths: HashSet<String> = HashSet::new();
 
     loop {
         result.rounds += 1;
@@ -274,7 +277,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                 // A predecessor's in-flight uploads may still be landing / becoming
                 // list-visible after our final list. The predecessor is fenced (we won the
                 // CAS), so this set is finite and drains within the settle window.
-                let late_found = drain_settle_barrier(downloader, &prefix, shard_id, node_id, peer_node_id, next_wal_seq, &applied_paths).await?;
+                let late_found = drain_settle_barrier(downloader, &prefix, shard_id, node_id, peer_node_id, next_wal_seq, &processed_paths).await?;
                 if late_found {
                     // Late files found — outer loop re-lists and applies them.
                     first_iteration = true;
@@ -293,7 +296,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                 .values()
                 .flatten()
                 .filter(|c| c.start_wal_seq <= next_wal_seq && c.end_wal_seq >= next_wal_seq)
-                .filter(|c| !applied_paths.contains(&c.path))
+                .filter(|c| !processed_paths.contains(&c.path))
                 .collect();
 
             if covering.is_empty() {
@@ -309,6 +312,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                     Ok(b) => b,
                     Err(e) => {
                         tracing::warn!(shard_id, path = %candidate.path, error = ?e, "skipping corrupt S3 batch");
+                        processed_paths.insert(candidate.path.clone());
                         continue;
                     }
                 };
@@ -318,11 +322,13 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                 // stitched into a single file. Never safe to apply.
                 if !is_batch_contiguous(&batch) {
                     tracing::warn!(shard_id, path = %candidate.path, "skipping S3 batch with internal wal_seq gap");
+                    processed_paths.insert(candidate.path.clone());
                     continue;
                 }
 
                 if !is_batch_lease_consistent(&batch) {
                     tracing::warn!(shard_id, path = %candidate.path, batch_lease = batch.lease_epoch, "skipping S3 batch with inconsistent per-item lease_epoch");
+                    processed_paths.insert(candidate.path.clone());
                     continue;
                 }
 
@@ -457,7 +463,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                             "celeriant_s3_catchup_no_common_ancestor_total",
                             "shard_id" => shard_id.to_string()
                         ).increment(1);
-                        applied_paths.insert(candidate.path.clone());
+                        processed_paths.insert(candidate.path.clone());
                         break;
                     }
                 };
@@ -495,7 +501,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                 .await
                 .map_err(S3CatchupError::FsyncFailed)?;
 
-            applied_paths.insert(candidate.path.clone());
+            processed_paths.insert(candidate.path.clone());
 
             let shard_label = [("shard_id", shard_id.to_string())];
             let applied_bytes: u64 = items.iter().map(|i| i.metablock.uncompressed_size).sum();
@@ -517,7 +523,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                 // at least one batch this invocation (same rationale as the pre-inner-loop
                 // check above: zero applied means no predecessor stream to drain).
                 if result.batches_applied > 0 {
-                    let late_found = drain_settle_barrier(downloader, &prefix, shard_id, node_id, peer_node_id, next_wal_seq, &applied_paths).await?;
+                    let late_found = drain_settle_barrier(downloader, &prefix, shard_id, node_id, peer_node_id, next_wal_seq, &processed_paths).await?;
                     if late_found {
                         first_iteration = true;
                         continue;
@@ -3165,6 +3171,27 @@ mod tests {
 
             assert_eq!(tc.wal_seq(), 3);
             assert_eq!(result.completion, CatchupCompletion::Caught);
+        });
+    }
+
+    /// A file strictly ahead of an unfilled gap (start > next_wal_seq) is not a
+    /// bridging predecessor and must not hold the drain barrier open. Otherwise an
+    /// unfillable middle gap (corrupt/deleted batch) wedges catchup forever instead
+    /// of handing the gap to TCP extended catchup. See docs/s3-catchup-drain-wedge.md.
+    #[test]
+    fn drain_barrier_ignores_file_beyond_gap() {
+        glommio_test!({
+            let dl = Rc::new(MockDownloader::new());
+            // Waiting on seq 3, but the only visible file covers 5..=5 — ahead of the gap.
+            let (path, data) = make_fallback_batch(0, 5, 5, GENESIS_HASH);
+            dl.insert(path, data);
+
+            let prefix = celeriant_distributed::paths::fallback_shard_prefix(0);
+            let late = drain_settle_barrier(&dl, &prefix, 0, 99, None, 3, &std::collections::HashSet::new())
+                .await
+                .unwrap();
+
+            assert!(!late, "a file ahead of the gap must not count as a late predecessor");
         });
     }
 }

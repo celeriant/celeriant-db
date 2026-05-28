@@ -226,7 +226,7 @@ pub fn all_tests() -> &'static [TestEntry] {
         TestEntry {
             name: "s3_degraded_segment_summaries",
             description: "Sealed-segment .summary sidecars land on local NVMe across rotations on both TCP and S3 fallback paths",
-            estimated_secs: 70,
+            estimated_secs: 200,
             categories: &[Replication, Durability],
             distributed: true,
         },
@@ -455,7 +455,7 @@ pub fn all_tests() -> &'static [TestEntry] {
         TestEntry {
             name: "edge_log_rotation_mid_replication",
             description: "Log rotation mid-replication doesn't lose data despite LRU eviction",
-            estimated_secs: 32,
+            estimated_secs: 90,
             categories: &[Edge],
             distributed: true,
         },
@@ -649,6 +649,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             name: "p3_3_sequential_cold_reads",
             description: "Sustained cold sequential read throughput for audit/replay access patterns",
             estimated_secs: 39,
+            categories: &[Performance],
+            distributed: false,
+        },
+        TestEntry {
+            name: "p3_4_read_thundering_herd",
+            description: "Concurrent distinct cold reads stress the reverse-scan path; verifies the read semaphore bounds NVMe load without wedging, and surfaces read amplification",
+            estimated_secs: 90,
             categories: &[Performance],
             distributed: false,
         },

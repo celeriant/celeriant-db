@@ -204,6 +204,7 @@ async fn dispatch_test(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         "p3_1_cold_read_latency" => p3_1_cold_read_latency::run().await,
         "p3_2_bloom_filter" => p3_2_bloom_filter::run().await,
         "p3_3_sequential_cold_reads" => p3_3_sequential_cold_reads::run().await,
+        "p3_4_read_thundering_herd" => p3_4_read_thundering_herd::run().await,
         "p4_1_rolling_upgrade" => p4_1_rolling_upgrade::run().await,
         "pool_test" => pool_test::run().await,
         "read_list_benchmark" => read_list_benchmark::run().await,

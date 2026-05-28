@@ -8340,5 +8340,144 @@ mod tests {
         });
     }
 
+    /// xorshift fill that resists the zstd dictionary, so each event's datablock
+    /// is stored externally at full size and a few writes fill a small segment.
+    fn incompressible(n: usize, seed: u64) -> Vec<u8> {
+        let mut v = vec![0u8; n];
+        let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        for c in v.chunks_mut(8) {
+            s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let b = z.to_le_bytes();
+            c.copy_from_slice(&b[..c.len()]);
+        }
+        v
+    }
+
+    fn big_event(client_seq: u64, seed: u64) -> DatablockAggregateEvent {
+        DatablockAggregateEvent {
+            client_seq,
+            event_type_major: 1,
+            // ~300KB external datablock; rotates a 1.5MB segment every ~1-2 writes.
+            event_value: Arc::new(incompressible(300 * 1024, seed)),
+            ..Default::default()
+        }
+    }
+
+    fn cold_scan_config(dir: &std::path::Path) -> InternalShardConfig {
+        InternalShardConfig {
+            shard_log_preallocate_bytes: 1536 * 1024, // 3 × 512KB header blocks
+            max_open_files: 4096,
+            cache_warmup_max_duration: Duration::ZERO,
+            ..test_config(dir)
+        }
+    }
+
+    async fn populate_segments<R: ReplicationClient, D: S3Downloader>(
+        shard: &ShardWal<R, D>,
+        min_active: u64,
+    ) -> (u64, u128) {
+        let mut last_id = 0u128;
+        for i in 1u128..=2000 {
+            write_ok(shard, client_write_req(key(1, 1, i), vec![big_event(1, i as u64)])).await;
+            last_id = i;
+            if shard.log_segments_cache.active_log_id() >= min_active && i >= min_active as u128 {
+                break;
+            }
+        }
+        let active = shard.log_segments_cache.active_log_id();
+        assert!(active >= min_active, "expected >= {min_active} segments, got {active}");
+        (active, last_id)
+    }
+
+    #[test]
+    fn negative_lookup_reopens_every_segment_after_cold_start() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let active = {
+                let shard = ShardWal::open(cold_scan_config(&dir), ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap();
+                let (active, _) = populate_segments(&shard, 4).await;
+                shard.close().await;
+                active
+            };
+
+            // Reopen cold: warmup disabled, so only the active segment is resident.
+            let shard = ShardWal::open(cold_scan_config(&dir), ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap();
+            for id in 1..active {
+                assert!(shard.log_segments_cache.get_if_cached(id).is_none(),
+                    "sealed segment {id} should be cold after open (warmup disabled)");
+            }
+
+            let missing = AggregateKey::new(1, 1, 9_000_000);
+            let result = shard.exists(&AggregateDetailsRequest { correlation_id: None, aggregate_key: missing }).await;
+            assert!(result.is_err(), "non-existent aggregate must report not-found");
+
+            // Every segment had to be opened just to read its bloom and skip.
+            for id in 1..=active {
+                assert!(shard.log_segments_cache.get_if_cached(id).is_some(),
+                    "negative lookup should have opened segment {id} (512KB header read) to check its bloom; active={active}");
+            }
+            eprintln!("[scan-cost] negative lookup over {active} segments => {active} segment-file opens (each a {}KB header read)", HEADER_BLOCK_SIZE_BYTES / 1024);
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn deep_aggregate_read_walks_back_to_oldest_segment() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let active = {
+                let shard = ShardWal::open(cold_scan_config(&dir), ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap();
+                // Aggregate 1 is written first → lands in segment 1 and is never touched again.
+                let (active, _) = populate_segments(&shard, 4).await;
+                shard.close().await;
+                active
+            };
+
+            let shard = ShardWal::open(cold_scan_config(&dir), ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap();
+            let deep = AggregateKey::new(1, 1, 1);
+            let result = shard.exists(&AggregateDetailsRequest { correlation_id: None, aggregate_key: deep }).await;
+            assert!(result.is_ok(), "deep aggregate should be found: {:?}", result.err());
+
+            for id in 1..=active {
+                assert!(shard.log_segments_cache.get_if_cached(id).is_some(),
+                    "deep read should have walked back through segment {id}; active={active}");
+            }
+            eprintln!("[scan-cost] deep aggregate (oldest segment) read over {active} segments => {active} segment-file opens");
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn recent_aggregate_read_does_not_touch_old_segments() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let (active, last_id) = {
+                let shard = ShardWal::open(cold_scan_config(&dir), ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap();
+                let (active, last_id) = populate_segments(&shard, 4).await;
+                shard.close().await;
+                (active, last_id)
+            };
+
+            let shard = ShardWal::open(cold_scan_config(&dir), ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap();
+            // The last-written aggregate lives in (or adjacent to) the active segment.
+            let recent = AggregateKey::new(1, 1, last_id);
+            let result = shard.exists(&AggregateDetailsRequest { correlation_id: None, aggregate_key: recent }).await;
+            assert!(result.is_ok(), "recent aggregate should be found: {:?}", result.err());
+
+            // The oldest segment is far from the read cursor; a recent hit must not reach it.
+            assert!(shard.log_segments_cache.get_if_cached(1).is_none(),
+                "recent-aggregate read should not have opened the oldest segment (active={active})");
+            eprintln!("[scan-cost] recent aggregate read over {active} segments => oldest segment untouched (O(1) vs O(segments))");
+
+            shard.close().await;
+        });
+    }
+
 }
 

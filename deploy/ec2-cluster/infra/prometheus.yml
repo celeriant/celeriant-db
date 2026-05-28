@@ -1,0 +1,12 @@
+# Template — setup-infra.sh substitutes the placeholders from .cluster-env.
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: celeriant
+    static_configs:
+      - targets:
+          - LEADER_HOST_PLACEHOLDER:METRICS_PORT_PLACEHOLDER
+          - FOLLOWER_HOST_PLACEHOLDER:METRICS_PORT_PLACEHOLDER
+        labels:
+          cluster: ec2-ktls-test

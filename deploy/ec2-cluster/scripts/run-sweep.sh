@@ -14,6 +14,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CDK_DIR="$(dirname "$SCRIPT_DIR")"
 CLUSTER_ENV="$CDK_DIR/.cluster-env"
+source "$SCRIPT_DIR/iostat-lib.sh"
 
 if [[ ! -f "$CLUSTER_ENV" ]]; then
   echo "ERROR: $CLUSTER_ENV not found — run 'make deploy' or 'make sync-env' first"
@@ -58,6 +59,10 @@ echo ""
 
 # CSV header
 echo "concurrency,tasks_per_client,clients,total_requests,total_errors,throughput_rps,avg_ms,p50_ms,p95_ms,p99_ms,p999_ms,min_ms,max_ms" > "$CSV_FILE"
+
+IOSTAT_PREFIX="${CSV_FILE%.csv}_iostat"
+echo "==> Starting disk capture on data nodes (spans the whole sweep)"
+iostat_start "$IOSTAT_PREFIX" || true
 
 for LEVEL in ${LEVELS//,/ }; do
   TASKS_PER_CLIENT=$(( LEVEL / CLIENT_COUNT ))
@@ -142,6 +147,10 @@ for LEVEL in ${LEVELS//,/ }; do
 
   sleep 3
 done
+
+echo ""
+echo "==> Disk utilisation across the sweep (per device, data nodes):"
+iostat_stop "$IOSTAT_PREFIX" || true
 
 echo ""
 echo "==> Sweep complete. Results: $CSV_FILE"

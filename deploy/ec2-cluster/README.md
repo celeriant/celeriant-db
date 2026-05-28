@@ -34,12 +34,14 @@ graph TB
     end
 
     S3["AWS S3<br/>cluster coordination"]
-    GC["Grafana Cloud<br/>metrics + logs"]
+    OBS["Prometheus + Loki + Grafana<br/>on client #1 — :3000 to home IP"]
 
     Leader --> S3
     Follower --> S3
-    L_METRICS -.->|"Alloy"| GC
-    F_METRICS -.->|"Alloy"| GC
+    OBS -.->|"scrape :9090"| L_METRICS
+    OBS -.->|"scrape :9090"| F_METRICS
+    Leader -.->|"promtail → :3100"| OBS
+    Follower -.->|"promtail → :3100"| OBS
 ```
 
 ## Instance type flexibility
@@ -65,6 +67,14 @@ architecture — use `make build` for x86_64 or `make build-arm` for ARM.
 | Storage-optimized ARM (8c) | `i4g.2xlarge` | 8 | 1x 468GB | ~$0.58 |
 | Storage-optimized ARM (16c) | `i4g.4xlarge` | 16 | 1x 937GB | ~$1.15 |
 | Storage-optimized ARM (32c) | `i4g.8xlarge` | 32 | 2x 1875GB Nitro SSD | ~$2.88 |
+
+Multi-NVMe instances (i4i.8xlarge and up) are **RAID0-striped across all their NVMes by
+default**. For an append-only event store the headline win is **capacity** — the full
+aggregate of every drive (6.8T on the 8xlarge, 13.6T on the 16xlarge vs 3.4T on one), so far
+more events live on local NVMe before compaction/S3 offload. Throughput is a bonus: ~neutral
+on the 8xlarge, **~+32% on the 16xlarge** (where one drive saturates under 64-core load).
+Single-NVMe instances are unaffected (the one drive is mounted directly). Use `-c raid0=false`
+to force a single drive (e.g. to reproduce the saturation in the `iostat` summary).
 
 ### Client node instance types
 
@@ -102,20 +112,24 @@ bottlenecks at high concurrency — tasks are split evenly across clients.
    The binary will fail with `GLIBC_2.XX not found` on EC2. The `make build` / `make build-arm`
    targets run the build inside an `amazonlinux:2023` Docker container so the binary links
    against the correct glibc. For ARM builds, QEMU binfmt is used to emulate aarch64 (~15-40 min
-   first build, seconds on subsequent builds if deps are cached).
+   first build, seconds on subsequent builds if deps are cached). `make deploy` checks the
+   binary's max glibc and refuses to ship a host build, so this trap fails fast rather than on EC2.
 
 ## Quick start
 
 ```bash
 cd deploy/ec2-cluster
 
-# 1. Build binaries in Docker (local builds won't work — glibc mismatch)
+# 1. Build binaries in the amazonlinux:2023 container. REQUIRED — a host `cargo build`
+#    links against newer glibc and fails on EC2; `make deploy` rejects such binaries.
 make build          # x86_64 (c6id, i4i, c7i)
 make build-arm      # ARM64 (i4g, c7g) — requires QEMU binfmt
 # ⚠️ Both targets output to target/release/ — building one overwrites the other.
 #    Always rebuild before deploying if you switched architecture.
 
-# 2. Deploy infrastructure (NVMe instance store required — see instance types above)
+# 2. Deploy infrastructure (NVMe instance store required — see instance types above).
+#    Grafana access is auto-opened to your current public IP — override with
+#    HOME_IP=1.2.3.4/32, or disable with HOME_IP= (SSH-tunnel only).
 make infra CDK_ARGS="-c keyPair=my-key"
 
 # Canonical 32-core x86 benchmark shape (matches docs/benchmark-results/ec2-benchmark.md):
@@ -134,12 +148,23 @@ make infra CDK_ARGS="-c keyPair=my-key \
 make certs
 make deploy KEY_ARG="--key-file ~/.ssh/id_rsa"
 
-# 4. Start and benchmark
+# 4. Start the cluster (leader first, then follower)
 make start
-make run-benchmark                                    # default: 8000 tasks
-make run-benchmark BENCH_TASKS=36000 BENCH_CONNS=12000  # high concurrency sweep
+
+# 5. (optional) Stand up self-hosted Grafana/Prometheus/Loki on client #1 to watch
+#    the run live. Grafana: http://<client1-public-ip>:3000 (admin/admin), reachable
+#    from the IP `make infra` opened.
+make setup-infra
+
+# 6. Benchmark
+make run-benchmark    # single level, concurrency auto-sized to your cluster's knee + disk %util
+make run-sweep        # full concurrency curve → CSV
 make stop
 ```
+
+Each `run-benchmark` / `run-sweep` also captures `iostat -x` on the data nodes and prints a
+per-device `%util` summary (saved next to the results). RAID0 across all NVMes is the default;
+deploy with `-c raid0=false` to compare a single drive and see whether striping is helping.
 
 ## Structure
 
@@ -148,11 +173,17 @@ deploy/ec2-cluster/
 ├── Makefile                     # Orchestration (mirrors rpi-cluster)
 ├── bin/ec2-cluster.ts           # CDK app entry point
 ├── lib/ec2-cluster-stack.ts     # Stack: 2 data + N client EC2, S3, SG, IAM, user data
+├── infra/                       # Self-hosted observability stack (deployed to client #1)
+│   ├── docker-compose.yml       # Prometheus + Loki + Grafana (no MinIO — EC2 uses real S3)
+│   ├── prometheus.yml           # Scrape template (data node IPs filled in at setup)
+│   └── grafana-provisioning/    # Datasources + dashboard provider
 ├── scripts/
 │   ├── generate-certs.sh        # Dual-CA cert generation with IP SANs
 │   ├── deploy.sh                # Deploys binaries, certs, env files to all nodes
+│   ├── setup-infra.sh           # Stands up the infra stack + promtail on data nodes
+│   ├── iostat-lib.sh            # Per-device disk capture, sourced by the bench scripts
 │   ├── run-benchmark.sh         # Runs benchmark on client(s), aggregates results
-│   └── deploy-dashboard.sh      # Imports Celeriant dashboard to Grafana Cloud
+│   └── run-sweep.sh             # Concurrency sweep, CSV output
 ├── certs/                       # Generated certs (gitignored)
 ├── results/                     # Benchmark results (gitignored)
 ├── .cluster-env                 # Cached IPs/config (gitignored, written by deploy.sh)
@@ -174,8 +205,9 @@ make stop              # Stop cluster
 make restart           # Stop then start
 make status            # Check service status
 make logs              # Tail logs from both nodes (Ctrl+C to stop)
+make setup-infra       # Stand up Grafana/Prometheus/Loki on client #1
 make run-benchmark     # Run benchmark and save results
-make dashboard         # Import Celeriant dashboard to Grafana Cloud
+make run-sweep         # Concurrency sweep, CSV output
 make sync-env          # Re-read CDK outputs into .cluster-env
 make teardown          # Stop cluster + destroy CDK stack
 make teardown-data     # Wipe data on data nodes
@@ -189,10 +221,18 @@ automatic leader failover, connecting to both nodes (same test the RPi cluster u
 With multiple clients (`-c clientCount=N`), total tasks are split evenly across clients
 and run in parallel. Results are aggregated (requests summed, per-client stats shown).
 
-Override defaults via Make variables:
+By default `make run-benchmark` **auto-sizes** total concurrency to the data-node vCPU
+count (~1,125 connections/vCPU, 1:1 with tasks), landing near the measured throughput
+knee — e.g. `i4i.8xlarge` (32 vCPU) → 36,000 tasks → ~358k req/s at P99 ~135ms. No
+arguments needed; it adapts to whatever cluster you deployed (8c→9k, 32c→36k, 64c→72k).
+
+Override via Make variables — `BENCH_TASKS` is total tasks (split across clients),
+`BENCH_CONNS` is the per-client connection pool (defaults to 1:1 with tasks):
 
 ```bash
-make run-benchmark BENCH_TASKS=4000 BENCH_CONNS=4000 BENCH_DURATION=30
+make run-benchmark                                       # auto-sized to the cluster (knee)
+make run-benchmark BENCH_TASKS=84000                     # push into the saturation peak
+make run-benchmark BENCH_TASKS=36000 BENCH_CONNS=4000 BENCH_DURATION=30  # tasks over a smaller pool
 ```
 
 Results are saved to `results/<timestamp>_<instance-type>_<storage-type>.txt` with
@@ -206,6 +246,7 @@ metadata headers for easy comparison across instance types.
 |---|---|---|---|
 | `default` *(unset)* | per `instanceType` | per `clientInstanceType` | one-off / custom shapes |
 | `i4i-32c` | 2x i4i.8xlarge | 3x c7i.4xlarge | matches `docs/benchmark-results/ec2-benchmark.md` 32-core sweep |
+| `i4i-64c` | 2x i4i.16xlarge | 4x c7i.4xlarge | 64-core sweep; RAID0 across all 4 NVMes (default) |
 | `i4g-32c` | 2x i4g.8xlarge | 3x c7g.4xlarge | ARM equivalent — use `make build-arm` |
 
 ### CDK context overrides
@@ -217,12 +258,9 @@ metadata headers for easy comparison across instance types.
 | `clientCount` | `1` | `-c clientCount=3` (max 4) |
 | `storageType` | `instance-store` | ⚠️ `ebs` exists but is broken (see above) |
 | `ebsDataVolumeSize` | `100` (GB) | `-c ebsDataVolumeSize=200` (EBS only) |
+| `raid0` | *(true)* | RAID0-stripes all instance-store NVMes by default; `-c raid0=false` uses only the first drive |
+| `homeIp` | *(auto)* | `make infra` auto-detects your public IP and opens Grafana :3000 to it; override with `HOME_IP=1.2.3.4/32` or skip with `HOME_IP=` |
 | `keyPair` | *(none, use SSM)* | `-c keyPair=my-key` |
-| `grafanaPromUser` | | `-c grafanaPromUser=123456` |
-| `grafanaPromUrl` | | `-c grafanaPromUrl=https://prometheus-prod-XX.grafana.net/api/prom/push` |
-| `grafanaLokiUser` | | `-c grafanaLokiUser=123456` |
-| `grafanaLokiUrl` | | `-c grafanaLokiUrl=https://logs-prod-XX.grafana.net/loki/api/v1/push` |
-| `grafanaApiKey` | | `-c grafanaApiKey=glc_...` |
 
 ## Trust model (dual CA)
 
@@ -241,8 +279,8 @@ A client cert cannot authenticate to the replication port.
 | Nodes | 2x RPi 5 + RPi 4 infra | 2x EC2 data + 1-4 EC2 clients |
 | Storage | NVMe HAT | NVMe instance store |
 | S3 | MinIO on infra node | AWS S3 |
-| Monitoring | Self-hosted Grafana/Prometheus/Loki | Grafana Cloud (optional) |
-| Dashboard | Auto-provisioned from local-cluster | `make dashboard` imports same JSON |
+| Monitoring | Self-hosted Grafana/Prometheus/Loki on infra Pi | Same stack on client #1 (`make setup-infra`) |
+| Dashboard | Auto-provisioned from local-cluster | Auto-provisioned from local-cluster |
 | Network | LAN switch | Same AZ (LAN-equivalent) |
 | Service mgmt | systemd | systemd |
 | Orchestration | Makefile | Makefile |
@@ -280,24 +318,24 @@ celeriant_cli read --org 1 --type 1 --id 1
 
 ### Logs and metrics
 
-Without Grafana Cloud:
+Quick CLI access without the stack:
 ```bash
 make logs                          # Tail both nodes
 ssh ec2-user@<node> 'journalctl -u celeriant -n 100 --no-pager'
 ```
 
-With Grafana Cloud (set `grafanaApiKey`, `grafanaPromUrl`, `grafanaLokiUrl`):
-- Metrics: `{job="celeriant"}` in Prometheus
-- Logs: `{unit="celeriant.service"}` in Loki
+Self-hosted Grafana (`make infra` opens :3000 to your IP automatically; `make setup-infra`
+brings the stack up) runs the same stack as the RPi cluster on client #1:
 
-Import the same Celeriant cluster dashboard used by the RPi and local clusters:
-```bash
-make dashboard GRAFANA_URL=https://your-stack.grafana.net GRAFANA_TOKEN=glsa_...
-```
+- **Grafana:** `http://<client1-public-ip>:3000` (admin/admin) — reachable only from the opened IP
+- **Metrics:** `{cluster="ec2-ktls-test"}` in Prometheus (scraped from each data node's :9090)
+- **Logs:** `{job="celeriant"}` in Loki (shipped by promtail on each data node)
 
-The `GRAFANA_TOKEN` needs Editor or Admin role — the `MetricsPublisher` key used
-by Alloy is not sufficient. Create a Service Account token in Grafana Cloud under
-**Administration > Service Accounts**.
+The Celeriant cluster dashboard is auto-provisioned from
+`deploy/local-cluster/grafana/dashboards/` — the same JSON the RPi and local clusters use.
+
+If your IP changes, re-run `make infra` (it re-detects) — or use an SSH tunnel:
+`ssh -L 3000:localhost:3000 ec2-user@<client1-public-ip>`.
 
 ## Teardown
 
@@ -309,7 +347,8 @@ NVMe instance store data is ephemeral. EBS data volumes are destroyed with the s
 
 ## Benchmark results
 
-See `docs/ec2-benchmark-results-2026-03-24.md` for single-client results across 6 configurations
-and `docs/ec2-3client-benchmark-2026-03-24.md` for multi-client performance curves.
+See `docs/benchmark-results/ec2-benchmark.md` for the full concurrency curves and the
+comparison against PostgreSQL and Kafka (the `.csv` alongside it has the raw numbers).
 
-Peak observed: **374,552 durable replicated writes/sec** on i4i.8xlarge (x86, 32 vCPU) with 3 clients.
+Peak observed: **398,471 durable replicated writes/sec** on i4i.8xlarge (x86, 32 vCPU)
+with 3 clients; **561,207/sec** on i4i.16xlarge (64 vCPU).

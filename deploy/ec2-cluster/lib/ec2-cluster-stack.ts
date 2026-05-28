@@ -11,7 +11,7 @@ import { Construct } from 'constructs';
  *   - 2 data nodes (leader + follower) with dual-CA mTLS, systemd services
  *   - 1 client node for running benchmarks and CLI
  *   - Real S3 for cluster coordination (replaces MinIO)
- *   - Grafana Cloud for observability (replaces self-hosted Grafana/Prometheus/Loki)
+ *   - Self-hosted Grafana/Prometheus/Loki on client #1 (see scripts/setup-infra.sh)
  *
  * Storage modes:
  *   - instance-store (default): local NVMe for /var/lib/celeriant (e.g. c6id, i4i, i4g)
@@ -32,6 +32,12 @@ export class Ec2ClusterStack extends cdk.Stack {
     const keyPairName = this.node.tryGetContext('keyPair');
     const storageType = this.node.tryGetContext('storageType') ?? 'instance-store';
     const ebsDataVolumeSize = parseInt(this.node.tryGetContext('ebsDataVolumeSize') ?? '100', 10);
+    // RAID0-stripe all instance-store NVMes into one volume. Default on: for an append-only
+    // event store the main win is capacity (full aggregate of every drive — more events on
+    // local NVMe before compaction/S3 offload), plus ~+32% throughput on the 16xlarge where a
+    // single drive saturates. Harmless on single-NVMe instances (mounts the one drive),
+    // throughput-neutral on the 8xlarge. -c raid0=false opts out.
+    const raid0 = String(this.node.tryGetContext('raid0') ?? 'true') === 'true';
 
     // Detect ARM (Graviton) instance types for correct AMI selection.
     // ARM families end in 'g' or 'gn' before the dot (i4g, c7g, c7gn, im4gn, is4gen, etc.)
@@ -49,13 +55,8 @@ export class Ec2ClusterStack extends cdk.Stack {
     }
     const cpuType = dataIsArm ? ec2.AmazonLinuxCpuType.ARM_64 : ec2.AmazonLinuxCpuType.X86_64;
 
-    // Grafana Cloud (optional — set all three to enable)
-    const grafanaPromUser = this.node.tryGetContext('grafanaPromUser') ?? '';
-    const grafanaPromUrl = this.node.tryGetContext('grafanaPromUrl') ?? '';
-    const grafanaLokiUser = this.node.tryGetContext('grafanaLokiUser') ?? '';
-    const grafanaLokiUrl = this.node.tryGetContext('grafanaLokiUrl') ?? '';
-    const grafanaApiKey = this.node.tryGetContext('grafanaApiKey') ?? '';
-    const grafanaEnabled = grafanaApiKey && grafanaPromUrl && grafanaLokiUrl;
+    // Home IP (CIDR) allowed to reach Grafana on :3000 — e.g. -c homeIp=1.2.3.4/32
+    const homeIp = this.node.tryGetContext('homeIp') ?? '';
 
     // --- VPC (default VPC) ---
     const vpc = ec2.Vpc.fromLookup(this, 'DefaultVpc', { isDefault: true });
@@ -95,6 +96,10 @@ export class Ec2ClusterStack extends cdk.Stack {
     sg.addIngressRule(sg, ec2.Port.tcp(10000), 'Celeriant client port');
     sg.addIngressRule(sg, ec2.Port.tcp(10001), 'Celeriant replication port');
     sg.addIngressRule(sg, ec2.Port.tcp(9090), 'Prometheus metrics');
+    sg.addIngressRule(sg, ec2.Port.tcp(3100), 'Loki log ingest (intra-cluster)');
+    if (homeIp) {
+      sg.addIngressRule(ec2.Peer.ipv4(homeIp), ec2.Port.tcp(3000), 'Grafana (home IP)');
+    }
 
     // --- AMI: Amazon Linux 2023 (auto-detect x86_64 or ARM64) ---
     const ami = ec2.MachineImage.latestAmazonLinux2023({ cpuType });
@@ -131,7 +136,7 @@ export class Ec2ClusterStack extends cdk.Stack {
       'SYSCTL',
       'sysctl -p /etc/sysctl.d/99-celeriant.conf',
       '',
-      'dnf install -y tar gzip',
+      'dnf install -y tar gzip sysstat',
     ];
 
     // Storage setup for data nodes — depends on storageType
@@ -155,6 +160,33 @@ export class Ec2ClusterStack extends cdk.Stack {
       '  echo "Mounted $DATA_DEV as /var/lib/celeriant"',
       'else',
       '  echo "ERROR: EBS data volume not found after 30s"',
+      '  mkdir -p /var/lib/celeriant',
+      'fi',
+    ] : raid0 ? [
+      '',
+      '# RAID0-stripe all NVMe instance-store devices into /dev/md0',
+      'dnf install -y mdadm',
+      'DEVS=()',
+      'for dev in /dev/nvme1n1 /dev/nvme2n1 /dev/nvme3n1 /dev/nvme4n1; do',
+      '  [[ -b "$dev" ]] && DEVS+=("$dev")',
+      'done',
+      '',
+      'if [[ ${#DEVS[@]} -ge 2 ]]; then',
+      '  mdadm --create /dev/md0 --level=0 --raid-devices=${#DEVS[@]} "${DEVS[@]}" --run',
+      '  mkfs.xfs -f /dev/md0',
+      '  mkdir -p /var/lib/celeriant',
+      '  mount -o noatime /dev/md0 /var/lib/celeriant',
+      '  mdadm --detail --scan >> /etc/mdadm.conf',
+      '  echo "/dev/md0 /var/lib/celeriant xfs defaults,noatime,nofail 0 2" >> /etc/fstab',
+      '  echo "Mounted RAID0 (/dev/md0) over ${#DEVS[@]} devices as /var/lib/celeriant"',
+      'elif [[ ${#DEVS[@]} -eq 1 ]]; then',
+      '  echo "Only one NVMe found — RAID0 needs 2+, mounting it directly"',
+      '  mkfs.xfs -f "${DEVS[0]}"',
+      '  mkdir -p /var/lib/celeriant',
+      '  mount -o noatime "${DEVS[0]}" /var/lib/celeriant',
+      '  echo "${DEVS[0]} /var/lib/celeriant xfs defaults,noatime,nofail 0 2" >> /etc/fstab',
+      'else',
+      '  echo "WARNING: No NVMe instance store found, using root EBS"',
       '  mkdir -p /var/lib/celeriant',
       'fi',
     ] : [
@@ -207,76 +239,8 @@ export class Ec2ClusterStack extends cdk.Stack {
       'systemctl daemon-reload',
     ];
 
-    // Grafana Alloy agent for shipping metrics + logs to Grafana Cloud
-    const alloySetup = grafanaEnabled ? [
-      '',
-      '# Install Grafana Alloy for metrics + log shipping',
-      'dnf install -y dnf-plugins-core',
-      'cat > /etc/yum.repos.d/grafana.repo <<\'GRAFANAREPO\'',
-      '[grafana]',
-      'name=grafana',
-      'baseurl=https://rpm.grafana.com',
-      'repo_gpgcheck=1',
-      'enabled=1',
-      'gpgcheck=1',
-      'gpgkey=https://rpm.grafana.com/gpg.key',
-      'sslverify=1',
-      'sslcacert=/etc/pki/tls/certs/ca-bundle.crt',
-      'GRAFANAREPO',
-      'dnf install -y alloy',
-      '',
-      'HOSTNAME=$(hostname)',
-      `cat > /etc/alloy/config.alloy <<'ALLOYEOF'`,
-      'prometheus.scrape "celeriant" {',
-      '  targets = [{"__address__" = "localhost:9090"}]',
-      '  scrape_interval = "5s"',
-      '  forward_to = [prometheus.remote_write.grafana_cloud.receiver]',
-      '}',
-      '',
-      'prometheus.remote_write "grafana_cloud" {',
-      '  endpoint {',
-      `    url = "${grafanaPromUrl}"`,
-      '    basic_auth {',
-      `      username = "${grafanaPromUser}"`,
-      `      password = "${grafanaApiKey}"`,
-      '    }',
-      '  }',
-      '}',
-      '',
-      'loki.source.journal "celeriant" {',
-      '  relabel_rules = loki.relabel.journal.rules',
-      '  forward_to = [loki.write.grafana_cloud.receiver]',
-      '  matches = "_SYSTEMD_UNIT=celeriant.service"',
-      '}',
-      '',
-      'loki.relabel "journal" {',
-      '  forward_to = []',
-      '  rule {',
-      '    source_labels = ["__journal__systemd_unit"]',
-      '    target_label = "unit"',
-      '  }',
-      '  rule {',
-      '    source_labels = ["__journal__hostname"]',
-      '    target_label = "node"',
-      '  }',
-      '}',
-      '',
-      'loki.write "grafana_cloud" {',
-      '  endpoint {',
-      `    url = "${grafanaLokiUrl}"`,
-      '    basic_auth {',
-      `      username = "${grafanaLokiUser}"`,
-      `      password = "${grafanaApiKey}"`,
-      '    }',
-      '  }',
-      '}',
-      'ALLOYEOF',
-      '',
-      'systemctl enable --now alloy',
-    ] : [];
-
     const nodeUserData = [
-      ...commonSetup, ...storageSetup, ...directoryAndServiceSetup, ...alloySetup,
+      ...commonSetup, ...storageSetup, ...directoryAndServiceSetup,
     ].join('\n');
     const clientUserData = [...commonSetup, '', 'mkdir -p /etc/celeriant/certs'].join('\n');
 
@@ -350,6 +314,7 @@ export class Ec2ClusterStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'ClientInstanceType', { value: clientInstanceType });
     new cdk.CfnOutput(this, 'ClientCount', { value: String(clientCount) });
     new cdk.CfnOutput(this, 'StorageType', { value: storageType });
+    new cdk.CfnOutput(this, 'Raid0', { value: String(raid0) });
     new cdk.CfnOutput(this, 'Architecture', { value: dataIsArm ? 'arm64' : 'x86_64' });
 
     // Client outputs — backward compatible: first client uses 'ClientPublicIp'/'ClientPrivateIp'

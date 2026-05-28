@@ -1,145 +1,154 @@
-# EC2 Benchmark — i4i
+# EC2 Benchmark: i4i
 
-Full performance curves on x86 i4i instances with durable, replicated writes over mTLS.
-All writes are durable to two NVMe disks via `fdatasync()` + Direct I/O, replicated over mTLS
-(kTLS-offloaded TLS 1.3), acknowledged only after both succeed.
+Durable, replicated writes on x86 i4i instances. Covers the single-NVMe vs RAID0 storage
+question on the 32 and 64 vCPU boxes, plus the cheapest tier that still runs a real cluster.
 
-- **32-core results:** 2026-05-03 (latest replication pipeline rewrite + heartbeat/lease changes)
-- **64-core results:** 2026-03-27 (not re-run)
+- **Date:** 2026-05-28
+- **Pipeline:** current, post the replication/durability rewrite. Not comparable to older runs.
+- **Durability:** every write is `fdatasync()` + Direct I/O on both nodes' NVMe, replicated over
+  mTLS (kTLS-offloaded TLS 1.3), acknowledged only after both succeed.
+- **One line:** RAID0 is throughput-neutral at 32 cores, +32% at 64 cores where a single drive
+  saturates, and gives the full aggregate capacity either way. That capacity is the real win for
+  an append-only event store. RAID0 across all NVMes is the deploy default; `-c raid0=false` opts out.
 
 ## Test setup
 
-### 32-core (i4i.8xlarge)
+Same AZ and VPC, 15s per concurrency level, mTLS with kTLS offload, `fdatasync()` on leader and
+follower before ack, XFS + io_uring Direct I/O. Tasks split evenly across clients, 1:1
+connections to tasks. Cost is the two data nodes only, Sydney on-demand Linux, 730 h/month.
 
-- **Data nodes:** 2x i4i.8xlarge (32 vCPU, 256 GB RAM, NVMe instance store, XFS, Direct I/O via io_uring)
-- **Client nodes:** 3x c7i.4xlarge (16 vCPU each)
-- **Network:** Same AZ, same VPC
-- **Duration:** 15 seconds per level
-- **Tasks split evenly:** total_concurrency / 3 per client
-- **TLS:** mTLS with kTLS offload (TLS 1.3)
-- **Durability:** `fdatasync()` on both leader and follower before ack
-- **Profile:** `make infra PROFILE=i4i-32c` then `make run-sweep`
+| Shape | Data nodes | NVMe/node | Clients | Cluster cost |
+|---|---|---|---|---|
+| Entry | 2× i4i.large (2 vCPU, 16 GB) | 1× 468 GB | 1× c7i.2xlarge | $0.41/hr, ~$301/mo |
+| 32-core | 2× i4i.8xlarge (32 vCPU, 256 GB) | 2× 3.75 TB | 3× c7i.4xlarge | $6.58/hr, ~$4,800/mo |
+| 64-core | 2× i4i.16xlarge (64 vCPU, 512 GB) | 4× 3.75 TB | 4× c7i.4xlarge | $13.16/hr, ~$9,600/mo |
 
-### 64-core (i4i.16xlarge)
+## Capacity, the headline win for an event store
 
-- **Data nodes:** 2x i4i.16xlarge (64 vCPU, 512 GB RAM, NVMe instance store, XFS, Direct I/O via io_uring)
-- **Client nodes:** 4x c7i.4xlarge (16 vCPU each)
-- **Network:** Same AZ, same VPC
-- **Duration:** 15 seconds per level
-- **Tasks split evenly:** total_concurrency / 4 per client
-- **TLS:** mTLS with kTLS offload (TLS 1.3)
-- **Durability:** `fdatasync()` on both leader and follower before ack
+i4i instances ship multiple NVMes but the OS mounts only one unless you stripe them. For an
+append-only event log, the aggregate capacity is what lets more events live on local NVMe
+before compaction or S3 offload:
 
-## Results — 32-core (i4i.8xlarge), 2026-05-03
+| Instance | NVMe drives | Single (`raid0=false`) | RAID0 (default) |
+|---|---|---|---|
+| i4i.large | 1× 468 GB | 436 GiB | single drive only |
+| i4i.8xlarge | 2× 3.75 TB | 3.4 TiB | **6.8 TiB** |
+| i4i.16xlarge | 4× 3.75 TB | 3.4 TiB | **13.6 TiB** |
+
+## Entry tier: i4i.large, ~$300/month
+
+The cheapest i4i box: 2 vCPU, 16 GB, one 468 GB NVMe. Two of them on-demand in Sydney run
+$0.41 an hour, about $301 a month. One c7i.2xlarge client drives the load.
+
+| Connections | req/s | avg ms | P50 ms | P95 ms | P99 ms | P99.9 ms |
+|---|---|---|---|---|---|---|
+| 1,000 | 14,986 | 66.3 | 63 | 67 | 96 | 856 |
+| 2,000 | 22,669 | 87.9 | 83 | 94 | 108 | 1,265 |
+| 4,000 | **30,200** | 132.6 | 115 | 144 | **158** | 3,488 |
+| 6,000 | 30,287 | 198.8 | 159 | 195 | 1,417 | 7,140 |
+| 8,000 | 30,336 | 265.1 | 181 | 238 | 3,845 | 11,465 |
+| 12,000 | 29,952 | 405.7 | 195 | 258 | 11,736 | 15,318 |
+
+Peak ~30,300 writes/s, saturating at ~4,000 connections, where p99 is still 158ms. Past that,
+throughput stays flat and the tail blows up. Disk barely moves (nvme1n1 ~3% util): a 2 vCPU
+node is CPU, fsync, and replication bound long before its NVMe. Zero errors.
+
+Cost efficiency runs the opposite way from raw throughput. The entry tier is ~100 writes/s per
+dollar/month (30k for $301). The 64-core RAID0 cluster is ~51 (492k for $9,600). The big box
+buys ceiling, capacity, and headroom, not efficiency.
+
+## 32-core (i4i.8xlarge), at 36k concurrency
+
+Run at 36,000 concurrency (12k/client), a single level, not a full sweep. Throughput-neutral:
+the single drive never saturates, so striping just spreads the same load. RAID0's win here is
+capacity.
+
+| Storage | req/s (repeated runs) | P50 ms | Leader disk %util |
+|---|---|---|---|
+| Single NVMe | ~329k (321.5 / 333.2 / 324.2 / 338.1k) | ~89 | nvme1n1 54-60% avg, **78% max**; 2nd drive idle |
+| RAID0 (2 drives) | ~332k (330.4 / 336.5 / 329.0k) | ~89 | ~31% per drive |
+
+Zero errors at every run.
+
+## 64-core (i4i.16xlarge), connection sweep
+
+### Single NVMe
+
+Swept at 72k and up. The single drive is already saturated there, so lower levels add nothing.
 
 | Concurrency | req/s | avg ms | P50 ms | P95 ms | P99 ms | P99.9 ms |
 |---|---|---|---|---|---|---|
-| 9,000 | 138,023 | 65.0 | 59 | 62 | 106 | 1,567 |
-| 12,000 | 181,130 | 66.0 | 61 | 67 | 72 | 1,327 |
-| 15,000 | 218,723 | 68.3 | 63 | 68 | 92 | 1,321 |
-| 18,000 | 245,790 | 72.9 | 66 | 72 | 125 | 1,720 |
-| 21,000 | 276,580 | 76.0 | 68 | 75 | 110 | 2,004 |
-| 24,000 | 298,047 | 80.1 | 71 | 80 | 98 | 2,289 |
-| 27,000 | 317,594 | 84.4 | 75 | 90 | 105 | 2,191 |
-| 30,000 | 334,875 | 89.3 | 77 | 92 | 147 | 2,658 |
-| 33,000 | 350,599 | 93.4 | 78 | 103 | 182 | 2,844 |
-| 36,000 | 357,911 | 99.7 | 82 | 112 | 135 | 3,061 |
-| 39,000 | 369,995 | 106.0 | 86 | 122 | 156 | 3,430 |
-| 42,000 | 369,740 | 114.0 | 88 | 129 | 249 | 4,043 |
-| 48,000 | 386,013 | 124.5 | 95 | 144 | 866 | 4,269 |
-| 54,000 | 384,544 | 140.6 | 103 | 158 | 1,692 | 5,267 |
-| 60,000 | 383,813 | 156.9 | 107 | 173 | 2,477 | 6,088 |
-| 66,000 | 384,234 | 172.2 | 108 | 188 | 3,017 | 6,833 |
-| 72,000 | 390,521 | 183.9 | 109 | 198 | 3,658 | 7,363 |
-| 84,000 | **398,471** | 211.7 | 109 | 206 | 4,969 | 9,727 |
-| 96,000 | 387,096 | 248.6 | 109 | 209 | 6,485 | 12,651 |
-| 108,000 | 381,685 | 282.7 | 108 | 207 | 8,031 | 15,109 |
+| 72,000 | 342,890 | 212.4 | 136 | 199 | 3,641 | 7,483 |
+| 96,000 | **373,758** | 258.0 | 147 | 242 | 5,084 | 8,993 |
+| 108,000 | 369,092 | 292.0 | 146 | 257 | 6,309 | 10,477 |
+| 120,000 | 359,254 | 331.3 | 147 | 263 | 7,700 | 11,813 |
+| 132,000 | 361,093 | 365.4 | 151 | 273 | 8,951 | 13,379 |
 
-Zero errors at every level — including 60k where the previous run (2026-03-27) collapsed
-with 15,336 client-side port exhaustion errors. Throughput plateaus around 380–400k req/s
-from ~48k all the way through 108k concurrency.
+The single drive is the bottleneck: leader `nvme1n1` ran **78.6% avg, 101% max** across the
+sweep (the other 3 drives idle); follower `nvme1n1` 42% avg, 71% max.
 
-P99 and P99.9 from ~48k onward reflect saturation behavior — queue depth dominated, not
-operational latency. At operational loads (≤36k, well below the plateau), P99 stays under
-200ms and is essentially unchanged from the prior run.
+### RAID0 (4 drives)
 
-## Results — 64-core (i4i.16xlarge), 2026-03-27
+Latency stays tight through ~48k connections, then the tail climbs past a second while
+throughput keeps rising to a ~492k peak. The usable operating point is ~36k connections, the
+number on the site: **325,563 writes/s at p99 201ms**.
 
 | Concurrency | req/s | avg ms | P50 ms | P95 ms | P99 ms | P99.9 ms |
 |---|---|---|---|---|---|---|
-| 24,000 | 333,305 | 71.6 | 66 | 85 | 108 | 887 |
-| 36,000 | 435,970 | 83.0 | 71 | 97 | 123 | 2,086 |
-| 48,000 | 495,760 | 95.0 | 82 | 112 | 141 | 2,624 |
-| 60,000 | 527,787 | 109.0 | 93 | 133 | 167 | 2,493 |
-| 72,000 | 535,292 | 126.0 | 105 | 156 | 210 | 3,490 |
-| 84,000 | 540,855 | 152.0 | 117 | 183 | 704 | 5,900 |
-| 96,000 | 549,579 | 188.8 | 125 | 215 | 2,262 | 7,672 |
-| 108,000 | **561,207** | 203.3 | 129 | 236 | 2,524 | 8,406 |
-| 120,000 | 549,289 | 234.9 | 132 | 254 | 4,179 | 15,570 |
-| 132,000 | 551,232 | 262.9 | 133 | 271 | 4,196 | 16,078 |
-| 144,000 | 519,527* | 259.9 | 135 | 280 | 5,107 | 11,862 |
-| 160,000 | 475,970* | 386.1 | 136 | 305 | 11,917 | 17,819 |
+| 24,000 | 258,238 | 92.3 | 77 | 96 | 186 | 3,152 |
+| 36,000 | 325,563 | 110.2 | 94 | 111 | **201** | 3,192 |
+| 48,000 | 381,791 | 125.8 | 101 | 121 | 362 | 4,238 |
+| 60,000 | 421,194 | 142.8 | 108 | 136 | 1,317 | 5,133 |
+| 72,000 | 450,059 | 161.9 | 107 | 171 | 2,422 | 6,630 |
+| 96,000 | 489,289 | 198.1 | 105 | 196 | 4,546 | 8,924 |
+| 108,000 | 484,792 | 221.6 | 105 | 207 | 5,798 | 10,114 |
+| 120,000 | **491,866** | 243.7 | 105 | 207 | 6,414 | 12,277 |
+| 132,000 | 485,440 | 273.1 | 105 | 213 | 7,497 | 13,990 |
 
-*\* = errors present (client-side connection timeouts at high concurrency)*
+Disk load spreads across all 4 drives: leader ~26-28% avg, ~43-51% max each; follower ~17-18%
+avg. No single drive is close to saturation, anywhere in the sweep.
+
+### Single vs RAID0
+
+| Concurrency | Single req/s | RAID0 req/s | Δ |
+|---|---|---|---|
+| 72,000 | 342,890 | 450,059 | +31% |
+| 96,000 | 373,758 | 489,289 | +31% |
+| 108,000 | 369,092 | 484,792 | +31% |
+| 120,000 | 359,254 | 491,866 | +37% |
+| 132,000 | 361,093 | 485,440 | +34% |
+| **Peak** | **373,758** | **491,866** | **+32%** |
+
+RAID0 also cuts latency, P50 from ~147ms to ~105ms, because the saturated drive was adding
+queue delay. Zero errors in both configs.
 
 ## Key findings
 
-### Peak performance
+- **Capacity scales with drive count regardless of load.** 2× on the 8xlarge, 4× on the
+  16xlarge. For an append-only event store this is the primary reason to stripe.
+- **The throughput crossover is core count.** At 32 cores one NVMe handles the write/fsync
+  volume with headroom (78% peak), so RAID0 is throughput-neutral. At 64 cores the leader pushes
+  ~2× the volume through one drive and saturates it (101%); RAID0 across 4 drives removes the disk
+  as the bottleneck for +32% throughput and lower latency.
+- **Past the disk, the ceiling is upstream:** replication round-trip, `fdatasync()` batching, and
+  network. Consistent with P50s in the 100ms range vs microsecond-scale local fsync.
+- **The entry tier is the cost-efficiency winner.** ~30k durable writes/s for ~$300/month, p99
+  under 160ms, on a box whose disk sits at 3% util. The big clusters buy raw ceiling, not value
+  per write.
+- **RAID0 is the deploy default.** `-c raid0=false` reproduces the single-drive saturation above.
 
-- **32-core peak: 398,471 req/s** at 84,000 concurrency (zero errors)
-- **64-core peak: 561,207 req/s** at 108,000 concurrency (zero errors) — 41% higher
-- 32-core sustains 380k+ req/s across a wide plateau (48k → 108k concurrency, zero errors)
-- The 32-core port-exhaustion collapse at 60k seen in the 2026-03-27 run is resolved
+## Reproduce
 
-### Scaling efficiency
+```bash
+# entry tier
+make infra CDK_ARGS="-c keyPair=my-key -c instanceType=i4i.large -c clientInstanceType=c7i.2xlarge -c clientCount=1"
+make deploy KEY_ARG="--key-file ~/.ssh/id_rsa" && make start
+make run-sweep SWEEP_LEVELS=1000,2000,4000,6000,8000,12000
 
-Doubling cores from 32 to 64 delivers 41% more throughput, not 2×. This is expected:
-replication, `fdatasync()` batching, and network I/O are shared bottlenecks that don't
-scale linearly with CPU count. The per-core efficiency at peak is ~12,450 req/s/core
-(32c) vs ~8,800 req/s/core (64c).
+# 64-core RAID0 (add -c raid0=false for single-NVMe)
+make infra PROFILE=i4i-64c CDK_ARGS="-c keyPair=my-key"
+make deploy KEY_ARG="--key-file ~/.ssh/id_rsa" && make start
+make run-sweep SWEEP_LEVELS=24000,36000,48000,60000,72000,96000,108000,120000,132000
+```
 
-### Latency profile
-
-Operational latency stays flat across the throughput-scaling region; tail latency
-grows once the system enters the saturation plateau.
-
-**32-core (operational range):**
-
-| Concurrency | req/s | P50 ms | P99 ms |
-|---|---|---|---|
-| 9,000 | 138,023 | 59 | 106 |
-| 24,000 | 298,047 | 71 | 98 |
-| 36,000 | 357,911 | 82 | 135 |
-
-P50 grows roughly with concurrency. P99 stays under 200ms across the whole operational
-range. Once the system enters its plateau (48k+), tail latency reflects queue depth
-rather than service time and is not a meaningful operational signal — by 84k (peak
-throughput) P99 is ~5s.
-
-**64-core:**
-
-| Concurrency | req/s | P50 ms | P99 ms |
-|---|---|---|---|
-| 24,000 | 333,305 | 66 | 108 |
-| 72,000 | 535,292 | 105 | 210 |
-| 108,000 | 561,207 | 129 | 2,524 |
-
-### Comparison with PostgreSQL and Kafka
-
-All systems on i4i.8xlarge, per-operation (no batching), with TLS and replication:
-
-| System | Peak req/s | P50 at peak | P99 at peak | Nodes | TLS | Fsync |
-|---|---|---|---|---|---|---|
-| **Celeriant (64c)** | **561,207** | **129ms** | **2,524ms** | 2 | mTLS (kTLS) | Both nodes |
-| **Celeriant (32c)** | **398,471** | **109ms** | **4,969ms** | 2 | mTLS (kTLS) | Both nodes |
-| PostgreSQL/Marten | 42,721 | 5 | 46 | 2 | mTLS (OpenSSL) | Both nodes |
-| Kafka | ~24,000 | ~1,177 | ~1,342 | 3 | TLS | None |
-
-P99 at peak reflects saturation queueing, not user-visible operational latency. At
-matched concurrency below the knee:
-
-At 24,000 connections:
-- **Celeriant (64c):** 333,305 req/s, 66ms P50, 108ms P99
-- **Celeriant (32c):** 298,047 req/s, 71ms P50, 98ms P99
-- **PostgreSQL:** 1,651 req/s, 40,170ms P50 (collapsed)
-- **Kafka:** 21,212 req/s, 1,177ms avg
+Each run prints a per-device `%util` summary alongside the throughput CSV.

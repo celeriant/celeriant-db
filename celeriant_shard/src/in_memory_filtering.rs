@@ -669,4 +669,50 @@ mod tests {
             .exclude_client_id(123);
         assert!(!is_include_batch(&meta, &filters));
     }
+
+    /// `include_event_types=[t]` where t is absent. Returns true iff the batch is
+    /// (wrongly) kept — i.e. a wasted datablock read.
+    fn batch_kept_for_type(meta: &Metablock, t: u64) -> bool {
+        is_include_batch(meta, &ReadFilters::new(1).include_event_types(vec![t]))
+    }
+
+    #[test]
+    fn event_type_direct_filter_is_exact_no_wasted_reads() {
+        // <=4 distinct types -> Direct -> exact, no false positives.
+        let meta = mk_metadata(10, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, &[10, 20, 30, 40]);
+        assert!(batch_kept_for_type(&meta, 20), "present type must be kept");
+        for absent in [0u64, 11, 25, 99, 1_000_000, u64::MAX] {
+            assert!(!batch_kept_for_type(&meta, absent), "Direct must exactly reject absent type {absent} (zero wasted reads)");
+        }
+    }
+
+    /// Fraction of absent-type probes that the per-batch bloom (wrongly) keeps,
+    /// for a batch holding `num_types` distinct event types.
+    fn event_type_bloom_fp(num_types: u64, probes: u64) -> f64 {
+        let present: Vec<u64> = (1000..1000 + num_types).collect();
+        let meta = mk_metadata_bloom(10, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, &present);
+        let mut kept = 0u64;
+        for p in 0..probes {
+            // Absent probe space, disjoint from [1000, 1000+num_types).
+            if batch_kept_for_type(&meta, 5_000_000 + p) {
+                kept += 1;
+            }
+        }
+        let rate = kept as f64 / probes as f64;
+        eprintln!("[event-type-bloom-fp] distinct_types={num_types} probes={probes} wasted_reads={kept} fp_rate={:.3}%", rate * 100.0);
+        rate
+    }
+
+    #[test]
+    fn event_type_bloom_fp_grows_with_distinct_types_per_batch() {
+        // Few types: bloom is nearly perfect -> negligible wasted datablock reads.
+        assert!(event_type_bloom_fp(8, 20_000) < 0.01, "8 types should be <1% FP");
+        // The 256-bit/4-hash per-batch bloom degrades fast once a batch mixes
+        // dozens of event types — each FP is a datablock read that returns nothing.
+        let fp50 = event_type_bloom_fp(50, 20_000);
+        let fp100 = event_type_bloom_fp(100, 20_000);
+        assert!(fp50 > 0.02, "50 types should show material FP (got {:.3})", fp50);
+        assert!(fp100 > fp50, "FP must grow with distinct types/batch");
+        assert!(fp100 > 0.20, "100 types/batch should be heavily saturated (got {:.3})", fp100);
+    }
 }

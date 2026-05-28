@@ -48,13 +48,13 @@ const CLIENTSIDE_TIMEOUT_S: u64 = 5;
 //   Standalone  24k conn: 414k writes/s, avg 57ms, p99 117ms
 //   Replicated  24k conn: 239k writes/s, avg 99ms, p99 131ms
 //   Standalone   1k conn:  44k writes/s, avg 22ms, p99 28ms
-//   Replicated   1k conn:  16k writes/s, avg 63ms, p99 79ms
+//   Replicated   1k conn:  16k writes/s, avg 63ms, p99 90ms (raised from 79ms by the post-replication ack-floor fsync, fe90ecc)
 const STANDALONE_THROUGHPUT_MIN: f64 = 352_000.0; // 414k * 0.85
 const REPLICATED_THROUGHPUT_MIN: f64 = 203_000.0; // 239k * 0.85
 const STANDALONE_LATENCY_AVG_MAX_MS: f64 = 25.5; // 22ms * 1.15
 const STANDALONE_LATENCY_P99_MAX_MS: u64 = 32; // 28ms * 1.15
 const REPLICATED_LATENCY_AVG_MAX_MS: f64 = 72.5; // 63ms * 1.15
-const REPLICATED_LATENCY_P99_MAX_MS: u64 = 91; // 79ms * 1.15
+const REPLICATED_LATENCY_P99_MAX_MS: u64 = 103; // 90ms * 1.15
 
 const CONNECTION_SWEEP: &[usize] = &[
     512, 1024, 2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384,

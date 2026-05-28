@@ -69,3 +69,11 @@ harness = false
 [[bench]]
 name = "bloom_size_benchmark"
 harness = false
+
+[[bench]]
+name = "cold_read_benchmark"
+harness = false
+
+[[bench]]
+name = "warmup_benchmark"
+harness = false

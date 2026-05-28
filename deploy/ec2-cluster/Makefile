@@ -19,10 +19,17 @@ endif
 SSH := ssh $(SSH_OPTS) ec2-user
 SCP := scp $(SSH_OPTS)
 
-# Benchmark defaults (override: make run-benchmark BENCH_TASKS=4000)
-BENCH_TASKS ?= 8000
-BENCH_CONNS ?= $(BENCH_TASKS)
+# Benchmark defaults. BENCH_TASKS=auto sizes total concurrency to the data-node
+# vCPU count (~1125/vCPU, the measured knee); override with a number. BENCH_CONNS
+# is the per-client connection pool (auto = 1:1 with tasks).
+BENCH_TASKS ?= auto
+BENCH_CONNS ?= auto
 BENCH_DURATION ?= 15
+
+# Grafana home access: `make infra` opens :3000 to your egress IP, auto-detected
+# from the machine you deploy from. Override with HOME_IP=1.2.3.4/32, or set
+# HOME_IP= (empty) to skip the rule entirely (SSH-tunnel only).
+HOME_IP ?= auto
 
 REPO_ROOT := $(shell cd ../.. && pwd)
 
@@ -32,14 +39,16 @@ PROFILE ?= default
 
 ifeq ($(PROFILE),i4i-32c)
   override CDK_ARGS += -c instanceType=i4i.8xlarge -c clientInstanceType=c7i.4xlarge -c clientCount=3
+else ifeq ($(PROFILE),i4i-64c)
+  override CDK_ARGS += -c instanceType=i4i.16xlarge -c clientInstanceType=c7i.4xlarge -c clientCount=4
 else ifeq ($(PROFILE),i4g-32c)
   override CDK_ARGS += -c instanceType=i4g.8xlarge -c clientInstanceType=c7g.4xlarge -c clientCount=3
 else ifneq ($(PROFILE),default)
-  $(error Unknown PROFILE '$(PROFILE)'. Valid: default, i4i-32c, i4g-32c)
+  $(error Unknown PROFILE '$(PROFILE)'. Valid: default, i4i-32c, i4i-64c, i4g-32c)
 endif
 
 .PHONY: help build build-arm infra certs deploy start stop restart status logs \
-        dashboard run-benchmark run-sweep sync-env teardown teardown-data
+        setup-infra run-benchmark run-sweep sync-env teardown teardown-data
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -48,8 +57,12 @@ help: ## Show this help
 # ---------------------------------------------------------------------------
 # Infrastructure
 # ---------------------------------------------------------------------------
+#
+# Binaries MUST be built in the amazonlinux:2023 container (the targets below). A
+# host `cargo build` links against newer glibc and fails on EC2 with "GLIBC_2.XX
+# not found" — `make deploy` rejects host-built binaries for this reason.
 
-build: ## Build x86_64 release binaries in Docker (for c6id, i4i, etc.)
+build: ## Build x86_64 binaries in the amazonlinux:2023 container — REQUIRED (host cargo build fails on EC2)
 	@printf "$(BOLD)>>> Building x86_64 release binaries in amazonlinux:2023 container$(RESET)\n"
 	cd $(REPO_ROOT) && docker run --rm -v "$$(pwd)":/build -w /build amazonlinux:2023 bash -c '\
 		set -e && \
@@ -70,8 +83,20 @@ build-arm: ## Build ARM64 release binaries in Docker (for i4g, c7g, etc. — req
 		cargo build --release -p celeriant -p celeriant_integration_tests -p celeriant_cli'
 	@printf "$(GREEN)Build complete (arm64).$(RESET)\n"
 
-infra: ## Deploy CDK stack (PROFILE=i4i-32c|i4g-32c|default; CDK_ARGS for extra flags, e.g. -c keyPair=my-key)
-	npx cdk deploy --require-approval never $(CDK_ARGS)
+infra: ## Deploy CDK stack (PROFILE=i4i-32c|i4g-32c|default; HOME_IP auto-opens Grafana; CDK_ARGS for extra flags)
+	@HIP="$(HOME_IP)"; \
+	if [ "$$HIP" = "auto" ]; then \
+		HIP="$$(curl -fsS --max-time 5 https://checkip.amazonaws.com 2>/dev/null)"; \
+		[ -n "$$HIP" ] && HIP="$$HIP/32"; \
+	fi; \
+	if [ -n "$$HIP" ]; then \
+		printf "$(BOLD)>>> Grafana :3000 will be opened to $$HIP (override: HOME_IP=..., disable: HOME_IP=)$(RESET)\n"; \
+		HOME_ARG="-c homeIp=$$HIP"; \
+	else \
+		printf "$(YELLOW)>>> HOME_IP unset/undetected — Grafana :3000 not exposed; use an SSH tunnel$(RESET)\n"; \
+		HOME_ARG=""; \
+	fi; \
+	npx cdk deploy --require-approval never $(CDK_ARGS) $$HOME_ARG
 
 # ---------------------------------------------------------------------------
 # TLS certificates
@@ -99,9 +124,10 @@ sync-env: ## Re-read CDK outputs into .cluster-env (run if stack was redeployed)
 		--query "Stacks[0].Outputs[?OutputKey=='$$1'].OutputValue" --output text; }; \
 	CC=$$(get ClientCount 2>/dev/null || echo 1); \
 	CPUBS=$$(get ClientPublicIp); \
-	for i in $$(seq 2 $$CC); do CPUBS="$$CPUBS,$$(get Client$${i}PublicIp)"; done; \
-	printf "LEADER_PUB=%s\nFOLLOWER_PUB=%s\nCLIENT_PUBS=%s\nCLIENT_COUNT=%s\nLEADER_IP=%s\nFOLLOWER_IP=%s\nBUCKET=%s\nREGION=%s\nINSTANCE_TYPE=%s\nCLIENT_INSTANCE_TYPE=%s\nSTORAGE_TYPE=%s\nARCH=%s\nKEY_FILE=$(KEY_FILE)\n" \
-		$$(get LeaderPublicIp) $$(get FollowerPublicIp) "$$CPUBS" "$$CC" \
+	CPRIVS=$$(get ClientPrivateIp); \
+	for i in $$(seq 2 $$CC); do CPUBS="$$CPUBS,$$(get Client$${i}PublicIp)"; CPRIVS="$$CPRIVS,$$(get Client$${i}PrivateIp)"; done; \
+	printf "LEADER_PUB=%s\nFOLLOWER_PUB=%s\nCLIENT_PUBS=%s\nCLIENT_PRIVS=%s\nCLIENT_COUNT=%s\nLEADER_IP=%s\nFOLLOWER_IP=%s\nBUCKET=%s\nREGION=%s\nINSTANCE_TYPE=%s\nCLIENT_INSTANCE_TYPE=%s\nSTORAGE_TYPE=%s\nARCH=%s\nKEY_FILE=$(KEY_FILE)\n" \
+		$$(get LeaderPublicIp) $$(get FollowerPublicIp) "$$CPUBS" "$$CPRIVS" "$$CC" \
 		$$(get LeaderPrivateIp) $$(get FollowerPrivateIp) \
 		$$(get BucketName) $$(get Region) \
 		$$(get InstanceType) $$(get ClientInstanceType) $$(get StorageType) $$(get Architecture) \
@@ -150,14 +176,11 @@ logs: ## Tail logs from both data nodes (Ctrl+C to stop)
 # Benchmarks
 # ---------------------------------------------------------------------------
 
-dashboard: ## Import Celeriant dashboard to Grafana Cloud (needs GRAFANA_URL and GRAFANA_TOKEN)
-	@if [[ -z "$(GRAFANA_URL)" || -z "$(GRAFANA_TOKEN)" ]]; then \
-		printf "$(RED)Usage: make dashboard GRAFANA_URL=https://your-stack.grafana.net GRAFANA_TOKEN=glsa_...$(RESET)\n"; \
-		exit 1; \
-	fi
-	@bash scripts/deploy-dashboard.sh --grafana-url $(GRAFANA_URL) --grafana-token $(GRAFANA_TOKEN)
+setup-infra: ## Stand up Prometheus/Loki/Grafana on client #1 + promtail on data nodes
+	@if [[ -z "$(CLIENT_PUBS)" ]]; then printf "$(RED)No .cluster-env — run 'make deploy' or 'make sync-env' first$(RESET)\n"; exit 1; fi
+	bash scripts/setup-infra.sh
 
-run-benchmark: ## Run benchmark on client node(s) and collect results
+run-benchmark: ## Run benchmark on client node(s) (concurrency auto-sized to the cluster) and collect results
 	@if [[ -z "$(CLIENT_PUBS)" ]]; then printf "$(RED)No .cluster-env$(RESET)\n"; exit 1; fi
 	@BENCH_TASKS=$(BENCH_TASKS) BENCH_CONNS=$(BENCH_CONNS) BENCH_DURATION=$(BENCH_DURATION) \
 		bash scripts/run-benchmark.sh

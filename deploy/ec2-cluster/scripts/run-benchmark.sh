@@ -15,6 +15,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CDK_DIR="$(dirname "$SCRIPT_DIR")"
 CLUSTER_ENV="$CDK_DIR/.cluster-env"
+source "$SCRIPT_DIR/iostat-lib.sh"
 
 if [[ ! -f "$CLUSTER_ENV" ]]; then
   echo "ERROR: $CLUSTER_ENV not found — run 'make deploy' or 'make sync-env' first"
@@ -39,12 +40,39 @@ if [[ -n "${KEY_FILE:-}" ]]; then
   SSH_OPTS="$SSH_OPTS -i $KEY_FILE"
 fi
 
-TOTAL_TASKS="${BENCH_TASKS:-8000}"
 DURATION="${BENCH_DURATION:-15}"
 
-# Split tasks evenly across clients
+# vCPU from the instance size suffix (consistent across the Nitro families used here).
+instance_vcpu() {
+  case "${1##*.}" in
+    large)    echo 2 ;;
+    xlarge)   echo 4 ;;
+    2xlarge)  echo 8 ;;
+    4xlarge)  echo 16 ;;
+    8xlarge)  echo 32 ;;
+    12xlarge) echo 48 ;;
+    16xlarge) echo 64 ;;
+    24xlarge) echo 96 ;;
+    32xlarge) echo 128 ;;
+    48xlarge) echo 192 ;;
+    *)        echo 8 ;;
+  esac
+}
+
+# Default concurrency auto-sizes to the data-node vCPU count (~1125 conns/vCPU),
+# landing at the measured throughput knee — i4i.8xlarge (32 vCPU) -> 36000 total tasks.
+TOTAL_TASKS="${BENCH_TASKS:-auto}"
+AUTO_NOTE=""
+if [[ "$TOTAL_TASKS" == "auto" ]]; then
+  VCPU=$(instance_vcpu "$INSTANCE_TYPE")
+  TOTAL_TASKS=$(( VCPU * 1125 ))
+  AUTO_NOTE=" — auto-sized from ${INSTANCE_TYPE} (${VCPU} vCPU)"
+fi
+
+# Split tasks evenly across clients; connections default to 1:1 with tasks.
 TASKS_PER_CLIENT=$(( TOTAL_TASKS / CLIENT_COUNT ))
-CONNS_PER_CLIENT="${BENCH_CONNS:-$TASKS_PER_CLIENT}"
+CONNS_PER_CLIENT="${BENCH_CONNS:-auto}"
+[[ "$CONNS_PER_CLIENT" == "auto" ]] && CONNS_PER_CLIENT="$TASKS_PER_CLIENT"
 
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 SAFE_TYPE=$(echo "$INSTANCE_TYPE" | tr '.' '-')
@@ -58,7 +86,7 @@ echo "  Client node: ${CLIENT_INSTANCE_TYPE:-$INSTANCE_TYPE}"
 echo "  Clients:     $CLIENT_COUNT ($CLIENT_PUBS)"
 echo "  Address 1:   $LEADER_IP:10000 (primary)"
 echo "  Address 2:   $FOLLOWER_IP:10000 (seed)"
-echo "  Total tasks: $TOTAL_TASKS (${TASKS_PER_CLIENT}/client)"
+echo "  Total tasks: $TOTAL_TASKS (${TASKS_PER_CLIENT}/client)$AUTO_NOTE"
 echo "  Connections: $CONNS_PER_CLIENT per node per client"
 echo "  Duration:    ${DURATION}s"
 echo "  Output:      $RESULT_FILE"
@@ -82,6 +110,10 @@ cat > "$RESULT_FILE" <<EOF
 # ---
 
 EOF
+
+IOSTAT_PREFIX="${RESULT_FILE%.txt}_iostat"
+echo "==> Starting disk capture on data nodes"
+iostat_start "$IOSTAT_PREFIX" || true
 
 echo "==> Running rpi_cluster_pool_bench on $CLIENT_COUNT client(s)"
 
@@ -115,6 +147,11 @@ for i in "${!PIDS[@]}"; do
     echo "  WARNING: Client $((i+1)) exited with error"
   fi
 done
+
+echo ""
+echo "==> Disk utilisation (per device, data nodes):"
+iostat_stop "$IOSTAT_PREFIX" || true
+{ echo ""; echo "# Disk utilisation (per device):"; sed 's/^/# /' "${IOSTAT_PREFIX}_summary.txt"; } >> "$RESULT_FILE"
 
 # Aggregate results from all clients
 echo ""

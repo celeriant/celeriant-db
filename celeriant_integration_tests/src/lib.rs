@@ -62,6 +62,7 @@ pub mod p2_4_s3_capacity;
 pub mod p3_1_cold_read_latency;
 pub mod p3_2_bloom_filter;
 pub mod p3_3_sequential_cold_reads;
+pub mod p3_4_read_thundering_herd;
 pub mod p4_1_rolling_upgrade;
 pub mod pool_test;
 pub mod read_list_benchmark;

@@ -30,7 +30,7 @@ RestartSec=3
 LimitNOFILE=1048576
 LimitMEMLOCK=infinity
 
-Environment=CELERIANT_DATA_ROOT=/var/lib/celeriant
+Environment=CELERIANT_DATA_ROOT=/var/lib/nvme/celeriant-data
 Environment=CELERIANT_LISTEN_ADDRESS=0.0.0.0
 Environment=CELERIANT_CLIENT_PORT=10000
 Environment=CELERIANT_REPLICATION_PORT=10001
