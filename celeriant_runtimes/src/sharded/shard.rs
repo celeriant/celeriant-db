@@ -108,6 +108,20 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
         }
     }
 
+    /// Read-only access to the per-shard WAL. Used by external runtime
+    /// extensions (e.g. celeriant-queue) to wire additional listeners on
+    /// the same executor as the storage engine, sharing the local
+    /// ShardWal so writes route through one fsync-before-ack path.
+    pub fn shard_wal_rc(&self) -> Rc<ShardWal<R, D>> {
+        self.shard_wal.clone()
+    }
+
+    /// Per-executor shutdown flag. Extension tasks should observe this so
+    /// they tear down cleanly when the shard initiates shutdown.
+    pub fn shutdown_flag(&self) -> Rc<Cell<bool>> {
+        self.shutdown_requested.clone()
+    }
+
     pub async fn run(&mut self) {
         debug!("Shard {} entering run loop", self.ctx.current_shard_id);
         spawn_shard_zero_shutdown_handler(self.ctx.clone());

@@ -41,10 +41,12 @@ rand.workspace = true
 tempfile.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
+rustls-pemfile.workspace = true
 tokio-rustls.workspace = true
 reqwest = { version = "0.12", features = ["blocking"] }
 apache-avro.workspace = true
 prost.workspace = true
+prost-types = "0.13"
 prost-reflect.workspace = true
 base64.workspace = true
 serde.workspace = true

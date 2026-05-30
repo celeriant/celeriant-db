@@ -383,6 +383,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let _ = self.lease_renewal_requester.set(requester);
     }
 
+    pub fn timestamp_config(&self) -> crate::timestamp_config::TimestampConfig {
+        self.config.timestamp_config
+    }
+
     /// Pre-warm aggregate and client caches by reverse-scanning the WAL.
     /// SoftDelete/SoftTrim metablocks carry full aggregate state, so each
     /// metablock kind can populate the cache immediately without continuing the scan.

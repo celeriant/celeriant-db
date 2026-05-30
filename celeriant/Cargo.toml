@@ -29,6 +29,7 @@ celeriant_runtimes = { path = "../celeriant_runtimes" }
 celeriant_sidecar = { path = "../celeriant_sidecar" }
 celeriant_shard = { path = "../celeriant_shard" }
 celeriant_ktls = { path = "../celeriant_ktls" }
+tokio.workspace = true
 clap.workspace = true
 mimalloc.workspace = true
 libc.workspace = true

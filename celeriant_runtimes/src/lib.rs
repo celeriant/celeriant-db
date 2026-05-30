@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
@@ -14,18 +15,49 @@ use glommio::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::{sharded::{intrashard_messages::IntrashardMessages, shard::Shard}, sidecar::{sidecar_channels::{SidecarSenders, create_sidecar_channel}, sidecar_lease_storage::SidecarLeaseStorage, sidecar_runtime::SidecarRuntime, sidecar_s3_downloader::SidecarS3Downloader, sidecar_s3_uploader::SidecarS3Uploader}};
+use crate::{sharded::{intrashard_messages::IntrashardMessages, shard::Shard}, sidecar::{sidecar_channels::{SidecarSenders, create_sidecar_channel}, sidecar_lease_storage::SidecarLeaseStorage, sidecar_runtime::SidecarRuntime}};
 
 mod sharded;
 mod sidecar;
 
 pub use {sharded::shard_config::{ApiKeyHashes, ShardConfig, TlsCertPaths}, sidecar::sidecar_config::SidecarConfig, sharded::routing_rule::RoutingRule, sharded::tls_config::{TlsConfig, TlsMode}};
 
+pub use sidecar::sidecar_s3_uploader::SidecarS3Uploader;
+pub use sidecar::sidecar_s3_downloader::SidecarS3Downloader;
+
 const MAX_SHARD_RESTARTS: u32 = 3;
 const SHARD_RESTART_DELAY: Duration = Duration::from_secs(5);
 const RESTART_BUDGET_RESET: Duration = Duration::from_secs(600);
 
+/// Extension point for per-shard "bolt-on" tasks. Implementations spawn
+/// glommio-local tasks on the same executor that owns the shard's WAL
+/// typical use is binding an additional listener port
+pub trait PerShardExtension: Send + Sync + 'static {
+    /// Called once per shard after the WAL is open and before
+    /// `Shard::run()` enters its main loop. Implementations should
+    /// `glommio::spawn_local` whatever background tasks they need and
+    /// return immediately. The tasks should observe `shutdown` and exit
+    /// when it flips true.
+    fn spawn_for_shard(
+        &self,
+        shard_id: usize,
+        shard_wal: Rc<ShardWal<FollowerConnection<SidecarS3Uploader>, SidecarS3Downloader>>,
+        shutdown: Rc<Cell<bool>>,
+    );
+}
+
 pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig, sidecar_config: SidecarConfig, mesh_channel_size: usize, node_id: u128, sidecar_store: S) {
+    run_executors_and_sidecar_with_extension(shard_config, sidecar_config, mesh_channel_size, node_id, sidecar_store, None)
+}
+
+pub fn run_executors_and_sidecar_with_extension<S: SidecarStoreTrait>(
+    shard_config: ShardConfig,
+    sidecar_config: SidecarConfig,
+    mesh_channel_size: usize,
+    node_id: u128,
+    sidecar_store: S,
+    extension: Option<Arc<dyn PerShardExtension>>,
+) {
     info!("Starting {} shard executors on node {}", shard_config.num_shards, node_id);
 
     let (sidecar_senders, _sidecar_runtime) = match new_sidecar(sidecar_config, sidecar_store) {
@@ -68,8 +100,9 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
             Err(_) => PoolPlacement::MaxSpread(num_shards, None),
         };
 
+        let extension = extension.clone();
         let results = LocalExecutorPoolBuilder::new(placement)
-            .on_all_shards(enclose!((mesh, shard_config, sidecar_senders, shard_failed, s3_upload_inflight) move || async move {
+            .on_all_shards(enclose!((mesh, shard_config, sidecar_senders, shard_failed, s3_upload_inflight, extension) move || async move {
 
                 let (sender, receivers) = mesh.join().await
                     .expect("Failed to join mesh - cannot initialize shard");
@@ -185,7 +218,11 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                     None
                 };
 
-                Shard::new(shard_config, current_shard_id, sender, receivers, client_tcp_listener, replication_tcp_listener, filesystem, lease_manager, shard_failed).run().await;
+                let mut shard = Shard::new(shard_config, current_shard_id, sender, receivers, client_tcp_listener, replication_tcp_listener, filesystem, lease_manager, shard_failed);
+                if let Some(ext) = extension.as_ref() {
+                    ext.spawn_for_shard(current_shard_id, shard.shard_wal_rc(), shard.shutdown_flag());
+                }
+                shard.run().await;
 
             }))
             .expect("Failed to spawn shard executor threads")

@@ -120,6 +120,18 @@ impl SidecarStore {
         self.s3_client.as_ref().ok_or(StoreError::S3NotConfigured)
     }
 
+    /// Verify at startup that S3 is reachable and the configured bucket exists.
+    pub async fn verify_reachable(&self) -> Result<(), StoreError> {
+        let Some(s3) = self.s3_client.as_ref() else {
+            return Ok(());
+        };
+        let prefix = s3.resolve_path("")?;
+        match s3.store.list(Some(&prefix)).next().await {
+            None | Some(Ok(_)) => Ok(()),
+            Some(Err(e)) => Err(e.into()),
+        }
+    }
+
     async fn put_object(
         &self,
         path: &str,

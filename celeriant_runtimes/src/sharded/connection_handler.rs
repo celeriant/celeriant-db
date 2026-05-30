@@ -737,11 +737,7 @@ fn determine_shard_write(
         match shard_id {
             None => shard_id = Some(id),
             Some(first) if first != id => {
-                return Err(ShardRoutingError::IncompatibleFilters {
-                    detail: format!(
-                        "Write request spans multiple shards. All writes must route to the same shard when using {} routing.",
-                        config.routing_rule
-                    ),
+                return Err(ShardRoutingError::MultipleShardRoutes {
                     num_shards: num_shards as u64,
                 });
             }
@@ -772,11 +768,7 @@ fn determine_shard_delete(
         match shard_id {
             None => shard_id = Some(id),
             Some(first) if first != id => {
-                return Err(ShardRoutingError::IncompatibleFilters {
-                    detail: format!(
-                        "Delete request spans multiple shards. All delete must route to the same shard when using {} routing.",
-                        config.routing_rule
-                    ),
+                return Err(ShardRoutingError::MultipleShardRoutes {
                     num_shards: num_shards as u64,
                 });
             }
@@ -1802,7 +1794,7 @@ mod tests {
             writes,
         });
         let result = determine_client_shard(&request, &config);
-        assert!(matches!(result, Err(ShardRoutingError::IncompatibleFilters { .. })));
+        assert!(matches!(result, Err(ShardRoutingError::MultipleShardRoutes { .. })));
     }
 
     #[test]

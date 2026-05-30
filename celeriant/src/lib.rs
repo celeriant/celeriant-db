@@ -1,6 +1,7 @@
 use celeriant_crypto::Crypto;
 use celeriant_ktls::verify_ktls_support;
-use celeriant_runtimes::run_executors_and_sidecar;
+use celeriant_runtimes::{run_executors_and_sidecar, run_executors_and_sidecar_with_extension, PerShardExtension};
+use std::sync::Arc;
 use clap::Parser;
 use dotenvy::dotenv;
 use tracing::{error, info};
@@ -20,6 +21,13 @@ mod ntp_check;
 mod server_meta;
 
 pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
+    startup_with_extension(args, None)
+}
+
+/// Same as `startup` but allows a bolt-on `PerShardExtension` (e.g. the
+/// `celeriant-queue` extension that binds a queue port on every shard
+/// executor and routes verbs through the local ShardWal).
+pub fn startup_with_extension(args: Vec<String>, extension: Option<Arc<dyn PerShardExtension>>) -> Result<(), std::io::Error> {
     install_crash_handler();
 
     load_dotenv();
@@ -312,7 +320,29 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
         }
     };
 
-    run_executors_and_sidecar(shard_config, sidecar_config, server_config.mesh_channel_size, node_id, sidecar_store);
+    // Fail fast if S3 is enabled but unreachable or the bucket is missing, rather
+    // than discovering it on the first replication write. No-op when S3 is off.
+    match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => {
+            if let Err(e) = rt.block_on(sidecar_store.verify_reachable()) {
+                error!(
+                    "S3 storage unavailable at startup: {}. Check the endpoint, credentials, and that the bucket exists.",
+                    e
+                );
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            error!("Failed to build runtime for S3 startup check: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    if extension.is_some() {
+        run_executors_and_sidecar_with_extension(shard_config, sidecar_config, server_config.mesh_channel_size, node_id, sidecar_store, extension);
+    } else {
+        run_executors_and_sidecar(shard_config, sidecar_config, server_config.mesh_channel_size, node_id, sidecar_store);
+    }
 
     Ok(())
 }

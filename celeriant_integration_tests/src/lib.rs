@@ -2,6 +2,22 @@
 
 pub mod registry;
 
+// Contract suite (docs-as-oracle), ported from the standalone blind-test harness.
+// Each phaseN module holds several `pub async fn` tests, registered by name in
+// `registry::all_tests()` and dispatched in `main::dispatch_test`.
+pub mod common;
+pub mod phase1;
+pub mod phase2;
+pub mod phase3;
+pub mod phase4;
+pub mod phase5;
+pub mod phase6;
+pub mod phase7;
+pub mod phase8;
+pub mod phase9;
+pub mod phase10;
+pub mod phase11;
+
 pub mod api_key_test;
 pub mod batch;
 pub mod bug_kick_after_restart;
@@ -122,7 +138,7 @@ use std::path::PathBuf;
 
 use celeriant_client_tokio::ClientTlsConfig;
 use celeriant_crypto::pki::PkiManager;
-use celeriant_lib::server_config::ConfigTlsMode;
+pub use celeriant_lib::server_config::{ConfigClientAuth, ConfigTlsMode};
 use rustls_pki_types::ServerName;
 use tempfile::TempDir;
 use tokio::net::TcpStream;
@@ -1618,11 +1634,39 @@ pub async fn scrape_counter(
 ///
 /// Returns `true` if the node accepts the write (is leader),
 /// `false` if it rejects (is follower or fenced).
+static IS_LEADER_PROBE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Probe whether `address` is currently the leader, idempotently and without
+/// side effects. A non-leader rejects any write with `NotLeader` before running
+/// aggregate logic; the leader runs it. We probe with `allow_create = false` to a
+/// fresh, never-created key: the leader rejects with `AggregateNotExists`
+/// (nothing created), a follower rejects with `NotLeader`. So "leader" == "the
+/// write was NOT rejected with NotLeader" — side-effect-free and safe to call
+/// repeatedly (the old probe created a junk aggregate and self-poisoned on
+/// re-probe via stale OCC).
 pub async fn is_leader(address: &str) -> Result<bool, Box<dyn std::error::Error>> {
-    let probe_key = AggregateKey::new(999, 999, 999);
+    use celeriant_client_tokio::client_error::ClientError;
+    use celeriant_client_tokio::client_operations::WriteEventsOptions;
+    use std::sync::atomic::Ordering;
+
+    let id = IS_LEADER_PROBE_ID.fetch_add(1, Ordering::Relaxed) as u128;
+    let probe_key = AggregateKey::new(999_001, 999_001, 900_000_000 + id);
+    let event = DatablockAggregateEvent {
+        client_seq: 1,
+        event_seq: 0,
+        event_id: None,
+        event_timestamp: 1,
+        event_type_major: 100,
+        event_type_minor: 0,
+        event_value: std::sync::Arc::new(b"{}".to_vec()),
+        iv: None,
+    };
     let mut client = CeleriantClient::connect(address).await?;
-    match write_event(&mut client, &probe_key, 1, true).await {
-        Ok(_) => Ok(true),
-        Err(_) => Ok(false),
+    match client
+        .write_events_with(probe_key, vec![event], WriteEventsOptions { allow_create: false, ..Default::default() })
+        .await
+    {
+        Err(ClientError::NotLeader { .. }) => Ok(false),
+        _ => Ok(true),
     }
 }
