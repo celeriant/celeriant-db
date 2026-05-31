@@ -121,6 +121,11 @@ pub fn set_node_status_and_metric(
     if shard_id == 0 {
         let role = if status.is_leader() || status.is_standalone() { 1.0 } else { 0.0 };
         metrics::gauge!("celeriant_node_role").set(role);
+        let prev_role = if prev.is_leader() || prev.is_standalone() { 1.0 } else { 0.0 };
+        if prev_role != role {
+            metrics::counter!("celeriant_node_role_transitions_total",
+                &[("to", if role > 0.5 { "leader" } else { "follower" }.to_string())]).increment(1);
+        }
     }
 }
 

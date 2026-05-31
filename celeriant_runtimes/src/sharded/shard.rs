@@ -520,7 +520,10 @@ impl LeaseRenewalRequester for IntrashardLeaseRenewalRequester {
     fn request_renewal(&self) {
         // Fire-and-forget, best-effort: coalesced on shard 0, and the replication spin loop
         // re-requests on its next iteration if the queue was momentarily full.
-        let _ = self.sender.try_send_to(0, IntrashardMessages::RenewS3LeaseNow { requesting_shard: self.shard_id });
+        let sent = self.sender.try_send_to(0, IntrashardMessages::RenewS3LeaseNow { requesting_shard: self.shard_id });
+        metrics::counter!("celeriant_s3_lease_renewal_requested_total",
+            &[("shard_id", self.shard_id.to_string()),
+              ("result", if sent.is_ok() { "sent" } else { "dropped" }.to_string())]).increment(1);
     }
 }
 
@@ -545,6 +548,7 @@ async fn renew_s3_lease_on_demand<R: ReplicationClient + 'static, D: S3Downloade
     // Only renew while we still believe we hold leadership; acquiring from a follower/boot
     // state is the election path's job, not this hook.
     if !ctx.shard_wal.node_status.get().raw().is_leader() {
+        metrics::counter!("celeriant_s3_lease_renewal_handled_total", &[("result", "not_leader".to_string())]).increment(1);
         return;
     }
     let lease_duration_ms = match ctx.config.replication_config.as_ref() {
@@ -557,12 +561,20 @@ async fn renew_s3_lease_on_demand<R: ReplicationClient + 'static, D: S3Downloade
     // Debounce: a CAS within the last half-lease already refreshed every shard's
     // confirmation, so coalesce the rest of the burst.
     let now_ms = validated_node_status::unix_epoch_now_ms();
-    if now_ms.saturating_sub(ctx.shard_wal.s3_cas_confirmed_at_ms.get()) < lease_duration_ms / 2 {
+    let cas_age_ms = now_ms.saturating_sub(ctx.shard_wal.s3_cas_confirmed_at_ms.get());
+    if cas_age_ms < lease_duration_ms / 2 {
+        metrics::counter!("celeriant_s3_lease_renewal_handled_total", &[("result", "debounced".to_string())]).increment(1);
         return;
     }
 
-    match retry_s3_operation(ctx.config.s3_retry_max_duration, "on_demand_lease_renewal",
-        || lease_manager.run_election_to_acquire_s3_lease()).await
+    let prior_lease_epoch = ctx.shard_wal.node_status.get().raw().lease_epoch_for_logging();
+    metrics::counter!("celeriant_s3_lease_renewal_handled_total", &[("result", "attempted".to_string())]).increment(1);
+    let cas_start = std::time::Instant::now();
+    let cas_outcome = retry_s3_operation(ctx.config.s3_retry_max_duration, "on_demand_lease_renewal",
+        || lease_manager.run_election_to_acquire_s3_lease()).await;
+    metrics::histogram!("celeriant_s3_lease_cas_duration_seconds", &[("reason", "on_demand".to_string())])
+        .record(cas_start.elapsed().as_secs_f64());
+    match cas_outcome
     {
         Ok(outcome) if outcome.status.raw().is_leader() => {
             // Renewed. Refresh our own CAS signal + TTL, then broadcast the fresh
@@ -590,7 +602,22 @@ async fn renew_s3_lease_on_demand<R: ReplicationClient + 'static, D: S3Downloade
                 ctx.intrashard_sender.clone(),
             ).await;
             metrics::counter!("celeriant_s3_lease_on_demand_renewal_total", &[("result", "superseded".to_string())]).increment(1);
-            warn!(requesting_shard, "On-demand S3 lease renewal: superseded by peer — fencing self, refusing further fallback acks");
+            // Probe: distinguish a legit handoff (a peer really took the lease, epoch bumped)
+            // from a false self-fence (our own lease lapsed under the fallback storm and the
+            // election declined to reclaim with no peer actually holding it).
+            let peer_present = outcome.peer_info.is_some();
+            metrics::counter!("celeriant_s3_lease_superseded_total", &[("peer_present", peer_present.to_string())]).increment(1);
+            warn!(
+                requesting_shard,
+                our_node_id = ctx.config.node_id,
+                prior_lease_epoch,
+                new_status = ?outcome.status.raw(),
+                new_lease_epoch = outcome.status.raw().lease_epoch_for_logging(),
+                peer_present,
+                peer_node_id = ?outcome.peer_info.as_ref().map(|p| p.node_id),
+                reacquired_own_lease = outcome.reacquired_own_lease,
+                cas_age_ms,
+                "On-demand S3 lease renewal: superseded by peer — fencing self, refusing further fallback acks");
         }
         Err(e) => {
             warn!(requesting_shard, error = %e, "On-demand S3 lease renewal CAS failed (transient); requesting shard keeps spin-waiting");
@@ -609,7 +636,10 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
     let is_currently_leader = previous_status.raw().is_leader();
     let previous_lease_epoch = previous_status.raw().lease_epoch().unwrap_or(0);
 
+    let cas_start = std::time::Instant::now();
     let outcome = retry_s3_operation(ctx.config.s3_retry_max_duration, "renew_s3_lease", || lease_manager.run_election_to_acquire_s3_lease()).await?;
+    metrics::histogram!("celeriant_s3_lease_cas_duration_seconds", &[("reason", reason.to_string())])
+        .record(cas_start.elapsed().as_secs_f64());
 
     metrics::counter!("celeriant_leader_elections_total").increment(1);
     metrics::counter!(
@@ -731,6 +761,7 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
     if role_changed {
         warn!(
             shard_id = ctx.current_shard_id,
+            reason,
             previous = ?previous.raw(),
             new = ?outcome.status.raw(),
             expires_at_ms = outcome.status.lease_expires_at_ms(),

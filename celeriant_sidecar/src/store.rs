@@ -35,6 +35,22 @@ impl S3Client {
         };
         Path::parse(&full_path).map_err(Into::into)
     }
+
+    /// Inverse of `resolve_path`: strip the subfolder so list/head results are
+    /// round-trippable as inputs to subsequent get/put calls. Without this, a
+    /// caller doing `list -> get` would have the subfolder prepended twice.
+    fn unresolve_path(&self, full: &str) -> String {
+        match &self.subfolder {
+            Some(prefix) => {
+                let p = prefix.trim_matches('/');
+                full.strip_prefix(p)
+                    .and_then(|s| s.strip_prefix('/'))
+                    .unwrap_or(full)
+                    .to_string()
+            }
+            None => full.to_string(),
+        }
+    }
 }
 
 impl std::fmt::Debug for SidecarStore {
@@ -92,6 +108,10 @@ impl SidecarStore {
 
         if let Some(secret_key) = &config.secret_access_key {
             builder = builder.with_secret_access_key(secret_key);
+        }
+
+        if let Some(token) = &config.session_token {
+            builder = builder.with_token(token);
         }
 
         if let Some(endpoint) = &config.endpoint {
@@ -184,7 +204,7 @@ impl SidecarStore {
         let meta = s3.store.head(&location).await?;
 
         Ok(Response::ObjectHead(ObjectMetadata {
-            path: meta.location.to_string(),
+            path: s3.unresolve_path(meta.location.as_ref()),
             size: meta.size,
             e_tag: meta.e_tag,
             last_modified: Some(meta.last_modified.timestamp() as u64),
@@ -238,7 +258,7 @@ impl SidecarStore {
 
         let objects: Vec<ObjectMetadata> = stream
             .map_ok(|meta| ObjectMetadata {
-                path: meta.location.to_string(),
+                path: s3.unresolve_path(meta.location.as_ref()),
                 size: meta.size,
                 e_tag: meta.e_tag,
                 last_modified: Some(meta.last_modified.timestamp() as u64),

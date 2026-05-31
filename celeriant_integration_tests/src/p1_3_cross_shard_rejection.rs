@@ -141,14 +141,14 @@ async fn test_cross_shard_write_rejection(
 
     match response {
         Err(celeriant_client_tokio::client_error::ClientError::Server(
-            celeriant_client_tokio::server_error::ServerError::ShardRouting { error_code: 9002, ref error_message }
+            celeriant_client_tokio::server_error::ServerError::ShardRouting { error_code: 9001, ref error_message }
         )) => {
-            println!("  Received ShardRouting::IncompatibleFilters error");
+            println!("  Received ShardRouting::MultipleShardRoutes error");
             println!("  Error message: {}", error_message);
 
-            if !error_message.contains("spans multiple shards") {
+            if !error_message.contains("num_shards") {
                 return Err(format!(
-                    "Error message doesn't match expected pattern. Got: {}",
+                    "Error message doesn't carry num_shards. Got: {}",
                     error_message
                 )
                 .into());

@@ -126,7 +126,31 @@ impl<S: LeaseStore> S3LeaseManager<S> {
                                 message: "lease disappeared after PreconditionFailed".into(),
                             }
                         })?;
-                        self.become_follower(&new_lwe.lease).await
+                        // A CAS etag-conflict on an own-lease renewal does NOT imply lost
+                        // leadership. When the follower drops, two own-renewal hooks fire near
+                        // simultaneously (the preemptive hook and the on-demand fallback-gate
+                        // hook); one wins the CAS and bumps the etag while keeping us leader at
+                        // the same epoch, the other lands here. Only demote when the lease
+                        // genuinely changed hands or expired; otherwise the re-read lease is
+                        // still ours and valid, so we remain the legitimate leader.
+                        let still_ours = new_lwe.lease.leader_node_id == self.config.node_id;
+                        let expired = new_lwe.lease.is_expired(now);
+                        let stay_leader = still_ours && !expired;
+                        tracing::warn!(
+                            attempted_own_lease = is_own_lease,
+                            self_node_id = self.config.node_id,
+                            reread_leader_node_id = new_lwe.lease.leader_node_id,
+                            reread_lease_epoch = new_lwe.lease.lease_epoch,
+                            reread_expired = expired,
+                            still_ours,
+                            stay_leader,
+                            "Election CAS PreconditionFailed — re-read lease"
+                        );
+                        if stay_leader {
+                            self.become_leader(&new_lwe.lease, true).await
+                        } else {
+                            self.become_follower(&new_lwe.lease).await
+                        }
                     }
                     Err(e) => Err(e),
                 }
@@ -483,6 +507,55 @@ mod tests {
         let result = block_on(manager.run_election_to_acquire_s3_lease());
 
         assert!(matches!(result, Err(LeaseStoreError::Unavailable { .. })));
+    }
+
+    /// Benign CAS conflict during our own-lease renewal: a concurrent own-renewal
+    /// won the etag race but the re-read lease is STILL ours and unexpired. We must
+    /// stay leader, not self-demote (the degraded-mode no-leader-stall bug).
+    #[test]
+    fn test_own_lease_benign_cas_conflict_stays_leader() {
+        let store = MockLeaseStore::new();
+        let now = validated_node_status::unix_epoch_now_ms();
+
+        store.push_get_lease(Ok(Some(make_lease_with_etag(1, 1, now, 10000))));
+        store.push_put_lease_conditional(Err(LeaseStoreError::PreconditionFailed));
+        // Re-read: still ours (node 1), same epoch, still valid.
+        store.push_get_lease(Ok(Some(make_lease_with_etag(1, 1, now, 10000))));
+        store.push_get_membership(Ok(Some(membership_with_etag(both_nodes_membership()))));
+
+        let manager = S3LeaseManager::new(store, test_config(1));
+        let outcome = block_on(manager.run_election_to_acquire_s3_lease()).unwrap();
+
+        assert!(
+            matches!(outcome.status.raw(), NodeStatus::Leader { lease_epoch: 1 }),
+            "own valid lease after benign CAS conflict must stay Leader, got {:?}",
+            outcome.status.raw()
+        );
+        assert!(outcome.reacquired_own_lease, "staying on own lease must set reacquired_own_lease=true");
+    }
+
+    /// CAS conflict during our own-lease renewal where a peer genuinely took over:
+    /// the re-read lease names another node at a higher epoch. We must demote.
+    #[test]
+    fn test_own_lease_cas_conflict_peer_took_over_becomes_follower() {
+        let store = MockLeaseStore::new();
+        let now = validated_node_status::unix_epoch_now_ms();
+
+        store.push_get_lease(Ok(Some(make_lease_with_etag(1, 1, now, 10000))));
+        store.push_put_lease_conditional(Err(LeaseStoreError::PreconditionFailed));
+        // Re-read: a peer (node 2) now holds a fresh, valid lease at epoch 2.
+        store.push_get_lease(Ok(Some(make_lease_with_etag(2, 2, now, 10000))));
+        store.push_get_membership(Ok(Some(membership_with_etag(both_nodes_membership()))));
+
+        let manager = S3LeaseManager::new(store, test_config(1));
+        let outcome = block_on(manager.run_election_to_acquire_s3_lease()).unwrap();
+
+        assert!(
+            matches!(outcome.status.raw(), NodeStatus::Follower { leader_lease_epoch: 2 }),
+            "genuine peer takeover must demote to Follower, got {:?}",
+            outcome.status.raw()
+        );
+        assert!(!outcome.reacquired_own_lease);
     }
 
     #[test]

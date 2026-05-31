@@ -48,6 +48,19 @@ fn aggregate_keys() -> [AggregateKey; NUM_SHARDS] {
     ]
 }
 
+/// poll_ready only confirms TCP accept; S3 lease acquisition + leader promotion
+/// happen afterwards (~100-500ms). Writing before that races NotLeader.
+async fn poll_until_leader(address: &str, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if matches!(is_leader(address).await, Ok(true)) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(format!("node at {address} did not become leader within {timeout:?}").into())
+}
+
 async fn assert_event_counts(
     client: &mut CeleriantClient,
     keys: &[AggregateKey],
@@ -140,6 +153,7 @@ async fn run_scenario(
     distributed_config.shard_log_preallocate_bytes = SMALL_PREALLOCATE;
 
     node_a.restart_with_config(distributed_config.clone()).await?;
+    poll_until_leader(node_a.address(), Duration::from_secs(15)).await?;
     println!("  Node A restarted in distributed mode (leader, no follower)\n");
 
     // ========================================

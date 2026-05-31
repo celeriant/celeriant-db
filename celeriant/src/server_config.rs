@@ -638,6 +638,7 @@ impl ServerConfig {
                 endpoint: self.s3_endpoint_override.clone(),
                 skip_signature: self.s3_skip_signature,
                 allow_http: self.s3_allow_http,
+                session_token: None,
             })
         } else {
             None

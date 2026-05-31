@@ -138,6 +138,11 @@ fn register_metric_descriptions() {
     describe_counter!("celeriant_follower_auto_fence_total", "Follower self-fenced (lease ownership lost mid-flight)");
     describe_counter!("celeriant_lease_budget_exhausted_total", "Lease-bounded operation aborted: budget exhausted");
     describe_gauge!("celeriant_clock_drift_ms", "Observed clock drift between nodes");
+    describe_counter!("celeriant_s3_lease_renewal_requested_total", "On-demand lease-renewal nudges sent by data shards to shard 0 (labels: shard_id, result=sent|dropped)");
+    describe_counter!("celeriant_s3_lease_renewal_handled_total", "Shard-0 on-demand renewal handler outcomes (labels: result=not_leader|debounced|attempted)");
+    describe_histogram!("celeriant_s3_lease_cas_duration_seconds", "Latency of the run_election_to_acquire_s3_lease CAS round-trip (labels: reason)");
+    describe_counter!("celeriant_s3_lease_superseded_total", "On-demand renewal concluded superseded / self-fence (labels: peer_present=true|false)");
+    describe_counter!("celeriant_node_role_transitions_total", "Shard-0 leader<->follower role flips (labels: to=leader|follower)");
 
     // Stability
     describe_counter!("celeriant_node_starts_total", "Node boot and restart cycles");

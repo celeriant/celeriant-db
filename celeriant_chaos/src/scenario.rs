@@ -658,6 +658,11 @@ pub async fn run_idempotency_audit_minio_outage(
         // counter checks — MinIO down briefly is the same shape of churn.
         max_s3_fallbacks: 10,
         max_bench_errors: 50_000,
+        // The MinIO bounce can cost one lease re-election + one heartbeat
+        // miss as the leader re-confirms its lease on S3's return. Measured
+        // 1/1 in a 1-in-5 run; allow a small margin.
+        max_leader_elections: 2,
+        max_heartbeat_failures: 2,
         assert_eventual_progress: true,
         ..ScenarioExpectations::default()
     };
@@ -750,8 +755,9 @@ pub async fn run_follower_graceful_stop(
         max_leader_elections: 30,
         // 4000 writers × 5s offline + S3 fallback + slow MinIO under load.
         max_s3_fallbacks: 300,
-        // Heartbeat to a stopped follower fails until restart.
-        max_heartbeat_failures: 30,
+        // Heartbeat to a stopped follower fails until restart. Count is
+        // downtime×cadence, not load-bounded; measured 60-63 across 6k/8k.
+        max_heartbeat_failures: 90,
         // Rollbacks are *expected* in this scenario when MinIO saturates.
         // 60k headroom for the higher-load runs where bench errors climb
         // during the rollback-cooldown window.
@@ -857,7 +863,8 @@ pub async fn run_follower_sigkill(
     let expectations = ScenarioExpectations {
         max_leader_elections: 30,
         max_s3_fallbacks: 300,
-        max_heartbeat_failures: 30,
+        // Same downtime×cadence shape as follower_graceful_stop; measured 64-65.
+        max_heartbeat_failures: 90,
         // SIGKILL leaves no graceful close — bench errors run higher than
         // the graceful-stop case. Empirical run hit ~35k; 60k headroom.
         max_bench_errors: 60_000,
@@ -956,9 +963,9 @@ pub async fn run_leader_graceful_stop(
         // S3 fallback fires while the new leader can't reach the (now-dead)
         // old leader as a follower, plus while the old leader is restarting.
         max_s3_fallbacks: 500,
-        // Heartbeats to the dead node fail until it restarts; ~15s gap →
-        // ~30 heartbeat attempts at the default ~500ms cadence.
-        max_heartbeat_failures: 60,
+        // Heartbeats to the dead node fail until it restarts; under 6k/8k
+        // load the gap stretches and measured 68-69 consistently.
+        max_heartbeat_failures: 90,
         // Rollbacks may fire when both TCP and S3 paths fail mid-transition.
         // Until a new leader is serving, every in-flight write fails. With
         // 4000 concurrent writers and a ~15s failover window, each task
@@ -2465,9 +2472,10 @@ pub async fn run_idempotency_audit_fast_blackout(
 /// them. The goal is "at least one node is healthy at every instant",
 /// not "leadership is retained".
 ///
-/// Timeline: bring up → bench (90s) → +10s stop follower → +10s start
-/// follower → +10s stop leader → +15s start former leader → wait for
-/// bench → settle 15s → evaluate.
+/// Timeline: bring up → bench (140s) → +10s warmup → stop follower → +10s
+/// start follower → +40s drain → stop leader → +35s start former leader
+/// (35s > 30s S3 lease TTL so the follower can promote) → wait for bench →
+/// evaluate.
 pub async fn run_rolling_restart(
     cfg: &ClusterConfig,
     params: ScenarioParams,
@@ -2536,7 +2544,12 @@ pub async fn run_rolling_restart(
     // old leader rejoins as the new follower.
     println!("[{SCEN}] stopping leader ({:?})", stop_leader);
     executor.run(&stop_leader)?;
-    sleep(Duration::from_secs(15)).await;
+    // Must exceed the S3 lease TTL (30s): graceful stop does NOT release the
+    // lease, so the surviving follower cannot promote until the stopped
+    // leader's lease expires. A shorter gap lets the ex-leader restart and
+    // reclaim before any handover, so leadership never moves (the cause of the
+    // DistinctLeaderHosts failure at 6k).
+    sleep(Duration::from_secs(35)).await;
     println!("[{SCEN}] starting former leader ({:?})", start_leader);
     executor.run(&start_leader)?;
 

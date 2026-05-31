@@ -4,6 +4,7 @@ pub struct S3Config {
     pub bucket: String,
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
+    pub session_token: Option<String>,
     pub endpoint: Option<String>,
     pub subfolder: Option<String>,
     /// Skip signing requests (for public buckets)
@@ -19,6 +20,7 @@ impl Default for S3Config {
             bucket: String::new(),
             access_key_id: None,
             secret_access_key: None,
+            session_token: None,
             endpoint: None,
             subfolder: None,
             skip_signature: false,
