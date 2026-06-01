@@ -2514,9 +2514,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     "cull_speculative_tail: rewinding write to read before promotion catchup"
                 );
                 Some(CullTarget::WriteToRead)
-            } else if rewind_to_ack_barrier && last_acked < read.wal_seq {
+            } else if rewind_to_ack_barrier && last_acked > 0 && last_acked < read.wal_seq {
                 // Demotion cull: read==write but ack barrier is below read.
                 // Drop the un-acked range (last_acked+1 .. read] by scanning backward.
+                // Do not drop if last_acked is set
                 let log_id = active.metadata.borrow().log_id;
                 tracing::info!(
                     shard_id = self.config.shard_id,
@@ -4869,6 +4870,45 @@ mod tests {
                 assert_eq!(mc.aggregate_read_snapshots_len(), 0, "aggregate_read_snapshots must be cleared by demotion cull");
                 assert_eq!(mc.aggregate_recent_writes_len(), 0, "aggregate_recent_writes must be cleared by demotion cull");
             }
+
+            shard.close().await;
+        });
+    }
+
+    /// even on the demotion path, a zero ack barrier must NOT rewind
+    #[test]
+    fn demotion_cull_does_not_rewind_when_ack_barrier_is_zero() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let agg = key(1, 1, 1);
+
+            // Standalone advances read==write on every fsync, so after 10 writes read==write==10.
+            let shard = open_shard(&dir).await;
+            for _ in 0..10 {
+                write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            }
+            {
+                let active = shard.log_segments_cache.active();
+                let meta = active.metadata.borrow();
+                assert_eq!(meta.write.wal_seq, 10);
+                assert_eq!(meta.read.as_ref().unwrap().wal_seq, 10);
+            }
+
+            // Caught-up-but-never-acked: read==write==10, last_self_acked==0.
+            {
+                let active = shard.log_segments_cache.active();
+                active.metadata.borrow_mut().last_self_acked_wal_seq = 0;
+            }
+
+            // Demotion cull with a zero ack barrier must be a no-op.
+            let culled = shard.cull_speculative_tail_for_promotion(true).await.unwrap();
+            assert!(!culled, "demotion cull must NOT fire when last_self_acked==0 (would wipe the caught-up chain)");
+
+            let active = shard.log_segments_cache.active();
+            let meta = active.metadata.borrow();
+            assert_eq!(meta.write.wal_seq, 10, "write cursor must be preserved (no rewind to genesis)");
+            assert_eq!(meta.read.as_ref().unwrap().wal_seq, 10, "read cursor must be preserved (no rewind to genesis)");
+            drop(meta);
 
             shard.close().await;
         });

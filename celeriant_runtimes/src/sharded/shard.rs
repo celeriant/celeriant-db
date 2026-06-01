@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use celeriant_distributed::{lease_store::LeaseStore, node_status_logic::{compute_new_ttl, decide_post_catchup_action, PostCatchupAction}, s3_lease_manager::{ElectionOutcome, S3LeaseManager}, validated_node_status::{self, ValidatedNodeStatus, set_node_status_and_metric}};
+use celeriant_distributed::{lease_store::LeaseStore, node_status::NodeStatus, node_status_logic::{compute_new_ttl, decide_post_catchup_action, PostCatchupAction}, s3_lease_manager::{ElectionOutcome, S3LeaseManager}, validated_node_status::{self, ValidatedNodeStatus, set_node_status_and_metric}};
 use celeriant_msg::response::responses::HeartbeatResult;
 use celeriant_shard::{error::send_heartbeat_error::SendHeartbeatError, replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::{LeaseRenewalRequester, ShardWal}, shard_wal_s3_catchup::CatchupCompletion};
 use glommio::{
@@ -381,13 +381,21 @@ fn spawn_shard_zero_shutdown_handler<R: ReplicationClient + 'static, D: S3Downlo
     .detach();
 }
 
-/// Returns true if all shards caught up successfully, false if shutdown was triggered.
+enum CatchupRunOutcome {
+    Caught,
+    Shutdown,
+    S3Unreachable,
+}
+
 async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     ctx: &ConnectionContext<R, D, S>,
     rx: &LocalReceiver<CatchupCompletionMsg>,
-) -> bool {
+) -> CatchupRunOutcome {
     let shard_count = ctx.config.num_shards as usize;
     let mut attempt = 0u32;
+    // 4 rounds x 5s ~= 20s of confirmed S3 outage before bailing so a follower can resume via TCP.
+    const MAX_S3_UNREACHABLE_ROUNDS: u32 = 4;
+    let mut consecutive_s3_unreachable = 0u32;
 
     loop {
         attempt += 1;
@@ -414,7 +422,10 @@ async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'stati
             }
         }
 
-        let mut has_retriable = false;
+        // Split so a pure-S3-error round (no contact) counts toward the unreachable bound, while
+        // any S3 contact (undrained) resets it.
+        let mut has_undrained = false;
+        let mut has_s3_error = false;
         let mut has_fatal = false;
 
         for msg in &results {
@@ -437,12 +448,12 @@ async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'stati
                             rounds = r.rounds,
                             "S3 catchup did not drain for shard, will retry"
                         );
-                        has_retriable = true;
+                        has_undrained = true;
                     }
                 },
                 Err(e) if e.is_retriable() => {
                     warn!(shard_id = msg.shard_id, error = ?e, "S3 catchup retriable error, will retry");
-                    has_retriable = true;
+                    has_s3_error = true;
                 }
                 Err(e) => {
                     error!(shard_id = msg.shard_id, error = ?e, "S3 catchup fatal error, shutting down");
@@ -454,11 +465,21 @@ async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'stati
         if has_fatal {
             ctx.shutdown_requested.set(true);
             broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::Shutdown, ctx.intrashard_sender.clone()).await;
-            return false;
+            return CatchupRunOutcome::Shutdown;
         }
 
-        if !has_retriable {
-            return true;
+        if !has_undrained && !has_s3_error {
+            return CatchupRunOutcome::Caught;
+        }
+
+        if has_s3_error && !has_undrained {
+            consecutive_s3_unreachable += 1;
+            if consecutive_s3_unreachable >= MAX_S3_UNREACHABLE_ROUNDS {
+                warn!(attempt, consecutive_s3_unreachable, "S3 unreachable across consecutive catchup rounds; bailing so a heartbeated follower can resume via TCP");
+                return CatchupRunOutcome::S3Unreachable;
+            }
+        } else {
+            consecutive_s3_unreachable = 0;
         }
 
         warn!(attempt, "S3 catchup has retriable errors, retrying in 5s");
@@ -673,7 +694,7 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
     // and may have authored a divergent tail) or on demotion.  Self-reclaim: keep the tail.
     // Also skip upload_s3_promotion_batch on self-reclaim: no incoming replication means
     // nothing to bridge, and its idempotent-cull prefix would re-cull the tail we kept.
-    let (needs_cull, leader_changed_hands, needs_catchup) = promotion_cull_flags(
+    let (needs_cull, leader_changed_hands, needs_catchup, rewind_to_ack_barrier) = promotion_cull_flags(
         became_leader,
         became_follower_from_leader_or_fenced,
         outcome.reacquired_own_lease,
@@ -699,11 +720,11 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
         if needs_cull {
             let shard_count = ctx.config.num_shards as usize;
             for peer in 1..shard_count {
-                if let Err(e) = try_send_with_retry(ctx.intrashard_sender.as_ref(), peer, IntrashardMessages::CullSpeculativeTail { rewind_to_ack_barrier: became_follower_from_leader_or_fenced }, 10).await {
+                if let Err(e) = try_send_with_retry(ctx.intrashard_sender.as_ref(), peer, IntrashardMessages::CullSpeculativeTail { rewind_to_ack_barrier }, 10).await {
                     panic!("Failed to send CullSpeculativeTail to shard {peer} after retries: {e:?}");
                 }
             }
-            if let Err(e) = ctx.shard_wal.cull_speculative_tail_for_promotion(became_follower_from_leader_or_fenced).await {
+            if let Err(e) = ctx.shard_wal.cull_speculative_tail_for_promotion(rewind_to_ack_barrier).await {
                 return Err(celeriant_distributed::lease_store::LeaseStoreError::Unavailable {
                     message: format!("pre-catchup speculative tail cull failed: {e:?}"),
                 });
@@ -711,8 +732,13 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
         }
 
         if needs_catchup {
-            if !run_s3_catchup(ctx, &rx).await {
-                return Err(celeriant_distributed::lease_store::LeaseStoreError::Unavailable { message: "Could not catch up WAL via S3".to_string() });
+            // A promoting leader must finish S3 catchup before serving. Fatal or S3-outage fails
+            // the election so it retries; never serve writes on an unverified WAL.
+            match run_s3_catchup(ctx, &rx).await {
+                CatchupRunOutcome::Caught => {}
+                CatchupRunOutcome::Shutdown | CatchupRunOutcome::S3Unreachable => {
+                    return Err(celeriant_distributed::lease_store::LeaseStoreError::Unavailable { message: "Could not catch up WAL via S3".to_string() });
+                }
             }
 
             // Close any gap in S3 left by the old leader rolling back a batch we kept.
@@ -1096,7 +1122,8 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
 
                 info!("Node was follower but got kicked, or we are in boot catchup phase, asking shards to catch up via s3");
 
-                if !run_s3_catchup(&ctx, &rx).await {
+                let catchup_outcome = run_s3_catchup(&ctx, &rx).await;
+                if matches!(catchup_outcome, CatchupRunOutcome::Shutdown) {
                     panic!("S3 catchup failed with fatal error");
                 }
 
@@ -1124,8 +1151,28 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                     boot_grace_ms,
                 );
                 match action {
-                    PostCatchupAction::StayFollower { .. } => {
-                        info!("Post-catchup: lease alive (heartbeat received during catchup); not challenging");
+                    PostCatchupAction::StayFollower { leader_lease_epoch, lease_expires_at_ms } => {
+                        if matches!(catchup_outcome, CatchupRunOutcome::S3Unreachable) {
+                            // Live leader heartbeating but S3 down: the normal resume (post-catchup
+                            // election) reads S3, so without this we stay pinned in FollowerCatchingUp
+                            // (can-accept-TCP=false) while the leader routes its tail to a dead S3
+                            // fallback. Resume to Follower locally so TCP drains the tail; the
+                            // receive-path tip-hash check rejects a genuine divergence (re-kicks us).
+                            let follower = ValidatedNodeStatus::create_custom_status(
+                                NodeStatus::Follower { leader_lease_epoch },
+                                ctx.config.max_clock_drift_ms,
+                                lease_expires_at_ms,
+                            );
+                            set_node_status_and_metric(&ctx.shard_wal.node_status, follower, ctx.current_shard_id as u32);
+                            broadcast_message_to_other_shards(
+                                ctx.current_shard_id,
+                                IntrashardMessages::StatusUpdate { status: follower, cas_confirmed_at_ms: None, leader_changed_hands: false },
+                                ctx.intrashard_sender.clone(),
+                            ).await;
+                            warn!(leader_lease_epoch, "S3 unreachable during catchup but live leader heartbeating; resumed as Follower for TCP-driven recovery");
+                        } else {
+                            info!("Post-catchup: lease alive (heartbeat received during catchup); not challenging");
+                        }
                     }
                     PostCatchupAction::BootWaitThenReevaluate { wait_ms } => {
                         info!(wait_ms, "Post-catchup boot-grace wait before challenging");
@@ -1382,23 +1429,27 @@ const PERIODIC_PROBE_INTERVAL_MS: u64 = 5_000;
 /// now_following_peer: new status is Follower/FollowerCatchingUp (a confirmed leader
 /// exists), not Fenced.
 ///
-/// Returns (needs_cull, leader_changed_hands, needs_catchup).
+/// Returns (needs_cull, leader_changed_hands, needs_catchup, rewind_to_ack_barrier).
 fn promotion_cull_flags(
     became_leader: bool,
     became_follower_from_leader_or_fenced: bool,
     reacquired_own_lease: bool,
     lease_changed_hands: bool,
     now_following_peer: bool,
-) -> (bool, bool, bool) {
+) -> (bool, bool, bool, bool) {
     let leader_changed_hands = became_leader && !reacquired_own_lease;
-    // Also cull when a higher-epoch peer took the lease while we were already non-leader
-    // (self-fenced before challenging, so became_follower_from_leader_or_fenced is false).
-    // now_following_peer means a peer leads; !reacquired_own_lease means it is not us. A bare
-    // self-fence is excluded so a self-reclaim keeps its tail.
-    let demoted_to_peer = now_following_peer && lease_changed_hands && !reacquired_own_lease;
+    // Cull whenever we follow a peer while non-leader (peer took a higher epoch, OR we were
+    // stopped-while-leader and rejoin as follower via boot). NOT gated on lease_changed_hands: a
+    // Follower outcome carries no lease_epoch (reads 0), so gating left the stale un-acked tail
+    // unculled. A bare self-fence (following no one) stays excluded so a self-reclaim keeps its tail.
+    let demoted_to_peer = now_following_peer && !reacquired_own_lease;
     let needs_cull = leader_changed_hands || became_follower_from_leader_or_fenced || demoted_to_peer;
     let needs_catchup = became_leader || lease_changed_hands;
-    (needs_cull, leader_changed_hands, needs_catchup)
+    // Rewind read to last_self_acked only when demoting from leadership actually held; there it is
+    // a real durable floor. A node that never led has last_self_acked=0, where rewinding wipes its
+    // S3-caught-up chain. needs_cull still fires for it but only via the safe write->read arm.
+    let rewind_to_ack_barrier = became_follower_from_leader_or_fenced;
+    (needs_cull, leader_changed_hands, needs_catchup, rewind_to_ack_barrier)
 }
 
 /// Whether a data shard, on receiving a leader-promotion `StatusUpdate`, should
@@ -1467,53 +1518,64 @@ mod tests {
     ///
     /// Columns: became_leader, became_follower, reacquired_own_lease, lease_changed_hands,
     ///          now_following_peer
-    /// Expected: (needs_cull, leader_changed_hands, needs_catchup)
+    /// Expected: (needs_cull, leader_changed_hands, needs_catchup, rewind_to_ack_barrier).
+    /// rewind_to_ack_barrier == the became_follower column: rewind read to last_self_acked only
+    /// when demoting from held leadership (§7.5).
     #[test]
     fn promotion_cull_flags_truth_table() {
         // (became_leader, became_follower, reacquired_own_lease, lease_changed_hands,
-        //  now_following_peer, exp_needs_cull, exp_leader_changed_hands, exp_needs_catchup)
-        let cases: &[(bool, bool, bool, bool, bool, bool, bool, bool)] = &[
+        //  now_following_peer, exp_needs_cull, exp_leader_changed_hands, exp_needs_catchup,
+        //  exp_rewind_to_ack_barrier)
+        let cases: &[(bool, bool, bool, bool, bool, bool, bool, bool, bool)] = &[
             // RESTART self-reclaim: previous_lease_epoch=0 (BootCatchup), S3 lease is ours
             // (epoch 1). reacquired_own_lease=true, so no cull (keep the tail).
-            (true, false, true, true, false, false, false, true),
+            (true, false, true, true, false, false, false, true, false),
 
             // Warm self-reclaim (no restart): epoch stable, reacquired.
-            (true, false, true, false, false, false, false, true),
+            (true, false, true, false, false, false, false, true, false),
 
             // Promote-over-peer: took over an expired/fenced peer lease.
-            (true, false, false, true, false, true, true, true),
+            (true, false, false, true, false, true, true, true, false),
 
             // Promote-over-peer where epoch didn't change (shouldn't happen; verify).
-            (true, false, false, false, false, true, true, true),
+            (true, false, false, false, false, true, true, true, false),
 
             // Demotion: leader lost lease to peer (Leader to Follower edge observed).
-            (false, true, false, true, true, true, false, true),
+            (false, true, false, true, true, true, false, true, true),
 
             // Demotion: self-fenced (Leader to Fenced, lease not yet taken). Culls; no catchup.
-            (false, true, false, false, false, true, false, false),
+            (false, true, false, false, false, true, false, false, true),
 
             // No role change (already leader, renewals): no cull, no catchup.
-            (false, false, true, false, false, false, false, false),
+            (false, false, true, false, false, false, false, false, false),
 
             // Already non-leader, a higher-epoch peer took the lease and we now follow it
             // (self-fenced before challenging, so no Leader to Follower edge).
             // !reacquired_own_lease confirms a peer, so cull the stranded tail.
-            (false, false, false, true, true, true, false, true),
+            (false, false, false, true, true, true, false, true, false),
+
+            // Stop-while-leader rejoin as follower: cull the stale un-acked tail (write>read arm),
+            // no catchup, no rewind (lease_changed_hands false; last_self_acked not a valid floor).
+            (false, false, false, false, true, true, false, false, false),
+
+            // guard: boot->follower after a clean S3 catchup (read==write, last_self_acked=0).
+            // Same inputs; rewind MUST stay false or we wipe the caught-up chain (fork-from-genesis).
+            (false, false, false, false, true, true, false, false, false),
 
             // Already non-leader, epoch advanced but not following anyone (Fenced): may
             // self-reclaim, so no cull. Catchup only.
-            (false, false, false, true, false, false, false, true),
+            (false, false, false, true, false, false, false, true, false),
 
             // Non-leader, epoch advanced, but reacquired our own lease: never cull even if
             // momentarily following.
-            (false, false, true, true, true, false, false, true),
+            (false, false, true, true, true, false, false, true, false),
         ];
 
-        for &(became_leader, became_follower, reacquired, lease_changed, following, exp_cull, exp_lch, exp_catchup) in cases {
-            let (cull, lch, catchup) = promotion_cull_flags(became_leader, became_follower, reacquired, lease_changed, following);
+        for &(became_leader, became_follower, reacquired, lease_changed, following, exp_cull, exp_lch, exp_catchup, exp_rewind) in cases {
+            let (cull, lch, catchup, rewind) = promotion_cull_flags(became_leader, became_follower, reacquired, lease_changed, following);
             assert_eq!(
-                (cull, lch, catchup),
-                (exp_cull, exp_lch, exp_catchup),
+                (cull, lch, catchup, rewind),
+                (exp_cull, exp_lch, exp_catchup, exp_rewind),
                 "became_leader={became_leader} became_follower={became_follower} reacquired={reacquired} lease_changed={lease_changed} following={following}",
             );
         }

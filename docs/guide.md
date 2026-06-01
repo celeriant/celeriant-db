@@ -26,6 +26,16 @@ There's no cardinality limit. Millions of aggregates, billions of events. Celeri
 
 If you're working with UUIDs, convert with `Uuid::as_u128()` and `Uuid::from_u128()`. The [reference example](../celeriant_reference/src/constants.rs) uses `Uuid::new_v5` to generate deterministic IDs from names.
 
+### Choosing IDs so shards stay balanced
+
+Routing is a modulo on the **low bits** of the routing field (`aggregate_id` by default, see Sharding in the [README](../README.md)). Aggregates spread evenly across shards only when those low bits are uniform.
+
+- **Safe:** UUIDv4, UUIDv5 (deterministic from a name), or any hash-derived `u128`. Uniform low bits, even spread.
+- **Hot shard:** anything with a low-entropy or time-ordered value in the **low** bits, a sequential counter, an auto-increment key, a timestamp packed into the bottom of the id. Every write lands on one shard.
+- **UUIDv7 is fine.** Its timestamp sits in the high bits, which the modulo ignores, and the low bits are random. Even spread, and the IDs are still time-sortable.
+
+Want everything for one org or one type co-located on a shard on purpose? Route by `OrgId` or `AggregateTypeId` instead.
+
 ## Connections and the pool
 
 ### Connections are cheap

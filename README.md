@@ -210,6 +210,8 @@ Aggregates are assigned to shards by configurable routing:
 
 Clients connect to any shard. Requests are redirected to the owning shard automatically.
 
+The modulo is on the low bits of the routing field, so pick IDs with uniform low bits or you'll hot-shard. See [Choosing IDs so shards stay balanced](docs/guide.md#choosing-ids-so-shards-stay-balanced).
+
 ## When Not to Use Celeriant
 
 - You need ad-hoc queries over aggregate state - use an OLAP database
