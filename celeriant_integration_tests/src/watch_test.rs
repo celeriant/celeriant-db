@@ -111,6 +111,30 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Test 7: Dial completes promptly (immediate ACK, not the 5s heartbeat)
+    match test_watch_dial_is_prompt(server.address()).await {
+        Ok(()) => {
+            println!("[PASS] test_watch_dial_is_prompt");
+            passed += 1;
+        }
+        Err(e) => {
+            println!("[FAIL] test_watch_dial_is_prompt: {}", e);
+            failed += 1;
+        }
+    }
+
+    // Test 8: Server detects client disconnect promptly (no CLOSE-WAIT leak)
+    match test_watch_disconnect_detected_promptly(&server).await {
+        Ok(()) => {
+            println!("[PASS] test_watch_disconnect_detected_promptly");
+            passed += 1;
+        }
+        Err(e) => {
+            println!("[FAIL] test_watch_disconnect_detected_promptly: {}", e);
+            failed += 1;
+        }
+    }
+
     println!("\n=== Results: {} passed, {} failed ===", passed, failed);
 
     if failed > 0 {
@@ -698,6 +722,112 @@ async fn test_write_then_watch_same_connection(
 
     println!("  Write-then-watch pipelining works correctly");
     Ok(())
+}
+
+/// A watch dial must complete promptly: the server should ACK the subscription
+/// immediately, not leave the client blocked until the first 5s idle heartbeat.
+/// Pre-fix the first frame on an idle aggregate only arrives after ~5s, so this
+/// 1s bound fails.
+async fn test_watch_dial_is_prompt(
+    address: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut watch = WatchConnection::connect(address).await?;
+
+    let watch_request = WatchRequest {
+        correlation_id: Some(7),
+        requested_latency_ms: Some(100),
+        shard_id: None,
+        orgs: None,
+        aggregate_types: None,
+        aggregates: Some(HashSet::from([7000])), // idle aggregate, no events
+        operation_types: None,
+    };
+
+    let start = std::time::Instant::now();
+    watch.send_watch_request(&watch_request).await?;
+
+    match watch.read_response_timeout(Duration::from_secs(1)).await? {
+        Some(ClientResponse::Watch(_)) => {
+            println!("  Dial acked in {:?}", start.elapsed());
+            Ok(())
+        }
+        Some(ClientResponse::GenericError(err)) => {
+            Err(format!("Server returned error: {}", err.error_message).into())
+        }
+        Some(other) => Err(format!("Unexpected response type: {:?}", other).into()),
+        None => Err(format!(
+            "No subscription ack within 1s (dial took >= {:?}) — server isn't sending an immediate watch ack",
+            start.elapsed()
+        )
+        .into()),
+    }
+}
+
+/// When a watch client disconnects, the server must notice the FIN and tear the
+/// session down promptly. Pre-fix the watch loop only ever writes, so it doesn't
+/// see the disconnect until its next heartbeat write (~5s); the session — and the
+/// underlying socket — lingers. We observe teardown via `watch_subscribers_active`.
+async fn test_watch_disconnect_detected_promptly(
+    sibling: &TestServer,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Use a dedicated, quiet server so the process-global `watch_subscribers_active`
+    // gauge is a clean 1->0 signal, not contaminated by lingering sessions from the
+    // other tests in this binary. Sibling ports (+10) avoid colliding with the
+    // shared server's client/replication/metrics ports.
+    let server = TestServer::start_with_port(sibling.port() + 10)
+        .await
+        .map_err(|e| format!("failed to start dedicated test server: {}", e))?;
+    let metrics_port = server.config().metrics_port;
+    let active = || async move {
+        crate::scrape_counter("127.0.0.1", metrics_port, "celeriant_watch_subscribers_active")
+            .await
+            .map_err(|e| format!("metrics scrape failed: {}", e))
+    };
+
+    let mut watch = WatchConnection::connect(server.address()).await?;
+    let watch_request = WatchRequest {
+        correlation_id: Some(8),
+        requested_latency_ms: Some(100),
+        shard_id: None,
+        orgs: None,
+        aggregate_types: None,
+        aggregates: Some(HashSet::from([8000])),
+        operation_types: None,
+    };
+    watch.send_watch_request(&watch_request).await?;
+    // Wait for the subscription to register.
+    watch.read_response_timeout(Duration::from_secs(1)).await?;
+    sleep(Duration::from_millis(100)).await;
+
+    let with_watcher = active().await?;
+    if with_watcher < 1 {
+        return Err(format!(
+            "subscriber gauge did not rise after subscribe (got {})",
+            with_watcher
+        )
+        .into());
+    }
+
+    // Disconnect: dropping the connection sends a FIN to the server.
+    drop(watch);
+
+    // The server must drop to zero well before the 5s heartbeat cadence.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        sleep(Duration::from_millis(100)).await;
+        let now = active().await?;
+        if now == 0 {
+            println!("  Subscriber gauge returned to 0 after disconnect");
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "server still reports {} active watcher(s) 2s after client disconnect — FIN not detected",
+                now
+            )
+            .into());
+        }
+    }
 }
 
 fn create_event(client_seq: u64, message: String) -> DatablockAggregateEvent {

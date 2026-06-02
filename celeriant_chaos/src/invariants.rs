@@ -731,6 +731,7 @@ mod tests {
             shard_panics_total: 0,
             node_starts_total: 0,
             client_connections_active: 0,
+            watch_subscribers_active: 0,
             capture_dropped_items_total: 0,
             capture_dropped_bytes_total: 0,
             writes_accepted_no_prior_client_seq_total: 0,

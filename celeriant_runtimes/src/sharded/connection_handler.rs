@@ -18,7 +18,7 @@ use celeriant_shard::{
     error::{s3_catchup_error::S3CatchupError, watch_session_error::WatchSessionError}, replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::ShardWal, shard_wal_s3_catchup::S3CatchupResult
 };
 use celeriant_wire::codec::compression::DictCodec;
-use celeriant_watch::{watch_output_type::WatchOutputType, watch_session::WatchSession};
+use celeriant_watch::{aggregate_reader::WatchReadError, watch_output_type::WatchOutputType, watch_session::WatchSession};
 use celeriant_msg::read_wire_data_error::ReadWireDataError;
 use celeriant_wire::network::wire_error::WireError;
 use celeriant_wire::network::wire_header::WireHeader;
@@ -1403,23 +1403,54 @@ async fn handle_watch<R: ReplicationClient + 'static, D: S3Downloader + 'static,
 
     metrics::gauge!("celeriant_watch_subscribers_active").increment(1.0);
 
+    // Ack the subscription immediately so the client confirms the watch without
+    // blocking until the first idle heartbeat (~5s). Empty events make this a
+    // heartbeat-shaped frame the client already treats as a no-op.
+    let ack = ClientResponse::Watch(WatchResponse::default());
+    if write_client_response_with_timeout(&mut tcp_stream, &ack, max_message_size, client_has_dict, dict_codec, message_version, ctx.config.slow_client_timeout).await.is_err() {
+        metrics::gauge!("celeriant_watch_subscribers_active").decrement(1.0);
+        return;
+    }
+
+    // A watch is connection-terminal. Client only reads from here on. Race
+    // each outgoing frame against a readable/EOF poll so a client disconnect (FIN)
+    // is detected promptly instead of lagging a full heartbeat; that lag is what
+    // left sockets stuck in CLOSE-WAIT. peek() borrows the stream shared and the
+    // race future drops before the &mut write below, so there's no borrow conflict.
+    enum WatchStep {
+        Frame(Result<WatchOutputType, WatchReadError>),
+        PeerGone,
+    }
+
     loop {
-        match watch_session.next().await {
-            Ok(WatchOutputType::Continue) => continue,
-            Ok(WatchOutputType::Response(watch_response)) => {
+        let mut peek_buf = [0u8; 1];
+        let step = futures_lite::future::or(
+            async { WatchStep::Frame(watch_session.next().await) },
+            async {
+                // Ok(0) = FIN, Ok(n) = unexpected client data, Err = socket error.
+                // Any of these means the watcher is gone; stop.
+                let _ = tcp_stream.peek(&mut peek_buf).await;
+                WatchStep::PeerGone
+            },
+        ).await;
+
+        match step {
+            WatchStep::PeerGone => break,
+            WatchStep::Frame(Ok(WatchOutputType::Continue)) => continue,
+            WatchStep::Frame(Ok(WatchOutputType::Response(watch_response))) => {
                 let response = ClientResponse::Watch(watch_response);
                 if write_client_response_with_timeout(&mut tcp_stream, &response, max_message_size, client_has_dict, dict_codec, message_version, ctx.config.slow_client_timeout).await.is_err() {
                     break;
                 }
             }
-            Ok(WatchOutputType::Heartbeat) => {
+            WatchStep::Frame(Ok(WatchOutputType::Heartbeat)) => {
                 let response = ClientResponse::Watch(WatchResponse::default());
                 if write_client_response_with_timeout(&mut tcp_stream, &response, max_message_size, client_has_dict, dict_codec, message_version, ctx.config.slow_client_timeout).await.is_err() {
                     break;
                 }
             }
-            Ok(WatchOutputType::Done) => break,
-            Err(error) => {
+            WatchStep::Frame(Ok(WatchOutputType::Done)) => break,
+            WatchStep::Frame(Err(error)) => {
                 let response = watch_read_error_to_client_response(correlation_id, error);
                 let _ = write_client_response_with_timeout(&mut tcp_stream, &response, max_message_size, client_has_dict, dict_codec, message_version, ctx.config.slow_client_timeout).await;
                 break;

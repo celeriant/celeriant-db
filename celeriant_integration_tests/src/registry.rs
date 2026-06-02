@@ -249,6 +249,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             distributed: false,
         },
         TestEntry {
+            name: "chaos_watch",
+            description: "Adversarial watch lifecycle (churn, half-open, slow readers, multi-shard) under read/write load",
+            estimated_secs: 30,
+            categories: &[Core, Edge],
+            distributed: false,
+        },
+        TestEntry {
             name: "connection_test",
             description: "Connection lifecycle, pipelining, and shard routing",
             estimated_secs: 1,

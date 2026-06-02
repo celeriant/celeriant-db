@@ -66,7 +66,18 @@ enum WatchMode {
 
 struct MultiShardState {
     receiver: tokio::sync::mpsc::UnboundedReceiver<Result<WatchResponse, ClientError>>,
-    _tasks: Vec<tokio::task::JoinHandle<()>>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for MultiShardState {
+    fn drop(&mut self) {
+        // Dropping a JoinHandle does not cancel the task. A per-shard reader
+        // parked in read_next() on a quiet shard would otherwise hold its
+        // ShardStream/socket forever. Abort them so the fds are released.
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
 }
 
 async fn identify_stream<F>(
@@ -146,7 +157,7 @@ fn spawn_shard_readers(streams: Vec<ShardStream>) -> MultiShardState {
     }
     drop(tx);
 
-    MultiShardState { receiver, _tasks: tasks }
+    MultiShardState { receiver, tasks }
 }
 
 impl WatchConnection {

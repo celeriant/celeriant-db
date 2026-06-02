@@ -24,6 +24,7 @@ pub mod bug_kick_after_restart;
 pub mod batch_standalone_cleartext;
 pub mod chaos;
 pub mod chaos_delete;
+pub mod chaos_watch;
 pub mod compaction_replicated;
 pub mod compaction_restart;
 pub mod compaction_standalone;

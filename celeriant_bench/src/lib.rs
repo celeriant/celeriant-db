@@ -18,6 +18,9 @@ use rustls_pki_types::ServerName;
 use tokio::sync::Barrier;
 use tokio::time::Instant;
 
+pub mod watch_flood;
+pub use watch_flood::{run_watch_flood, watch_dial_probe, WatchFloodParams, WatchFloodResult};
+
 #[derive(Debug, Clone)]
 pub struct BenchmarkResult {
     pub num_tasks: usize,

@@ -232,6 +232,7 @@ async fn dispatch_test(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         "batch_standalone_cleartext" => batch_standalone_cleartext::run().await,
         "chaos" => chaos::run().await,
         "chaos_delete" => chaos_delete::run().await,
+        "chaos_watch" => chaos_watch::run().await,
         "compaction_replicated" => compaction_replicated::run().await,
         "compaction_restart" => compaction_restart::run().await,
         "compaction_standalone" => compaction_standalone::run().await,

@@ -3,7 +3,8 @@ use std::time::{Duration, Instant};
 
 use celeriant_bench::{
     BenchmarkResult, DataIntegrityReport, DeepAuditReport, IdempotentBenchCounters, Pool, PoolBuilder,
-    deep_audit_failing_aggregates, run_benchmark, run_benchmark_idempotent, smoke_test, verify_no_seq_gaps,
+    WatchFloodParams, build_tls_config, deep_audit_failing_aggregates, run_benchmark,
+    run_benchmark_idempotent, run_watch_flood, smoke_test, verify_no_seq_gaps, watch_dial_probe,
 };
 
 use crate::actions::{Action, ActionExecutor};
@@ -520,6 +521,160 @@ pub async fn run_baseline(
         run_dir,
     )
     .await
+}
+
+/// Watch storm on a HAPPY cluster (no fault injection). Runs the normal write
+/// bench while an adversarial watch flood churns connections, opens slow/never-
+/// reading watchers, and holds long-lived watchers that must keep receiving
+/// events. Verifies the watch path can't take the server down or leak through
+/// it: server stays the single leader, write throughput holds, the subscriber
+/// gauge drains after the flood (no CLOSE-WAIT leak), and a fresh dial is still
+/// prompt (no 503/~5s-dial degradation).
+pub async fn run_watch_storm(
+    cfg: &ClusterConfig,
+    params: ScenarioParams,
+    run_dir: &PathBuf,
+) -> Result<ScenarioReport, String> {
+    const SCEN: &str = "watch_storm";
+    let up = bring_up_cluster(cfg, SCEN, run_dir).await?;
+    let pool = build_bench_pool(cfg, &up, params).await?;
+
+    println!("[{SCEN}] smoke test");
+    smoke_test(&pool).await.map_err(|e| format!("smoke: {e}"))?;
+
+    // Watch client targets the actual leader resolved during bring-up. SNI must be
+    // the leader hostname to match the cert SANs.
+    let watch_addr = up.bench_primary.clone();
+    let leader_host = watch_addr.split(':').next().unwrap_or(&watch_addr).to_string();
+    let watch_tls = build_tls_config(
+        cfg.ca_cert.to_str().ok_or("ca_cert path not utf8")?,
+        cfg.client_cert.to_str().ok_or("client_cert path not utf8")?,
+        cfg.client_key.to_str().ok_or("client_key path not utf8")?,
+        &leader_host,
+    )
+    .map_err(|e| format!("watch tls: {e}"))?;
+
+    // Aggregate ids the watchers filter on. The write bench writes (1, 1, id) for
+    // id in 0..tasks, so this range overlaps and long-lived watchers see events.
+    // churn_tasks × the ~40-80ms inter-cycle gap sets the storm rate. 16 keeps
+    // the runner's client-side TIME_WAIT bounded over a 60s window while still
+    // sustaining ~200 connect/disconnect per second — pre-fix that leaves ~1000
+    // sockets in CLOSE-WAIT on the leader at steady state.
+    let flood_params = WatchFloodParams {
+        duration_secs: params.duration_secs,
+        churn_tasks: 16,
+        long_lived_tasks: 8,
+        slow_tasks: 4,
+        aggregate_ids: (0u128..64).collect(),
+    };
+
+    let bench_window_start_ms = up.elapsed_ms();
+    println!(
+        "[{SCEN}] bench {} tasks + watch flood (churn {}, long {}, slow {}) for {}s",
+        params.tasks, flood_params.churn_tasks, flood_params.long_lived_tasks,
+        flood_params.slow_tasks, params.duration_secs,
+    );
+
+    // Drive the write bench and the watch flood concurrently for the window.
+    let pool_clone = pool.clone();
+    let tasks = params.tasks;
+    let dur = params.duration_secs;
+    let bench_handle = tokio::spawn(async move { run_benchmark(&pool_clone, tasks, dur).await });
+
+    let flood = run_watch_flood(&watch_addr, watch_tls.clone(), flood_params).await;
+
+    let bench_result = bench_handle.await.map_err(|e| format!("bench join: {e}"))?;
+    let bench_window_end_ms = up.elapsed_ms();
+
+    println!(
+        "[{SCEN}] bench done: {} req, {} err, {:.0} req/s | watch: {} cycles, {} attempts ({} conn errors), {} events",
+        bench_result.total_requests, bench_result.errors, bench_result.throughput,
+        flood.cycles, flood.connect_attempts, flood.connect_errors, flood.events_received,
+    );
+
+    let mut extra_checks: Vec<CheckResult> = Vec::new();
+
+    // 1) Delivery survived the churn.
+    extra_checks.push(if flood.events_received > 0 {
+        CheckResult::pass_with_detail("WatchEventsDelivered", format!("{} events", flood.events_received))
+    } else {
+        CheckResult::fail("WatchEventsDelivered", "long-lived watchers received no events under churn")
+    });
+
+    // 2) No leaked sessions. Every watcher is dropped once run_watch_flood returns;
+    //    after a short settle the leader's gauge must be ~0. A pre-fix leak keeps
+    //    sessions alive until their next ~5s heartbeat write fails, so the gauge
+    //    stays elevated well past this 3s settle.
+    sleep(Duration::from_secs(3)).await;
+    let metrics_url = cfg.metrics_url(&leader_host);
+    match scrape_watch_subscribers(&metrics_url, &leader_host).await {
+        Ok(active) if active <= 4 => {
+            extra_checks.push(CheckResult::pass_with_detail("WatchSubscribersDrained", format!("{active} active")));
+        }
+        Ok(active) => {
+            extra_checks.push(CheckResult::fail(
+                "WatchSubscribersDrained",
+                format!("{active} watch sessions still active 3s after the flood — likely leaked (CLOSE-WAIT)"),
+            ));
+        }
+        Err(e) => {
+            extra_checks.push(CheckResult::fail("WatchSubscribersDrained", format!("metrics scrape failed: {e}")));
+        }
+    }
+
+    // 3) No degradation: a fresh dial still acks promptly (the original symptom was
+    //    ~5s dials / 503s once the leak saturated watch servicing).
+    match watch_dial_probe(&watch_addr, watch_tls, 9_999_999, Duration::from_secs(2)).await {
+        Ok(d) if d < Duration::from_secs(1) => {
+            extra_checks.push(CheckResult::pass_with_detail("WatchDialPrompt", format!("dial acked in {d:?}")));
+        }
+        Ok(d) => {
+            extra_checks.push(CheckResult::fail("WatchDialPrompt", format!("dial took {d:?} (>1s)")));
+        }
+        Err(e) => {
+            extra_checks.push(CheckResult::fail("WatchDialPrompt", e));
+        }
+    }
+
+    // Happy cluster: no elections/panics/restarts expected. The connection storm
+    // can induce a few transient write timeouts, so allow a small bench-error
+    // budget; the throughput floor is the real "didn't fall over" guard.
+    let expectations = ScenarioExpectations { max_bench_errors: 200, ..Default::default() };
+
+    tear_down_and_evaluate_with_audit(
+        SCEN,
+        cfg,
+        up,
+        bench_result,
+        bench_window_start_ms,
+        bench_window_end_ms,
+        expectations,
+        params,
+        extra_checks,
+        None,
+        None,
+        None,
+        run_dir,
+    )
+    .await
+}
+
+/// One-shot scrape of the watch-subscriber gauge from a node's metrics endpoint.
+/// Reuses `parse_metrics` so the summing semantics match the scraper.
+async fn scrape_watch_subscribers(metrics_url: &str, host: &str) -> Result<u64, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .map_err(|e| format!("reqwest build: {e}"))?;
+    let body = client
+        .get(metrics_url)
+        .send()
+        .await
+        .map_err(|e| format!("get {metrics_url}: {e}"))?
+        .text()
+        .await
+        .map_err(|e| format!("body: {e}"))?;
+    Ok(crate::sample::parse_metrics(host.to_string(), 0, &body).watch_subscribers_active)
 }
 
 /// Idempotency audit on a quiet cluster. Drives the same bench as `baseline`

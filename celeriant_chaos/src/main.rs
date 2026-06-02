@@ -27,6 +27,7 @@ use crate::scenario::{
     run_partition_asymmetric, run_partition_then_kill_minio,
     run_rolling_restart, run_sigstop_leader,
     run_partition_leader_follower_replication, run_partition_leader_minio,
+    run_watch_storm,
 };
 
 #[derive(Parser)]
@@ -121,9 +122,11 @@ async fn main() -> Result<(), String> {
         Some("idempotency_audit_minio_outage") => vec!["idempotency_audit_minio_outage"],
         Some("idempotency_audit_partition_then_kill_minio") => vec!["idempotency_audit_partition_then_kill_minio"],
         Some("idempotency_audit_fast_blackout") => vec!["idempotency_audit_fast_blackout"],
+        Some("watch_storm") => vec!["watch_storm"],
         Some(other) => return Err(format!("unknown scenario: {other}")),
         None if args.full => vec![
             "baseline",
+            "watch_storm",
             "follower_graceful_stop",
             "follower_sigkill",
             "leader_graceful_stop",
@@ -178,6 +181,7 @@ async fn run_one_iteration(
     for name in scenarios_to_run {
         let report = match *name {
             "baseline" => run_baseline(cfg, params, &dir.root).await?,
+            "watch_storm" => run_watch_storm(cfg, params, &dir.root).await?,
             "follower_graceful_stop" => run_follower_graceful_stop(cfg, params, &dir.root).await?,
             "follower_sigkill" => run_follower_sigkill(cfg, params, &dir.root).await?,
             "leader_graceful_stop" => run_leader_graceful_stop(cfg, params, &dir.root).await?,

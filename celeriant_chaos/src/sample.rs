@@ -37,6 +37,11 @@ pub struct NodeSample {
     /// Used to distinguish "listener never saw a TCP connection" from
     /// "listener saw it and rejected it" during post-promotion debugging.
     pub client_connections_active: u64,
+    /// Sum of `celeriant_watch_subscribers_active` across all shards. The watch
+    /// chaos scenario watches this drain to ~0 after the flood — a leaked watch
+    /// session (the CLOSE-WAIT bug) shows up as a gauge that stays elevated.
+    #[serde(default)]
+    pub watch_subscribers_active: u64,
     /// Items popped from `pending_replication_batches` but dropped on the
     /// floor because the rollback flag was set after the pop. Smoking gun
     /// for the orphan-snapshot missing-data hypothesis
@@ -112,6 +117,7 @@ impl NodeSample {
             shard_panics_total: 0,
             node_starts_total: 0,
             client_connections_active: 0,
+            watch_subscribers_active: 0,
             capture_dropped_items_total: 0,
             capture_dropped_bytes_total: 0,
             writes_accepted_no_prior_client_seq_total: 0,
@@ -150,6 +156,7 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
     let mut wal_seq_max: u64 = 0;
     let mut wal_seq_by_shard: BTreeMap<u32, u64> = BTreeMap::new();
     let mut client_connections_active: u64 = 0;
+    let mut watch_subscribers_active: u64 = 0;
 
     const COUNTERS: &[&str] = &[
         "celeriant_writes_total",
@@ -226,6 +233,12 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
             }
             continue;
         }
+        if name == "celeriant_watch_subscribers_active" {
+            if let Ok(v) = value_str.parse::<f64>() {
+                watch_subscribers_active = watch_subscribers_active.saturating_add(v as u64);
+            }
+            continue;
+        }
         if let Some(&counter) = COUNTERS.iter().find(|c| **c == name)
             && let Ok(v) = value_str.parse::<f64>()
         {
@@ -253,6 +266,7 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         shard_panics_total: get("celeriant_shard_panics_total"),
         node_starts_total: get("celeriant_node_starts_total"),
         client_connections_active,
+        watch_subscribers_active,
         capture_dropped_items_total: get("celeriant_replication_capture_dropped_items_total"),
         capture_dropped_bytes_total: get("celeriant_replication_capture_dropped_bytes_total"),
         writes_accepted_no_prior_client_seq_total: get("celeriant_writes_accepted_no_prior_client_seq_total"),
