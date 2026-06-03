@@ -582,7 +582,7 @@ async fn build_compacted_file(
                     MetablockKind::SoftDelete(sd) => bloom.insert(&sd.aggregate_key),
                     MetablockKind::SoftTrim(st) => bloom.insert(&st.aggregate_key),
                     MetablockKind::SchemaRegistration(sr) => {
-                        bloom.insert_hash(&sr.schema_key.hash_bytes())
+                        bloom.insert_hash(sr.schema_key.bloom_hash())
                     }
                 }
 

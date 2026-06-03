@@ -93,6 +93,34 @@ mod tests {
     }
 
     #[test]
+    fn watchers_cap_rejects_past_limit_and_frees_on_remove() {
+        glommio_test!({
+            let watchers = AggregateWatchers::new();
+            const MAX: usize = 3;
+
+            // Fill to capacity.
+            let mut ids = Vec::new();
+            for _ in 0..MAX {
+                let (id, _) = watchers
+                    .add_subscriber_capped(watch_request(), MAX)
+                    .expect("under cap should be accepted");
+                ids.push(id);
+            }
+            assert_eq!(watchers.subscriber_count(), MAX);
+
+            // One past the cap is rejected — and does NOT allocate a subscriber.
+            assert!(watchers.add_subscriber_capped(watch_request(), MAX).is_none());
+            assert_eq!(watchers.subscriber_count(), MAX);
+
+            // Freeing a slot lets a new subscriber back in.
+            watchers.remove_subscriber(ids[0]);
+            assert_eq!(watchers.subscriber_count(), MAX - 1);
+            assert!(watchers.add_subscriber_capped(watch_request(), MAX).is_some());
+            assert_eq!(watchers.subscriber_count(), MAX);
+        })
+    }
+
+    #[test]
     fn watchers_remove_nonexistent_subscriber_does_not_panic() {
         glommio_test!({
             let watchers = AggregateWatchers::new();

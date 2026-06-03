@@ -447,7 +447,7 @@ pub(crate) async fn sync(
                 log_segment_file_metadata.write.aggregate_key_bloom.insert(&event_batch.aggregate_key);
             }
             MetablockKind::SchemaRegistration(schema_reg) => {
-                log_segment_file_metadata.write.aggregate_key_bloom.insert_hash(&schema_reg.schema_key.hash_bytes());
+                log_segment_file_metadata.write.aggregate_key_bloom.insert_hash(schema_reg.schema_key.bloom_hash());
             }
             MetablockKind::SoftDelete(soft_delete) => {
                 log_segment_file_metadata.write.aggregate_key_bloom.insert(&soft_delete.aggregate_key);

@@ -938,6 +938,10 @@ impl<V: Validate> ShardMemCache<V> {
         self.aggregate_write_client_snapshots.clear();
     }
 
+    pub fn clear_aggregate_write_snapshots_for_test(&mut self) {
+        self.aggregate_write_snapshots.clear();
+    }
+
     pub fn aggregate_read_snapshots_len(&self) -> usize {
         self.aggregate_read_snapshots.len()
     }

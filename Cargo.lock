@@ -806,7 +806,6 @@ dependencies = [
  "celeriant_wal",
  "celeriant_wire",
  "criterion",
- "fastbloom",
  "futures-lite",
  "glommio",
  "lru 0.16.2",
@@ -870,7 +869,6 @@ dependencies = [
  "crc32c",
  "criterion",
  "deepsize",
- "fastbloom",
  "futures-lite",
  "glommio",
  "jsonschema",
@@ -883,6 +881,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "uuid",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -908,6 +907,7 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "uuid",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -1497,18 +1497,6 @@ dependencies = [
  "bit-set",
  "regex-automata",
  "regex-syntax",
-]
-
-[[package]]
-name = "fastbloom"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18c1ddb9231d8554c2d6bdf4cfaabf0c59251658c68b6c95cd52dd0c513a912a"
-dependencies = [
- "getrandom 0.3.4",
- "libm",
- "rand 0.9.2",
- "siphasher",
 ]
 
 [[package]]
@@ -5395,6 +5383,12 @@ dependencies = [
  "thiserror 2.0.17",
  "time",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"
 
 [[package]]
 name = "yasna"

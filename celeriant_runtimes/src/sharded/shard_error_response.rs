@@ -57,6 +57,10 @@ pub fn watch_session_error_to_client_response(correlation_id: Option<u128>, erro
             WATCH_LATENCY_TOO_HIGH,
             format!(r#"{{"requested_ms":{},"max_ms":{}}}"#, latency_ms, max_latency_ms),
         ),
+        WatchSessionError::TooManySubscribers { active, max } => (
+            WATCH_TOO_MANY_SUBSCRIBERS,
+            format!(r#"{{"active_subscribers":{},"max_subscribers":{}}}"#, active, max),
+        ),
     };
     ClientResponse::GenericError(ErrorResponse { correlation_id, error_code, error_message })
 }

@@ -1550,11 +1550,22 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         let last_known_metablock = self.shard_mem_cache.borrow_mut().get_aggregate_last_metablock_pos(aggregate_key, CachePath::Write);
 
-        // Begin the search from the last_known_metablock, moving backwards
+        // Guard against cache miss, aggregate can still have blocks present
+        // No cache means we need to do the full reverse scan
+        let (start_log_id, start_from_position) = if last_known_metablock.log_id == 0 {
+            (self.log_segments_cache.active_log_id(), None)
+        } else {
+            (
+                last_known_metablock.log_id,
+                Some(last_known_metablock.metablock_absolute_pos.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64)), //Include SELF
+            )
+        };
+
+        // Begin the search from the chosen start, moving backwards
         let mut scanner = ReverseMetablockScanner::new(
             &self.log_segments_cache,
-            last_known_metablock.log_id,
-            Some(last_known_metablock.metablock_absolute_pos.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64)), //Include SELF
+            start_log_id,
+            start_from_position,
             self.config.read_max_chunk_size,
         )
         .with_bloom_filter(aggregate_key)
@@ -1663,7 +1674,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             None,
             self.config.read_max_chunk_size,
         )
-        .with_bloom_filter_hash(schema_key.hash_bytes());
+        .with_bloom_filter_hash(schema_key.bloom_hash());
 
         let found_metablock = scanner
             .scan::<(u64, Metablock), ()>(|log_id, _metablock_absolute_pos, metablock_bytes| {
@@ -4583,6 +4594,152 @@ mod tests {
                 "dedup scan must reach write cursor: a reload returning {cached:?} \
                  would let a retry with client_seq <=5 be accepted as fresh, producing \
                  a same-client_seq-with-different-aggregate_version duplicate on disk"
+            );
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn client_dedup_scan_with_absent_aggregate_snapshot_finds_stored_seq() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+            let client_id = 7u128;
+
+            for n in 1u64..=5 {
+                let evt = DatablockAggregateEvent {
+                    client_seq: n,
+                    event_type_major: 1,
+                    event_value: Arc::new(vec![n as u8]),
+                    ..Default::default()
+                };
+                let req = write_req_full(agg.clone(), vec![evt], true, None, client_id, true);
+                write_ok(&shard, req).await;
+            }
+
+            assert_eq!(
+                shard.shard_mem_cache.borrow_mut().get_client_seq(&agg, client_id),
+                Some(5),
+                "precondition: dedup cache should hold client_seq=5 after 5 writes"
+            );
+
+            // Force the absent-aggregate-snapshot state: drop BOTH the aggregate
+            // write snapshot (so the scan's start position defaults to log_id 0)
+            // and the client mapping (so the dedup scan actually runs). The on-disk
+            // WAL still holds all 5 writes.
+            {
+                let mut mc = shard.shard_mem_cache.borrow_mut();
+                mc.clear_aggregate_write_snapshots_for_test();
+                mc.clear_aggregate_write_client_snapshots_for_test();
+            }
+            assert_eq!(
+                shard.shard_mem_cache.borrow_mut().get_client_seq(&agg, client_id),
+                None,
+                "precondition: client snapshot must be empty so the dedup scan runs"
+            );
+
+            let client_key = AggregateClientKey::new(agg.clone(), client_id);
+            shard.cache_aggregate_client(&agg, &client_key)
+                .await
+                .expect("dedup scan should succeed");
+
+            let cached = shard.shard_mem_cache.borrow_mut().get_client_seq(&agg, client_id);
+            assert_eq!(
+                cached, Some(5),
+                "dedup scan with an absent aggregate snapshot must still find client_seq=5 \
+                 on disk; reading back {cached:?} (sentinel 0 -> None) would accept a replay \
+                 with client_seq <=5 as fresh — an exactly-once violation"
+            );
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn client_dedup_scan_absent_snapshot_finds_multiple_clients() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+            let client_a = 7u128;
+            let client_b = 9u128;
+
+            for n in 1u64..=5 {
+                let evt = DatablockAggregateEvent {
+                    client_seq: n,
+                    event_type_major: 1,
+                    event_value: Arc::new(vec![n as u8]),
+                    ..Default::default()
+                };
+                write_ok(&shard, write_req_full(agg.clone(), vec![evt], true, None, client_a, true)).await;
+            }
+            for n in 1u64..=3 {
+                let evt = DatablockAggregateEvent {
+                    client_seq: n,
+                    event_type_major: 1,
+                    event_value: Arc::new(vec![n as u8]),
+                    ..Default::default()
+                };
+                write_ok(&shard, write_req_full(agg.clone(), vec![evt], false, None, client_b, true)).await;
+            }
+
+            // Drop the aggregate write snapshot AND both client mappings.
+            {
+                let mut mc = shard.shard_mem_cache.borrow_mut();
+                mc.clear_aggregate_write_snapshots_for_test();
+                mc.clear_aggregate_write_client_snapshots_for_test();
+            }
+
+            // Scanning for client_a must find seq 5 and eager-cache client_b's seq 3.
+            let key_a = AggregateClientKey::new(agg.clone(), client_a);
+            shard.cache_aggregate_client(&agg, &key_a).await.expect("dedup scan should succeed");
+
+            assert_eq!(
+                shard.shard_mem_cache.borrow_mut().get_client_seq(&agg, client_a),
+                Some(5),
+                "target client seq must be found with the aggregate snapshot absent"
+            );
+            assert_eq!(
+                shard.shard_mem_cache.borrow_mut().get_client_seq(&agg, client_b),
+                Some(3),
+                "co-resident client's seq must be eager-cached during the same scan"
+            );
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn client_dedup_scan_absent_snapshot_new_aggregate_is_never_seen() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let written = key(1, 1, 1);
+            let never_written = key(1, 1, 2);
+            let client_id = 7u128;
+
+            // Populate the WAL with an unrelated aggregate so the scan has real
+            // segments to (bloom-)traverse rather than an empty log.
+            for n in 1u64..=5 {
+                let evt = DatablockAggregateEvent {
+                    client_seq: n,
+                    event_type_major: 1,
+                    event_value: Arc::new(vec![n as u8]),
+                    ..Default::default()
+                };
+                write_ok(&shard, write_req_full(written.clone(), vec![evt], true, None, client_id, true)).await;
+            }
+            shard.shard_mem_cache.borrow_mut().clear_aggregate_write_snapshots_for_test();
+
+            let key_new = AggregateClientKey::new(never_written.clone(), client_id);
+            shard.cache_aggregate_client(&never_written, &key_new).await.expect("dedup scan should succeed");
+
+            assert_eq!(
+                shard.shard_mem_cache.borrow_mut().get_client_seq(&never_written, client_id),
+                None,
+                "a never-written aggregate must remain never-seen so its first write is accepted"
             );
 
             shard.close().await;

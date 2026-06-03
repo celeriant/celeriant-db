@@ -7,8 +7,9 @@
 //! wall-clock time, `lease.bin` is stale.
 //!
 //! A restarting follower reads the stale lease and CAS-bumps the epoch — split brain.
-//! `decide_post_catchup_action` would catch this (BootWaitThenReevaluate path) but it
-//! is currently dead code: not called from shard.rs. See docs/pending-commit-review.md.
+//! `decide_post_catchup_action` (BootWaitThenReevaluate path) guards against this and is
+//! now wired in (called from shard.rs and connection_handler.rs). An earlier review note
+//! flagged it as unreachable dead code; that is no longer accurate.
 //!
 //! Sequence:
 //!   Phase 1: Start cs1 (leader) + cs2 (follower). Warmup writes. Cluster

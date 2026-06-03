@@ -30,7 +30,7 @@ celeriant_rotating_log = { path = "../celeriant_rotating_log" }
 celeriant_client_glommio = { path = "../celeriant_client_glommio" }
 glommio.workspace = true
 futures-lite.workspace = true
-fastbloom.workspace = true
+xxhash-rust.workspace = true
 crc32c.workspace = true
 deepsize.workspace = true
 bytes.workspace = true

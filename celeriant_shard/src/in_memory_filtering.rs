@@ -1,6 +1,6 @@
 use celeriant_msg::request::read_filters::ReadFilters;
-use celeriant_wal::{constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED}, datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch, metablocks::{metablock::Metablock, metablock_event_batch::EventTypesKind, metablock_kind::MetablockKind}};
-use fastbloom::BloomFilter;
+use celeriant_wal::{datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch, metablocks::{metablock::Metablock, metablock_event_batch::EventTypesKind, metablock_kind::MetablockKind}};
+use crate::bloom::bloom_filter_cache::event_type_hash;
 
 pub fn apply_event_filters(event_batch: &mut DatablockAggregateEventBatch, read_filters: &ReadFilters) {
     // Final event type filtering (bloom filter might have false positives)
@@ -180,19 +180,14 @@ fn check_event_types_match(event_types_data: &EventTypesKind, include_event_type
             }
         }
         EventTypesKind::Bloom(bloom_bytes) => {
-            // Create bloom filter and test each required type
-            let bloom = bloom_filter_from_bytes(bloom_bytes);
+            // Query the owned split-block bloom directly (no reconstruction).
             include_event_types
                 .iter()
-                .any(|&include_event_type| bloom.contains(&include_event_type.to_le_bytes()))
+                .any(|&include_event_type| {
+                    celeriant_wal::sbbf::contains(bloom_bytes, event_type_hash(include_event_type))
+                })
         }
     }
-}
-
-fn bloom_filter_from_bytes(bloom_bytes: &[u64; BLOOM_BYTES / 8]) -> BloomFilter {
-    BloomFilter::from_vec(bloom_bytes.to_vec())
-        .seed(&BLOOM_HASH_SEED)
-        .hashes(BLOOM_HASH_COUNT)
 }
 
 pub fn trim_end_if_exceeds_max_bytes(
@@ -254,6 +249,7 @@ pub fn trim_end_if_exceeds_max_bytes(
 
 #[cfg(test)]
 mod tests {
+    use celeriant_wal::constants::BLOOM_BYTES;
     use celeriant_wal::{aggregate_key::AggregateKey, constants::GENESIS_HASH, datablocks::datablock_aggregate_event::DatablockAggregateEvent, metablocks::{datablock_block_ref::DatablockBlockRef, datablock_storage_kind::DatablockStorageKind, metablock::Metablock, metablock_event_batch::MetablockEventBatch}};
 
     use super::*;
@@ -317,15 +313,10 @@ mod tests {
         uncompressed_size: u64,
         types_to_insert: &[u64],
     ) -> Metablock {
-        let mut bloom = BloomFilter::from_vec(vec![0u64; BLOOM_BYTES / 8])
-            .seed(&BLOOM_HASH_SEED)
-            .hashes(BLOOM_HASH_COUNT);
-
-        for t in types_to_insert {
-            bloom.insert(&t.to_le_bytes());
+        let mut bloom_bytes = [0u64; BLOOM_BYTES / 8];
+        for &t in types_to_insert {
+            celeriant_wal::sbbf::insert(&mut bloom_bytes, event_type_hash(t));
         }
-
-        let bloom_bytes: [u64; BLOOM_BYTES / 8] = bloom.as_slice().try_into().unwrap();
 
         Metablock {
             wal_seq: 0,

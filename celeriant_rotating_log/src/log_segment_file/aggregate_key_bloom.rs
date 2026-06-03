@@ -1,14 +1,13 @@
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::constants::{AGGREGATE_BLOOM_BYTES, AGGREGATE_BLOOM_HASH_COUNT, AGGREGATE_BLOOM_HASH_SEED};
-use fastbloom::BloomFilter;
+use celeriant_wal::constants::AGGREGATE_BLOOM_BYTES;
+use celeriant_wal::sbbf;
 
-/// Bloom filter cache for aggregate keys in log segment headers.
-///
-/// Uses the pre-computed hash from AggregateKey for efficient insertion/lookup.
-/// This struct is not thread-safe - designed for single-threaded shard access.
+const WORDS: usize = AGGREGATE_BLOOM_BYTES / 8;
+
+/// Persisted bloom of aggregate (and schema) keys in log segment headers.
 #[derive(Clone)]
 pub struct AggregateKeyBloom {
-    bloom_filter: BloomFilter,
+    words: Vec<u64>,
 }
 
 impl Default for AggregateKeyBloom {
@@ -18,41 +17,33 @@ impl Default for AggregateKeyBloom {
 }
 
 impl AggregateKeyBloom {
-    /// Create a new aggregate key bloom filter with standard parameters.
+    /// Create a new, empty aggregate key bloom.
     #[must_use]
     pub fn new() -> Self {
-        let bloom_filter = BloomFilter::with_num_bits(AGGREGATE_BLOOM_BYTES * 8)
-            .seed(&AGGREGATE_BLOOM_HASH_SEED)
-            .hashes(AGGREGATE_BLOOM_HASH_COUNT);
-        
-        Self { bloom_filter }
+        Self { words: vec![0u64; WORDS] }
     }
 
     /// Create from existing bloom bytes (e.g., loaded from disk).
     #[must_use]
     pub fn from_bytes(bytes: &[u64]) -> Self {
-        let bloom_filter = BloomFilter::from_vec(bytes.to_vec())
-            .seed(&AGGREGATE_BLOOM_HASH_SEED)
-            .hashes(AGGREGATE_BLOOM_HASH_COUNT);
-
-        Self { bloom_filter }
+        debug_assert_eq!(bytes.len(), WORDS, "persisted aggregate bloom is the wrong size");
+        Self { words: bytes.to_vec() }
     }
 
     /// Clear the bloom filter for reuse.
     pub fn clear(&mut self) {
-        self.bloom_filter.clear();
+        self.words.iter_mut().for_each(|w| *w = 0);
     }
 
     /// Insert an aggregate key into the bloom filter.
     pub fn insert(&mut self, aggregate_key: &AggregateKey) {
-        // Use the pre-computed hash from AggregateKey
-        self.bloom_filter.insert(&aggregate_key.hash_bytes());
+        sbbf::insert(&mut self.words, aggregate_key.bloom_hash());
     }
 
     /// Insert multiple aggregate keys.
     pub fn insert_all(&mut self, aggregate_keys: &[AggregateKey]) {
         for key in aggregate_keys {
-            self.bloom_filter.insert(&key.hash_bytes());
+            sbbf::insert(&mut self.words, key.bloom_hash());
         }
     }
 
@@ -60,26 +51,24 @@ impl AggregateKeyBloom {
     /// Returns `false` if definitely not in set, `true` if possibly in set.
     #[must_use]
     pub fn may_contain(&self, aggregate_key: &AggregateKey) -> bool {
-        self.bloom_filter.contains(&aggregate_key.hash_bytes())
+        sbbf::contains(&self.words, aggregate_key.bloom_hash())
     }
 
-    /// Insert a hash directly into the bloom filter.
-    /// Used for non-AggregateKey types (e.g., SchemaKey) that have pre-computed hashes.
-    pub fn insert_hash(&mut self, hash_bytes: &[u8; 8]) {
-        self.bloom_filter.insert(hash_bytes);
+    /// Insert a precomputed key hash directly (e.g. `SchemaKey::bloom_hash`).
+    pub fn insert_hash(&mut self, hash: u64) {
+        sbbf::insert(&mut self.words, hash);
     }
 
-    /// Check if a hash might be in the set.
-    /// Returns `false` if definitely not in set, `true` if possibly in set.
+    /// Check if a precomputed key hash might be in the set.
     #[must_use]
-    pub fn may_contain_hash(&self, hash_bytes: &[u8; 8]) -> bool {
-        self.bloom_filter.contains(hash_bytes)
+    pub fn may_contain_hash(&self, hash: u64) -> bool {
+        sbbf::contains(&self.words, hash)
     }
 
     /// Export the bloom filter as bytes for storage in header.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u64> {
-        self.bloom_filter.iter().collect()
+        self.words.clone()
     }
 }
 
@@ -136,9 +125,9 @@ mod tests {
     // every false positive turns a "skip" into a full region scan of that
     // segment.
     //
-    // These tests pin the real filter's behaviour (256KB, 10 hashes — see
-    // AGGREGATE_BLOOM_BYTES / AGGREGATE_BLOOM_HASH_COUNT), not the 128-byte
-    // per-batch event-type bloom that some older analysis conflated it with.
+    // These tests pin the real filter's behaviour (256KB split-block bloom — see
+    // AGGREGATE_BLOOM_BYTES), not the 32-byte per-batch event-type bloom that
+    // some older analysis conflated it with.
 
     /// Measure the FP rate by inserting `inserted` keys and probing a disjoint
     /// set of `probes` absent keys. Insert/probe key spaces never overlap.

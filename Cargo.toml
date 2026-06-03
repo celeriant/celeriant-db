@@ -52,7 +52,7 @@ tokio-util = { version = "0.7.17", features = ["compat"]}
 futures-util = { version = "0.3.31", features = ["io"] }
 glommio = { git = "https://github.com/utilitydelta/glommio", branch = "tcp-into-raw-fd-accepted-stream" }
 tempfile = "3.23.0"
-fastbloom = "0.14.0"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 uuid = { version = "1.18.1", features = ["v4"] }
 lru = "0.16.2"
 num_cpus = "1.17.0"

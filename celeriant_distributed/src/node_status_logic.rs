@@ -6,49 +6,6 @@ pub fn compute_new_ttl(current_expiry_ms: u64, leader_timestamp_ms: u64, heartbe
     current_expiry_ms.max(leader_timestamp_ms + heartbeat_lease_duration_ms)
 }
 
-/// Outcome of a clock-drift fence check (invariants.md:60 + Phase 30k staleness guard).
-#[derive(Debug, PartialEq, Eq)]
-pub enum ClockDriftOutcome {
-    /// Drift is within bounds.
-    Ok,
-    /// Heartbeat is older than `heartbeat_interval_ms * 2`: likely delivered after a process
-    /// pause (SIGSTOP/SIGCONT) rather than genuine clock skew. Skip the drift fence; caller
-    /// should log WARN and wait for a fresh heartbeat.
-    StaleSkipped { gap_ms: u64 },
-    /// Genuine clock drift detected: `|local_now_ms - leader_timestamp_ms| > max_clock_drift_ms`.
-    Drift { drift_ms: u64 },
-}
-
-/// Staleness-aware clock-drift check. Primarily to handle heartbeat timeouts, which are not
-/// to be recognised as clock drift.
-///
-/// When `local_now_ms - leader_timestamp_ms > heartbeat_interval_ms * 2`, the gap is too large
-/// to be explained by network RTT alone — the heartbeat is stale (e.g. queued during a process
-/// pause). In that case we skip the drift fence and return `StaleSkipped` so the caller can log
-/// and discard. A fresh heartbeat will arrive within one TTL and produce an authoritative check.
-///
-/// Only the forward direction (local > leader) can indicate process-pause staleness; if the
-/// leader's timestamp is in the future relative to local, that's real drift.
-pub fn evaluate_clock_drift(
-    local_now_ms: u64,
-    leader_timestamp_ms: u64,
-    max_clock_drift_ms: u64,
-    heartbeat_interval_ms: u64,
-) -> ClockDriftOutcome {
-    if local_now_ms > leader_timestamp_ms {
-        let gap = local_now_ms - leader_timestamp_ms;
-        if gap > heartbeat_interval_ms * 2 {
-            return ClockDriftOutcome::StaleSkipped { gap_ms: gap };
-        }
-    }
-    let drift = local_now_ms.abs_diff(leader_timestamp_ms);
-    if drift > max_clock_drift_ms {
-        ClockDriftOutcome::Drift { drift_ms: drift }
-    } else {
-        ClockDriftOutcome::Ok
-    }
-}
-
 /// Outcome of a kick request, computed purely from current node status.
 #[derive(Debug, PartialEq, Eq)]
 pub enum KickOutcome {
@@ -130,48 +87,6 @@ mod tests {
     fn compute_new_ttl_with_zero_lease_duration() {
         // leader_ts ahead of current_expiry with lease_dur=0 still applies max
         assert_eq!(compute_new_ttl(100, 200, 0), 200);
-    }
-
-    #[test]
-    fn evaluate_clock_drift_within_bounds_is_ok() {
-        // gap within max_clock_drift_ms is Ok — no skip, no fence.
-        let cases: &[(u64, u64, u64)] = &[
-            (1000, 1000, 50),  // same time
-            (1000, 1049, 50),  // local-ahead drift=49
-            (1049, 1000, 50),  // leader-behind drift=49
-        ];
-        for &(local_now, leader_ts, max_drift) in cases {
-            let outcome = evaluate_clock_drift(local_now, leader_ts, max_drift, 1_500);
-            assert_eq!(outcome, ClockDriftOutcome::Ok, "local={local_now} leader={leader_ts} max={max_drift}");
-        }
-    }
-
-    #[test]
-    fn evaluate_clock_drift_fences_real_drift() {
-        // a leader whose clock is meaningfully ahead of the follower's is real drift and must fence.
-        let local_now: u64 = 1_000_000;
-        let leader_ts = local_now + 600; // leader 600ms ahead, max_drift=500
-        let outcome = evaluate_clock_drift(local_now, leader_ts, 500, 1_500);
-        assert_eq!(outcome, ClockDriftOutcome::Drift { drift_ms: 600 });
-    }
-
-    #[test]
-    fn evaluate_clock_drift_skips_stale_heartbeat() {
-        // a heartbeat queued during a process pause (SIGSTOP/SIGCONT) has a gap greater than
-        // heartbeat interval. This is not clock drift.
-        let leader_ts: u64 = 1_000_000;
-        let local_now = leader_ts + 5_000; // 5s after leader sent it; threshold = 2 * 1500 = 3000ms
-        let outcome = evaluate_clock_drift(local_now, leader_ts, 500, 1_500);
-        assert_eq!(outcome, ClockDriftOutcome::StaleSkipped { gap_ms: 5_000 });
-    }
-
-    #[test]
-    fn evaluate_clock_drift_skips_stale_heartbeat_2() {
-        // large gap but the other direction (not timeout over network or sigstop)
-        let leader_ts: u64 = 1_000_000;
-        let local_now = leader_ts - 5_000; // 5s after leader sent it; threshold = 2 * 1500 = 3000ms
-        let outcome = evaluate_clock_drift(local_now, leader_ts, 500, 1_500);
-        assert_eq!(outcome, ClockDriftOutcome::Drift { drift_ms: 5_000 });
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
 use tracing::{debug, warn};
@@ -100,7 +100,12 @@ impl SidecarStore {
     fn build_s3_client(config: S3Config) -> Result<S3Client, StoreError> {
         let mut builder = AmazonS3Builder::new()
             .with_bucket_name(&config.bucket)
-            .with_region(&config.region);
+            .with_region(&config.region)
+            // Pin the conditional-put mode used by leader-election CAS. This is the
+            // object_store 0.13 default, but pinning it means a future crate
+            // default-flip can't silently degrade CAS into last-writer-wins (split
+            // brain). ETagMatch enforces If-Match / If-None-Match preconditions.
+            .with_conditional_put(S3ConditionalPut::ETagMatch);
 
         if let Some(access_key) = &config.access_key_id {
             builder = builder.with_access_key_id(access_key);

@@ -1,7 +1,5 @@
+/// Per-batch event-type bloom size: one 32-byte split-block (see `celeriant_wal::sbbf`).
 pub const BLOOM_BYTES: usize = 32;
-pub const BLOOM_HASH_COUNT: u32 = 4;
-pub const BLOOM_HASH_SEED: u128 = 123456789012345678901234567890123456u128;
-pub const BLOOM_BITS: usize = BLOOM_BYTES * 8;
 #[cfg(not(feature = "small-metablock"))]
 pub const FIXED_BLOCK_SIZE_BYTES: usize = 1024;
 #[cfg(feature = "small-metablock")]
@@ -20,9 +18,9 @@ pub const WIRE_VERSION_S3_FALLBACK_BATCH: u32 = 1;
 pub const WIRE_VERSION_SEGMENT_SUMMARY_BLOCK: u32 = 1;
 pub const WIRE_SIZE_ENUM_DISCRIMINANT: usize = 4;
 pub const FIRST_AGGREGATE_VERSION: u64 = 1;
-pub const AGGREGATE_BLOOM_BYTES: usize = 256 * 1024; // 2^18 (256KB) gives <1% chance for 200k entries per shard log segment
-pub const AGGREGATE_BLOOM_HASH_COUNT: u32 = 10;
-pub const AGGREGATE_BLOOM_HASH_SEED: u128 = 987654321098765432109876543210987u128;
+/// Per-segment aggregate-key bloom size (256KB split-block; see `celeriant_wal::sbbf`).
+/// ~10.5 bits/key at the 200k design capacity <1% false-positive rate.
+pub const AGGREGATE_BLOOM_BYTES: usize = 256 * 1024;
 pub type EntryHashBytes = [u8; 32];
 pub const GENESIS_HASH: EntryHashBytes = [0u8; 32];
 pub const STRUCT_TO_MEMORY_REAL_SIZE: usize = 3;

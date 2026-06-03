@@ -73,20 +73,20 @@ impl SchemaKey {
         }
     }
 
-    /// Returns the pre-computed hash as bytes for bloom filter insertion.
+    /// Stable hash used as the persisted bloom-filter key. xxh3-64 is a frozen
+    /// spec (cross-version AND cross-arch deterministic), unlike `DefaultHasher`.
     #[inline]
-    pub fn hash_bytes(&self) -> [u8; 8] {
-        self.hash.to_le_bytes()
+    pub fn bloom_hash(&self) -> u64 {
+        self.hash
     }
 
     fn compute_hash(org_id: u128, aggregate_type_id: u128, event_type_major: u64, event_type_minor: u64) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        let mut hasher = DefaultHasher::new();
-        org_id.hash(&mut hasher);
-        aggregate_type_id.hash(&mut hasher);
-        event_type_major.hash(&mut hasher);
-        event_type_minor.hash(&mut hasher);
-        hasher.finish()
+        let mut buf = [0u8; 48];
+        buf[0..16].copy_from_slice(&org_id.to_le_bytes());
+        buf[16..32].copy_from_slice(&aggregate_type_id.to_le_bytes());
+        buf[32..40].copy_from_slice(&event_type_major.to_le_bytes());
+        buf[40..48].copy_from_slice(&event_type_minor.to_le_bytes());
+        xxhash_rust::xxh3::xxh3_64(&buf)
     }
 }
 
@@ -170,7 +170,7 @@ mod tests {
             assert_eq!(encoded.len(), SchemaKey::WIRE_SIZE_TOTAL);
             let (decoded, _): (SchemaKey, _) = bincode::decode_from_slice(&encoded, config).unwrap();
             assert_eq!(decoded, key);
-            assert_eq!(decoded.hash_bytes(), key.hash_bytes());
+            assert_eq!(decoded.bloom_hash(), key.bloom_hash());
         }
     }
 
@@ -201,10 +201,19 @@ mod tests {
     }
 
     #[test]
-    fn hash_bytes_deterministic_for_same_fields() {
+    fn bloom_hash_deterministic_for_same_fields() {
         let a = SchemaKey::new(100, 200, 300, 400);
         let b = SchemaKey::new(100, 200, 300, 400);
-        assert_eq!(a.hash_bytes(), b.hash_bytes());
-        assert_ne!(a.hash_bytes(), SchemaKey::new(100, 200, 300, 401).hash_bytes());
+        assert_eq!(a.bloom_hash(), b.bloom_hash());
+        assert_ne!(a.bloom_hash(), SchemaKey::new(100, 200, 300, 401).bloom_hash());
+    }
+
+    /// FROZEN persisted-format pin: the bloom hash is xxh3-64 over a fixed field
+    /// layout and is written to disk, so its exact value must never change
+    /// (across Rust versions, xxhash-crate versions, or CPU arch). If this trips,
+    /// a hash change is about to silently invalidate every persisted bloom.
+    #[test]
+    fn bloom_hash_value_is_pinned() {
+        assert_eq!(SchemaKey::new(1, 2, 3, 4).bloom_hash(), 365921206506951139);
     }
 }

@@ -14,7 +14,7 @@ pub struct ReverseMetablockScanner<'a> {
     start_from_position: Option<u64>,
     /// Optional hash for bloom filter optimization.
     /// When set, log segments where the bloom filter says "definitely not present" are skipped.
-    bloom_filter_hash: Option<[u8; 8]>,
+    bloom_filter_hash: Option<u64>,
     /// When true, scan up to the write cursor (uncommitted region included)
     use_write_cursor: bool,
 }
@@ -35,15 +35,15 @@ impl<'a> ReverseMetablockScanner<'a> {
     /// Log segments where the bloom filter says "definitely not present" will be skipped entirely.
     #[must_use]
     pub fn with_bloom_filter(mut self, aggregate_key: &AggregateKey) -> Self {
-        self.bloom_filter_hash = Some(aggregate_key.hash_bytes());
+        self.bloom_filter_hash = Some(aggregate_key.bloom_hash());
         self
     }
 
     /// Enable bloom filter optimization using a pre-computed hash.
     /// Log segments where the bloom filter says "definitely not present" will be skipped entirely.
     #[must_use]
-    pub fn with_bloom_filter_hash(mut self, hash_bytes: [u8; 8]) -> Self {
-        self.bloom_filter_hash = Some(hash_bytes);
+    pub fn with_bloom_filter_hash(mut self, hash: u64) -> Self {
+        self.bloom_filter_hash = Some(hash);
         self
     }
 
@@ -106,7 +106,7 @@ impl<'a> ReverseMetablockScanner<'a> {
             };
 
             // Check bloom filter - skip entire log segment if key definitely not present
-            if let Some(hash) = &self.bloom_filter_hash {
+            if let Some(hash) = self.bloom_filter_hash {
                 if !bloom.may_contain_hash(hash) {
                     metrics::counter!("celeriant_read_bloom_short_circuit_total").increment(1);
                     tracing::trace!(log_id, "Bloom filter skip");

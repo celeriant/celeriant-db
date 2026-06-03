@@ -19,9 +19,30 @@ impl AggregateWatchers {
         }
     }
 
+    /// Current number of active subscribers on this shard.
+    pub fn subscriber_count(&self) -> usize {
+        self.watcher_handles.borrow().len()
+    }
+
+    /// Like [`add_subscriber`] but refuses once the shard already holds
+    /// `max_subscribers`. Each subscription eagerly reserves a ~0.8 MB event
+    /// ring that is off the per-shard memory budget, so an uncapped subscriber
+    /// count is an unbounded (and adversarially reachable) memory growth path.
+    /// Returns `None` when at capacity; the caller maps that to a client error.
+    pub fn add_subscriber_capped(
+        &self,
+        request: WatchRequest,
+        max_subscribers: usize,
+    ) -> Option<(u64, Rc<RefCell<SubscribedClient>>)> {
+        if self.watcher_handles.borrow().len() >= max_subscribers {
+            return None;
+        }
+        Some(self.add_subscriber(request))
+    }
+
     /// Creates a unique monotonically increasing ID for a subscriber so it can remove itself
     /// and returns the SubscribedClient for the shard to receive events through the channel
-    pub fn add_subscriber(&self, 
+    pub fn add_subscriber(&self,
         request: WatchRequest,
     ) -> (u64, Rc<RefCell<SubscribedClient>>) {
         let id = self.next_id.get();

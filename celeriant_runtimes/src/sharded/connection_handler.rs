@@ -1392,7 +1392,7 @@ async fn handle_watch<R: ReplicationClient + 'static, D: S3Downloader + 'static,
 ) {
     let correlation_id = watch_request.correlation_id;
 
-    let mut watch_session = match create_watch_session(&ctx.shard_wal, watch_request, ctx.config.max_requested_latency) {
+    let mut watch_session = match create_watch_session(&ctx.shard_wal, watch_request, ctx.config.max_requested_latency, ctx.config.max_watch_subscribers) {
         Ok(session) => session,
         Err(error) => {
             let response = watch_session_error_to_client_response(correlation_id, error);
@@ -1465,6 +1465,7 @@ fn create_watch_session<R: ReplicationClient + 'static, D: S3Downloader + 'stati
     shard_wal: &Rc<ShardWal<R, D>>,
     request: WatchRequest,
     max_requested_latency: Duration,
+    max_watch_subscribers: usize,
 ) -> Result<WatchSession<ShardWal<R, D>>, WatchSessionError> {
     if let Some(latency_ms) = request.requested_latency_ms
         && Duration::from_millis(latency_ms) > max_requested_latency
@@ -1475,7 +1476,19 @@ fn create_watch_session<R: ReplicationClient + 'static, D: S3Downloader + 'stati
         });
     }
 
-    let (watcher_id, subscribed_client) = shard_wal.watched_aggregates.add_subscriber(request);
+    // Bound resident memory: refuse new subscriptions past the per-shard cap.
+    let (watcher_id, subscribed_client) = match shard_wal
+        .watched_aggregates
+        .add_subscriber_capped(request, max_watch_subscribers)
+    {
+        Some(pair) => pair,
+        None => {
+            return Err(WatchSessionError::TooManySubscribers {
+                active: shard_wal.watched_aggregates.subscriber_count(),
+                max: max_watch_subscribers,
+            });
+        }
+    };
     Ok(WatchSession::new(watcher_id, subscribed_client, shard_wal.clone()))
 }
 
@@ -1518,6 +1531,7 @@ mod tests {
             max_response_size: 1024,
             slow_client_timeout: Duration::from_secs(30),
             max_requested_latency: Duration::from_millis(100),
+            max_watch_subscribers: 10_000,
             shard_log_preallocate_bytes: 1024,
             fsync_delay: Duration::from_millis(10),
             recent_write_cache_bytes: 1024,

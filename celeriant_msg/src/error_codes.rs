@@ -89,6 +89,7 @@ pub const WATCH_LATENCY_TOO_HIGH: u32 = 8001;
 pub const WATCH_READ_IO: u32 = 8002;
 pub const WATCH_READ_SERIALIZATION: u32 = 8003;
 pub const WATCH_READ_OTHER: u32 = 8004;
+pub const WATCH_TOO_MANY_SUBSCRIBERS: u32 = 8005;
 
 // --- Shard routing errors: 9xxx ---
 pub const SHARD_ROUTING_NO_KEY: u32 = 9000;

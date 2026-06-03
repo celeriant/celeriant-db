@@ -67,19 +67,21 @@ impl AggregateKey {
         }
     }
 
-    /// Returns the pre-computed hash as bytes for bloom filter insertion.
+    /// Stable hash used as the persisted bloom-filter key. xxh3-64 is a frozen
+    /// spec (cross-version AND cross-arch deterministic), unlike `DefaultHasher`
+    /// whose output std does not guarantee stable; critical because the bloom
+    /// bits are written to disk and trusted on read.
     #[inline]
-    pub fn hash_bytes(&self) -> [u8; 8] {
-        self.hash.to_le_bytes()
+    pub fn bloom_hash(&self) -> u64 {
+        self.hash
     }
 
     fn compute_hash(org_id: u128, aggregate_type_id: u128, aggregate_id: u128) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        let mut hasher = DefaultHasher::new();
-        org_id.hash(&mut hasher);
-        aggregate_type_id.hash(&mut hasher);
-        aggregate_id.hash(&mut hasher);
-        hasher.finish()
+        let mut buf = [0u8; 48];
+        buf[0..16].copy_from_slice(&org_id.to_le_bytes());
+        buf[16..32].copy_from_slice(&aggregate_type_id.to_le_bytes());
+        buf[32..48].copy_from_slice(&aggregate_id.to_le_bytes());
+        xxhash_rust::xxh3::xxh3_64(&buf)
     }
 }
 
@@ -135,5 +137,25 @@ impl fmt::Debug for AggregateKey {
 impl Default for AggregateKey {
     fn default() -> Self {
         Self::new(0, 0, 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bloom_hash_deterministic_for_same_fields() {
+        assert_eq!(AggregateKey::new(1, 2, 3).bloom_hash(), AggregateKey::new(1, 2, 3).bloom_hash());
+        assert_ne!(AggregateKey::new(1, 2, 3).bloom_hash(), AggregateKey::new(1, 2, 4).bloom_hash());
+    }
+
+    /// FROZEN persisted-format pin: the bloom hash is xxh3-64 over a fixed field
+    /// layout and is written to disk, so its exact value must never change across
+    /// Rust versions, xxhash-crate versions, or CPU arch. A trip here means a hash
+    /// change is about to silently invalidate every persisted bloom.
+    #[test]
+    fn bloom_hash_value_is_pinned() {
+        assert_eq!(AggregateKey::new(1, 2, 3).bloom_hash(), 10086399049413766308);
     }
 }

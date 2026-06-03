@@ -86,6 +86,10 @@ pub enum TrimError {
 pub enum WatchError {
     RequestInvalid,
     LatencyTooHigh,
+    TooManySubscribers {
+        active_subscribers: Option<u64>,
+        max_subscribers: Option<u64>,
+    },
     ReadIo,
     ReadSerialization,
     ReadOther,
@@ -218,6 +222,13 @@ impl From<ErrorResponse> for ServerError {
 
             WATCH_REQUEST_INVALID => ServerError::Watch { kind: WatchError::RequestInvalid, error_message: msg },
             WATCH_LATENCY_TOO_HIGH => ServerError::Watch { kind: WatchError::LatencyTooHigh, error_message: msg },
+            WATCH_TOO_MANY_SUBSCRIBERS => ServerError::Watch {
+                kind: WatchError::TooManySubscribers {
+                    active_subscribers: parse_u64_field(&msg, "active_subscribers"),
+                    max_subscribers: parse_u64_field(&msg, "max_subscribers"),
+                },
+                error_message: msg,
+            },
             WATCH_READ_IO => ServerError::Watch { kind: WatchError::ReadIo, error_message: msg },
             WATCH_READ_SERIALIZATION => ServerError::Watch { kind: WatchError::ReadSerialization, error_message: msg },
             WATCH_READ_OTHER => ServerError::Watch { kind: WatchError::ReadOther, error_message: msg },
@@ -320,6 +331,7 @@ impl std::fmt::Display for WatchError {
         match self {
             WatchError::RequestInvalid => write!(f, "watch request invalid"),
             WatchError::LatencyTooHigh => write!(f, "watch latency too high"),
+            WatchError::TooManySubscribers { .. } => write!(f, "watch too many subscribers"),
             WatchError::ReadIo => write!(f, "watch read I/O error"),
             WatchError::ReadSerialization => write!(f, "watch read serialization error"),
             WatchError::ReadOther => write!(f, "watch read error"),

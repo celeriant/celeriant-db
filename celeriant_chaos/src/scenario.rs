@@ -2899,6 +2899,12 @@ pub async fn run_sigstop_leader(
         // SIGSTOP freezes the leader's heartbeat path; same TTL-driven
         // 1500ms recovery budget as graceful-stop and sigkill scenarios.
         max_failover_ms: Some(1500),
+        // This is THE pause/clock-skew dual-ack trigger: a zombie leader resuming
+        // after its lease was taken at a higher epoch. The gauge-tick split-brain
+        // check (max_split_brain_ticks, 2Hz scrape) can miss a brief contested-seq
+        // overlap, so also assert on WAL truth — SSH both nodes post-run and reject
+        // any same-wal_seq / different-tip_hash fork via wal-inspect.
+        assert_no_divergent_tips: true,
         ..ScenarioExpectations::default()
     };
 

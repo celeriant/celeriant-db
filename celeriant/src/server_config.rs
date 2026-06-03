@@ -175,6 +175,14 @@ pub struct ServerConfig {
 
     #[arg(
         long,
+        default_value_t = 16384,
+        env = "CELERIANT_MAX_WATCH_SUBSCRIBERS",
+        help = "Maximum concurrent watch subscriptions per shard. Each reserves a ~0.8MB event ring off the memory budget; bounds an otherwise unbounded growth path."
+    )]
+    pub max_watch_subscribers: usize,
+
+    #[arg(
+        long,
         default_value_t = 2000,
         env = "CELERIANT_LIST_MAX_DURATION_MS",
         help = "Maximum duration to scan the WAL for listings (2000ms)"
@@ -772,6 +780,7 @@ impl ServerConfig {
             recent_write_cache_bytes: memory_budget.recent_write_cache_bytes,
             slow_client_timeout: Duration::from_millis(self.client_connection_timeout_ms),
             max_requested_latency: Duration::from_millis(self.max_requested_latency_ms),
+            max_watch_subscribers: self.max_watch_subscribers,
             fsync_delay: Duration::from_micros(self.fsync_delay_us),
             replication_delay: Duration::from_micros(self.replication_delay_us),
             s3_replication_delay: Duration::from_micros(self.s3_replication_delay_us),
@@ -886,6 +895,7 @@ impl ServerConfig {
         check_field!(internode_max_request_size);
         check_field!(max_response_size);
         check_field!(max_requested_latency_ms);
+        check_field!(max_watch_subscribers);
         check_field!(list_max_duration_ms);
         check_field!(list_page_size);
         check_field!(list_max_concurrent);
@@ -974,6 +984,7 @@ impl Default for ServerConfig {
             internode_max_request_size: 64 * 1024 * 1024,
             max_response_size: 64 * 1024 * 1024,
             max_requested_latency_ms: 2000,
+            max_watch_subscribers: 16384,
             log_level: "info".to_string(),
             s3_enabled: false,
             s3_region: None,

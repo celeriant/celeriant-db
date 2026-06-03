@@ -73,6 +73,7 @@ pub struct ShardConfig {
     pub internode_request_timeout: Duration,
     pub slow_client_timeout: Duration,
     pub max_requested_latency: Duration,
+    pub max_watch_subscribers: usize,
     pub shard_log_preallocate_bytes: u64,
     pub fsync_delay: Duration,
     pub replication_delay: Duration,
