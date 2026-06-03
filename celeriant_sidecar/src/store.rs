@@ -3,7 +3,7 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, RetryConfig, UpdateVersion};
 use tracing::{debug, warn};
 
 use crate::error::StoreError;
@@ -105,7 +105,19 @@ impl SidecarStore {
             // object_store 0.13 default, but pinning it means a future crate
             // default-flip can't silently degrade CAS into last-writer-wins (split
             // brain). ETagMatch enforces If-Match / If-None-Match preconditions.
-            .with_conditional_put(S3ConditionalPut::ETagMatch);
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            // Bound the worst-case duration of a single S3 op. The crate default
+            // (10 retries, 180s retry window) lets a blackholed endpoint stall a
+            // shard's write await for ~3 minutes; replication's HARD_TIMEOUT and
+            // s3_lease_duration both operate on a ~30s scale, so cap the retry
+            // window to match and let the layers above (replication spin loop,
+            // lease orchestrator, catchup) own longer-horizon retries. Per-request
+            // HTTP timeouts stay at the crate defaults (30s request, 5s connect).
+            .with_retry(RetryConfig {
+                max_retries: 3,
+                retry_timeout: std::time::Duration::from_secs(30),
+                ..Default::default()
+            });
 
         if let Some(access_key) = &config.access_key_id {
             builder = builder.with_access_key_id(access_key);
