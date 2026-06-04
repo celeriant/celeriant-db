@@ -138,8 +138,9 @@ const _: () = {
 
     async fn write_events(pool: &CeleriantPool) -> Result<(), Box<dyn std::error::Error>> {
         let key = AggregateKey::new(1, 2, 3);
+        let my_client_id: u128 = 42;
         let events = vec![json_event(1, &order(123))?];
-        pool.write_events(key.clone(), events).await?;
+        pool.write_events(key.clone(), events, my_client_id).await?;
         Ok(())
     }
 
@@ -154,8 +155,8 @@ const _: () = {
         pool.write_events_with(
             key,
             events,
+            my_client_id,
             WriteEventsOptions {
-                client_id: my_client_id,
                 expected_version: Some(current_version),
                 ..Default::default()
             },
@@ -168,8 +169,9 @@ const _: () = {
 
     async fn occ_error_match(pool: &CeleriantPool) {
         let key = AggregateKey::new(1, 2, 3);
+        let my_client_id: u128 = 42;
         let events = vec![json_event(1, &order(123)).unwrap()];
-        let result = pool.write_events(key, events).await;
+        let result = pool.write_events(key, events, my_client_id).await;
 
         match result {
             Err(ClientError::Server(ServerError::Write {
@@ -504,7 +506,8 @@ const _: () = {
 
             let order_event = OrderPlaced { order_id: 42, amount_cents: 9995 };
             let events = vec![json_event(1, &order_event)?];
-            pool.write_events(key.clone(), events).await?;
+            let my_client_id: u128 = 42;
+            pool.write_events(key.clone(), events, my_client_id).await?;
 
             let response = pool.read(ReadRequest {
                 correlation_id: None,

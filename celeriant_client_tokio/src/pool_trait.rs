@@ -21,8 +21,8 @@ pub trait CeleriantPoolApi: Send + Sync {
     fn aggregate_details(&self, request: AggregateDetailsRequest) -> impl Future<Output = Result<AggregateDetailsResponse, ClientError>> + Send;
     fn register_schema(&self, request: RegisterSchemaRequest) -> impl Future<Output = Result<SuccessResponse, ClientError>> + Send;
     fn watch(&self, request: WatchRequest, options: WatchOptions) -> impl Future<Output = Result<WatchConnection, ClientError>> + Send;
-    fn write_events(&self, aggregate_key: AggregateKey, events: Vec<DatablockAggregateEvent>) -> impl Future<Output = Result<SuccessResponse, ClientError>> + Send;
-    fn write_events_with(&self, aggregate_key: AggregateKey, events: Vec<DatablockAggregateEvent>, options: WriteEventsOptions) -> impl Future<Output = Result<SuccessResponse, ClientError>> + Send;
+    fn write_events(&self, aggregate_key: AggregateKey, events: Vec<DatablockAggregateEvent>, client_id: u128) -> impl Future<Output = Result<SuccessResponse, ClientError>> + Send;
+    fn write_events_with(&self, aggregate_key: AggregateKey, events: Vec<DatablockAggregateEvent>, client_id: u128, options: WriteEventsOptions) -> impl Future<Output = Result<SuccessResponse, ClientError>> + Send;
 }
 
 impl CeleriantPoolApi for CeleriantPool {
@@ -54,11 +54,11 @@ impl CeleriantPoolApi for CeleriantPool {
         self.watch(request, options)
     }
 
-    fn write_events(&self, aggregate_key: AggregateKey, events: Vec<DatablockAggregateEvent>) -> impl Future<Output = Result<SuccessResponse, ClientError>> + Send {
-        self.write_events(aggregate_key, events)
+    fn write_events(&self, aggregate_key: AggregateKey, events: Vec<DatablockAggregateEvent>, client_id: u128) -> impl Future<Output = Result<SuccessResponse, ClientError>> + Send {
+        self.write_events(aggregate_key, events, client_id)
     }
 
-    fn write_events_with(&self, aggregate_key: AggregateKey, events: Vec<DatablockAggregateEvent>, options: WriteEventsOptions) -> impl Future<Output = Result<SuccessResponse, ClientError>> + Send {
-        self.write_events_with(aggregate_key, events, options)
+    fn write_events_with(&self, aggregate_key: AggregateKey, events: Vec<DatablockAggregateEvent>, client_id: u128, options: WriteEventsOptions) -> impl Future<Output = Result<SuccessResponse, ClientError>> + Send {
+        self.write_events_with(aggregate_key, events, client_id, options)
     }
 }

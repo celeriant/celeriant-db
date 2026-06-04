@@ -44,7 +44,7 @@ pub async fn schema_rejects_bad_event() -> R {
     let mut bad = event(1, 1, 1000, r#"{"amount":"not-an-integer"}"#); // wrong type
     bad.event_type_minor = 0;
     let res = c
-        .write_events_with(key.clone(), vec![bad], WriteEventsOptions { allow_create: true, ..Default::default() })
+        .write_events_with(key.clone(), vec![bad], 0, WriteEventsOptions { allow_create: true, ..Default::default() })
         .await;
     match res {
         Err(ClientError::Server(ServerError::Schema { kind: SchemaError::ValidationFailed, .. })) => {}
@@ -68,7 +68,7 @@ pub async fn schema_accepts_good_event() -> R {
     let key = AggregateKey::new(ORG, ATYPE, 2);
     let mut good = event(1, 1, 1000, r#"{"amount":42}"#);
     good.event_type_minor = 0;
-    c.write_events_with(key.clone(), vec![good], WriteEventsOptions { allow_create: true, ..Default::default() })
+    c.write_events_with(key.clone(), vec![good], 0, WriteEventsOptions { allow_create: true, ..Default::default() })
         .await?;
 
     let batches = read_all(&mut c, &key).await?;
@@ -132,7 +132,7 @@ pub async fn schema_unregistered_version_unvalidated() -> R {
     // Payload would fail the (1,0) schema, but (1,1) is unvalidated.
     let mut ev = event(1, 1, 1000, r#"{"totally":"unrelated"}"#);
     ev.event_type_minor = 1;
-    c.write_events_with(key.clone(), vec![ev], WriteEventsOptions { allow_create: true, ..Default::default() })
+    c.write_events_with(key.clone(), vec![ev], 0, WriteEventsOptions { allow_create: true, ..Default::default() })
         .await?;
 
     let batches = read_all(&mut c, &key).await?;

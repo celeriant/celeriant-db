@@ -69,13 +69,13 @@ pub async fn watch_notifies_on_write() -> R {
     // version range. (A first-write "create" is reported as a distinct operation
     // and omits the range — see FINDINGS F3.)
     let mut c = CeleriantClient::connect(server.address()).await?;
-    c.write_events_with(key.clone(), vec![event(1, TYPE, 1000, "{}")], WriteEventsOptions { allow_create: true, ..Default::default() })
+    c.write_events_with(key.clone(), vec![event(1, TYPE, 1000, "{}")], 0, WriteEventsOptions { allow_create: true, ..Default::default() })
         .await?;
 
     let mut w = WatchConnection::connect(server.address(), watch_aggregates(&[agg_id]), WatchOptions::default()).await?;
 
     // Append after the watch is live.
-    c.write_events_with(key.clone(), vec![event(2, TYPE, 1001, "{}")], WriteEventsOptions { allow_create: false, ..Default::default() })
+    c.write_events_with(key.clone(), vec![event(2, TYPE, 1001, "{}")], 0, WriteEventsOptions { allow_create: false, ..Default::default() })
         .await?;
 
     // The notification for the append must name the aggregate and the affected
@@ -108,7 +108,7 @@ pub async fn watch_create_notification_carries_version_range() -> R {
 
     // The FIRST write creates the aggregate.
     let mut c = CeleriantClient::connect(server.address()).await?;
-    c.write_events_with(key.clone(), vec![event(1, TYPE, 1000, "{}")], WriteEventsOptions { allow_create: true, ..Default::default() })
+    c.write_events_with(key.clone(), vec![event(1, TYPE, 1000, "{}")], 0, WriteEventsOptions { allow_create: true, ..Default::default() })
         .await?;
 
     // Wait for the notification that carries the range (the accompanying write
@@ -193,7 +193,7 @@ pub async fn watch_cursor_misses_no_events() -> R {
     for i in 1..=n {
         writer
             .write_events_with(key.clone(), vec![event(i, TYPE, 1000 + i, &format!("{{\"n\":{i}}}"))],
-                WriteEventsOptions { allow_create: i == 1, ..Default::default() })
+                0, WriteEventsOptions { allow_create: i == 1, ..Default::default() })
             .await?;
     }
 
@@ -237,13 +237,13 @@ pub async fn watch_operations_are_distinct() -> R {
     // we only observe the three operations under test on the live tail).
     for i in 1..=4u64 {
         c.write_events_with(key.clone(), vec![event(i, TYPE, 1000 + i, "{}")],
-            WriteEventsOptions { allow_create: i == 1, ..Default::default() }).await?;
+            0, WriteEventsOptions { allow_create: i == 1, ..Default::default() }).await?;
     }
 
     let mut w = WatchConnection::connect(server.address(), watch_aggregates(&[agg_id]), WatchOptions::default()).await?;
 
     // Operation 1: a write (append one more event).
-    c.write_events_with(key.clone(), vec![event(5, TYPE, 2000, "{}")], WriteEventsOptions { allow_create: false, ..Default::default() }).await?;
+    c.write_events_with(key.clone(), vec![event(5, TYPE, 2000, "{}")], 0, WriteEventsOptions { allow_create: false, ..Default::default() }).await?;
     let write_op = await_event(&mut w, |e| e.aggregate_id == agg_id).await?.operation;
 
     // Operation 2: a trim. Its notification differs from the write's op code.

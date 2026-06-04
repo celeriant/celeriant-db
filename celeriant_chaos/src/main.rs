@@ -1,6 +1,8 @@
 mod actions;
+mod checkers;
 mod config;
 mod disk_truth;
+mod final_read;
 mod invariants;
 mod logs;
 mod report;
@@ -18,7 +20,9 @@ use crate::actions::find_project_root;
 use crate::config::ClusterConfig;
 use crate::report::{RunDir, write_run_report, write_scenario};
 use crate::scenario::{
-    ScenarioParams, ScenarioReport, run_baseline, run_follower_graceful_stop, run_follower_sigkill,
+    ScenarioParams, ScenarioReport, run_baseline, run_bridge, run_cas_storm_scenario,
+    run_clock_scrambler, run_duplicate_replay,
+    run_follower_graceful_stop, run_follower_sigkill, run_single_node_isolation,
     run_idempotency_audit_baseline, run_idempotency_audit_minio_outage,
     run_idempotency_audit_partition_then_kill_minio, run_idempotency_audit_fast_blackout,
     run_leader_graceful_stop, run_leader_restart_loop, run_leader_sigkill,
@@ -27,7 +31,7 @@ use crate::scenario::{
     run_partition_asymmetric, run_partition_then_kill_minio,
     run_rolling_restart, run_sigstop_leader,
     run_partition_leader_follower_replication, run_partition_leader_minio,
-    run_watch_storm,
+    run_watch_storm, run_watch_storm_failover,
 };
 
 #[derive(Parser)]
@@ -118,15 +122,23 @@ async fn main() -> Result<(), String> {
         Some("clock_skew_follower") => vec!["clock_skew_follower"],
         Some("follower_disk_full") => vec!["follower_disk_full"],
         Some("bench_load_sweep") => vec!["bench_load_sweep"],
+        Some("bridge") => vec!["bridge"],
+        Some("single_node_isolation") => vec!["single_node_isolation"],
+        Some("clock_scrambler") => vec!["clock_scrambler"],
+        Some("duplicate_replay") => vec!["duplicate_replay"],
+        Some("cas_storm") => vec!["cas_storm"],
+        Some("cas_storm_partition") => vec!["cas_storm_partition"],
         Some("idempotency_audit_baseline") => vec!["idempotency_audit_baseline"],
         Some("idempotency_audit_minio_outage") => vec!["idempotency_audit_minio_outage"],
         Some("idempotency_audit_partition_then_kill_minio") => vec!["idempotency_audit_partition_then_kill_minio"],
         Some("idempotency_audit_fast_blackout") => vec!["idempotency_audit_fast_blackout"],
         Some("watch_storm") => vec!["watch_storm"],
+        Some("watch_storm_failover") => vec!["watch_storm_failover"],
         Some(other) => return Err(format!("unknown scenario: {other}")),
         None if args.full => vec![
             "baseline",
             "watch_storm",
+            "watch_storm_failover",
             "follower_graceful_stop",
             "follower_sigkill",
             "leader_graceful_stop",
@@ -135,17 +147,23 @@ async fn main() -> Result<(), String> {
             "partition_leader_minio",
             "partition_asymmetric",
             "partition_leader_follower_replication",
+            "bridge",
+            "single_node_isolation",
             "network_flap",
             "minio_outage_short",
             "minio_outage_long",
             "partition_then_kill_minio",
             "rolling_restart",
             "clock_skew_follower",
+            "clock_scrambler",
             "sigstop_leader",
             "follower_disk_full",
             "idempotency_audit_baseline",
             "idempotency_audit_minio_outage",
             "idempotency_audit_partition_then_kill_minio",
+            "duplicate_replay",
+            "cas_storm",
+            "cas_storm_partition",
             // Previously excluded: partition_then_kill_minio exposed a
             // follower-orphan-entries-after-leader-rollback bug that the
             // `rollback_active_to_read_cursor` fallback from SCEN-15
@@ -182,6 +200,7 @@ async fn run_one_iteration(
         let report = match *name {
             "baseline" => run_baseline(cfg, params, &dir.root).await?,
             "watch_storm" => run_watch_storm(cfg, params, &dir.root).await?,
+            "watch_storm_failover" => run_watch_storm_failover(cfg, params, &dir.root).await?,
             "follower_graceful_stop" => run_follower_graceful_stop(cfg, params, &dir.root).await?,
             "follower_sigkill" => run_follower_sigkill(cfg, params, &dir.root).await?,
             "leader_graceful_stop" => run_leader_graceful_stop(cfg, params, &dir.root).await?,
@@ -203,6 +222,12 @@ async fn run_one_iteration(
             "clock_skew_follower" => run_clock_skew_follower(cfg, params, &dir.root).await?,
             "follower_disk_full" => run_follower_disk_full(cfg, params, &dir.root).await?,
             "bench_load_sweep" => run_bench_load_sweep(cfg, params, &dir.root).await?,
+            "bridge" => run_bridge(cfg, params, &dir.root).await?,
+            "single_node_isolation" => run_single_node_isolation(cfg, params, &dir.root).await?,
+            "clock_scrambler" => run_clock_scrambler(cfg, params, &dir.root).await?,
+            "duplicate_replay" => run_duplicate_replay(cfg, params, &dir.root).await?,
+            "cas_storm" => run_cas_storm_scenario(cfg, params, &dir.root, false).await?,
+            "cas_storm_partition" => run_cas_storm_scenario(cfg, params, &dir.root, true).await?,
             "idempotency_audit_baseline" => run_idempotency_audit_baseline(cfg, params, &dir.root).await?,
             "idempotency_audit_minio_outage" => run_idempotency_audit_minio_outage(cfg, params, &dir.root).await?,
             "idempotency_audit_partition_then_kill_minio" => run_idempotency_audit_partition_then_kill_minio(cfg, params, &dir.root).await?,

@@ -23,16 +23,28 @@ struct CacheEntry {
 ///   event that carries an `event_id`. This warms cold instances after a BFF crash
 ///   so a retried `Idempotency-Key` can be resolved without re-writing.
 ///
-/// Not a correctness layer. Server-side `enforce_client_idempotency` (CEI) is the
-/// underlying dedup for retries that hold `client_seq` constant. This cache shortens
-/// the cross-instance recovery path for the BFF-crash-after-fsync case.
+/// `entries` is not a correctness layer: server-side CEI is the dedup, this just
+/// restores the lost response. `seq_owners` IS load-bearing. Requests share the
+/// service's client_id, so two can derive the same client_seq; if the loser's OCC
+/// rejection is lost to a timeout, its retry gets a CEI violation that refers to
+/// the sibling's event. The `(aggregate_id, client_seq) -> event_id` map is how
+/// the violation arm tells "mine" from "theirs" before claiming success.
 pub struct IdempotencyCache {
     entries: Mutex<HashMap<(u128, u128), CacheEntry>>,
+    seq_owners: Mutex<HashMap<(u128, u64), SeqOwnerEntry>>,
+}
+
+struct SeqOwnerEntry {
+    event_id: u128,
+    expires_at: Instant,
 }
 
 impl IdempotencyCache {
     pub fn new() -> Self {
-        Self { entries: Mutex::new(HashMap::new()) }
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            seq_owners: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn try_get(&self, event_id: u128, aggregate_id: u128) -> Option<IdempotencyEntry> {
@@ -49,6 +61,22 @@ impl IdempotencyCache {
     pub fn set(&self, event_id: u128, aggregate_id: u128, value: IdempotencyEntry) {
         self.entries.lock().unwrap().insert((event_id, aggregate_id), CacheEntry {
             value,
+            expires_at: Instant::now() + TTL,
+        });
+    }
+
+    /// Which event_id landed on this (aggregate, client_seq)? None = unknown
+    /// (outside the warm window, or the event carried no event_id).
+    pub fn seq_owner(&self, aggregate_id: u128, client_seq: u64) -> Option<u128> {
+        let mut map = self.seq_owners.lock().unwrap();
+        let now = Instant::now();
+        map.retain(|_, v| v.expires_at > now);
+        map.get(&(aggregate_id, client_seq)).map(|e| e.event_id)
+    }
+
+    pub fn set_seq_owner(&self, aggregate_id: u128, client_seq: u64, event_id: u128) {
+        self.seq_owners.lock().unwrap().insert((aggregate_id, client_seq), SeqOwnerEntry {
+            event_id,
             expires_at: Instant::now() + TTL,
         });
     }

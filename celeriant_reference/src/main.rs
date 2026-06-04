@@ -160,7 +160,7 @@ async fn deposit(
     State(state): State<SharedState>,
     Json(req): Json<AmountRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let event_id = parse_idempotency_key(&headers);
+    let event_id = request_event_id(&headers);
     if let Some(eid) = event_id {
         if let Some(hit) = state.idempotency.try_get(eid, account_id.as_u128()) {
             return Ok(Json(json!({
@@ -187,7 +187,7 @@ async fn withdraw(
     State(state): State<SharedState>,
     Json(req): Json<AmountRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let event_id = parse_idempotency_key(&headers);
+    let event_id = request_event_id(&headers);
     if let Some(eid) = event_id {
         if let Some(hit) = state.idempotency.try_get(eid, account_id.as_u128()) {
             return Ok(Json(json!({
@@ -221,7 +221,7 @@ async fn transfer(
     State(state): State<SharedState>,
     Json(req): Json<TransferRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let event_id = parse_idempotency_key(&headers);
+    let event_id = request_event_id(&headers);
     if let Some(eid) = event_id {
         let from = state.idempotency.try_get(eid, req.from_account_id.as_u128());
         let to = state.idempotency.try_get(eid, req.to_account_id.as_u128());
@@ -301,13 +301,17 @@ fn map_account_error(e: AccountError) -> (StatusCode, Json<Value>) {
 
 // --- Idempotency helpers ---
 
-/// Parse the `Idempotency-Key` header as a UUID. This becomes the `event_id`
-/// stamped on the WriteRequest, so retries can be detected by catch-up replay
-/// even on a cold BFF instance.
-fn parse_idempotency_key(headers: &HeaderMap) -> Option<u128> {
-    let header = headers.get("idempotency-key")?;
-    let parsed: Uuid = header.to_str().ok()?.parse().ok()?;
-    Some(parsed.as_u128())
+/// The `Idempotency-Key` header as a UUID, or a freshly minted one. It becomes the
+/// `event_id` on the write. A caller-supplied key makes HTTP retries resolvable
+/// without re-writing; any key, minted or not, is what lets a CEI violation be
+/// verified as ours rather than a sibling's.
+fn request_event_id(headers: &HeaderMap) -> Option<u128> {
+    let from_header = headers
+        .get("idempotency-key")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<Uuid>().ok())
+        .map(|u| u.as_u128());
+    Some(from_header.unwrap_or_else(|| Uuid::new_v4().as_u128()))
 }
 
 // --- Database init ---
@@ -355,8 +359,7 @@ async fn seed_accounts(pool: &CeleriantPool, db: &tokio_postgres::Client) {
         }
 
         let evt = json_event(1, &Deposited { amount_cents: account.seed_cents }).unwrap();
-        if let Err(e) = pool.write_events_with(key, vec![evt], WriteEventsOptions {
-            client_id: *SERVICE_CLIENT_ID,
+        if let Err(e) = pool.write_events_with(key, vec![evt], *SERVICE_CLIENT_ID, WriteEventsOptions {
             allow_create: true,
             ..Default::default()
         }).await {

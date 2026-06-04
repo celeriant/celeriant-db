@@ -125,7 +125,7 @@ pub async fn cluster_replicates_and_rejects_follower_write() -> R {
         let mut lc = CeleriantClient::connect(&leader).await?;
         for i in 1..=5u64 {
             lc.write_events_with(key.clone(), vec![event(i, TYPE, 1000 + i, &format!("{{\"n\":{i}}}"))],
-                WriteEventsOptions { allow_create: i == 1, ..Default::default() }).await?;
+                0, WriteEventsOptions { allow_create: i == 1, ..Default::default() }).await?;
         }
     }
 
@@ -134,7 +134,7 @@ pub async fn cluster_replicates_and_rejects_follower_write() -> R {
         let mut fc = CeleriantClient::connect(&follower).await?;
         let res = fc
             .write_events_with(AggregateKey::new(1, 1, 6002), vec![event(1, TYPE, 1000, "{}")],
-                WriteEventsOptions { allow_create: true, ..Default::default() })
+                0, WriteEventsOptions { allow_create: true, ..Default::default() })
             .await;
         match res {
             Err(ClientError::NotLeader { .. }) => {}
@@ -171,7 +171,7 @@ pub async fn follower_read_converges() -> R {
         let mut lc = CeleriantClient::connect(&leader).await?;
         for i in 1..=n {
             lc.write_events_with(key.clone(), vec![event(i, TYPE, 1000 + i, "{}")],
-                WriteEventsOptions { allow_create: i == 1, ..Default::default() }).await?;
+                0, WriteEventsOptions { allow_create: i == 1, ..Default::default() }).await?;
         }
     }
 
@@ -204,7 +204,7 @@ pub async fn failover_promotes_follower() -> R {
         let mut lc = CeleriantClient::connect(&leader).await?;
         for i in 1..=4u64 {
             lc.write_events_with(key.clone(), vec![event(i, TYPE, 1000 + i, "{}")],
-                WriteEventsOptions { allow_create: i == 1, ..Default::default() }).await?;
+                0, WriteEventsOptions { allow_create: i == 1, ..Default::default() }).await?;
         }
     }
     // Make sure the follower has it before we kill the leader.
@@ -231,7 +231,7 @@ pub async fn failover_promotes_follower() -> R {
             Ok(mut sc) => {
                 match sc
                     .write_events_with(new_key.clone(), vec![event(1, TYPE, 3000, "{}")],
-                        WriteEventsOptions { allow_create: true, ..Default::default() })
+                        0, WriteEventsOptions { allow_create: true, ..Default::default() })
                     .await
                 {
                     Ok(_) => { accepted = true; break; }

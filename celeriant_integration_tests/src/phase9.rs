@@ -66,7 +66,7 @@ pub async fn mtls_require_good_client_connects() -> R {
     c.write_events_with(
         key.clone(),
         vec![event(1, TYPE, 1000, "{}")],
-        WriteEventsOptions { allow_create: true, ..Default::default() },
+        0, WriteEventsOptions { allow_create: true, ..Default::default() },
     )
     .await?;
 
@@ -157,7 +157,7 @@ pub async fn tls_strict_refuses_plaintext() -> R {
     let res = tokio::time::timeout(Duration::from_secs(10), async {
         let mut c = CeleriantClient::connect(server.address()).await?;
         c.write_events_with(key, vec![event(1, TYPE, 1000, "{}")],
-            WriteEventsOptions { allow_create: true, ..Default::default() }).await
+            0, WriteEventsOptions { allow_create: true, ..Default::default() }).await
     })
     .await;
     match res {
@@ -186,7 +186,7 @@ pub async fn tls_client_auth_none_allows_anonymous() -> R {
     c.write_events_with(
         key.clone(),
         vec![event(1, TYPE, 1000, "{}")],
-        WriteEventsOptions { allow_create: true, ..Default::default() },
+        0, WriteEventsOptions { allow_create: true, ..Default::default() },
     )
     .await?;
     let batches = read_all(&mut c, &key).await?;
@@ -219,7 +219,7 @@ pub async fn identity_required_but_absent_rejected() -> R {
         .write_events_with(
             AggregateKey::new(900, 5, 1),
             vec![event(1, TYPE, 1000, "{}")],
-            WriteEventsOptions { allow_create: true, ..Default::default() },
+            0, WriteEventsOptions { allow_create: true, ..Default::default() },
         )
         .await;
     match res {
@@ -263,7 +263,7 @@ pub async fn public_key_identity_accepted_and_deterministic() -> R {
     c.write_events_with(
         AggregateKey::new(900, 6, 1),
         vec![event(1, TYPE, 1000, "{}")],
-        WriteEventsOptions { allow_create: true, client_id: expected_id, ..Default::default() },
+        expected_id, WriteEventsOptions { allow_create: true, ..Default::default() },
     )
     .await?;
     Ok(())
@@ -325,7 +325,7 @@ pub async fn identity_clientid_mismatch_rejected() -> R {
         .write_events_with(
             AggregateKey::new(900, 8, 1),
             vec![event(1, TYPE, 1000, "{}")],
-            WriteEventsOptions { allow_create: true, client_id: bogus, ..Default::default() },
+            bogus, WriteEventsOptions { allow_create: true, ..Default::default() },
         )
         .await;
     match res {
@@ -354,7 +354,7 @@ async fn connect_and_probe(
     c.write_events_with(
         AggregateKey::new(900, 2, 1),
         vec![event(1, TYPE, 1000, "{}")],
-        WriteEventsOptions { allow_create: true, ..Default::default() },
+        0, WriteEventsOptions { allow_create: true, ..Default::default() },
     )
     .await?;
     Ok(())

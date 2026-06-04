@@ -36,7 +36,7 @@ pub async fn occ_match_commits_and_advances() -> R {
     c.write_events_with(
         key.clone(),
         vec![event(1, TYPE, 1000, "{}")],
-        WriteEventsOptions { allow_create: true, expected_version: Some(0), ..Default::default() },
+        0, WriteEventsOptions { allow_create: true, expected_version: Some(0), ..Default::default() },
     )
     .await?;
     let v = version(&mut c, &key).await?;
@@ -47,7 +47,7 @@ pub async fn occ_match_commits_and_advances() -> R {
     c.write_events_with(
         key.clone(),
         vec![event(2, TYPE, 1001, "{}")],
-        WriteEventsOptions { allow_create: false, expected_version: Some(1), ..Default::default() },
+        0, WriteEventsOptions { allow_create: false, expected_version: Some(1), ..Default::default() },
     )
     .await?;
     let v2 = version(&mut c, &key).await?;
@@ -68,13 +68,13 @@ pub async fn occ_stale_rejected_no_append() -> R {
     c.write_events_with(
         key.clone(),
         vec![event(1, TYPE, 1000, "{}")],
-        WriteEventsOptions { allow_create: true, expected_version: Some(0), ..Default::default() },
+        0, WriteEventsOptions { allow_create: true, expected_version: Some(0), ..Default::default() },
     )
     .await?;
     c.write_events_with(
         key.clone(),
         vec![event(2, TYPE, 1001, "{}")],
-        WriteEventsOptions { expected_version: Some(1), ..Default::default() },
+        0, WriteEventsOptions { expected_version: Some(1), ..Default::default() },
     )
     .await?;
     let before = version(&mut c, &key).await?; // 2
@@ -84,7 +84,7 @@ pub async fn occ_stale_rejected_no_append() -> R {
         .write_events_with(
             key.clone(),
             vec![event(3, TYPE, 1002, "{}")],
-            WriteEventsOptions { expected_version: Some(1), ..Default::default() },
+            0, WriteEventsOptions { expected_version: Some(1), ..Default::default() },
         )
         .await;
     match res {
@@ -111,7 +111,7 @@ pub async fn occ_create_guard_races_cleanly() -> R {
     c.write_events_with(
         key.clone(),
         vec![event(1, TYPE, 1000, "{}")],
-        WriteEventsOptions { allow_create: true, expected_version: Some(0), ..Default::default() },
+        0, WriteEventsOptions { allow_create: true, expected_version: Some(0), ..Default::default() },
     )
     .await?;
 
@@ -120,7 +120,7 @@ pub async fn occ_create_guard_races_cleanly() -> R {
         .write_events_with(
             key.clone(),
             vec![event(1, TYPE, 1001, "{}")],
-            WriteEventsOptions { allow_create: true, expected_version: Some(0), ..Default::default() },
+            0, WriteEventsOptions { allow_create: true, expected_version: Some(0), ..Default::default() },
         )
         .await;
     match res {
@@ -140,15 +140,14 @@ pub async fn idempotency_dedupes_replay() -> R {
     let key = unique_key("idempotency_dedupes_replay");
 
     let opts = WriteEventsOptions {
-        client_id: 7,
         allow_create: true,
         enforce_client_idempotency: true,
         ..Default::default()
     };
-    c.write_events_with(key.clone(), vec![event(1, TYPE, 1000, r#"{"v":1}"#)], opts.clone()).await?;
+    c.write_events_with(key.clone(), vec![event(1, TYPE, 1000, r#"{"v":1}"#)], 7, opts.clone()).await?;
     // Replay the exact same client_seq=1.
     let res = c
-        .write_events_with(key.clone(), vec![event(1, TYPE, 1000, r#"{"v":1}"#)], opts.clone())
+        .write_events_with(key.clone(), vec![event(1, TYPE, 1000, r#"{"v":1}"#)], 7, opts.clone())
         .await;
     match res {
         Err(ClientError::Server(ServerError::Write {
@@ -176,14 +175,14 @@ pub async fn idempotency_scoped_per_client() -> R {
     c.write_events_with(
         key.clone(),
         vec![event(1, TYPE, 1000, r#"{"who":"A"}"#)],
-        WriteEventsOptions { client_id: 100, allow_create: true, enforce_client_idempotency: true, ..Default::default() },
+        100, WriteEventsOptions { allow_create: true, enforce_client_idempotency: true, ..Default::default() },
     )
     .await?;
     // Different client_id, same client_seq=1 — must NOT be deduped.
     c.write_events_with(
         key.clone(),
         vec![event(1, TYPE, 1001, r#"{"who":"B"}"#)],
-        WriteEventsOptions { client_id: 200, allow_create: false, enforce_client_idempotency: true, ..Default::default() },
+        200, WriteEventsOptions { allow_create: false, enforce_client_idempotency: true, ..Default::default() },
     )
     .await?;
 
@@ -215,9 +214,9 @@ pub async fn multi_aggregate_atomic_rollback() -> R {
 
     // Create both at version 1.
     c.write_events_with(a.clone(), vec![event(1, TYPE, 1000, "{}")],
-        WriteEventsOptions { allow_create: true, expected_version: Some(0), ..Default::default() }).await?;
+        0, WriteEventsOptions { allow_create: true, expected_version: Some(0), ..Default::default() }).await?;
     c.write_events_with(b.clone(), vec![event(1, TYPE, 1000, "{}")],
-        WriteEventsOptions { allow_create: true, expected_version: Some(0), ..Default::default() }).await?;
+        0, WriteEventsOptions { allow_create: true, expected_version: Some(0), ..Default::default() }).await?;
 
     // Atomic write: a guarded correctly (v=1), b guarded stale (v=0) -> whole thing rejected.
     let mut writes = HashMap::new();
@@ -308,14 +307,14 @@ pub async fn occ_and_idempotency_compose() -> R {
     c.write_events_with(
         key.clone(),
         vec![event(1, TYPE, 1000, "{}")],
-        WriteEventsOptions { client_id: 9, allow_create: true, expected_version: Some(0), enforce_client_idempotency: true },
+        9, WriteEventsOptions { allow_create: true, expected_version: Some(0), enforce_client_idempotency: true },
     )
     .await?;
     // Conditional append guarded on v=1, idempotency seq=2.
     c.write_events_with(
         key.clone(),
         vec![event(2, TYPE, 1001, "{}")],
-        WriteEventsOptions { client_id: 9, allow_create: false, expected_version: Some(1), enforce_client_idempotency: true },
+        9, WriteEventsOptions { allow_create: false, expected_version: Some(1), enforce_client_idempotency: true },
     )
     .await?;
     // Replay that exact conditional write. The aggregate has moved to 2, so the
@@ -325,7 +324,7 @@ pub async fn occ_and_idempotency_compose() -> R {
         .write_events_with(
             key.clone(),
             vec![event(2, TYPE, 1001, "{}")],
-            WriteEventsOptions { client_id: 9, allow_create: false, expected_version: Some(1), enforce_client_idempotency: true },
+            9, WriteEventsOptions { allow_create: false, expected_version: Some(1), enforce_client_idempotency: true },
         )
         .await;
     let batches = read_all(&mut c, &key).await?;
@@ -338,7 +337,7 @@ pub async fn occ_and_idempotency_compose() -> R {
         .write_events_with(
             key.clone(),
             vec![event(2, TYPE, 1001, "{}")],
-            WriteEventsOptions { client_id: 9, allow_create: false, expected_version: Some(1), enforce_client_idempotency: true },
+            9, WriteEventsOptions { allow_create: false, expected_version: Some(1), enforce_client_idempotency: true },
         )
         .await;
     match res {
@@ -361,7 +360,7 @@ pub async fn unconditional_write_appends() -> R {
     // expected_version stays None (Default) on every write.
     for i in 1..=3u64 {
         c.write_events_with(key.clone(), vec![event(i, TYPE, 1000 + i, "{}")],
-            WriteEventsOptions { allow_create: i == 1, ..Default::default() }).await?;
+            0, WriteEventsOptions { allow_create: i == 1, ..Default::default() }).await?;
     }
     let batches = read_all(&mut c, &key).await?;
     let versions: Vec<u64> = batches.iter().map(|b| b.aggregate_version).collect();

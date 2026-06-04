@@ -137,8 +137,7 @@ async fn deposit(
     let key = account_key(account_id.as_u128());
     let evt = json_event(1, &Deposited { amount_cents: req.amount_cents }).unwrap();
 
-    match state.pool.write_events_with(key.clone(), vec![evt], WriteEventsOptions {
-        client_id: req.client_id.as_u128(),
+    match state.pool.write_events_with(key.clone(), vec![evt], req.client_id.as_u128(), WriteEventsOptions {
         allow_create: true,
         expected_version: Some(req.expected_aggregate_version),
         ..Default::default()
@@ -177,8 +176,7 @@ async fn withdraw(
     let key = account_key(account_id.as_u128());
     let evt = json_event(2, &Withdrawn { amount_cents: req.amount_cents }).unwrap();
 
-    match state.pool.write_events_with(key.clone(), vec![evt], WriteEventsOptions {
-        client_id: req.client_id.as_u128(),
+    match state.pool.write_events_with(key.clone(), vec![evt], req.client_id.as_u128(), WriteEventsOptions {
         allow_create: true,
         expected_version: Some(req.expected_aggregate_version),
         ..Default::default()
@@ -336,8 +334,7 @@ async fn seed_accounts(pool: &CeleriantPool) {
         }
 
         let evt = json_event(1, &Deposited { amount_cents: account.seed_cents }).unwrap();
-        if let Err(e) = pool.write_events_with(key, vec![evt], WriteEventsOptions {
-            client_id: first_client_id,
+        if let Err(e) = pool.write_events_with(key, vec![evt], first_client_id, WriteEventsOptions {
             allow_create: true,
             ..Default::default()
         }).await {

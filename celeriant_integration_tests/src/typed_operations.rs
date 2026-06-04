@@ -114,7 +114,7 @@ async fn test_typed_read(client: &mut CeleriantClient) {
 async fn test_write_events(client: &mut CeleriantClient) {
     let agg = AggregateKey::new(10, 1, 1003);
     let events = vec![make_event(0, "write_events convenience")];
-    match client.write_events(agg.clone(), events).await {
+    match client.write_events(agg.clone(), events, 0).await {
         Ok(_) => {
             // verify via read
             let req = ReadRequest { correlation_id: None, aggregate_key: agg, filters: ReadFilters::new(1) };
@@ -133,13 +133,12 @@ async fn test_write_events(client: &mut CeleriantClient) {
 async fn test_write_events_with_no_create(client: &mut CeleriantClient) {
     let agg = AggregateKey::new(10, 1, 1004);
     let options = WriteEventsOptions {
-        client_id: 1,
         allow_create: false,
         expected_version: None,
         enforce_client_idempotency: false,
     };
     let events = vec![make_event(0, "should fail — no create")];
-    match client.write_events_with(agg, events, options).await {
+    match client.write_events_with(agg, events, 1, options).await {
         Err(ClientError::Server(ServerError::Write {
             kind: WriteError::AggregateNotExists,
             ..
@@ -202,7 +201,7 @@ async fn test_typed_delete(client: &mut CeleriantClient) {
     let agg = AggregateKey::new(10, 1, 1006);
 
     // Write then delete
-    let _ = client.write_events(agg.clone(), vec![make_event(0, "to be deleted")]).await;
+    let _ = client.write_events(agg.clone(), vec![make_event(0, "to be deleted")], 0).await;
 
     let mut deletes = HashMap::new();
     deletes.insert(agg.clone(), SingleAggregateDelete {
@@ -241,13 +240,12 @@ async fn test_trim_start(client: &mut CeleriantClient) {
     // Write 3 batches
     for i in 0u64..3 {
         let opts = WriteEventsOptions {
-            client_id: 1,
             allow_create: i == 0,
             expected_version: Some(i),
             enforce_client_idempotency: false,
         };
         let events = vec![make_event(i, &format!("batch {}", i))];
-        if let Err(e) = client.write_events_with(agg.clone(), events, opts).await {
+        if let Err(e) = client.write_events_with(agg.clone(), events, 1, opts).await {
             fail("trim_start() setup write", e);
             return;
         }
@@ -299,12 +297,11 @@ async fn test_aggregate_details(client: &mut CeleriantClient) {
     // Write 2 batches
     for i in 0u64..2 {
         let opts = WriteEventsOptions {
-            client_id: 1,
             allow_create: i == 0,
             expected_version: Some(i),
             enforce_client_idempotency: false,
         };
-        let _ = client.write_events_with(agg.clone(), vec![make_event(i, "detail event")], opts).await;
+        let _ = client.write_events_with(agg.clone(), vec![make_event(i, "detail event")], 1, opts).await;
     }
 
     let req = AggregateDetailsRequest { correlation_id: None, aggregate_key: agg };
@@ -349,13 +346,12 @@ async fn test_read_all_iterator(client: &mut CeleriantClient) {
     // 5 batches is sufficient to verify the iterator collects all
     for i in 0u64..5 {
         let opts = WriteEventsOptions {
-            client_id: 1,
             allow_create: i == 0,
             expected_version: Some(i),
             enforce_client_idempotency: false,
         };
         let events = vec![make_event(i, &format!("iterator batch {}", i))];
-        if let Err(e) = client.write_events_with(agg.clone(), events, opts).await {
+        if let Err(e) = client.write_events_with(agg.clone(), events, 1, opts).await {
             fail("ReadAllIterator setup write", e);
             return;
         }
@@ -389,12 +385,11 @@ async fn test_auto_compression(client: &mut CeleriantClient) {
     let events = vec![make_event(0, &large_payload)];
     // write() auto-selects compression when payload >= threshold
     let opts = WriteEventsOptions {
-        client_id: 1,
         allow_create: true,
         expected_version: Some(0),
         enforce_client_idempotency: false,
     };
-    match client.write_events_with(agg, events, opts).await {
+    match client.write_events_with(agg, events, 1, opts).await {
         Ok(_) => pass("auto-compression — large payload accepted"),
         Err(e) => fail("auto-compression", e),
     }
@@ -421,16 +416,15 @@ async fn test_write_error_optimistic_concurrency(client: &mut CeleriantClient) {
     let agg = AggregateKey::new(10, 1, 9902);
 
     // Write first batch to create the aggregate at index 1
-    let _ = client.write_events(agg.clone(), vec![make_event(0, "initial")]).await;
+    let _ = client.write_events(agg.clone(), vec![make_event(0, "initial")], 0).await;
 
     // Now write with wrong expected_version (0 instead of 1)
     let opts = WriteEventsOptions {
-        client_id: 1,
         allow_create: false,
         expected_version: Some(0),
         enforce_client_idempotency: false,
     };
-    match client.write_events_with(agg, vec![make_event(1, "wrong index")], opts).await {
+    match client.write_events_with(agg, vec![make_event(1, "wrong index")], 1, opts).await {
         Err(ClientError::Server(ServerError::Write {
             kind: WriteError::OptimisticConcurrencyViolation {
                 expected_version,
@@ -456,12 +450,11 @@ async fn test_write_error_optimistic_concurrency(client: &mut CeleriantClient) {
 async fn test_write_error_empty_events(client: &mut CeleriantClient) {
     let agg = AggregateKey::new(10, 1, 9903);
     let opts = WriteEventsOptions {
-        client_id: 1,
         allow_create: true,
         expected_version: None,
         enforce_client_idempotency: false,
     };
-    match client.write_events_with(agg, vec![], opts).await {
+    match client.write_events_with(agg, vec![], 1, opts).await {
         Err(ClientError::Server(ServerError::Write {
             kind: WriteError::EmptyEventsList,
             ..

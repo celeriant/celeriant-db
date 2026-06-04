@@ -72,7 +72,7 @@ async fn write_seq(
         c.write_events_with(
             key.clone(),
             vec![event(i, TYPE, 1000 + i, &format!("{{\"n\":{i}}}"))],
-            WriteEventsOptions { allow_create: i == 1, expected_version: Some(i - 1), ..Default::default() },
+            0, WriteEventsOptions { allow_create: i == 1, expected_version: Some(i - 1), ..Default::default() },
         )
         .await
         .map_err(|e| format!("write seq {i}: {e:?}"))?;
@@ -364,7 +364,7 @@ pub async fn exactly_once_across_failover() -> R {
     while std::time::Instant::now() < deadline {
         match CeleriantClient::connect(&survivor).await {
             Ok(mut c) => match c.write_events_with(new_key.clone(), vec![event(1, TYPE, 3000, "{}")],
-                WriteEventsOptions { allow_create: true, ..Default::default() }).await {
+                0, WriteEventsOptions { allow_create: true, ..Default::default() }).await {
                 Ok(_) => { promoted = true; break; }
                 Err(e) => last_err = format!("{e:?}"),
             },

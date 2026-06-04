@@ -95,7 +95,7 @@ pub async fn avro_accepts_conforming_payload() -> R {
     let key = AggregateKey::new(ORG, ATYPE, 1);
     let payload = avro_encode_amount(42)?;
     let ev = raw_event(1, 1, 0, payload.clone());
-    c.write_events_with(key.clone(), vec![ev], create_opts()).await?;
+    c.write_events_with(key.clone(), vec![ev], 0, create_opts()).await?;
 
     let batches = read_all(&mut c, &key).await?;
     if batches.len() != 1 {
@@ -127,7 +127,7 @@ pub async fn avro_rejects_nonconforming_payload() -> R {
 
     let key = AggregateKey::new(ORG, ATYPE, 2);
     let res = c
-        .write_events_with(key.clone(), vec![raw_event(1, 1, 0, bad_payload)], create_opts())
+        .write_events_with(key.clone(), vec![raw_event(1, 1, 0, bad_payload)], 0, create_opts())
         .await;
     match res {
         Err(ClientError::Server(ServerError::Schema { kind: SchemaError::ValidationFailed, .. })) => {}
@@ -236,7 +236,7 @@ pub async fn protobuf_accepts_conforming_payload() -> R {
 
     let key = AggregateKey::new(ORG, ATYPE, 3);
     let payload = proto_encode_amount(42);
-    c.write_events_with(key.clone(), vec![raw_event(1, 1, 0, payload.clone())], create_opts())
+    c.write_events_with(key.clone(), vec![raw_event(1, 1, 0, payload.clone())], 0, create_opts())
         .await?;
 
     let batches = read_all(&mut c, &key).await?;
@@ -266,7 +266,7 @@ pub async fn protobuf_rejects_nonconforming_payload() -> R {
 
     let key = AggregateKey::new(ORG, ATYPE, 4);
     let res = c
-        .write_events_with(key.clone(), vec![raw_event(1, 1, 0, bad_payload)], create_opts())
+        .write_events_with(key.clone(), vec![raw_event(1, 1, 0, bad_payload)], 0, create_opts())
         .await;
     match res {
         Err(ClientError::Server(ServerError::Schema { kind: SchemaError::ValidationFailed, .. })) => {}
@@ -331,7 +331,7 @@ pub async fn encrypted_payload_roundtrips_unchanged() -> R {
     let key = AggregateKey::new(ORG, ATYPE, 5);
     let mut ev = raw_event(1, 1, 0, ciphertext_and_tag.clone());
     ev.iv = Some(iv);
-    c.write_events_with(key.clone(), vec![ev], create_opts()).await?;
+    c.write_events_with(key.clone(), vec![ev], 0, create_opts()).await?;
 
     let batches = read_all(&mut c, &key).await?;
     if batches.len() != 1 || batches[0].events.len() != 1 {
@@ -372,7 +372,7 @@ pub async fn encrypted_payload_skips_schema_validation() -> R {
     // rejected (proves the schema is enforced for this (major,minor)).
     let plain_key = AggregateKey::new(ORG, ATYPE, 6);
     let plain = raw_event(1, 1, 0, opaque.clone());
-    match c.write_events_with(plain_key, vec![plain], create_opts()).await {
+    match c.write_events_with(plain_key, vec![plain], 0, create_opts()).await {
         Err(ClientError::Server(ServerError::Schema { kind: SchemaError::ValidationFailed, .. })) => {}
         other => {
             return Err(format!(
@@ -386,7 +386,7 @@ pub async fn encrypted_payload_skips_schema_validation() -> R {
     let enc_key = AggregateKey::new(ORG, ATYPE, 7);
     let mut enc = raw_event(1, 1, 0, opaque.clone());
     enc.iv = Some([1u8; 12]);
-    c.write_events_with(enc_key.clone(), vec![enc], create_opts())
+    c.write_events_with(enc_key.clone(), vec![enc], 0, create_opts())
         .await
         .map_err(|e| format!("encrypted event of a validated type should NOT be validated, but write failed: {e:?}"))?;
 

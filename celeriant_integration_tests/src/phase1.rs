@@ -25,7 +25,7 @@ pub async fn append_reads_back_unchanged() -> R {
     let key = unique_key("append_reads_back_unchanged");
 
     let ev = event(1, TYPE, 4242, r#"{"hello":"world"}"#);
-    c.write_events(key.clone(), vec![ev.clone()]).await?;
+    c.write_events(key.clone(), vec![ev.clone()], 0).await?;
 
     let batches = read_all(&mut c, &key).await?;
     let events = flatten(&batches);
@@ -54,7 +54,7 @@ pub async fn reads_are_ordered_and_gap_free() -> R {
 
     let n = 25u64;
     for i in 1..=n {
-        c.write_events(key.clone(), vec![event(i, TYPE, 1000 + i, &format!("{{\"n\":{i}}}"))])
+        c.write_events(key.clone(), vec![event(i, TYPE, 1000 + i, &format!("{{\"n\":{i}}}"))], 0)
             .await?;
     }
     let batches = read_all(&mut c, &key).await?;
@@ -87,7 +87,7 @@ pub async fn version_tracks_batch_count() -> R {
 
     let k = 7u64;
     for i in 1..=k {
-        c.write_events(key.clone(), vec![event(i, TYPE, 1000 + i, "{}")]).await?;
+        c.write_events(key.clone(), vec![event(i, TYPE, 1000 + i, "{}")], 0).await?;
     }
     let details = c
         .aggregate_details(AggregateDetailsRequest { correlation_id: None, aggregate_key: key.clone() })
@@ -119,7 +119,7 @@ pub async fn empty_write_rejected() -> R {
     let mut c = CeleriantClient::connect(server.address()).await?;
     let key = unique_key("empty_write_rejected");
 
-    let res = c.write_events(key, vec![]).await;
+    let res = c.write_events(key, vec![], 0).await;
     match res {
         Err(ClientError::Server(ServerError::Write { kind: WriteError::EmptyEventsList, .. })) => Ok(()),
         other => Err(format!("expected WriteError::EmptyEventsList, got {other:?}").into()),
@@ -132,7 +132,7 @@ pub async fn zero_event_type_rejected() -> R {
     let mut c = CeleriantClient::connect(server.address()).await?;
     let key = unique_key("zero_event_type_rejected");
 
-    let res = c.write_events(key, vec![event(1, 0, 1000, "{}")]).await;
+    let res = c.write_events(key, vec![event(1, 0, 1000, "{}")], 0).await;
     match res {
         Err(ClientError::Server(ServerError::Write { kind: WriteError::ZeroEventType, .. })) => Ok(()),
         other => Err(format!("expected WriteError::ZeroEventType, got {other:?}").into()),
@@ -149,7 +149,7 @@ pub async fn write_no_create_rejected() -> R {
         .write_events_with(
             key,
             vec![event(1, TYPE, 1000, "{}")],
-            WriteEventsOptions { allow_create: false, ..Default::default() },
+            0, WriteEventsOptions { allow_create: false, ..Default::default() },
         )
         .await;
     match res {
@@ -199,7 +199,7 @@ pub async fn pagination_streams_whole_aggregate() -> R {
             event_value: std::sync::Arc::new(blob),
             iv: None,
         };
-        c.write_events(key.clone(), vec![ev]).await?;
+        c.write_events(key.clone(), vec![ev], 0).await?;
     }
 
     let mut seen = Vec::new();
@@ -242,7 +242,7 @@ pub async fn offset_filter_bounds_range() -> R {
     let key = unique_key("offset_filter_bounds_range");
 
     for i in 1..=10u64 {
-        c.write_events(key.clone(), vec![event(i, TYPE, 1000 + i, "{}")]).await?;
+        c.write_events(key.clone(), vec![event(i, TYPE, 1000 + i, "{}")], 0).await?;
     }
     let resp = c
         .read(ReadRequest {
@@ -268,7 +268,7 @@ pub async fn event_type_filter() -> R {
     // Alternate two event types across 6 batches.
     for i in 1..=6u64 {
         let t = if i % 2 == 0 { 200 } else { 100 };
-        c.write_events(key.clone(), vec![event(i, t, 1000 + i, "{}")]).await?;
+        c.write_events(key.clone(), vec![event(i, t, 1000 + i, "{}")], 0).await?;
     }
     let resp = c
         .read(ReadRequest {
@@ -302,13 +302,13 @@ pub async fn client_id_filter() -> R {
     c.write_events_with(
         key.clone(),
         vec![event(1, TYPE, 1000, r#"{"w":"a"}"#)],
-        WriteEventsOptions { client_id: 11, allow_create: true, ..Default::default() },
+        11, WriteEventsOptions { allow_create: true, ..Default::default() },
     )
     .await?;
     c.write_events_with(
         key.clone(),
         vec![event(1, TYPE, 1001, r#"{"w":"b"}"#)],
-        WriteEventsOptions { client_id: 22, allow_create: false, ..Default::default() },
+        22, WriteEventsOptions { allow_create: false, ..Default::default() },
     )
     .await?;
 
@@ -338,7 +338,7 @@ pub async fn writes_survive_restart() -> R {
     {
         let mut c = CeleriantClient::connect(server.address()).await?;
         for i in 1..=5u64 {
-            c.write_events(key.clone(), vec![event(i, TYPE, 1000 + i, &format!("{{\"n\":{i}}}"))])
+            c.write_events(key.clone(), vec![event(i, TYPE, 1000 + i, &format!("{{\"n\":{i}}}"))], 0)
                 .await?;
         }
     }
@@ -376,9 +376,9 @@ pub async fn exclude_client_id_filter() -> R {
     let key = unique_key("exclude_client_id_filter");
 
     c.write_events_with(key.clone(), vec![event(1, TYPE, 1000, r#"{"w":"a"}"#)],
-        WriteEventsOptions { client_id: 11, allow_create: true, ..Default::default() }).await?;
+        11, WriteEventsOptions { allow_create: true, ..Default::default() }).await?;
     c.write_events_with(key.clone(), vec![event(1, TYPE, 1001, r#"{"w":"b"}"#)],
-        WriteEventsOptions { client_id: 22, allow_create: false, ..Default::default() }).await?;
+        22, WriteEventsOptions { allow_create: false, ..Default::default() }).await?;
 
     let resp = c.read(ReadRequest {
         correlation_id: None,
@@ -408,7 +408,7 @@ pub async fn multi_event_batch_preserves_order() -> R {
         event(1, TYPE, 1001, r#"{"i":1}"#),
         event(2, TYPE, 1002, r#"{"i":2}"#),
         event(3, TYPE, 1003, r#"{"i":3}"#),
-    ]).await?;
+    ], 0).await?;
 
     let batches = read_all(&mut c, &key).await?;
     if batches.len() != 1 {
@@ -435,7 +435,7 @@ pub async fn event_time_range_filter() -> R {
     // event_timestamps 1000,1010,1020,1030,1040 across 5 batches.
     for i in 0..5u64 {
         c.write_events_with(key.clone(), vec![event(i + 1, TYPE, 1000 + i * 10, "{}")],
-            WriteEventsOptions { allow_create: i == 0, ..Default::default() }).await?;
+            0, WriteEventsOptions { allow_create: i == 0, ..Default::default() }).await?;
     }
     // Range [1010, 1030] inclusive should select the middle three.
     let resp = c.read(ReadRequest {

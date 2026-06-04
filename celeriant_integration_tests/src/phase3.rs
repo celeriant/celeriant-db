@@ -23,7 +23,7 @@ const TYPE: u64 = 100;
 async fn make_stream(c: &mut CeleriantClient, key: &AggregateKey, n: u64) -> R {
     for i in 1..=n {
         let opts = WriteEventsOptions { allow_create: i == 1, ..Default::default() };
-        c.write_events_with(key.clone(), vec![event(i, TYPE, 1000 + i, &format!("{{\"n\":{i}}}"))], opts)
+        c.write_events_with(key.clone(), vec![event(i, TYPE, 1000 + i, &format!("{{\"n\":{i}}}"))], 0, opts)
             .await?;
     }
     Ok(())
@@ -199,7 +199,7 @@ pub async fn delete_no_recreate_blocks_rewrite() -> R {
         .write_events_with(
             key.clone(),
             vec![event(1, TYPE, 2000, "{}")],
-            WriteEventsOptions { allow_create: true, ..Default::default() },
+            0, WriteEventsOptions { allow_create: true, ..Default::default() },
         )
         .await;
     match res {
@@ -227,7 +227,7 @@ pub async fn delete_recreate_allows_rewrite() -> R {
     c.write_events_with(
         key.clone(),
         vec![event(1, TYPE, 2000, r#"{"reborn":true}"#)],
-        WriteEventsOptions { allow_create: true, ..Default::default() },
+        0, WriteEventsOptions { allow_create: true, ..Default::default() },
     )
     .await?;
 
@@ -306,7 +306,7 @@ pub async fn delete_sequence_continuation() -> R {
     async fn cycle(c: &mut CeleriantClient, key: &AggregateKey, continuation: bool) -> Result<(u64, u64), Box<dyn std::error::Error>> {
         for i in 1..=3u64 {
             c.write_events_with(key.clone(), vec![event(i, TYPE, 1000 + i, "{}")],
-                WriteEventsOptions { allow_create: i == 1, ..Default::default() }).await?;
+                0, WriteEventsOptions { allow_create: i == 1, ..Default::default() }).await?;
         }
         let pre = c.aggregate_details(AggregateDetailsRequest { correlation_id: None, aggregate_key: key.clone() }).await?.max_event_seq;
 
@@ -319,7 +319,7 @@ pub async fn delete_sequence_continuation() -> R {
         c.delete(DeleteRequest { correlation_id: None, client_id: 1, user_id: None, deletes }).await?;
 
         c.write_events_with(key.clone(), vec![event(1, TYPE, 2000, "{}")],
-            WriteEventsOptions { allow_create: true, ..Default::default() }).await?;
+            0, WriteEventsOptions { allow_create: true, ..Default::default() }).await?;
         let post = c.aggregate_details(AggregateDetailsRequest { correlation_id: None, aggregate_key: key.clone() }).await?.max_event_seq;
         Ok((pre, post))
     }
@@ -362,7 +362,7 @@ pub async fn delete_cross_shard_rejected() -> R {
     let b = AggregateKey::new(1, 1, 1001);
     for k in [&a, &b] {
         c.write_events_with(k.clone(), vec![event(1, TYPE, 1000, "{}")],
-            WriteEventsOptions { allow_create: true, ..Default::default() }).await?;
+            0, WriteEventsOptions { allow_create: true, ..Default::default() }).await?;
     }
 
     // Delete both in ONE request — spans two shards.

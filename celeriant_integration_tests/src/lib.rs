@@ -51,13 +51,16 @@ pub mod follower_read_snapshot;
 pub mod identity_test;
 pub mod invariant_clock_drift_rejection;
 pub mod invariant_concurrent_write;
+pub mod invariant_held_seq_sibling_recovery;
 pub mod invariant_occ_before_idempotency;
 pub mod invariant_read_count;
 pub mod invariant_replication_convergence;
 pub mod invariant_replication_queue_pressure;
 pub mod invariant_s3_fallback_dedup;
 pub mod leader_read_visibility;
+pub mod debug_demotion_cull_acked_loss;
 pub mod metamorphic_common;
+pub mod metamorphic_cull_parity;
 pub mod metamorphic_divergence_recovery_parity;
 pub mod metamorphic_follower_crash_catchup_parity;
 pub mod metamorphic_leader_follower_parity;
@@ -109,7 +112,9 @@ pub mod schema_zero_cache;
 pub mod segment_summary_correctness;
 pub mod single;
 pub mod standalone_to_distributed;
+pub mod storage_corruption_header_recovery;
 pub mod typed_operations;
+pub mod watch_failover;
 pub mod watch_test;
 
 use std::collections::HashMap;
@@ -1664,7 +1669,7 @@ pub async fn is_leader(address: &str) -> Result<bool, Box<dyn std::error::Error>
     };
     let mut client = CeleriantClient::connect(address).await?;
     match client
-        .write_events_with(probe_key, vec![event], WriteEventsOptions { allow_create: false, ..Default::default() })
+        .write_events_with(probe_key, vec![event], 0, WriteEventsOptions { allow_create: false, ..Default::default() })
         .await
     {
         Err(ClientError::NotLeader { .. }) => Ok(false),

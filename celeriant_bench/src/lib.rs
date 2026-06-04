@@ -18,7 +18,11 @@ use rustls_pki_types::ServerName;
 use tokio::sync::Barrier;
 use tokio::time::Instant;
 
+pub mod cas_storm;
+pub mod history;
 pub mod watch_flood;
+pub use cas_storm::{cas_storm_aggregate, run_cas_storm, CasStormOutcome};
+pub use history::{HistoryRecorder, HistorySummary};
 pub use watch_flood::{run_watch_flood, watch_dial_probe, WatchFloodParams, WatchFloodResult};
 
 #[derive(Debug, Clone)]
@@ -111,7 +115,7 @@ pub async fn smoke_test(pool: &Arc<CeleriantPool>) -> Result<(), Box<dyn std::er
         event_value: Arc::new(b"smoke-test".to_vec()),
         iv: None,
     };
-    pool.write_events(smoke_key, vec![smoke_event]).await?;
+    pool.write_events(smoke_key, vec![smoke_event], 0).await?;
     Ok(())
 }
 
@@ -162,7 +166,7 @@ pub async fn run_benchmark(
 
                 let key = AggregateKey::new(1, 1, id as u128);
                 let req_start = Instant::now();
-                match pool.write_events(key, vec![event]).await {
+                match pool.write_events(key, vec![event], 0).await {
                     Ok(_) => {
                         latencies.push(req_start.elapsed().as_millis() as u64);
                         ok_counter.fetch_add(1, Ordering::Relaxed);
@@ -291,6 +295,46 @@ pub async fn run_benchmark_idempotent(
     num_tasks: usize,
     duration_secs: u64,
 ) -> IdempotentBenchOutcome {
+    run_benchmark_idempotent_opts(pool, num_tasks, duration_secs, IdempotentBenchOptions::default()).await
+}
+
+/// `run_benchmark_idempotent` plus optional per-op history recording
+/// (`history::HistoryRecorder`). With `None` the hot loop pays one branch per
+/// attempt; the caller owns the recorder and calls `finish()` after this
+/// returns.
+pub async fn run_benchmark_idempotent_with_history(
+    pool: &Arc<CeleriantPool>,
+    num_tasks: usize,
+    duration_secs: u64,
+    history: Option<Arc<HistoryRecorder>>,
+) -> IdempotentBenchOutcome {
+    run_benchmark_idempotent_opts(
+        pool,
+        num_tasks,
+        duration_secs,
+        IdempotentBenchOptions { history, ..Default::default() },
+    )
+    .await
+}
+
+#[derive(Default, Clone)]
+pub struct IdempotentBenchOptions {
+    pub history: Option<Arc<HistoryRecorder>>,
+    /// `duplicate_replay` workload: after every acked write, deliberately
+    /// resubmit the same `client_seq` once. The server must reject the
+    /// replay (2002) and the WAL must hold exactly one record per seq —
+    /// `HistoryIdempotency` validates the rejections, the
+    /// `HistoryWalMonotonicity` upper bound catches duplicate acceptance.
+    pub duplicate_replay: bool,
+}
+
+pub async fn run_benchmark_idempotent_opts(
+    pool: &Arc<CeleriantPool>,
+    num_tasks: usize,
+    duration_secs: u64,
+    opts: IdempotentBenchOptions,
+) -> IdempotentBenchOutcome {
+    let IdempotentBenchOptions { history, duplicate_replay } = opts;
     let barrier = Arc::new(Barrier::new(num_tasks));
     let total_ok = Arc::new(AtomicU64::new(0));
     let total_err = Arc::new(AtomicU64::new(0));
@@ -319,6 +363,7 @@ pub async fn run_benchmark_idempotent(
         // collapse across tasks.
         let client_id: u128 = (id as u128) + 1;
         let aggregate_key = AggregateKey::new(1, 1, id as u128);
+        let history = history.clone();
 
         tasks.push(tokio::spawn(async move {
             let mut latencies = Vec::new();
@@ -331,29 +376,33 @@ pub async fn run_benchmark_idempotent(
             const BACKOFF_INITIAL_MS: u64 = 10;
             const BACKOFF_MAX_MS: u64 = 500;
 
-            while Instant::now() < deadline {
-                let event = DatablockAggregateEvent {
-                    client_seq: current_seq,
-                    event_seq: 0,
-                    event_id: None,
-                    event_timestamp: 0,
-                    event_type_major: 1,
-                    event_type_minor: 0,
-                    event_value: Arc::new(format!("[t-{id}-s-{current_seq}]").into_bytes()),
-                    iv: None,
-                };
+            let make_event = |seq: u64| DatablockAggregateEvent {
+                client_seq: seq,
+                event_seq: 0,
+                event_id: None,
+                event_timestamp: 0,
+                event_type_major: 1,
+                event_type_minor: 0,
+                event_value: Arc::new(format!("[t-{id}-s-{seq}]").into_bytes()),
+                iv: None,
+            };
 
+            while Instant::now() < deadline {
                 let req_start = Instant::now();
                 let res = pool.write_events_with(
                     aggregate_key.clone(),
-                    vec![event],
+                    vec![make_event(current_seq)],
+                    client_id,
                     WriteEventsOptions {
-                        client_id,
                         allow_create: true,
                         expected_version: None,
                         enforce_client_idempotency: true,
                     },
                 ).await;
+
+                if let Some(h) = &history {
+                    h.record_op(id as u32, &aggregate_key, client_id, current_seq, None, &res, req_start);
+                }
 
                 match res {
                     Ok(_) => {
@@ -361,6 +410,37 @@ pub async fn run_benchmark_idempotent(
                         total_ok.fetch_add(1, Ordering::Relaxed);
                         ok_acks.fetch_add(1, Ordering::Relaxed);
                         max_acked = current_seq;
+
+                        if duplicate_replay {
+                            // Deliberate replay of the just-acked seq. Expect a
+                            // 2002; an Ok here is duplicate acceptance, which
+                            // the history checkers catch via the final-read
+                            // version bound. Best-effort: not retried.
+                            let dup_start = Instant::now();
+                            let dup_res = pool.write_events_with(
+                                aggregate_key.clone(),
+                                vec![make_event(current_seq)],
+                                client_id,
+                                WriteEventsOptions {
+                                    allow_create: false,
+                                    expected_version: None,
+                                    enforce_client_idempotency: true,
+                                },
+                            ).await;
+                            if let Some(h) = &history {
+                                h.record_op(id as u32, &aggregate_key, client_id, current_seq, None, &dup_res, dup_start);
+                            }
+                            if matches!(
+                                dup_res,
+                                Err(ClientError::Server(ServerError::Write {
+                                    kind: WriteError::ClientIdempotencyViolation { .. },
+                                    ..
+                                }))
+                            ) {
+                                idempotency_acks.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+
                         current_seq += 1;
                         backoff_ms = 0;
                     }
@@ -557,6 +637,22 @@ pub struct DataIntegrityReport {
 /// returned report (totals always cover everything). Concurrency is
 /// bounded by `max_in_flight` so a 4000-aggregate audit doesn't melt the
 /// cluster's read path.
+/// One `aggregate_details` round trip: the committed batch count on the node
+/// behind `pool`. Exists so callers (the chaos final-read phase) don't need a
+/// direct `celeriant_msg` dependency.
+pub async fn read_max_aggregate_version(
+    pool: &Arc<CeleriantPool>,
+    key: &AggregateKey,
+) -> Result<u64, ClientError> {
+    use celeriant_msg::request::requests::AggregateDetailsRequest;
+    pool.aggregate_details(AggregateDetailsRequest {
+        correlation_id: None,
+        aggregate_key: key.clone(),
+    })
+    .await
+    .map(|d| d.max_aggregate_version)
+}
+
 pub async fn verify_no_seq_gaps(
     pool: &Arc<CeleriantPool>,
     acks: &[TaskAckSummary],

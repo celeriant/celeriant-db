@@ -256,6 +256,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             distributed: false,
         },
         TestEntry {
+            name: "watch_failover",
+            description: "Watch delivery history stays consistent with the final read across a leader kill + promotion + reconnect",
+            estimated_secs: 60,
+            categories: &[Replication, Election, Edge],
+            distributed: true,
+        },
+        TestEntry {
             name: "connection_test",
             description: "Connection lifecycle, pipelining, and shard routing",
             estimated_secs: 1,
@@ -435,6 +442,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             distributed: true,
         },
         TestEntry {
+            name: "invariant_held_seq_sibling_recovery",
+            description: "A held client_seq consumed by a sibling yields a 2002 that must be verified, not trusted",
+            estimated_secs: 1,
+            categories: &[Invariant, Correctness],
+            distributed: false,
+        },
+        TestEntry {
             name: "invariant_occ_before_idempotency",
             description: "OCC check fires before idempotency when both would fail",
             estimated_secs: 1,
@@ -509,6 +523,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             name: "metamorphic_divergence_recovery_parity",
             description: "Old leader with divergent WAL truncates + S3-catches-up when rejoining, ends byte-identical with new leader",
             estimated_secs: 130,
+            categories: &[Metamorphic, Replication, Election],
+            distributed: true,
+        },
+        TestEntry {
+            name: "metamorphic_cull_parity",
+            description: "Speculative-tail removal across all three paths — in-process demotion cull, boot divergence truncation, GC-forced reframe — ends byte-identical with no acked loss",
+            estimated_secs: 180,
             categories: &[Metamorphic, Replication, Election],
             distributed: true,
         },
@@ -713,6 +734,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             distributed: false,
         },
         TestEntry {
+            name: "storage_corruption_header_recovery",
+            description: "Corrupt primary WAL header → node recovers byte-identical from the backup header",
+            estimated_secs: 8,
+            categories: &[Durability],
+            distributed: false,
+        },
+        TestEntry {
             name: "p2_4_s3_capacity",
             description: "S3 degraded-mode capacity with large-volume fallback and follower catchup",
             estimated_secs: 42,
@@ -850,6 +878,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             description: "Follower under replication queue pressure with external process launch",
             estimated_secs: 60,
             categories: &[Debug],
+            distributed: true,
+        },
+        TestEntry {
+            name: "debug_demotion_cull_acked_loss",
+            description: "Fence-bounce demotion cull rewinds past peer-acked entries; reconciliation probe must re-supply them before the leader dies",
+            estimated_secs: 100,
+            categories: &[Debug, Durability],
             distributed: true,
         },
     ]

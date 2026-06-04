@@ -111,7 +111,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         event_value: Arc::new(b"smoke-test".to_vec()),
         iv: None,
     };
-    pool.write_events(smoke_key, vec![smoke_event]).await?;
+    pool.write_events(smoke_key, vec![smoke_event], 0).await?;
     println!("  Write OK\n");
 
     // Throughput benchmark
@@ -188,7 +188,7 @@ async fn run_benchmark(
 
                 let key = AggregateKey::new(1, 1, id as u128);
                 let req_start = Instant::now();
-                match pool.write_events(key, vec![event]).await {
+                match pool.write_events(key, vec![event], 0).await {
                     Ok(_) => {
                         latencies.push(req_start.elapsed().as_millis() as u64);
                         ok_counter.fetch_add(1, Ordering::Relaxed);

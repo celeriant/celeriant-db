@@ -73,7 +73,7 @@ async fn write_seq(addr: &str, key: &AggregateKey, lo: u64, hi: u64) -> Result<(
         c.write_events_with(
             key.clone(),
             vec![event(i, TYPE, 1000 + i, &format!("{{\"n\":{i}}}"))],
-            WriteEventsOptions { allow_create: i == 1, expected_version: Some(i - 1), ..Default::default() },
+            0, WriteEventsOptions { allow_create: i == 1, expected_version: Some(i - 1), ..Default::default() },
         )
         .await
         .map_err(|e| format!("write seq {i}: {e:?}"))?;
@@ -189,7 +189,7 @@ pub async fn leader_self_fences_on_lost_lease() -> R {
     while std::time::Instant::now() < deadline {
         match CeleriantClient::connect(&follower).await {
             Ok(mut c) => match c.write_events_with(new_key.clone(), vec![event(1, TYPE, 9000, "{}")],
-                WriteEventsOptions { allow_create: true, ..Default::default() }).await {
+                0, WriteEventsOptions { allow_create: true, ..Default::default() }).await {
                 Ok(_) => { promoted = true; break; }
                 Err(e) => last = format!("{e:?}"),
             },
@@ -246,7 +246,7 @@ pub async fn notleader_redirect_carries_leader_address() -> R {
         let mut fc = CeleriantClient::connect(&follower).await?;
         let res = fc
             .write_events_with(key.clone(), vec![event(1, TYPE, 2000, "{}")],
-                WriteEventsOptions { allow_create: true, ..Default::default() })
+                0, WriteEventsOptions { allow_create: true, ..Default::default() })
             .await;
         match res {
             Err(ClientError::NotLeader { leader_address: Some(addr), .. }) => {
@@ -270,7 +270,7 @@ pub async fn notleader_redirect_carries_leader_address() -> R {
     let mut lc = CeleriantClient::connect(&redirect).await
         .map_err(|e| format!("could not connect to the redirect target {redirect}: {e}"))?;
     lc.write_events_with(key.clone(), vec![event(1, TYPE, 2000, "{}")],
-        WriteEventsOptions { allow_create: true, ..Default::default() })
+        0, WriteEventsOptions { allow_create: true, ..Default::default() })
         .await
         .map_err(|e| format!("redirect target {redirect} did not accept the write (it is not the real leader): {e:?}"))?;
 
@@ -371,7 +371,7 @@ pub async fn throttled_link_preserves_acked_writes() -> R {
         // Unconditional append (no expected_version) so we can keep firing even
         // if some are shed; idempotency off.
         match c.write_events_with(key.clone(), vec![ev],
-            WriteEventsOptions { allow_create: false, ..Default::default() }).await {
+            0, WriteEventsOptions { allow_create: false, ..Default::default() }).await {
             Ok(_) => { acked += 1; next += 1; }
             Err(ClientError::ServerBusy) => { server_busy += 1; }
             // A throttled link can also surface as a replication error / timeout;
@@ -470,7 +470,7 @@ pub async fn compaction_reclaims_after_trim() -> R {
             iv: None,
         };
         c.write_events_with(key.clone(), vec![ev],
-            WriteEventsOptions { allow_create: i == 1, expected_version: Some(i - 1), ..Default::default() })
+            0, WriteEventsOptions { allow_create: i == 1, expected_version: Some(i - 1), ..Default::default() })
             .await
             .map_err(|e| format!("compaction setup write {i}: {e:?}"))?;
     }

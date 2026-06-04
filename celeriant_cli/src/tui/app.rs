@@ -851,8 +851,7 @@ impl App {
             iv: None,
         };
 
-        let resp = pool.write_events_with(key, vec![event], WriteEventsOptions {
-                client_id: self.client_id,
+        let resp = pool.write_events_with(key, vec![event], self.client_id, WriteEventsOptions {
                 ..Default::default()
             })
             .await

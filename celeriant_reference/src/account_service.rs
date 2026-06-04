@@ -150,18 +150,16 @@ impl AccountService {
             });
         }
 
-        // Step 3: Replay new events
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        // Step 3: Replay new events. Warm-window aging is batch-vs-tip in server time;
+        // mixing in the local clock would let skew silently disable warming.
+        let tip_ts = response.event_batches.last().map(|b| b.server_timestamp).unwrap_or(0);
         let warm_window_ms = CACHE_TTL.as_millis() as u64;
 
         let mut new_version = last_version;
         for batch in &response.event_batches {
             new_version = batch.aggregate_version;
             let track_client_seq = batch.client_id == *SERVICE_CLIENT_ID;
-            let warm_cache = now_ms.saturating_sub(batch.server_timestamp) < warm_window_ms;
+            let warm_cache = tip_ts.saturating_sub(batch.server_timestamp) < warm_window_ms;
 
             for evt in &batch.events {
                 if track_client_seq && evt.client_seq > max_client_seq {
@@ -175,6 +173,10 @@ impl AccountService {
                             balance_cents,
                             aggregate_version: batch.aggregate_version,
                         });
+                        // Record the seq's owner so a CEI violation can be verified.
+                        if track_client_seq {
+                            self.idempotency.set_seq_owner(account_id, evt.client_seq, eid);
+                        }
                     }
                 }
             }
@@ -187,7 +189,8 @@ impl AccountService {
                  last_version, last_client_seq, updated_at) \
                  VALUES ($1, $2, $3, $4, $5, now()) \
                  ON CONFLICT (account_id) DO UPDATE \
-                 SET balance_cents = $3, account_name = $2, \
+                 SET balance_cents = $3, \
+                     account_name = COALESCE(NULLIF($2, ''), account_balances.account_name), \
                      last_version = $4, last_client_seq = $5, updated_at = now() \
                  WHERE account_balances.last_version < $4",
                 &[
@@ -258,8 +261,8 @@ impl AccountService {
             match self.pool.write_events_with(
                 account_key(account_id),
                 vec![evt],
+                *SERVICE_CLIENT_ID,
                 WriteEventsOptions {
-                    client_id: *SERVICE_CLIENT_ID,
                     allow_create: true,
                     expected_version: Some(projection.last_version),
                     enforce_client_idempotency: true,
@@ -267,16 +270,19 @@ impl AccountService {
             ).await {
                 Ok(_) => {
                     let new_version = projection.last_version + 1;
-                    self.update_projection_optimistically(
-                        account_id, new_balance,
-                        new_version, projection.last_version, client_seq,
-                    ).await;
+                    // Caches before the projection bump: the bump kills the replay path
+                    // for same-key siblings, so the cache must already answer by then.
                     if let Some(eid) = event_id {
                         self.idempotency.set(eid, account_id, IdempotencyEntry {
                             balance_cents: new_balance,
                             aggregate_version: new_version,
                         });
+                        self.idempotency.set_seq_owner(account_id, client_seq, eid);
                     }
+                    self.update_projection_optimistically(
+                        account_id, new_balance,
+                        new_version, projection.last_version, client_seq,
+                    ).await;
                     return Ok(WriteResult { balance_cents: new_balance, aggregate_version: new_version });
                 }
                 Err(ClientError::Server(ServerError::Write {
@@ -302,9 +308,9 @@ impl AccountService {
                 Err(ClientError::Server(ServerError::Write {
                     kind: WriteError::ClientIdempotencyViolation { .. }, ..
                 })) => {
-                    // Prior attempt with the same client_seq already landed.
-                    // Catch-up will warm the cache from event_id if it matches.
-                    tracing::info!("Idempotency hit on deposit for {account_id:x} — prior attempt landed");
+                    // Someone landed this client_seq: our timed-out prior attempt, or a
+                    // sibling request that derived the same number. Verify before claiming
+                    // success; a false "done" silently drops the deposit.
                     let p = self.catch_up(account_id, None).await?;
                     if let Some(eid) = event_id {
                         if let Some(hit) = self.idempotency.try_get(eid, account_id) {
@@ -313,8 +319,23 @@ impl AccountService {
                                 aggregate_version: hit.aggregate_version,
                             });
                         }
+                        match self.idempotency.seq_owner(account_id, client_seq) {
+                            Some(owner) if owner == eid => {
+                                tracing::info!("Idempotency hit on deposit for {account_id:x} — prior attempt landed");
+                                return Ok(WriteResult { balance_cents: p.balance_cents, aggregate_version: p.last_version });
+                            }
+                            Some(_) => {
+                                // A sibling took the seq; our event never landed.
+                                tracing::info!("client_seq {client_seq} on {account_id:x} taken by a sibling — re-deriving");
+                                re_derive_cei = true;
+                                continue;
+                            }
+                            None => {} // unknown: refuse to guess
+                        }
                     }
-                    return Ok(WriteResult { balance_cents: p.balance_cents, aggregate_version: p.last_version });
+                    return Err(AccountError::OccExhausted(
+                        "Deposit state unverifiable after idempotency violation — retry the request.".into(),
+                    ));
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -385,8 +406,8 @@ impl AccountService {
             match self.pool.write_events_with(
                 account_key(account_id),
                 vec![evt],
+                *SERVICE_CLIENT_ID,
                 WriteEventsOptions {
-                    client_id: *SERVICE_CLIENT_ID,
                     allow_create: true,
                     expected_version: Some(projection.last_version),
                     enforce_client_idempotency: true,
@@ -394,16 +415,18 @@ impl AccountService {
             ).await {
                 Ok(_) => {
                     let new_version = projection.last_version + 1;
-                    self.update_projection_optimistically(
-                        account_id, new_balance,
-                        new_version, projection.last_version, client_seq,
-                    ).await;
+                    // Caches before the projection bump, as in deposit.
                     if let Some(eid) = event_id {
                         self.idempotency.set(eid, account_id, IdempotencyEntry {
                             balance_cents: new_balance,
                             aggregate_version: new_version,
                         });
+                        self.idempotency.set_seq_owner(account_id, client_seq, eid);
                     }
+                    self.update_projection_optimistically(
+                        account_id, new_balance,
+                        new_version, projection.last_version, client_seq,
+                    ).await;
                     return Ok(WriteResult { balance_cents: new_balance, aggregate_version: new_version });
                 }
                 Err(ClientError::Server(ServerError::Write {
@@ -426,7 +449,7 @@ impl AccountService {
                 Err(ClientError::Server(ServerError::Write {
                     kind: WriteError::ClientIdempotencyViolation { .. }, ..
                 })) => {
-                    tracing::info!("Idempotency hit on withdraw for {account_id:x} — prior attempt landed");
+                    // Same verification as deposit.
                     let p = self.catch_up(account_id, None).await?;
                     if let Some(eid) = event_id {
                         if let Some(hit) = self.idempotency.try_get(eid, account_id) {
@@ -435,8 +458,22 @@ impl AccountService {
                                 aggregate_version: hit.aggregate_version,
                             });
                         }
+                        match self.idempotency.seq_owner(account_id, client_seq) {
+                            Some(owner) if owner == eid => {
+                                tracing::info!("Idempotency hit on withdraw for {account_id:x} — prior attempt landed");
+                                return Ok(WriteResult { balance_cents: p.balance_cents, aggregate_version: p.last_version });
+                            }
+                            Some(_) => {
+                                tracing::info!("client_seq {client_seq} on {account_id:x} taken by a sibling — re-deriving");
+                                re_derive_cei = true;
+                                continue;
+                            }
+                            None => {}
+                        }
                     }
-                    return Ok(WriteResult { balance_cents: p.balance_cents, aggregate_version: p.last_version });
+                    return Err(AccountError::OccExhausted(
+                        "Withdrawal state unverifiable after idempotency violation — retry the request.".into(),
+                    ));
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -542,14 +579,7 @@ impl AccountService {
                     let new_from_batch = from_proj.last_version + 1;
                     let new_to_batch = to_proj.last_version + 1;
 
-                    self.update_projection_optimistically(
-                        from_account_id, new_from_balance,
-                        new_from_batch, from_proj.last_version, from_cei,
-                    ).await;
-                    self.update_projection_optimistically(
-                        to_account_id, new_to_balance,
-                        new_to_batch, to_proj.last_version, to_cei,
-                    ).await;
+                    // Caches before the projection bumps, as in deposit.
                     if let Some(eid) = event_id {
                         self.idempotency.set(eid, from_account_id, IdempotencyEntry {
                             balance_cents: new_from_balance,
@@ -559,7 +589,17 @@ impl AccountService {
                             balance_cents: new_to_balance,
                             aggregate_version: new_to_batch,
                         });
+                        self.idempotency.set_seq_owner(from_account_id, from_cei, eid);
+                        self.idempotency.set_seq_owner(to_account_id, to_cei, eid);
                     }
+                    self.update_projection_optimistically(
+                        from_account_id, new_from_balance,
+                        new_from_batch, from_proj.last_version, from_cei,
+                    ).await;
+                    self.update_projection_optimistically(
+                        to_account_id, new_to_balance,
+                        new_to_batch, to_proj.last_version, to_cei,
+                    ).await;
 
                     return Ok(TransferResult {
                         from: WriteResult { balance_cents: new_from_balance, aggregate_version: new_from_batch },
@@ -586,16 +626,36 @@ impl AccountService {
                 Err(ClientError::Server(ServerError::Write {
                     kind: WriteError::ClientIdempotencyViolation { .. }, ..
                 })) => {
-                    tracing::info!("Idempotency hit on transfer — prior attempt landed");
+                    // At least one leg's client_seq was consumed: our prior transfer, or a
+                    // sibling's write on either account. Verify.
                     let fp = self.catch_up(from_account_id, None).await?;
                     let tp = self.catch_up(to_account_id, None).await?;
                     if let Some(hit) = self.cached_transfer(event_id, from_account_id, to_account_id) {
                         return Ok(hit);
                     }
-                    return Ok(TransferResult {
-                        from: WriteResult { balance_cents: fp.balance_cents, aggregate_version: fp.last_version },
-                        to: WriteResult { balance_cents: tp.balance_cents, aggregate_version: tp.last_version },
-                    });
+                    if let Some(eid) = event_id {
+                        let from_owner = self.idempotency.seq_owner(from_account_id, from_cei);
+                        let to_owner = self.idempotency.seq_owner(to_account_id, to_cei);
+                        let sibling_took_a_leg = matches!(from_owner, Some(o) if o != eid)
+                            || matches!(to_owner, Some(o) if o != eid);
+                        if sibling_took_a_leg {
+                            tracing::info!("transfer client_seq taken by a sibling — re-deriving");
+                            re_derive_cei = true;
+                            continue;
+                        }
+                        // The write is all-or-nothing: owning either leg proves the whole
+                        // transfer landed.
+                        if from_owner == Some(eid) || to_owner == Some(eid) {
+                            tracing::info!("Idempotency hit on transfer — prior attempt landed");
+                            return Ok(TransferResult {
+                                from: WriteResult { balance_cents: fp.balance_cents, aggregate_version: fp.last_version },
+                                to: WriteResult { balance_cents: tp.balance_cents, aggregate_version: tp.last_version },
+                            });
+                        }
+                    }
+                    return Err(AccountError::OccExhausted(
+                        "Transfer state unverifiable after idempotency violation — retry the request.".into(),
+                    ));
                 }
                 Err(e) => return Err(e.into()),
             }

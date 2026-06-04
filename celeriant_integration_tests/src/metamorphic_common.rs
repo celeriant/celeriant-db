@@ -5,10 +5,47 @@
 //! exposed through the client API). Redundant with per-field equality — kept
 //! as a compact log signal.
 
+use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::time::Duration;
+
+/// Poll until `address` accepts a write — i.e. its node is `Leader` and out
+/// of catchup. Each attempt uses a fresh probe `AggregateKey` so
+/// `allow_create=true` never collides with prior probes' state. The probe
+/// keys (`org_id=7777`) are disjoint from workload keys, so they don't appear
+/// in callers' diff loops.
+///
+/// Failover sequence: heartbeat TTL expires on the survivor → S3 CAS → S3
+/// catchup → transition to Leader. Until that completes writes return
+/// `WRITE_NOT_LEADER`. The 30s budget covers a 10s heartbeat TTL plus catchup
+/// on an essentially empty cluster.
+pub async fn wait_for_promotion(address: &str) -> Result<CeleriantClient, Box<dyn std::error::Error>> {
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(30);
+    let mut last_err = String::new();
+    let mut attempt: u128 = 0;
+    while start.elapsed() < timeout {
+        attempt += 1;
+        match CeleriantClient::connect(address).await {
+            Ok(mut client) => {
+                let probe_key = AggregateKey::new(7777, 7777, attempt);
+                match crate::write_event(&mut client, &probe_key, 1, true).await {
+                    Ok(_) => return Ok(client),
+                    Err(e) => last_err = e.to_string(),
+                }
+            }
+            Err(e) => last_err = e.to_string(),
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Err(format!(
+        "promotion timeout after {:?} (last error: {})",
+        timeout, last_err
+    ).into())
+}
 
 /// How to compare two read results.
 ///

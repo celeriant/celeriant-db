@@ -561,6 +561,7 @@ dependencies = [
  "clap",
  "rustls-pki-types",
  "serde",
+ "serde_json",
  "tokio",
 ]
 

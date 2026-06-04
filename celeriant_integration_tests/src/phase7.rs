@@ -62,7 +62,7 @@ pub async fn concurrent_occ_writers_one_wins() -> R {
     {
         let mut c = CeleriantClient::connect(&addr).await?;
         c.write_events_with(key.clone(), vec![event(1, TYPE, 1000, "{}")],
-            WriteEventsOptions { allow_create: true, expected_version: Some(0), ..Default::default() }).await?;
+            0, WriteEventsOptions { allow_create: true, expected_version: Some(0), ..Default::default() }).await?;
     }
 
     // N writers all guard on version 1 concurrently.
@@ -77,7 +77,7 @@ pub async fn concurrent_occ_writers_one_wins() -> R {
                 .write_events_with(
                     key,
                     vec![event(100 + i, TYPE, 2000 + i, &format!("{{\"w\":{i}}}"))],
-                    WriteEventsOptions { allow_create: false, expected_version: Some(1), ..Default::default() },
+                    0, WriteEventsOptions { allow_create: false, expected_version: Some(1), ..Default::default() },
                 )
                 .await;
             Ok::<Outcome, String>(classify(res))
@@ -134,7 +134,7 @@ pub async fn concurrent_creators_one_wins() -> R {
                 .write_events_with(
                     key,
                     vec![event(1, TYPE, 1000 + i, &format!("{{\"creator\":{i}}}"))],
-                    WriteEventsOptions { allow_create: true, expected_version: Some(0), ..Default::default() },
+                    0, WriteEventsOptions { allow_create: true, expected_version: Some(0), ..Default::default() },
                 )
                 .await;
             Ok::<Outcome, String>(classify(res))
@@ -180,7 +180,7 @@ pub async fn concurrent_idempotent_retries_dedupe() -> R {
     {
         let mut c = CeleriantClient::connect(&addr).await?;
         c.write_events_with(key.clone(), vec![event(1, TYPE, 500, r#"{"seed":1}"#)],
-            WriteEventsOptions { client_id: 99, allow_create: true, ..Default::default() }).await?;
+            99, WriteEventsOptions { allow_create: true, ..Default::default() }).await?;
     }
 
     // N concurrent retries of the identical (client_id=7, client_seq=1) write
@@ -196,7 +196,7 @@ pub async fn concurrent_idempotent_retries_dedupe() -> R {
                 .write_events_with(
                     key,
                     vec![event(1, TYPE, 1000, r#"{"v":1}"#)],
-                    WriteEventsOptions { client_id: 7, allow_create: false, enforce_client_idempotency: true, ..Default::default() },
+                    7, WriteEventsOptions { allow_create: false, enforce_client_idempotency: true, ..Default::default() },
                 )
                 .await;
             // The single winner appends (Ok); every other racer is deduped. A loser
@@ -268,7 +268,7 @@ pub async fn per_aggregate_order_across_shards() -> R {
                 c.write_events_with(
                     key.clone(),
                     vec![event(i, TYPE, 1000 + i, &payload)],
-                    WriteEventsOptions { allow_create: i == 1, expected_version: Some(i - 1), ..Default::default() },
+                    0, WriteEventsOptions { allow_create: i == 1, expected_version: Some(i - 1), ..Default::default() },
                 )
                 .await
                 .map_err(|e| format!("agg {a} seq {i}: {e:?}"))?;
@@ -341,7 +341,7 @@ pub async fn large_values_long_stream_intact() -> R {
         c.write_events_with(
             key.clone(),
             vec![ev],
-            WriteEventsOptions { allow_create: i == 1, expected_version: Some(i - 1), ..Default::default() },
+            0, WriteEventsOptions { allow_create: i == 1, expected_version: Some(i - 1), ..Default::default() },
         )
         .await
         .map_err(|e| format!("write {i}: {e:?}"))?;

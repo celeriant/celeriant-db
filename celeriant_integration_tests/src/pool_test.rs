@@ -71,14 +71,14 @@ async fn test_pool_write(pool: &CeleriantPool) {
     }
 }
 
-// ─── Test 2: pool.write_events() ─────────────────────────────────────────────
+// ─── Test 2: pool.write_events(, 0) ─────────────────────────────────────────────
 
 async fn test_pool_write_events(pool: &CeleriantPool) {
     let agg = AggregateKey::new(20, 1, 2002);
     let events = vec![make_event(0, "pool write_events")];
-    match pool.write_events(agg.clone(), events).await {
-        Ok(_) => pass("pool.write_events()"),
-        Err(e) => fail("pool.write_events()", e),
+    match pool.write_events(agg.clone(), events, 0).await {
+        Ok(_) => pass("pool.write_events(, 0)"),
+        Err(e) => fail("pool.write_events(, 0)", e),
     }
 }
 
@@ -88,7 +88,7 @@ async fn test_pool_read(pool: &CeleriantPool) {
     let agg = AggregateKey::new(20, 1, 2003);
 
     // Write first
-    let _ = pool.write_events(agg.clone(), vec![make_event(0, "read me back via pool")]).await;
+    let _ = pool.write_events(agg.clone(), vec![make_event(0, "read me back via pool")], 0).await;
 
     let req = ReadRequest {
         correlation_id: None,
@@ -107,7 +107,7 @@ async fn test_pool_read(pool: &CeleriantPool) {
 async fn test_pool_aggregate_details(pool: &CeleriantPool) {
     let agg = AggregateKey::new(20, 1, 2004);
 
-    let _ = pool.write_events(agg.clone(), vec![make_event(0, "details test")]).await;
+    let _ = pool.write_events(agg.clone(), vec![make_event(0, "details test")], 0).await;
 
     let req = AggregateDetailsRequest { correlation_id: None, aggregate_key: agg };
     match pool.aggregate_details(req).await {
@@ -122,7 +122,7 @@ async fn test_pool_aggregate_details(pool: &CeleriantPool) {
 async fn test_pool_delete(pool: &CeleriantPool) {
     let agg = AggregateKey::new(20, 1, 2005);
 
-    let _ = pool.write_events(agg.clone(), vec![make_event(0, "to delete via pool")]).await;
+    let _ = pool.write_events(agg.clone(), vec![make_event(0, "to delete via pool")], 0).await;
 
     let mut deletes = HashMap::new();
     deletes.insert(
@@ -162,13 +162,12 @@ async fn test_pool_read_all(pool: &CeleriantPool) {
     for i in 0u64..4 {
         use celeriant_client_tokio::WriteEventsOptions;
         let opts = WriteEventsOptions {
-            client_id: 1,
             allow_create: i == 0,
             expected_version: Some(i),
             enforce_client_idempotency: false,
         };
         let events = vec![make_event(i, &format!("read_all batch {}", i))];
-        if let Err(e) = pool.write_events_with(agg.clone(), events, opts).await {
+        if let Err(e) = pool.write_events_with(agg.clone(), events, 1, opts).await {
             fail("pool.read_all() setup write", e);
             return;
         }
@@ -190,7 +189,7 @@ async fn test_connection_reuse(pool: &CeleriantPool) {
     let agg = AggregateKey::new(20, 1, 2007);
 
     // First request creates the aggregate
-    match pool.write_events(agg.clone(), vec![make_event(0, "first request")]).await {
+    match pool.write_events(agg.clone(), vec![make_event(0, "first request")], 0).await {
         Ok(_) => {}
         Err(e) => { fail("connection reuse -- first write", e); return; }
     }
@@ -213,7 +212,7 @@ async fn test_connection_reuse(pool: &CeleriantPool) {
 async fn test_get_connection(pool: &CeleriantPool) {
     let agg = AggregateKey::new(20, 1, 2008);
 
-    let _ = pool.write_events(agg.clone(), vec![make_event(0, "get_connection test")]).await;
+    let _ = pool.write_events(agg.clone(), vec![make_event(0, "get_connection test")], 0).await;
 
     match pool.get_connection().await {
         Ok(mut conn) => {
@@ -270,7 +269,7 @@ async fn test_custom_pool_options(address: &str) {
     let pool = CeleriantPool::new(options);
 
     let agg = AggregateKey::new(20, 1, 2010);
-    match pool.write_events(agg, vec![make_event(0, "custom options write")]).await {
+    match pool.write_events(agg, vec![make_event(0, "custom options write")], 0).await {
         Ok(_) => pass("custom pool options (request_timeout=60s)"),
         Err(e) => fail("custom pool options", e),
     }
@@ -283,7 +282,7 @@ async fn test_pool_auto_compression(pool: &CeleriantPool) {
     // Payload above the default 1024-byte auto-compression threshold
     let large_payload = "x".repeat(2048);
     let events = vec![make_event(0, &large_payload)];
-    match pool.write_events(agg, events).await {
+    match pool.write_events(agg, events, 0).await {
         Ok(_) => pass("pool auto-compression -- large payload accepted"),
         Err(e) => fail("pool auto-compression", e),
     }

@@ -593,12 +593,16 @@ impl CeleriantPool {
     }
 
     /// Convenience method: write events to a single aggregate without constructing a `WriteRequest`.
+    ///
+    /// `client_id` scopes client-seq idempotency — use a stable id per logical writer, never a
+    /// fresh random value per call.
     pub async fn write_events(
         &self,
         aggregate_key: AggregateKey,
         events: Vec<DatablockAggregateEvent>,
+        client_id: u128,
     ) -> Result<SuccessResponse, ClientError> {
-        self.write_events_with(aggregate_key, events, WriteEventsOptions::default()).await
+        self.write_events_with(aggregate_key, events, client_id, WriteEventsOptions::default()).await
     }
 
     /// Like `write_events` but accepts options to control idempotency, optimistic concurrency, etc.
@@ -606,6 +610,7 @@ impl CeleriantPool {
         &self,
         aggregate_key: AggregateKey,
         events: Vec<DatablockAggregateEvent>,
+        client_id: u128,
         options: WriteEventsOptions,
     ) -> Result<SuccessResponse, ClientError> {
         let mut writes = HashMap::new();
@@ -617,7 +622,7 @@ impl CeleriantPool {
         });
         self.write(WriteRequest {
             correlation_id: None,
-            client_id: options.client_id,
+            client_id,
             user_id: None,
             writes,
         })

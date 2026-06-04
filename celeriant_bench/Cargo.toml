@@ -22,3 +22,4 @@ rustls-pki-types.workspace = true
 tokio.workspace = true
 clap.workspace = true
 serde.workspace = true
+serde_json.workspace = true

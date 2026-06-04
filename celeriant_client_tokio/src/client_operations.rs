@@ -14,9 +14,11 @@ use crate::celeriant_client::CeleriantClient;
 use crate::client_error::ClientError;
 
 /// Options for `write_events_with`. All fields default to the same values used by `write_events`.
+///
+/// The `client_id` is deliberately not an option: it scopes client-seq idempotency, so the
+/// caller must always supply it explicitly. The client library never invents one.
 #[derive(Debug, Clone)]
 pub struct WriteEventsOptions {
-    pub client_id: u128,
     pub allow_create: bool,
     pub expected_version: Option<u64>,
     pub enforce_client_idempotency: bool,
@@ -25,7 +27,6 @@ pub struct WriteEventsOptions {
 impl Default for WriteEventsOptions {
     fn default() -> Self {
         Self {
-            client_id: 0,
             allow_create: true,
             expected_version: None,
             enforce_client_idempotency: false,
@@ -73,12 +74,16 @@ impl CeleriantClient {
     }
 
     /// Convenience method: write events to a single aggregate without constructing a `WriteRequest`.
+    ///
+    /// `client_id` scopes client-seq idempotency — use a stable id per logical writer, never a
+    /// fresh random value per call.
     pub async fn write_events(
         &mut self,
         aggregate_key: AggregateKey,
         events: Vec<DatablockAggregateEvent>,
+        client_id: u128,
     ) -> Result<SuccessResponse, ClientError> {
-        self.write_events_with(aggregate_key, events, WriteEventsOptions::default()).await
+        self.write_events_with(aggregate_key, events, client_id, WriteEventsOptions::default()).await
     }
 
     /// Like `write_events` but accepts options to control idempotency, optimistic concurrency, etc.
@@ -86,6 +91,7 @@ impl CeleriantClient {
         &mut self,
         aggregate_key: AggregateKey,
         events: Vec<DatablockAggregateEvent>,
+        client_id: u128,
         options: WriteEventsOptions,
     ) -> Result<SuccessResponse, ClientError> {
         let mut writes = HashMap::new();
@@ -97,7 +103,7 @@ impl CeleriantClient {
         });
         self.write(WriteRequest {
             correlation_id: None,
-            client_id: options.client_id,
+            client_id,
             user_id: None,
             writes,
         })

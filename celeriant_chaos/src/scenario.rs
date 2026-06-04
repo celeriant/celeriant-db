@@ -2,10 +2,13 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use celeriant_bench::{
-    BenchmarkResult, DataIntegrityReport, DeepAuditReport, IdempotentBenchCounters, Pool, PoolBuilder,
-    WatchFloodParams, build_tls_config, deep_audit_failing_aggregates, run_benchmark,
-    run_benchmark_idempotent, run_watch_flood, smoke_test, verify_no_seq_gaps, watch_dial_probe,
+    BenchmarkResult, DataIntegrityReport, DeepAuditReport, HistoryRecorder, IdempotentBenchCounters,
+    Pool, PoolBuilder, TaskAckSummary, WatchFloodParams, build_tls_config,
+    deep_audit_failing_aggregates, run_benchmark, run_benchmark_idempotent_opts,
+    run_benchmark_idempotent_with_history, run_cas_storm, run_watch_flood, smoke_test,
+    verify_no_seq_gaps, watch_dial_probe,
 };
+use std::sync::Arc;
 
 use crate::actions::{Action, ActionExecutor};
 use crate::config::ClusterConfig;
@@ -209,6 +212,64 @@ pub async fn build_bench_pool(
     .build()
     .await
     .map_err(|e| format!("pool build: {e}"))
+}
+
+/// Per-op history recorder for the idempotent bench, writing
+/// `<run_dir>/<scenario>-history.jsonl`. Creation failure disables recording
+/// (warn, not abort) — the metric predicates still run.
+pub fn new_history_recorder(scen: &str, run_dir: &std::path::Path) -> Option<Arc<HistoryRecorder>> {
+    let path = run_dir.join(format!("{scen}-history.jsonl"));
+    match HistoryRecorder::create(&path) {
+        Ok(r) => Some(Arc::new(r)),
+        Err(e) => {
+            eprintln!("[{scen}] history recording disabled ({}): {e}", path.display());
+            None
+        }
+    }
+}
+
+/// Close the history file, run the client-API final-read phase against both
+/// nodes (must run while services are still up), append the final-read
+/// records, and run the history checkers. Returns checks to merge into the
+/// scenario's `extra_checks`.
+pub async fn finish_history_and_check(
+    scen: &str,
+    cfg: &ClusterConfig,
+    history: Option<Arc<HistoryRecorder>>,
+    acks: &[TaskAckSummary],
+) -> Vec<CheckResult> {
+    let Some(arc) = history else { return Vec::new() };
+    let Ok(recorder) = Arc::try_unwrap(arc) else {
+        // Bench tasks all joined before this runs, so a still-shared Arc is a
+        // wiring bug, not a runtime condition.
+        return vec![CheckResult::fail(
+            "HistoryRecorded",
+            "recorder still shared after bench join — history not finalized",
+        )];
+    };
+    let summary = recorder.finish();
+    println!(
+        "[{scen}] history: {} records ({} dropped) → {}",
+        summary.records_written,
+        summary.records_dropped,
+        summary.path.display()
+    );
+
+    match crate::final_read::run_final_read_phase(scen, cfg, acks).await {
+        Ok(records) => {
+            if let Err(e) = celeriant_bench::history::append_final_reads(&summary.path, &records) {
+                eprintln!("[{scen}] appending final reads failed: {e}");
+            }
+        }
+        Err(e) => eprintln!("[{scen}] final-read phase failed: {e}"),
+    }
+
+    match celeriant_bench::history::read_history(&summary.path) {
+        Ok((lines, unparseable)) => {
+            crate::checkers::run_history_checks(&lines, summary.records_dropped + unparseable)
+        }
+        Err(e) => vec![CheckResult::fail("HistoryRecorded", format!("history unreadable: {e}"))],
+    }
 }
 
 /// Standard tear-down: settle scraper one more tick, stop services, splice
@@ -535,7 +596,33 @@ pub async fn run_watch_storm(
     params: ScenarioParams,
     run_dir: &PathBuf,
 ) -> Result<ScenarioReport, String> {
-    const SCEN: &str = "watch_storm";
+    run_watch_storm_inner(cfg, params, run_dir, false).await
+}
+
+/// `watch_storm` plus a mid-storm leader kill (remaining-tests.md item 4):
+/// the flood runs against the original leader, which is SIGKILLed ~40% into
+/// the window. The flood's watchers against the dead node drop (the
+/// failover-disconnect contract); the distinct assertions move to the
+/// *promoted* node — it must service fresh watch dials promptly and show no
+/// leaked sessions once it leads. Per-watcher delivery correctness across the
+/// reconnect is covered by the `watch_failover` integration test; this
+/// scenario proves watch servicing recovers on the survivor under storm load.
+pub async fn run_watch_storm_failover(
+    cfg: &ClusterConfig,
+    params: ScenarioParams,
+    run_dir: &PathBuf,
+) -> Result<ScenarioReport, String> {
+    run_watch_storm_inner(cfg, params, run_dir, true).await
+}
+
+async fn run_watch_storm_inner(
+    cfg: &ClusterConfig,
+    params: ScenarioParams,
+    run_dir: &PathBuf,
+    with_kill: bool,
+) -> Result<ScenarioReport, String> {
+    #[allow(non_snake_case)]
+    let SCEN: &'static str = if with_kill { "watch_storm_failover" } else { "watch_storm" };
     let up = bring_up_cluster(cfg, SCEN, run_dir).await?;
     let pool = build_bench_pool(cfg, &up, params).await?;
 
@@ -553,6 +640,19 @@ pub async fn run_watch_storm(
         &leader_host,
     )
     .map_err(|e| format!("watch tls: {e}"))?;
+
+    // The survivor (becomes leader after the kill): the config slot that
+    // isn't the current leader. Probes/drains retarget here post-kill.
+    let survivor_host = if leader_host == cfg.leader_host { cfg.follower_host.clone() } else { cfg.leader_host.clone() };
+    let survivor_addr = format!("{survivor_host}:{}", cfg.client_port);
+    let survivor_tls = build_tls_config(
+        cfg.ca_cert.to_str().ok_or("ca_cert path not utf8")?,
+        cfg.client_cert.to_str().ok_or("client_cert path not utf8")?,
+        cfg.client_key.to_str().ok_or("client_key path not utf8")?,
+        &survivor_host,
+    )
+    .map_err(|e| format!("survivor tls: {e}"))?;
+    let kill_leader = if leader_host == cfg.leader_host { Action::KillCs1 } else { Action::KillCs2 };
 
     // Aggregate ids the watchers filter on. The write bench writes (1, 1, id) for
     // id in 0..tasks, so this range overlaps and long-lived watchers see events.
@@ -581,10 +681,32 @@ pub async fn run_watch_storm(
     let dur = params.duration_secs;
     let bench_handle = tokio::spawn(async move { run_benchmark(&pool_clone, tasks, dur).await });
 
-    let flood = run_watch_flood(&watch_addr, watch_tls.clone(), flood_params).await;
+    let flood = if with_kill {
+        let executor = ActionExecutor::new(cfg);
+        let watch_addr2 = watch_addr.clone();
+        let watch_tls2 = watch_tls.clone();
+        let flood_handle = tokio::spawn(async move { run_watch_flood(&watch_addr2, watch_tls2, flood_params).await });
+        // Kill ~40% into the window so there's storm both before and after.
+        sleep(Duration::from_secs((params.duration_secs * 2 / 5).max(5))).await;
+        println!("[{SCEN}] SIGKILL leader {leader_host} ({kill_leader:?}) mid-storm");
+        executor.run(&kill_leader)?;
+        flood_handle.await.map_err(|e| format!("flood join: {e}"))?
+    } else {
+        run_watch_flood(&watch_addr, watch_tls.clone(), flood_params).await
+    };
 
     let bench_result = bench_handle.await.map_err(|e| format!("bench join: {e}"))?;
     let bench_window_end_ms = up.elapsed_ms();
+
+    // Post-kill the original leader is dead; drain + dial probes must target
+    // the promoted survivor. Give it time to win the lease and serve.
+    let (probe_addr, probe_host, probe_tls) = if with_kill {
+        println!("[{SCEN}] waiting for {survivor_host} to promote before probing watch servicing");
+        sleep(Duration::from_secs(20)).await;
+        (survivor_addr.clone(), survivor_host.clone(), survivor_tls.clone())
+    } else {
+        (watch_addr.clone(), leader_host.clone(), watch_tls.clone())
+    };
 
     println!(
         "[{SCEN}] bench done: {} req, {} err, {:.0} req/s | watch: {} cycles, {} attempts ({} conn errors), {} events",
@@ -606,15 +728,15 @@ pub async fn run_watch_storm(
     //    sessions alive until their next ~5s heartbeat write fails, so the gauge
     //    stays elevated well past this 3s settle.
     sleep(Duration::from_secs(3)).await;
-    let metrics_url = cfg.metrics_url(&leader_host);
-    match scrape_watch_subscribers(&metrics_url, &leader_host).await {
+    let metrics_url = cfg.metrics_url(&probe_host);
+    match scrape_watch_subscribers(&metrics_url, &probe_host).await {
         Ok(active) if active <= 4 => {
-            extra_checks.push(CheckResult::pass_with_detail("WatchSubscribersDrained", format!("{active} active")));
+            extra_checks.push(CheckResult::pass_with_detail("WatchSubscribersDrained", format!("{active} active on {probe_host}")));
         }
         Ok(active) => {
             extra_checks.push(CheckResult::fail(
                 "WatchSubscribersDrained",
-                format!("{active} watch sessions still active 3s after the flood — likely leaked (CLOSE-WAIT)"),
+                format!("{active} watch sessions still active 3s after the flood on {probe_host} — likely leaked (CLOSE-WAIT)"),
             ));
         }
         Err(e) => {
@@ -622,24 +744,61 @@ pub async fn run_watch_storm(
         }
     }
 
-    // 3) No degradation: a fresh dial still acks promptly (the original symptom was
-    //    ~5s dials / 503s once the leak saturated watch servicing).
-    match watch_dial_probe(&watch_addr, watch_tls, 9_999_999, Duration::from_secs(2)).await {
+    // 3) No degradation: a fresh dial to the (post-kill: promoted) leader still
+    //    acks promptly (the original symptom was ~5s dials / 503s once the leak
+    //    saturated watch servicing).
+    match watch_dial_probe(&probe_addr, probe_tls, 9_999_999, Duration::from_secs(2)).await {
         Ok(d) if d < Duration::from_secs(1) => {
-            extra_checks.push(CheckResult::pass_with_detail("WatchDialPrompt", format!("dial acked in {d:?}")));
+            extra_checks.push(CheckResult::pass_with_detail("WatchDialPrompt", format!("dial to {probe_host} acked in {d:?}")));
         }
         Ok(d) => {
-            extra_checks.push(CheckResult::fail("WatchDialPrompt", format!("dial took {d:?} (>1s)")));
+            extra_checks.push(CheckResult::fail("WatchDialPrompt", format!("dial to {probe_host} took {d:?} (>1s)")));
         }
         Err(e) => {
             extra_checks.push(CheckResult::fail("WatchDialPrompt", e));
         }
     }
 
-    // Happy cluster: no elections/panics/restarts expected. The connection storm
-    // can induce a few transient write timeouts, so allow a small bench-error
-    // budget; the throughput floor is the real "didn't fall over" guard.
-    let expectations = ScenarioExpectations { max_bench_errors: 200, ..Default::default() };
+    let expectations = if with_kill {
+        // Leader killed mid-storm: a single failover is expected. Same shape
+        // as leader_sigkill, plus the connection-storm bench-error budget.
+        // The failover opens a no-leader window (survivor waits its full TTL
+        // before challenging) — allow it; the survivor's watch-dial probe
+        // above is the robust proof that promotion completed and watch
+        // servicing recovered, so we don't also gate on the timing-fragile
+        // in-window `require_distinct_leader_hosts` (the survivor often
+        // promotes near or just after the bench window closes).
+        // No `assert_eventual_progress`: the killed leader is never restarted
+        // in this scenario, so cross-node convergence is undefined — the
+        // survivor promotes from its own replicated point and the old
+        // leader's un-replicated tail is culled, leaving the dead node's
+        // stale high-water permanently ahead. Data-integrity-under-failover
+        // is covered by the idempotency_audit_* and single_node_isolation
+        // scenarios (which restart and audit). Here the thesis is "watch
+        // servicing recovers on the promoted node", proven by the
+        // WatchDialPrompt / WatchSubscribersDrained / WatchEventsDelivered
+        // checks above.
+        ScenarioExpectations {
+            max_leader_elections: 6,
+            max_s3_fallbacks: 1000,
+            max_heartbeat_failures: 100,
+            max_bench_errors: 500_000,
+            max_role_flips: 4,
+            max_node_starts: 1,
+            max_split_brain_ticks: 40,
+            ..ScenarioExpectations::default()
+        }
+    } else {
+        // Happy cluster: no elections/panics/restarts expected. The connection
+        // storm can induce a few transient write timeouts, so allow a small
+        // bench-error budget; the throughput floor is the real "didn't fall
+        // over" guard.
+        ScenarioExpectations { max_bench_errors: 200, ..Default::default() }
+    };
+    let mut params = params;
+    if with_kill {
+        params.throughput_floor = (params.throughput_floor * 0.3).max(50.0);
+    }
 
     tear_down_and_evaluate_with_audit(
         SCEN,
@@ -698,9 +857,11 @@ pub async fn run_idempotency_audit_baseline(
     println!("[{SCEN}] smoke test");
     smoke_test(&pool).await.map_err(|e| format!("smoke: {e}"))?;
 
+    let history = new_history_recorder(SCEN, run_dir);
     let bench_window_start_ms = up.elapsed_ms();
     println!("[{SCEN}] idempotent bench: {} tasks, {}s", params.tasks, params.duration_secs);
-    let outcome = run_benchmark_idempotent(&pool, params.tasks, params.duration_secs).await;
+    let outcome =
+        run_benchmark_idempotent_with_history(&pool, params.tasks, params.duration_secs, history.clone()).await;
     let bench_window_end_ms = up.elapsed_ms();
     println!(
         "[{SCEN}] bench done: {} req, {} err, {:.0} req/s, p50={}ms p99={}ms (ok_acks={} 2002_acks={} repl_retry={} transient_retry={} fatal={})",
@@ -722,6 +883,9 @@ pub async fn run_idempotency_audit_baseline(
     let (integrity, deep) = run_integrity_and_deep_audit(SCEN, &pool, &outcome.task_acks, 32).await;
     let integrity_check = data_integrity_check(&integrity, 0);
 
+    let mut extra_checks = vec![integrity_check];
+    extra_checks.extend(finish_history_and_check(SCEN, cfg, history, &outcome.task_acks).await);
+
     tear_down_and_evaluate_with_audit(
         SCEN,
         cfg,
@@ -731,11 +895,600 @@ pub async fn run_idempotency_audit_baseline(
         bench_window_end_ms,
         ScenarioExpectations::default(),
         params,
-        vec![integrity_check],
+        extra_checks,
         Some(integrity),
         Some(outcome.counters),
         deep,
         run_dir,
+    )
+    .await
+}
+
+/// `duplicate_replay` workload (remaining-tests.md item 2): the idempotent
+/// bench where every acked write is deliberately resubmitted with the same
+/// `client_seq`. Exactly one WAL record per seq may exist; the replay must
+/// come back as a 2002. `HistoryIdempotency` validates every 2002 against
+/// the recorded acks; the `HistoryWalMonotonicity` upper bound catches
+/// duplicate acceptance; the integrity audit catches loss.
+pub async fn run_duplicate_replay(
+    cfg: &ClusterConfig,
+    params: ScenarioParams,
+    run_dir: &PathBuf,
+) -> Result<ScenarioReport, String> {
+    const SCEN: &str = "duplicate_replay";
+    let up = bring_up_cluster(cfg, SCEN, run_dir).await?;
+    let pool = build_bench_pool(cfg, &up, params).await?;
+
+    println!("[{SCEN}] smoke test");
+    smoke_test(&pool).await.map_err(|e| format!("smoke: {e}"))?;
+
+    let history = new_history_recorder(SCEN, run_dir);
+    let bench_window_start_ms = up.elapsed_ms();
+    println!("[{SCEN}] duplicate-replay bench: {} tasks, {}s", params.tasks, params.duration_secs);
+    let outcome = run_benchmark_idempotent_opts(
+        &pool,
+        params.tasks,
+        params.duration_secs,
+        celeriant_bench::IdempotentBenchOptions { history: history.clone(), duplicate_replay: true },
+    )
+    .await;
+    let bench_window_end_ms = up.elapsed_ms();
+    println!(
+        "[{SCEN}] bench done: {} acked, {} replays rejected (2002), {} repl_retry, {} transient_retry, {} fatal",
+        outcome.counters.ok_acks,
+        outcome.counters.idempotency_acks,
+        outcome.counters.replication_retries,
+        outcome.counters.transient_retries,
+        outcome.counters.fatal_errors,
+    );
+
+    sleep(Duration::from_secs(2)).await;
+
+    let (integrity, deep) = run_integrity_and_deep_audit(SCEN, &pool, &outcome.task_acks, 32).await;
+    let integrity_check = data_integrity_check(&integrity, 0);
+
+    // The workload's own liveness gate: replays must actually have been
+    // issued and rejected. Healthy-cluster replays are best-effort (not
+    // retried), so demand most of them, not all.
+    let replay_check = if outcome.counters.idempotency_acks * 2 >= outcome.counters.ok_acks {
+        CheckResult::pass_with_detail(
+            "DuplicateReplayExercised",
+            format!("{} of {} acked writes replayed and rejected", outcome.counters.idempotency_acks, outcome.counters.ok_acks),
+        )
+    } else {
+        CheckResult::fail(
+            "DuplicateReplayExercised",
+            format!(
+                "only {} 2002s for {} acked writes — replays not exercising the idempotency path",
+                outcome.counters.idempotency_acks, outcome.counters.ok_acks
+            ),
+        )
+    };
+
+    let mut extra_checks = vec![integrity_check, replay_check];
+    extra_checks.extend(finish_history_and_check(SCEN, cfg, history, &outcome.task_acks).await);
+
+    // Every op costs two round trips, so the floor halves relative to the
+    // plain idempotent bench.
+    let mut scen_params = params;
+    scen_params.throughput_floor = (params.throughput_floor * 0.4).max(50.0);
+
+    tear_down_and_evaluate_with_audit(
+        SCEN,
+        cfg,
+        up,
+        outcome.benchmark.clone(),
+        bench_window_start_ms,
+        bench_window_end_ms,
+        ScenarioExpectations::default(),
+        scen_params,
+        extra_checks,
+        Some(integrity),
+        Some(outcome.counters),
+        deep,
+        run_dir,
+    )
+    .await
+}
+
+/// `cas_storm` workload (remaining-tests.md item 2): N writers contend on
+/// one aggregate with the same `expected_version` per barrier-synchronized
+/// round. OCC must admit exactly one per round — `HistoryOcc` is the
+/// authoritative oracle; on a healthy cluster losers must see a definitive
+/// `OccConflict`, not a timeout. `with_partition` re-runs the storm across a
+/// leader→follower replication partition + heal.
+pub async fn run_cas_storm_scenario(
+    cfg: &ClusterConfig,
+    params: ScenarioParams,
+    run_dir: &PathBuf,
+    with_partition: bool,
+) -> Result<ScenarioReport, String> {
+    let scen: &'static str = if with_partition { "cas_storm_partition" } else { "cas_storm" };
+    const WRITERS: usize = 64;
+
+    let up = bring_up_cluster(cfg, scen, run_dir).await?;
+    let mut pool_params = params;
+    pool_params.tasks = WRITERS;
+    let pool = build_bench_pool(cfg, &up, pool_params).await?;
+
+    println!("[{scen}] smoke test");
+    smoke_test(&pool).await.map_err(|e| format!("smoke: {e}"))?;
+
+    let executor = ActionExecutor::new(cfg);
+    let (leader_host, follower_host) = if up.bench_primary == cfg.leader_addr() {
+        (cfg.leader_host.clone(), cfg.follower_host.clone())
+    } else {
+        (cfg.follower_host.clone(), cfg.leader_host.clone())
+    };
+    let partition = Action::Partition {
+        src: leader_host.clone(),
+        dst: follower_host.clone(),
+        port: cfg.replication_port,
+    };
+    let heal = Action::Heal {
+        src: leader_host.clone(),
+        dst: follower_host.clone(),
+        port: cfg.replication_port,
+    };
+
+    let history = new_history_recorder(scen, run_dir);
+    let bench_window_start_ms = up.elapsed_ms();
+    println!("[{scen}] cas storm: {} writers, {}s", WRITERS, params.duration_secs);
+    let pool_clone = pool.clone();
+    let history_clone = history.clone();
+    let dur = params.duration_secs;
+    let storm_handle =
+        tokio::spawn(async move { run_cas_storm(&pool_clone, WRITERS, dur, history_clone).await });
+
+    if with_partition {
+        sleep(Duration::from_secs(10)).await;
+        println!("[{scen}] partitioning {leader_host} -> {follower_host}:{}", cfg.replication_port);
+        executor.run(&partition)?;
+        sleep(Duration::from_secs(15)).await;
+        println!("[{scen}] healing partition");
+        if let Err(e) = executor.run(&heal) {
+            let _ = executor.run(&heal);
+            return Err(format!("heal failed: {e}"));
+        }
+    }
+
+    let storm = storm_handle
+        .await
+        .map_err(|e| format!("storm join: {e}"))?
+        .map_err(|e| format!("storm: {e}"))?;
+    let bench_window_end_ms = up.elapsed_ms();
+    println!(
+        "[{scen}] storm done: {} rounds, {} acked, {} occ_conflicts, {} ambiguous, {} other_failures in {:.0}s",
+        storm.rounds, storm.ok_writes, storm.occ_conflicts, storm.ambiguous, storm.other_failures, storm.elapsed_secs,
+    );
+
+    sleep(Duration::from_secs(2)).await;
+
+    let mut extra_checks = Vec::new();
+    extra_checks.push(if storm.rounds > 0 && storm.ok_writes > 0 {
+        CheckResult::pass_with_detail(
+            "CasStormProgress",
+            format!("{} rounds, {} acked", storm.rounds, storm.ok_writes),
+        )
+    } else {
+        CheckResult::fail(
+            "CasStormProgress",
+            format!("storm made no progress ({} rounds, {} acked)", storm.rounds, storm.ok_writes),
+        )
+    });
+    // Losers must lose definitively. Healthy cluster: a timeout instead of an
+    // OccConflict is itself a finding, and so is a non-OCC rejection
+    // (NotLeader/ServerBusy). Budget = one bad round. Under partition both
+    // are expected.
+    if !with_partition {
+        let non_occ = storm.ambiguous + storm.other_failures;
+        extra_checks.push(if non_occ <= WRITERS as u64 {
+            CheckResult::pass_with_detail(
+                "CasStormDefinitiveConflicts",
+                format!(
+                    "{} conflicts, {} ambiguous, {} other failures",
+                    storm.occ_conflicts, storm.ambiguous, storm.other_failures
+                ),
+            )
+        } else {
+            CheckResult::fail(
+                "CasStormDefinitiveConflicts",
+                format!(
+                    "{} non-OCC outcomes ({} ambiguous, {} other) on a healthy cluster — losers should see OccConflict",
+                    non_occ, storm.ambiguous, storm.other_failures
+                ),
+            )
+        });
+    }
+
+    // Final-read target: the single contended aggregate. ok_writes + the
+    // seed batch = acked version floor for the read.
+    let storm_acks = vec![TaskAckSummary {
+        aggregate_key: celeriant_bench::cas_storm_aggregate(),
+        client_id: 9_000,
+        max_acked_client_seq: storm.ok_writes + 1,
+    }];
+    extra_checks.extend(finish_history_and_check(scen, cfg, history, &storm_acks).await);
+
+    let expectations = if with_partition {
+        ScenarioExpectations {
+            max_s3_fallbacks: 1000,
+            max_heartbeat_failures: 250,
+            max_leader_elections: 2,
+            max_role_flips: 8,
+            max_bench_errors: 100_000,
+            assert_eventual_progress: true,
+            ..ScenarioExpectations::default()
+        }
+    } else {
+        ScenarioExpectations::default()
+    };
+
+    // Synthetic BenchmarkResult: round-rate, not request-rate. Conflicts are
+    // correct behavior, so only ambiguous/other count as errors.
+    let bench_result = BenchmarkResult {
+        num_tasks: WRITERS,
+        total_requests: storm.ok_writes,
+        errors: storm.ambiguous + storm.other_failures,
+        throughput: storm.ok_writes as f64 / storm.elapsed_secs.max(0.001),
+        avg_latency_ms: 0.0,
+        p50_ms: 0,
+        p95_ms: 0,
+        p99_ms: 0,
+        p999_ms: 0,
+        min_ms: 0,
+        max_ms: 0,
+    };
+    let mut scen_params = params;
+    scen_params.tasks = WRITERS;
+    scen_params.throughput_floor = 1.0; // rounds are latency-bound; HistoryOcc is the real oracle
+
+    tear_down_and_evaluate_with_audit(
+        scen,
+        cfg,
+        up,
+        bench_result,
+        bench_window_start_ms,
+        bench_window_end_ms,
+        expectations,
+        scen_params,
+        extra_checks,
+        None,
+        None,
+        None,
+        run_dir,
+    )
+    .await
+}
+
+/// `bridge` (remaining-tests.md item 3): replication severed in BOTH
+/// directions (leader↔follower replication port) while both nodes keep S3 —
+/// Jepsen's bridge nemesis adapted to the two-node S3-lease design. The
+/// existing SCEN-7 blocks only leader→follower; the symmetric cut is the
+/// distinctive case: heartbeats die both ways, the leader must retain its
+/// lease purely via S3 renewal while the follower's challenges lose the CAS
+/// against a live lease. All commits ride S3 fallback; no split brain;
+/// convergence after heal.
+pub async fn run_bridge(
+    cfg: &ClusterConfig,
+    params: ScenarioParams,
+    run_dir: &PathBuf,
+) -> Result<ScenarioReport, String> {
+    const SCEN: &str = "bridge";
+    let up = bring_up_cluster(cfg, SCEN, run_dir).await?;
+    let pool = build_bench_pool(cfg, &up, params).await?;
+
+    println!("[{SCEN}] smoke test");
+    smoke_test(&pool).await.map_err(|e| format!("smoke: {e}"))?;
+
+    let executor = ActionExecutor::new(cfg);
+    let (leader_host, follower_host) = if up.bench_primary == cfg.leader_addr() {
+        (cfg.leader_host.clone(), cfg.follower_host.clone())
+    } else {
+        (cfg.follower_host.clone(), cfg.leader_host.clone())
+    };
+
+    let cut_fwd = Action::Partition { src: leader_host.clone(), dst: follower_host.clone(), port: cfg.replication_port };
+    let cut_rev = Action::Partition { src: follower_host.clone(), dst: leader_host.clone(), port: cfg.replication_port };
+    let heal_fwd = Action::Heal { src: leader_host.clone(), dst: follower_host.clone(), port: cfg.replication_port };
+    let heal_rev = Action::Heal { src: follower_host.clone(), dst: leader_host.clone(), port: cfg.replication_port };
+
+    let bench_window_start_ms = up.elapsed_ms();
+    println!("[{SCEN}] bench: {} tasks, {}s", params.tasks, params.duration_secs);
+    let pool_clone = pool.clone();
+    let tasks = params.tasks;
+    let dur = params.duration_secs;
+    let bench_handle = tokio::spawn(async move { run_benchmark(&pool_clone, tasks, dur).await });
+
+    sleep(Duration::from_secs(15)).await;
+    println!("[{SCEN}] bridging: {leader_host} <-x-> {follower_host}:{}", cfg.replication_port);
+    executor.run(&cut_fwd)?;
+    if let Err(e) = executor.run(&cut_rev) {
+        let _ = executor.run(&heal_fwd);
+        return Err(format!("reverse partition failed: {e}"));
+    }
+
+    sleep(Duration::from_secs(25)).await;
+
+    println!("[{SCEN}] healing bridge");
+    let r1 = executor.run(&heal_fwd);
+    let r2 = executor.run(&heal_rev);
+    if let Err(e) = r1.and(r2) {
+        let _ = executor.run(&heal_fwd);
+        let _ = executor.run(&heal_rev);
+        return Err(format!("heal failed: {e}"));
+    }
+
+    let bench_result = bench_handle.await.map_err(|e| format!("bench join: {e}"))?;
+    println!(
+        "[{SCEN}] bench done: {} req, {} err, {:.0} req/s",
+        bench_result.total_requests, bench_result.errors, bench_result.throughput,
+    );
+
+    println!("[{SCEN}] settle 15s for catchup + role re-stabilisation");
+    sleep(Duration::from_secs(15)).await;
+    let bench_window_end_ms = up.elapsed_ms();
+    let _ = executor.run(&heal_fwd);
+    let _ = executor.run(&heal_rev);
+
+    let expectations = ScenarioExpectations {
+        // The follower's TTL expires and it challenges each cycle; every
+        // challenge loses the CAS against the leader's S3-renewed lease but
+        // bumps the elections counter (same shape as clock_skew_follower).
+        max_leader_elections: 40,
+        // Every commit during the 25s bridge rides S3 fallback.
+        max_s3_fallbacks: 1500,
+        max_heartbeat_failures: 250,
+        max_bench_errors: 500_000,
+        // The bridge MUST NOT change leadership: S3 renewal beats the
+        // follower's challenge by design.
+        require_leader_retained: true,
+        max_role_flips: 4,
+        max_split_brain_ticks: 4,
+        require_final_leader_write_progress: true,
+        assert_eventual_progress: true,
+        ..ScenarioExpectations::default()
+    };
+
+    let mut scen_params = params;
+    scen_params.throughput_floor = (params.throughput_floor * 0.3).max(50.0);
+
+    tear_down_and_evaluate(
+        SCEN, cfg, up, bench_result, bench_window_start_ms, bench_window_end_ms,
+        expectations, scen_params, run_dir,
+    )
+    .await
+}
+
+/// `single_node_isolation` (remaining-tests.md item 3): the leader loses
+/// BOTH its peer and S3 — total egress cut, "I'm alone, should I fence?".
+/// Distinct from SCEN-10 (which kills the dependencies; here they're
+/// healthy and only the leader is blind). The isolated leader must
+/// self-fence within its lease TTL (no acks once replication can't
+/// succeed), the survivor promotes via S3, and the idempotent-bench history
+/// must show no dual-ack window: every acked write survives the failover
+/// (integrity audit + history checkers + final-read parity).
+pub async fn run_single_node_isolation(
+    cfg: &ClusterConfig,
+    params: ScenarioParams,
+    run_dir: &PathBuf,
+) -> Result<ScenarioReport, String> {
+    const SCEN: &str = "single_node_isolation";
+    let Some(infra_host) = cfg.infra_host.clone() else {
+        return Err(format!("{SCEN}: INFRA_HOST is not set in config.env — S3 egress cut needs a known S3 host"));
+    };
+    let up = bring_up_cluster(cfg, SCEN, run_dir).await?;
+    let pool = build_bench_pool(cfg, &up, params).await?;
+
+    println!("[{SCEN}] smoke test");
+    smoke_test(&pool).await.map_err(|e| format!("smoke: {e}"))?;
+
+    let executor = ActionExecutor::new(cfg);
+    let (leader_host, follower_host) = if up.bench_primary == cfg.leader_addr() {
+        (cfg.leader_host.clone(), cfg.follower_host.clone())
+    } else {
+        (cfg.follower_host.clone(), cfg.leader_host.clone())
+    };
+
+    let cut_peer = Action::Partition { src: leader_host.clone(), dst: follower_host.clone(), port: cfg.replication_port };
+    let cut_s3 = Action::Partition { src: leader_host.clone(), dst: infra_host.clone(), port: cfg.s3_port };
+    let heal_peer = Action::Heal { src: leader_host.clone(), dst: follower_host.clone(), port: cfg.replication_port };
+    let heal_s3 = Action::Heal { src: leader_host.clone(), dst: infra_host.clone(), port: cfg.s3_port };
+
+    let history = new_history_recorder(SCEN, run_dir);
+    let bench_window_start_ms = up.elapsed_ms();
+    println!("[{SCEN}] idempotent bench: {} tasks, {}s", params.tasks, params.duration_secs);
+    let pool_clone = pool.clone();
+    let history_clone = history.clone();
+    let tasks = params.tasks;
+    let dur = params.duration_secs;
+    let bench_handle = tokio::spawn(async move {
+        run_benchmark_idempotent_with_history(&pool_clone, tasks, dur, history_clone).await
+    });
+
+    sleep(Duration::from_secs(15)).await;
+    println!("[{SCEN}] isolating {leader_host}: cutting peer ({follower_host}:{}) and S3 ({infra_host}:{})", cfg.replication_port, cfg.s3_port);
+    executor.run(&cut_peer)?;
+    if let Err(e) = executor.run(&cut_s3) {
+        let _ = executor.run(&heal_peer);
+        return Err(format!("S3 cut failed: {e}"));
+    }
+
+    // Long enough for the isolated leader to fence at lease expiry and the
+    // survivor to win the CAS and start serving (the bench pool fails over).
+    sleep(Duration::from_secs(35)).await;
+
+    println!("[{SCEN}] healing isolation");
+    let r1 = executor.run(&heal_peer);
+    let r2 = executor.run(&heal_s3);
+    if let Err(e) = r1.and(r2) {
+        let _ = executor.run(&heal_peer);
+        let _ = executor.run(&heal_s3);
+        return Err(format!("heal failed: {e}"));
+    }
+
+    let outcome = bench_handle.await.map_err(|e| format!("bench join: {e}"))?;
+    println!(
+        "[{SCEN}] bench done: {} req, {} err (ok_acks={} 2002_acks={} repl_retry={} transient_retry={} fatal={})",
+        outcome.benchmark.total_requests,
+        outcome.benchmark.errors,
+        outcome.counters.ok_acks,
+        outcome.counters.idempotency_acks,
+        outcome.counters.replication_retries,
+        outcome.counters.transient_retries,
+        outcome.counters.fatal_errors,
+    );
+
+    println!("[{SCEN}] settle 60s for old-leader rejoin + catchup");
+    sleep(Duration::from_secs(60)).await;
+    let bench_window_end_ms = up.elapsed_ms();
+    let _ = executor.run(&heal_peer);
+    let _ = executor.run(&heal_s3);
+
+    let (integrity, deep) = run_integrity_and_deep_audit(SCEN, &pool, &outcome.task_acks, 32).await;
+    let integrity_check = data_integrity_check(&integrity, (params.tasks as u64 / 50).max(5));
+
+    let mut extra_checks = vec![integrity_check];
+    extra_checks.extend(finish_history_and_check(SCEN, cfg, history, &outcome.task_acks).await);
+
+    let expectations = ScenarioExpectations {
+        max_leader_elections: 40,
+        max_s3_fallbacks: 2000,
+        max_heartbeat_failures: 250,
+        max_bench_errors: 1_000_000,
+        max_role_flips: 8,
+        // The isolation necessarily opens a no-leader window: the isolated
+        // leader fences at lease expiry, and the survivor waits its FULL TTL
+        // before challenging (invariants.md, Leader Election). Observed
+        // ~13s (26 ticks at 2Hz) on the rpi cluster; allow 20s. Split brain
+        // (two leaders) would also land in this counter — the integrity
+        // audit + history parity are the guards against that side.
+        max_split_brain_ticks: 40,
+        // The whole point: leadership must move to the survivor.
+        require_distinct_leader_hosts: Some(2),
+        require_final_leader_write_progress: true,
+        assert_eventual_progress: true,
+        ..ScenarioExpectations::default()
+    };
+
+    let mut scen_params = params;
+    scen_params.throughput_floor = (params.throughput_floor * 0.2).max(30.0);
+
+    tear_down_and_evaluate_with_audit(
+        SCEN, cfg, up, outcome.benchmark.clone(), bench_window_start_ms, bench_window_end_ms,
+        expectations, scen_params, extra_checks, Some(integrity), Some(outcome.counters), deep, run_dir,
+    )
+    .await
+}
+
+/// `clock_scrambler` (remaining-tests.md item 3): seeded, bounded, random
+/// clock skew on BOTH nodes. One-sided fixed skew (SCEN-14) exercises one
+/// node's fencing; symmetric randomized drift exercises both nodes'
+/// drift-fencing (`00fd32c`) concurrently — heartbeats rejected in either
+/// direction, lease math disagreeing on both ends, challenges racing. The
+/// schedule is deterministic from the printed seed.
+pub async fn run_clock_scrambler(
+    cfg: &ClusterConfig,
+    params: ScenarioParams,
+    run_dir: &PathBuf,
+) -> Result<ScenarioReport, String> {
+    const SCEN: &str = "clock_scrambler";
+    const SEED: u64 = 0xCE1E_51A7;
+    const ROUNDS: u64 = 4;
+
+    let up = bring_up_cluster(cfg, SCEN, run_dir).await?;
+    let pool = build_bench_pool(cfg, &up, params).await?;
+
+    println!("[{SCEN}] smoke test");
+    smoke_test(&pool).await.map_err(|e| format!("smoke: {e}"))?;
+
+    let executor = ActionExecutor::new(cfg);
+    let hosts = [cfg.leader_host.clone(), cfg.follower_host.clone()];
+    let restores: Vec<Action> =
+        hosts.iter().map(|h| Action::RestoreClock { host: h.clone() }).collect();
+
+    let bench_window_start_ms = up.elapsed_ms();
+    println!("[{SCEN}] bench: {} tasks, {}s (skew seed {SEED:#x})", params.tasks, params.duration_secs);
+    let pool_clone = pool.clone();
+    let tasks = params.tasks;
+    let dur = params.duration_secs;
+    let bench_handle = tokio::spawn(async move { run_benchmark(&pool_clone, tasks, dur).await });
+
+    sleep(Duration::from_secs(15)).await;
+
+    // splitmix64 over (seed, round, host): offsets in ±1..=3s, well past the
+    // 500ms drift tolerance, small enough that NTP re-sync is quick.
+    let mut rng_state = SEED;
+    let mut splitmix = move || {
+        rng_state = rng_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = rng_state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+
+    let mut skew_failed = None;
+    'rounds: for round in 0..ROUNDS {
+        for host in &hosts {
+            let r = splitmix();
+            let magnitude = (r % 3) as i64 + 1;
+            let offset_secs = if (r >> 8) & 1 == 0 { magnitude } else { -magnitude };
+            println!("[{SCEN}] round {round}: skewing {host} by {offset_secs:+}s");
+            if let Err(e) = executor.run(&Action::SkewClock { host: host.clone(), offset_secs }) {
+                skew_failed = Some(format!("skew {host} failed: {e}"));
+                break 'rounds;
+            }
+        }
+        sleep(Duration::from_secs(8)).await;
+    }
+
+    println!("[{SCEN}] restoring clocks (re-enabling NTP on both nodes)");
+    for restore in &restores {
+        if let Err(e) = executor.run(restore) {
+            let _ = executor.run(restore);
+            eprintln!("[{SCEN}] restore-clock failed once: {e}");
+        }
+    }
+    if let Some(e) = skew_failed {
+        return Err(e);
+    }
+
+    let bench_result = bench_handle.await.map_err(|e| format!("bench join: {e}"))?;
+    println!(
+        "[{SCEN}] bench done: {} req, {} err, {:.0} req/s",
+        bench_result.total_requests, bench_result.errors, bench_result.throughput,
+    );
+
+    // NTP needs a moment to re-discipline both clocks; convergence checks
+    // read the post-restore window.
+    println!("[{SCEN}] settle 20s for NTP re-sync + role re-stabilisation");
+    sleep(Duration::from_secs(20)).await;
+    let bench_window_end_ms = up.elapsed_ms();
+    for restore in &restores {
+        let _ = executor.run(restore);
+    }
+
+    let expectations = ScenarioExpectations {
+        // Both nodes challenge during their fenced windows; every challenge
+        // bumps the elections counter (cf. clock_skew_follower's 30 for one
+        // node over one window — two nodes over four windows needs more).
+        max_leader_elections: 80,
+        max_s3_fallbacks: 1500,
+        max_heartbeat_failures: 400,
+        max_bench_errors: 500_000,
+        max_role_flips: 12,
+        max_split_brain_ticks: 20,
+        require_final_leader_write_progress: true,
+        assert_eventual_progress: true,
+        ..ScenarioExpectations::default()
+    };
+
+    let mut scen_params = params;
+    scen_params.throughput_floor = (params.throughput_floor * 0.2).max(30.0);
+
+    tear_down_and_evaluate(
+        SCEN, cfg, up, bench_result, bench_window_start_ms, bench_window_end_ms,
+        expectations, scen_params, run_dir,
     )
     .await
 }
@@ -768,10 +1521,14 @@ pub async fn run_idempotency_audit_minio_outage(
 
     let bench_window_start_ms = up.elapsed_ms();
     println!("[{SCEN}] idempotent bench: {} tasks, {}s", params.tasks, params.duration_secs);
+    let history = new_history_recorder(SCEN, run_dir);
     let pool_clone = pool.clone();
+    let history_clone = history.clone();
     let tasks = params.tasks;
     let dur = params.duration_secs;
-    let bench_handle = tokio::spawn(async move { run_benchmark_idempotent(&pool_clone, tasks, dur).await });
+    let bench_handle = tokio::spawn(async move {
+        run_benchmark_idempotent_with_history(&pool_clone, tasks, dur, history_clone).await
+    });
 
     // Steady-state warm-up.
     sleep(Duration::from_secs(15)).await;
@@ -825,6 +1582,9 @@ pub async fn run_idempotency_audit_minio_outage(
     let mut scen_params = params;
     scen_params.throughput_floor = (params.throughput_floor * 0.5).max(50.0);
 
+    let mut extra_checks = vec![integrity_check];
+    extra_checks.extend(finish_history_and_check(SCEN, cfg, history, &outcome.task_acks).await);
+
     tear_down_and_evaluate_with_audit(
         SCEN,
         cfg,
@@ -834,7 +1594,7 @@ pub async fn run_idempotency_audit_minio_outage(
         bench_window_end_ms,
         expectations,
         scen_params,
-        vec![integrity_check],
+        extra_checks,
         Some(integrity),
         Some(outcome.counters),
         deep,
@@ -2390,10 +3150,12 @@ pub async fn run_idempotency_audit_partition_then_kill_minio(
 
     let bench_window_start_ms = up.elapsed_ms();
     println!("[{SCEN}] idempotent bench: {} tasks, {}s", params.tasks, AUDIT_BENCH_SECS);
+    let history = new_history_recorder(SCEN, run_dir);
     let pool_clone = pool.clone();
+    let history_clone = history.clone();
     let tasks = params.tasks;
     let bench_handle = tokio::spawn(async move {
-        run_benchmark_idempotent(&pool_clone, tasks, AUDIT_BENCH_SECS).await
+        run_benchmark_idempotent_with_history(&pool_clone, tasks, AUDIT_BENCH_SECS, history_clone).await
     });
 
     sleep(Duration::from_secs(15)).await;
@@ -2464,6 +3226,9 @@ pub async fn run_idempotency_audit_partition_then_kill_minio(
     scen_params.throughput_floor = (params.throughput_floor * 0.2).max(30.0);
     scen_params.duration_secs = AUDIT_BENCH_SECS;
 
+    let mut extra_checks = vec![integrity_check];
+    extra_checks.extend(finish_history_and_check(SCEN, cfg, history, &outcome.task_acks).await);
+
     tear_down_and_evaluate_with_audit(
         SCEN,
         cfg,
@@ -2473,7 +3238,7 @@ pub async fn run_idempotency_audit_partition_then_kill_minio(
         bench_window_end_ms,
         expectations,
         scen_params,
-        vec![integrity_check],
+        extra_checks,
         Some(integrity),
         Some(outcome.counters),
         deep,
@@ -2523,10 +3288,12 @@ pub async fn run_idempotency_audit_fast_blackout(
 
     let bench_window_start_ms = up.elapsed_ms();
     println!("[{SCEN}] idempotent bench: {} tasks, {}s", params.tasks, FAST_BENCH_SECS);
+    let history = new_history_recorder(SCEN, run_dir);
     let pool_clone = pool.clone();
+    let history_clone = history.clone();
     let tasks = params.tasks;
     let bench_handle = tokio::spawn(async move {
-        run_benchmark_idempotent(&pool_clone, tasks, FAST_BENCH_SECS).await
+        run_benchmark_idempotent_with_history(&pool_clone, tasks, FAST_BENCH_SECS, history_clone).await
     });
 
     sleep(Duration::from_secs(FAST_WARMUP_SECS)).await;
@@ -2598,6 +3365,9 @@ pub async fn run_idempotency_audit_fast_blackout(
     scen_params.throughput_floor = (params.throughput_floor * 0.2).max(30.0);
     scen_params.duration_secs = FAST_BENCH_SECS;
 
+    let mut extra_checks = vec![integrity_check];
+    extra_checks.extend(finish_history_and_check(SCEN, cfg, history, &outcome.task_acks).await);
+
     tear_down_and_evaluate_with_audit(
         SCEN,
         cfg,
@@ -2607,7 +3377,7 @@ pub async fn run_idempotency_audit_fast_blackout(
         bench_window_end_ms,
         expectations,
         scen_params,
-        vec![integrity_check],
+        extra_checks,
         Some(integrity),
         Some(outcome.counters),
         deep,
