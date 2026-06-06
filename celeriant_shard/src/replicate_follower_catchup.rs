@@ -86,13 +86,13 @@ pub(crate) async fn replicate_follower_catchup<R: ReplicationClient + 'static>(
             Ok(()) => {
                 sent += end_idx;
             }
-            Err(ReplicateToFollowerError::FollowerNetworkError(_) | ReplicateToFollowerError::LockTimeout) => {
+            Err(e @ (ReplicateToFollowerError::FollowerNetworkError(_) | ReplicateToFollowerError::LockTimeout)) => {
                 replication_client.set_follower_reachable(false);
-                debug!(shard_id, "Catchup TCP failed; falling back to S3");
+                debug!(shard_id, sent, chunk_len = end_idx, error = ?e, "Catchup TCP failed; falling back to S3");
                 return Ok(CatchupOutcome::FallbackToS3);
             }
-            Err(_) => {
-                debug!(shard_id, "Catchup TCP rejected; falling back to S3");
+            Err(e) => {
+                debug!(shard_id, sent, chunk_len = end_idx, error = ?e, "Catchup TCP rejected; falling back to S3");
                 return Ok(CatchupOutcome::FallbackToS3);
             }
         }

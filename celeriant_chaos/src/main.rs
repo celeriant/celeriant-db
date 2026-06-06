@@ -2,13 +2,17 @@ mod actions;
 mod checkers;
 mod config;
 mod disk_truth;
+pub mod epoch_oracle;
 mod final_read;
 mod invariants;
+pub mod journal_assert;
 mod logs;
 mod report;
+pub mod resource_baseline;
 mod sample;
 mod scenario;
 mod scrape;
+pub mod s3_lifecycle;
 mod tip_fork;
 
 use std::path::PathBuf;
@@ -32,6 +36,7 @@ use crate::scenario::{
     run_rolling_restart, run_sigstop_leader,
     run_partition_leader_follower_replication, run_partition_leader_minio,
     run_watch_storm, run_watch_storm_failover,
+    run_cold_segment_reads, run_nemesis_composition,
 };
 
 #[derive(Parser)]
@@ -134,6 +139,8 @@ async fn main() -> Result<(), String> {
         Some("idempotency_audit_fast_blackout") => vec!["idempotency_audit_fast_blackout"],
         Some("watch_storm") => vec!["watch_storm"],
         Some("watch_storm_failover") => vec!["watch_storm_failover"],
+        Some("cold_segment_reads") => vec!["cold_segment_reads"],
+        Some("nemesis_composition") => vec!["nemesis_composition"],
         Some(other) => return Err(format!("unknown scenario: {other}")),
         None if args.full => vec![
             "baseline",
@@ -171,6 +178,8 @@ async fn main() -> Result<(), String> {
             // recovery via reverse WAL walk, commit b2ffaea) resolved
             // that path. Re-enabled after standalone retest
             // `1775886847` passed all 13 checks (25567 req/s, 0 errors).
+            "cold_segment_reads",
+            "nemesis_composition",
         ],
         None => vec!["baseline"],
     };
@@ -201,6 +210,8 @@ async fn run_one_iteration(
             "baseline" => run_baseline(cfg, params, &dir.root).await?,
             "watch_storm" => run_watch_storm(cfg, params, &dir.root).await?,
             "watch_storm_failover" => run_watch_storm_failover(cfg, params, &dir.root).await?,
+            "cold_segment_reads" => run_cold_segment_reads(cfg, params, &dir.root).await?,
+            "nemesis_composition" => run_nemesis_composition(cfg, params, &dir.root).await?,
             "follower_graceful_stop" => run_follower_graceful_stop(cfg, params, &dir.root).await?,
             "follower_sigkill" => run_follower_sigkill(cfg, params, &dir.root).await?,
             "leader_graceful_stop" => run_leader_graceful_stop(cfg, params, &dir.root).await?,

@@ -124,7 +124,7 @@ fn test_pending_commit_data() -> PendingCommitData {
     };
     let header = ShardLogHeader {
         write: cursor.clone(),
-        aggregate_bloom: vec![0u64; 4],
+        aggregate_bloom: celeriant_rotating_log::log_segment_file::aggregate_key_bloom::AggregateKeyBloom::new().to_bytes(),
         last_received_replication_wal_seq: 0,
         last_self_acked_wal_seq: 0,
         read: cursor,
@@ -1525,15 +1525,31 @@ fn cull_preserves_queue_positions_and_schema_state() {
     assert!(c.schema_is_pending(&sk(3, 0)));
 }
 
+/// A cull that orphans queued PCDs must look like a rollback to their
+/// in-flight writers: generation bump fails the write()-side guard, the
+/// flag fails the next capture. Otherwise the writer resolves Ok via
+/// NoCaptureRaceButOk for a write the cull just destroyed
 #[test]
-fn cull_does_not_bump_rollback_generation() {
+fn cull_with_drained_items_signals_rollback_to_inflight_writers() {
     let mut c = cache();
     let before = c.rollback_generation();
 
     c.push_pending_replication(test_pending_commit_data());
     c.clear_speculative_write_caches_for_cull();
 
+    assert_eq!(c.rollback_generation(), before.wrapping_add(1));
+    assert!(c.take_replication_rollback_flag());
+}
+
+#[test]
+fn cull_with_nothing_drained_is_signal_free() {
+    let mut c = cache();
+    let before = c.rollback_generation();
+
+    c.clear_speculative_write_caches_for_cull();
+
     assert_eq!(c.rollback_generation(), before);
+    assert!(!c.take_replication_rollback_flag());
 }
 
 #[test]

@@ -34,6 +34,8 @@ use tokio::time::Instant;
 pub enum HistoryLine {
     Op(OpRecord),
     FinalRead(FinalReadRecord),
+    Ryw(RywRecord),
+    WatchDelivery(WatchDeliveryRecord),
 }
 
 /// u128 ids ride as JSON strings: serde's internally-tagged enum buffering
@@ -76,8 +78,72 @@ pub struct OpRecord {
     pub outcome: OpOutcome,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub error: Option<String>,
+    /// The `max_aggregate_version` recorded at ack time (= `client_seq` for the
+    /// idempotent bench, where one seq = one batch). `None` for non-Ok outcomes
+    /// and workloads that don't populate it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub acked_max_aggregate_version: Option<u64>,
     pub t_start_ns: u64,
     pub t_end_ns: u64,
+}
+
+/// A read-your-writes probe: immediately after a write ack, read the same
+/// aggregate and record whether the acked version was visible.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RywRecord {
+    /// Which node served the read (pinned probes). None = un-pinned pool read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// Groups multi-node reads of the same probe instant: records sharing
+    /// (process, probe_id) observed the same acked write. A violation requires
+    /// EVERY successful read in the group to be below the acked version —
+    /// the acking node provably has visibility before the ack, so a single
+    /// stale replica read is documented behavior, not a bug.
+    #[serde(default)]
+    pub probe_id: u64,
+    pub process: u32,
+    #[serde(with = "u128_str")]
+    pub org_id: u128,
+    #[serde(with = "u128_str")]
+    pub type_id: u128,
+    #[serde(with = "u128_str")]
+    pub agg_id: u128,
+    #[serde(with = "u128_str")]
+    pub client_id: u128,
+    /// The version the write was acknowledged at (= `client_seq` in the
+    /// idempotent bench).
+    pub acked_max_aggregate_version: u64,
+    /// What the subsequent read returned. `None` means the read errored.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub observed_max_aggregate_version: Option<u64>,
+    /// Error string from the read, if it errored.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub read_error: Option<String>,
+    /// Timestamp (ns from recorder epoch) at which the probe completed.
+    pub t_ns: u64,
+}
+
+/// A watch event delivered to a long-lived watcher.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WatchDeliveryRecord {
+    /// Watcher id (index within the long-lived set).
+    pub connection: u32,
+    /// Connection epoch: bumped on every (re)connect. The no-dup/no-reorder
+    /// contract holds within ONE TCP stream; across a reconnect the server
+    /// legally re-delivers the boundary range (invariants.md watch section),
+    /// so ordering checks must key on (connection, epoch).
+    #[serde(default)]
+    pub epoch: u32,
+    #[serde(with = "u128_str")]
+    pub org_id: u128,
+    #[serde(with = "u128_str")]
+    pub type_id: u128,
+    #[serde(with = "u128_str")]
+    pub agg_id: u128,
+    pub from_version: u64,
+    pub to_version: u64,
+    /// Timestamp (ns from recorder epoch) at which this event was received.
+    pub t_ns: u64,
 }
 
 /// Per-aggregate state read from one node after heal + quiesce.
@@ -139,6 +205,8 @@ impl HistoryRecorder {
 
     /// Record one write attempt. `req_start` is the `Instant` captured just
     /// before the pool call; the end timestamp is taken here.
+    /// `acked_max_aggregate_version` is `Some(client_seq)` on an Ok outcome
+    /// for the idempotent bench (one seq = one batch), `None` otherwise.
     pub fn record_op<T>(
         &self,
         process: u32,
@@ -153,6 +221,11 @@ impl HistoryRecorder {
             Ok(_) => (OpOutcome::Ok, None),
             Err(e) => classify_error(e),
         };
+        let acked_max_aggregate_version = if outcome == OpOutcome::Ok {
+            Some(client_seq)
+        } else {
+            None
+        };
         let record = HistoryLine::Op(OpRecord {
             process,
             org_id: key.org_id,
@@ -163,8 +236,64 @@ impl HistoryRecorder {
             expected_version,
             outcome,
             error,
+            acked_max_aggregate_version,
             t_start_ns: req_start.duration_since(self.epoch).as_nanos() as u64,
             t_end_ns: self.epoch.elapsed().as_nanos() as u64,
+        });
+        self.push(&record);
+    }
+
+    /// Record a read-your-writes probe result.
+    pub fn record_ryw(
+        &self,
+        process: u32,
+        key: &AggregateKey,
+        client_id: u128,
+        acked_max_aggregate_version: u64,
+        observed: Result<u64, String>,
+        node: Option<String>,
+        probe_id: u64,
+    ) {
+        let (observed_max_aggregate_version, read_error) = match observed {
+            Ok(v) => (Some(v), None),
+            Err(e) => (None, Some(e)),
+        };
+        let record = HistoryLine::Ryw(RywRecord {
+            process,
+            node,
+            probe_id,
+            org_id: key.org_id,
+            type_id: key.aggregate_type_id,
+            agg_id: key.aggregate_id,
+            client_id,
+            acked_max_aggregate_version,
+            observed_max_aggregate_version,
+            read_error,
+            t_ns: self.epoch.elapsed().as_nanos() as u64,
+        });
+        self.push(&record);
+    }
+
+    /// Record a watch delivery event.
+    pub fn record_watch_delivery(
+        &self,
+        connection: u32,
+        epoch: u32,
+        org_id: u128,
+        type_id: u128,
+        agg_id: u128,
+        from_version: u64,
+        to_version: u64,
+    ) {
+        let record = HistoryLine::WatchDelivery(WatchDeliveryRecord {
+            connection,
+            epoch,
+            org_id,
+            type_id,
+            agg_id,
+            from_version,
+            to_version,
+            t_ns: self.epoch.elapsed().as_nanos() as u64,
         });
         self.push(&record);
     }
@@ -300,6 +429,7 @@ mod tests {
             expected_version: None,
             outcome: OpOutcome::Ok,
             error: None,
+            acked_max_aggregate_version: Some(1),
             t_start_ns: 1_568_545,
             t_end_ns: 95_666_311,
         });
@@ -313,6 +443,51 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn ryw_record_roundtrips_through_json() {
+        let line = HistoryLine::Ryw(RywRecord {
+            process: 7,
+            node: None,
+            probe_id: 7,
+            org_id: 1,
+            type_id: 1,
+            agg_id: 99,
+            client_id: 8,
+            acked_max_aggregate_version: 42,
+            observed_max_aggregate_version: Some(42),
+            read_error: None,
+            t_ns: 100_000,
+        });
+        let json = serde_json::to_string(&line).expect("serialize");
+        let back: HistoryLine = serde_json::from_str(&json)
+            .unwrap_or_else(|e| panic!("deserialize {json}: {e}"));
+        match back {
+            HistoryLine::Ryw(r) => {
+                assert_eq!(r.acked_max_aggregate_version, 42);
+                assert_eq!(r.observed_max_aggregate_version, Some(42));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn watch_delivery_record_roundtrips_through_json() {
+        let line = HistoryLine::WatchDelivery(WatchDeliveryRecord {
+            connection: 3,
+            epoch: 0,
+            org_id: 1,
+            type_id: 1,
+            agg_id: 55,
+            from_version: 10,
+            to_version: 20,
+            t_ns: 500_000,
+        });
+        let json = serde_json::to_string(&line).expect("serialize");
+        let back: HistoryLine = serde_json::from_str(&json)
+            .unwrap_or_else(|e| panic!("deserialize {json}: {e}"));
+        assert!(matches!(back, HistoryLine::WatchDelivery(_)));
     }
 
     #[test]

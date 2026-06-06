@@ -981,6 +981,12 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                                 debug!(error = ?e, "Reconciliation probe replication errored");
                             }
                         }).detach();
+                        // Data shards probe on reachability transitions (FollowerReachable),
+                        // but the periodic tick must reach them too: a steadily-reachable
+                        // follower behind on a data shard is otherwise never re-probed.
+                        if periodic_probe {
+                            broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::PeriodicProbe, ctx.intrashard_sender.clone()).await;
+                        }
                     }
                     broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::FollowerReachable { reachable, was_reachable }, ctx.intrashard_sender.clone()).await;
                     
@@ -1342,6 +1348,16 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
                 glommio::spawn_local(async move {
                     if let Err(e) = shard_wal.probe_replicate().await {
                         debug!(error = ?e, "Reconciliation probe replication errored");
+                    }
+                }).detach();
+            }
+        }
+        IntrashardMessages::PeriodicProbe => {
+            if ctx.shard_wal.node_status.get().is_leader() && ctx.shard_wal.replication_client.is_follower_reachable() {
+                let shard_wal = ctx.shard_wal.clone();
+                glommio::spawn_local(async move {
+                    if let Err(e) = shard_wal.probe_replicate().await {
+                        debug!(error = ?e, "Periodic probe replication errored");
                     }
                 }).detach();
             }

@@ -1,4 +1,4 @@
-use std::{cell::RefCell, path::{Path, PathBuf}, rc::Rc};
+use std::{cell::{Cell, RefCell}, path::{Path, PathBuf}, rc::Rc};
 
 use celeriant_disk::files::{open_dma_files::{create_file_dma, existing_file_dma}, rwlock_timeout::{LockTimeoutError, read_with_timeout, write_with_timeout}};
 use celeriant_wal::{
@@ -30,9 +30,21 @@ pub struct LogSegmentFile {
 
     // Metadata directly associated with the log segment file structure
     pub metadata: RefCell<LogSegmentFileMetadata>,
+
+    /// Highest `last_self_acked_wal_seq` known durable in this file's headers.
+    /// Conservative (only bumped after a successful header fdatasync); lets the
+    /// replication barrier skip its own fsync when a data fsync already covered it.
+    pub last_self_acked_synced: Cell<u64>,
 }
 
 impl LogSegmentFile {
+    /// Record that a header containing `last_self_acked` reached disk. Monotonic.
+    pub fn note_header_synced(&self, last_self_acked: u64) {
+        if last_self_acked > self.last_self_acked_synced.get() {
+            self.last_self_acked_synced.set(last_self_acked);
+        }
+    }
+
     pub async fn lock_reader(&self, location: &'static str) -> Result<RwLockReadGuard<'_, Option<Rc<DmaFile>>>, LockTimeoutError> {
         read_with_timeout(&self.reader, location).await
     }
@@ -229,6 +241,7 @@ async fn build_log_segment(
     Ok(LogSegmentFile {
         writer: RwLock::new(Some(Rc::new(writer))),
         reader: RwLock::new(Some(Rc::new(reader))),
+        last_self_acked_synced: Cell::new(header.last_self_acked_wal_seq),
         metadata: RefCell::new(LogSegmentFileMetadata::new(
             log_id, file_len, datablocks_carry_over, header, advance_read,
         )),

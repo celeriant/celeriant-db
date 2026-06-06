@@ -476,6 +476,8 @@ pub(crate) async fn sync(
     dma_file_writer.fdatasync().await
         .map_err(|e| ShardFsyncError::FDataSyncError(e.to_string()))?;
 
+    log_segment_file.note_header_synced(log_segment_file_metadata.last_self_acked_wal_seq);
+
     Ok(log_segment_file_metadata)
 }
 
@@ -501,6 +503,8 @@ pub(crate) async fn sync_header_only(
 
     dma_file_writer.fdatasync().await
         .map_err(|e| ShardFsyncError::FDataSyncError(e.to_string()))?;
+
+    log_segment_file.note_header_synced(metadata.last_self_acked_wal_seq);
 
     Ok(())
 }

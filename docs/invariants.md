@@ -30,7 +30,7 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 - On standalone/follower, writes become readable immediately after fsync.
 - Two separate LRU caches exist: `aggregate_write_snapshots` (updated after fsync, used for OCC/idempotency) and `aggregate_read_snapshots` (updated after replication on leader, used by reads).
 - The recent-write cache filters by `visible_wal_seq`. Entries with `wal_seq > visible_wal_seq` are excluded from reads.
-- The reverse metablock scanner uses the `read` cursor exclusively. Segments not yet replicated are invisible to scans.
+- The reverse metablock scanner defaults to the `read` cursor: not-yet-replicated bytes are invisible to client reads. Write-side scans opt into the write-cursor bound (`with_write_cursor_upper_bound`): OCC/idempotency cache loads and replication catchup — catchup ships durable bytes, not reader-visible bytes, so a sealed `read < write` tail is still bridgeable.
 - Read operations are never rejected based on node status. A fenced or catching-up node serves stale reads silently.
 - There is no cross-shard transactional consistency. Multi-shard listings are sequential per-shard with no cross-shard snapshot isolation.
 
@@ -135,7 +135,10 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 - `RefCell` borrows must NEVER be held across `.await` points. Snapshot into owned data, drop borrow, await, re-borrow to commit.
 - All `RwLock` acquisitions use 1-second timeout wrappers. Timeout returns `PotentialDeadlock` error rather than blocking indefinitely.
 - The fsync `Coordinator` batches concurrent writers: first caller becomes leader (sleeps `fsync_delay`), subsequent callers become followers receiving the same result. At most one fsync executes at a time, enforced by `sync_gate`.
-- The coordinator's Phase 1 (capture snapshot) runs before Phase 2 (clear queue), preventing a race where a new leader finds an empty queue.
+- The coordinator's capture and orchestrator-clear are atomic under the orchestrator write lock: a follower is always waiting on the batch that captured its item.
+- Single-phase (header-only) and two-phase (capture) cycles use separate orchestrator slots. A two-phase follower may only attach to a two-phase event; an Ok from a captureless cycle is a false ack.
+- Follower/rider listeners are registered under the orchestrator guard, atomic with observing the event. `LocalEvent` does not deliver a notify to listeners registered after it fires.
+- Coordinator lock order: the replication coordinator's gate may be held while awaiting the fsync coordinator (the ack-barrier header sync does this). Never the reverse.
 - Shard 0 handles all cluster coordination: lease management, heartbeats, kick processing.
 - All S3/HTTP work runs in a separate tokio sidecar runtime. io_uring and tokio are incompatible in the same thread.
 
@@ -207,7 +210,14 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 - The write path uses non-blocking `try_send()`. If the channel is full, the client is immediately removed from the watcher list. No backpressure propagates to the writer.
 - Broadcast filtering (operation type, org, aggregate type, aggregate ID) runs before `try_send()`. The write hot path never blocks on watch consumers.
 - Clients cannot request a watch latency exceeding `max_requested_latency` (default 2000ms). Rejected with `WatchLatencyTooHigh`.
-- Watch subscriptions are not included in the per-shard memory budget. Bounded per-client (10K events) but unbounded in total subscriber count.
+- Watch subscriptions are not included in the per-shard memory budget. Bounded per-client (10K events), AND total subscribers per shard are capped at `max_watch_subscribers` (default 16384). A subscribe past the cap is rejected with `TooManySubscribers { active, max }`; the `celeriant_watch_subscribers_active` gauge tracks the live count per shard.
+
+### Behaviour across failover / node death
+
+- A watch subscription is bound to one TCP connection to one node; there is no server-side migration. When that node dies, demotes, or fences and the connection drops, the watcher observes a **connection error / end-of-stream — never silent truncation**. Re-subscription (to the new leader) is the client's responsibility; the client library does not auto-reconnect a `WatchConnection`.
+- A fresh subscription delivers only events durable **after** it is established. There is no historical replay on (re)subscribe, so a watcher that reconnects across a failover may have a **gap** spanning the disconnect window. The gap is bounded below by the last event it received and above by the first event on the new connection; the client reconciles it with a read (the events are all in the WAL). Delivery on each node still obeys the durability rule above: post-replication on a leader, post-fsync on a non-leader.
+- Within a single connection's stream there are **no duplicates and no reordering** per aggregate. Across a reconnect, the new stream may re-deliver an aggregate-version range the client already saw (the promoted leader's read cursor can sit at or before the old leader's last delivered version); `(aggregate, from_aggregate_version, to_aggregate_version)` is the tuple the client dedupes on. Watch events carry version ranges, not a global WAL index or event id, so cross-connection dedup is version-based.
+- A watcher is never delivered an event for a write that the cluster did not durably keep: because delivery is post-durability and a promoted leader serves from its replicated/caught-up WAL, any event a watcher saw is present in a post-quiesce final read (modulo the reconnect gap above). The converse does not hold — the final read is a superset, since events during the disconnect window are in the WAL but were never delivered.
 
 ## State Machine Transitions
 

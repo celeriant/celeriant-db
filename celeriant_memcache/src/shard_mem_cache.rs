@@ -951,13 +951,21 @@ impl<V: Validate> ShardMemCache<V> {
     }
 
     /// Cull-side clear. Drains pending_replication and clears the OCC/idempotency
-    /// LRUs that point at the discarded speculative tail. Leaves aggregate_queue_positions,
-    /// schema caches, and rollback_generation alone (those belong to a real rollback).
+    /// LRUs that point at the discarded speculative tail. Leaves aggregate_queue_positions
+    /// and schema caches alone (those belong to a real rollback).
+    ///
+    /// When the drain orphans queued PCDs, their writers are still in flight;
+    /// set the rollback flag and bump the generation so they resolve with
+    /// `RollbackInProgress` instead of a false `NoCaptureRaceButOk` ack
     pub fn clear_speculative_write_caches_for_cull(&mut self) -> usize {
         let drained = std::mem::take(&mut self.pending_replication_batches).len();
         self.pending_replication_bytes = 0;
         self.aggregate_write_snapshots.clear();
         self.aggregate_write_client_snapshots.clear();
+        if drained > 0 {
+            self.replication_rollback_occurred = true;
+            self.rollback_generation = self.rollback_generation.wrapping_add(1);
+        }
         drained
     }
 

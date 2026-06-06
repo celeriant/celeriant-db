@@ -33,6 +33,7 @@ pub enum IntrashardMessages {
     UpdatePeerNodeId { peer_node_id: Option<u128> },
     UpdateFollower { replication_address: Option<String>, peer_node_id: Option<u128> },
     FollowerReachable { reachable: bool, was_reachable: bool },
+    PeriodicProbe,
     HeartbeatInFlightStarted { unix_ms: u64 },
     HeartbeatInFlightCleared,
     UpdateLeaderClientAddress { client_address: Option<String> },

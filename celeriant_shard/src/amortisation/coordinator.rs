@@ -1,4 +1,4 @@
-use crate::amortisation::local_event::LocalEvent;
+use crate::amortisation::local_event::{LocalEvent, LocalEventListener};
 use celeriant_disk::files::rwlock_timeout::{read_with_timeout, with_budget, write_with_timeout};
 use glommio::sync::RwLock;
 use std::{rc::Rc, time::Duration};
@@ -39,8 +39,15 @@ pub enum CaptureResult<T, E: Clone> {
 pub struct Coordinator<E: Clone> {
     lock_orchestrator: RwLock<Option<Rc<LocalEvent<SyncResult<E>>>>>,
 
+    /// Orchestrator for single-phase `request_sync` callers (header-only barrier
+    /// fsyncs). Kept separate from the two-phase orchestrator: a two-phase writer
+    /// attaching to a single-phase cycle resolves Ok without its queue item ever
+    /// being captured; a false ack.
+    lock_orchestrator_single: RwLock<Option<Rc<LocalEvent<SyncResult<E>>>>>,
+
     /// Sync gate: serializes sync execution and supports rollback drain/gate.
     /// Fsync and rollback both acquire write lock - ensures one-at-a-time execution.
+    /// Shared by both orchestrators: single- and two-phase cycles never overlap.
     sync_gate: RwLock<()>,
 }
 
@@ -48,6 +55,7 @@ impl<E: Clone> Coordinator<E> {
     pub fn new() -> Self {
         Self {
             lock_orchestrator: RwLock::new(None),
+            lock_orchestrator_single: RwLock::new(None),
             sync_gate: RwLock::new(()),
         }
     }
@@ -73,26 +81,29 @@ impl<E: Clone> Coordinator<E> {
             _ => Duration::from_millis(0),
         };
 
+        // Followers register their listener under the guard: registration is
+        // atomic with observing the event in the slot, so the leader's notify
+        // cannot be missed (a listener registered after notify hangs).
         enum Acquired<E: Clone> {
             Leader(Rc<LocalEvent<SyncResult<E>>>),
-            Follower(Rc<LocalEvent<SyncResult<E>>>),
+            Follower(LocalEventListener<SyncResult<E>>),
             Retry,
         }
 
         loop {
             let acquired = {
-                match self.lock_orchestrator.try_write() {
+                match self.lock_orchestrator_single.try_write() {
                     Ok(mut guard) => match guard.as_ref() {
-                        Some(event) => Acquired::Follower(event.clone()),
+                        Some(event) => Acquired::Follower(event.listen()),
                         None => {
                             let event = Rc::new(LocalEvent::new());
                             *guard = Some(event.clone());
                             Acquired::Leader(event)
                         }
                     },
-                    Err(_) => match read_with_timeout(&self.lock_orchestrator, "request_sync_read_be_follower").await {
+                    Err(_) => match read_with_timeout(&self.lock_orchestrator_single, "request_sync_read_be_follower").await {
                         Ok(guard) => match guard.as_ref() {
-                            Some(event) => Acquired::Follower(event.clone()),
+                            Some(event) => Acquired::Follower(event.listen()),
                             None => Acquired::Retry,
                         },
                         Err(_) => Acquired::Retry,
@@ -104,7 +115,7 @@ impl<E: Clone> Coordinator<E> {
                 Acquired::Leader(event) => {
                     glommio::timer::sleep(delay).await;
 
-                    if let Ok(mut guard) = write_with_timeout(&self.lock_orchestrator, "request_sync_clear_orchestrator").await {
+                    if let Ok(mut guard) = write_with_timeout(&self.lock_orchestrator_single, "request_sync_clear_orchestrator").await {
                         guard.take();
                     }
 
@@ -123,21 +134,88 @@ impl<E: Clone> Coordinator<E> {
                     event.notify(result.clone());
                     return result;
                 }
-                Acquired::Follower(event) => return event.listen().await,
+                Acquired::Follower(listener) => return listener.await,
                 Acquired::Retry => continue,
             }
         }
     }
 
-    /// Two-phase sync: capture snapshot first, then commit.
+    /// Sync for callers that only need `satisfied()` to become true (the
+    /// replication barrier: a bump needs a header on disk that covers it).
     ///
-    /// This fixes a race condition in the single-phase API where clearing the orchestrator
-    /// before taking the snapshot can cause a subsequent leader to find an empty queue
-    /// (because the previous leader's snapshot captured their items).
+    /// Every data fsync writes dual headers, so any two-phase cycle that
+    /// captures after our bump does our work for free. Before paying for our
+    /// own fsync, wait on in-flight cycles and re-check `satisfied()` after
+    /// each. A cycle that did no I/O (NoCaptureRaceButOk) just fails the
+    /// re-check, which is fine. After MAX_RIDES, or when there is nothing to
+    /// ride, take the gate and run `sync_fn` ourselves.
     ///
-    /// The fix: take snapshot FIRST (while orchestrator still has event), THEN clear orchestrator.
-    /// This ensures followers are correctly associated with the batch that captures their items.
-    pub async fn request_sync_two_phase<C, S, T, Fut1, Fut2>(
+    /// This path never publishes an event of its own, so two-phase writers
+    /// cannot ride us. Letting them ride a cycle with no capture step is a
+    /// false ack.
+    pub async fn request_sync_until<F, Fut, P>(
+        &self,
+        gate_timeout_err: E,
+        sync_fn: F,
+        satisfied: P,
+    ) -> SyncResult<E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = SyncResult<E>>,
+        P: Fn() -> bool,
+    {
+        const MAX_RIDES: u32 = 3;
+        let mut rides = 0;
+        loop {
+            if satisfied() {
+                return Ok(());
+            }
+            if rides >= MAX_RIDES {
+                break;
+            }
+            let ride = match self.lock_orchestrator.try_write() {
+                Ok(guard) => guard.as_ref().map(|event| event.listen()),
+                Err(_) => match read_with_timeout(&self.lock_orchestrator, "request_sync_until_ride").await {
+                    Ok(guard) => guard.as_ref().map(|event| event.listen()),
+                    Err(_) => None,
+                },
+            };
+            match ride {
+                // Event present implies pre-capture: its sync_fn (and header
+                // write) hasn't started, so it will include the caller's bump.
+                // The listener is registered under the guard, atomic with
+                // observing the event, so the leader's notify cannot be missed.
+                Some(listener) => {
+                    rides += 1;
+                    let _ = listener.await;
+                }
+                None => break,
+            }
+        }
+
+        let _sync_guard = match with_budget(GATE_BUDGET, self.sync_gate.write()).await {
+            Some(Ok(g)) => g,
+            _ => {
+                metrics::counter!("celeriant_coordinator_gate_timeout_total", "path" => "request_sync_until").increment(1);
+                return Err(gate_timeout_err);
+            }
+        };
+        // A cycle that completed while we queued on the gate may have covered us.
+        if satisfied() {
+            return Ok(());
+        }
+        sync_fn().await
+    }
+
+    /// Amortised fsync in two phases: capture the pending work, then sync it.
+    /// Followers wait on the leader's event and take its result.
+    ///
+    /// The invariant that matters: a follower is always waiting on the batch
+    /// that captured its item. Capture and orchestrator-clear are atomic under
+    /// the write lock, so a late writer attaches to the next leader, never to
+    /// a snapshot that already missed it. Breaking that ordering is a false
+    /// ack (an Ok for an item the batch never carried).
+    pub async fn request_sync_two_phase<C, S, T, Fut2>(
         &self,
         delay: Option<Duration>,
         gate_timeout_err: E,
@@ -145,8 +223,7 @@ impl<E: Clone> Coordinator<E> {
         sync_fn: S,
     ) -> SyncResult<E>
     where
-        C: FnOnce() -> Fut1,
-        Fut1: std::future::Future<Output = CaptureResult<T, E>>,
+        C: FnOnce() -> CaptureResult<T, E>,
         S: FnOnce(T) -> Fut2,
         Fut2: std::future::Future<Output = SyncResult<E>>,
     {
@@ -155,9 +232,10 @@ impl<E: Clone> Coordinator<E> {
             _ => Duration::from_millis(0),
         };
 
+        // Follower listeners registered under the guard, same as request_sync.
         enum Acquired<E: Clone> {
             Leader(Rc<LocalEvent<SyncResult<E>>>),
-            Follower(Rc<LocalEvent<SyncResult<E>>>),
+            Follower(LocalEventListener<SyncResult<E>>),
             Retry,
         }
 
@@ -165,7 +243,7 @@ impl<E: Clone> Coordinator<E> {
             let acquired = {
                 match self.lock_orchestrator.try_write() {
                     Ok(mut guard) => match guard.as_ref() {
-                        Some(event) => Acquired::Follower(event.clone()),
+                        Some(event) => Acquired::Follower(event.listen()),
                         None => {
                             let event = Rc::new(LocalEvent::new());
                             *guard = Some(event.clone());
@@ -174,7 +252,7 @@ impl<E: Clone> Coordinator<E> {
                     },
                     Err(_) => match read_with_timeout(&self.lock_orchestrator, "request_sync_two_phase_read").await {
                         Ok(guard) => match guard.as_ref() {
-                            Some(event) => Acquired::Follower(event.clone()),
+                            Some(event) => Acquired::Follower(event.listen()),
                             None => Acquired::Retry,
                         },
                         Err(_) => Acquired::Retry,
@@ -222,14 +300,25 @@ impl<E: Clone> Coordinator<E> {
                         }
                     };
 
-                    // Phase 1: Capture snapshot FIRST (while orchestrator still has our event)
-                    // Any writer that arrives now sees our event and becomes a follower
-                    let captured = capture_fn().await;
-
-                    // NOW clear orchestrator - new leaders can only start for items added AFTER capture
-                    if let Ok(mut guard) = write_with_timeout(&self.lock_orchestrator, "two_phase_clear_orchestrator").await {
-                        guard.take();
-                    }
+                    // Phase 1: capture + clear the orchestrator atomically under the
+                    // write lock. capture_fn is sync, so no writer can attach to our
+                    // event after its item missed the snapshot — the false-ack window
+                    // (writer attaches between capture and clear, then receives this
+                    // batch's Ok for an item the batch never carried) is closed.
+                    let captured = match write_with_timeout(&self.lock_orchestrator, "two_phase_capture_and_clear").await {
+                        Ok(mut guard) => {
+                            let captured = capture_fn();
+                            guard.take();
+                            captured
+                        }
+                        Err(_) => {
+                            metrics::counter!("celeriant_coordinator_gate_timeout_total", "path" => "two_phase_orchestrator").increment(1);
+                            drop(_sync_guard);
+                            let result: SyncResult<E> = Err(gate_timeout_err);
+                            event.notify(result.clone());
+                            return result;
+                        }
+                    };
 
                     // Phase 2: Process captured data
                     let result = match captured {
@@ -242,7 +331,7 @@ impl<E: Clone> Coordinator<E> {
                     event.notify(result.clone());
                     return result;
                 }
-                Acquired::Follower(event) => return event.listen().await,
+                Acquired::Follower(listener) => return listener.await,
                 Acquired::Retry => continue,
             }
         }
@@ -946,6 +1035,277 @@ mod tests {
 
             // All waiters should have completed, not hung
             assert_eq!(completed_count.get(), 10);
+        });
+    }
+
+    // ==================== Two-Phase Capture Atomicity ====================
+
+    /// Ok means your item committed in a successful batch. That's the
+    /// false-ack invariant.
+    ///
+    /// The queue models the replication queue: capture drains it, a failed
+    /// commit returns items (return_to_pending_replication), an empty
+    /// capture is NoCaptureRaceButOk.
+    #[test]
+    fn ok_resolution_implies_item_committed() {
+        run_with_glommio(|| async {
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let queue: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(vec![]));
+            let committed: Rc<RefCell<std::collections::HashSet<u32>>> = Rc::new(RefCell::new(Default::default()));
+            let batch_no = Rc::new(Cell::new(0u32));
+
+            let mut handles = vec![];
+            for id in 0..100u32 {
+                let coord = coordinator.clone();
+                let queue = queue.clone();
+                let committed = committed.clone();
+                let batch_no = batch_no.clone();
+                handles.push(spawn_local(async move {
+                    loop {
+                        queue.borrow_mut().push(id);
+                        let q = queue.clone();
+                        let c = committed.clone();
+                        let b = batch_no.clone();
+                        let result = coord
+                            .request_sync_two_phase(
+                                Some(Duration::from_micros(200)),
+                                "gate-timeout".to_string(),
+                                move || {
+                                    let items = std::mem::take(&mut *q.borrow_mut());
+                                    if items.is_empty() {
+                                        CaptureResult::NoCaptureRaceButOk
+                                    } else {
+                                        CaptureResult::Captured((items, q))
+                                    }
+                                },
+                                move |(items, q)| async move {
+                                    yield_now().await; // commit phase yields, like real replication
+                                    let n = b.get() + 1;
+                                    b.set(n);
+                                    if n % 3 == 0 {
+                                        // Failed batch: items go back, like return_to_pending_replication.
+                                        q.borrow_mut().extend(items);
+                                        return Err("batch failed".to_string());
+                                    }
+                                    c.borrow_mut().extend(items);
+                                    Ok(())
+                                },
+                            )
+                            .await;
+                        match result {
+                            Ok(()) => {
+                                assert!(
+                                    committed.borrow().contains(&id),
+                                    "writer {id} resolved Ok but its item was never committed (false ack)"
+                                );
+                                return;
+                            }
+                            Err(_) => {
+                                // Retry: drop our requeued copy first so the retry's push is the only one.
+                                queue.borrow_mut().retain(|&x| x != id);
+                                yield_now().await;
+                            }
+                        }
+                    }
+                }));
+                if id % 7 == 0 {
+                    yield_now().await; // stagger to vary batch composition
+                }
+            }
+
+            for h in handles {
+                h.await;
+            }
+            assert_eq!(committed.borrow().len(), 100);
+        });
+    }
+
+    /// Barrier fsyncs (`request_sync`) and writer data fsyncs
+    /// (`request_sync_two_phase`) used to share one orchestrator, so a writer
+    /// could attach to a barrier cycle and take its Ok. Barrier cycles have
+    /// no capture step. The writer's item was never processed.
+    #[test]
+    fn two_phase_writer_must_not_attach_to_single_phase_cycle() {
+        run_with_glommio(|| async {
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let queue: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(vec![]));
+            let committed: Rc<RefCell<std::collections::HashSet<u32>>> = Rc::new(RefCell::new(Default::default()));
+
+            // Barrier cycle: registers its event, then sleeps its delay.
+            let coord = coordinator.clone();
+            let barrier = spawn_local(async move {
+                coord
+                    .request_sync(Some(Duration::from_millis(10)), "gate-timeout".to_string(), || async { Ok(()) })
+                    .await
+            });
+            yield_now().await; // barrier registers and starts its delay sleep
+
+            // Writer: pushes its item, then requests a two-phase data sync.
+            let coord = coordinator.clone();
+            let q = queue.clone();
+            let c = committed.clone();
+            let writer = spawn_local(async move {
+                q.borrow_mut().push(7);
+                let q2 = q.clone();
+                let c2 = c.clone();
+                coord
+                    .request_sync_two_phase(
+                        Some(Duration::from_millis(1)),
+                        "gate-timeout".to_string(),
+                        move || {
+                            let items = std::mem::take(&mut *q2.borrow_mut());
+                            if items.is_empty() {
+                                CaptureResult::NoCaptureRaceButOk
+                            } else {
+                                CaptureResult::Captured(items)
+                            }
+                        },
+                        move |items| async move {
+                            c2.borrow_mut().extend(items);
+                            Ok(())
+                        },
+                    )
+                    .await
+            });
+
+            barrier.await.unwrap();
+            let writer_result = writer.await;
+
+            if writer_result.is_ok() {
+                assert!(
+                    committed.borrow().contains(&7),
+                    "writer resolved Ok via the barrier cycle but its item was never captured (false ack)"
+                );
+            }
+        });
+    }
+
+    // ==================== request_sync_until (barrier ride) ====================
+
+    #[test]
+    fn sync_until_rides_two_phase_cycle_without_own_sync() {
+        run_with_glommio(|| async {
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let header_synced = Rc::new(Cell::new(false));
+            let own_sync_ran = Rc::new(Cell::new(false));
+
+            // Data cycle: writes "headers" as a side effect.
+            let coord = coordinator.clone();
+            let hs = header_synced.clone();
+            let data_cycle = spawn_local(async move {
+                coord
+                    .request_sync_two_phase(
+                        Some(Duration::from_millis(5)),
+                        "gate-timeout".to_string(),
+                        || CaptureResult::Captured(()),
+                        move |_| async move {
+                            hs.set(true);
+                            Ok(())
+                        },
+                    )
+                    .await
+            });
+            yield_now().await; // data cycle registers
+
+            let hs = header_synced.clone();
+            let osr = own_sync_ran.clone();
+            let result = coordinator
+                .request_sync_until(
+                    "gate-timeout".to_string(),
+                    move || async move {
+                        osr.set(true);
+                        Ok(())
+                    },
+                    move || hs.get(),
+                )
+                .await;
+
+            data_cycle.await.unwrap();
+            assert!(result.is_ok());
+            assert!(header_synced.get(), "ride target must have run");
+            assert!(!own_sync_ran.get(), "barrier must ride the data cycle, not fsync itself");
+        });
+    }
+
+    #[test]
+    fn sync_until_falls_through_when_ride_does_no_io() {
+        run_with_glommio(|| async {
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let own_sync_ran = Rc::new(Cell::new(false));
+
+            // Data cycle resolves NoCaptureRaceButOk: Ok with no I/O performed.
+            let coord = coordinator.clone();
+            let data_cycle = spawn_local(async move {
+                coord
+                    .request_sync_two_phase(
+                        Some(Duration::from_millis(5)),
+                        "gate-timeout".to_string(),
+                        || CaptureResult::<(), String>::NoCaptureRaceButOk,
+                        |_| async { Ok(()) },
+                    )
+                    .await
+            });
+            yield_now().await;
+
+            let osr = own_sync_ran.clone();
+            let osr_check = own_sync_ran.clone();
+            let result = coordinator
+                .request_sync_until(
+                    "gate-timeout".to_string(),
+                    move || async move {
+                        osr.set(true);
+                        Ok(())
+                    },
+                    move || osr_check.get(), // only our own sync satisfies
+                )
+                .await;
+
+            data_cycle.await.unwrap();
+            assert!(result.is_ok());
+            assert!(own_sync_ran.get(), "a no-IO ride must not satisfy the barrier");
+        });
+    }
+
+    #[test]
+    fn sync_until_runs_own_sync_when_idle() {
+        run_with_glommio(|| async {
+            let coordinator: Coordinator<String> = Coordinator::new();
+            let own_sync_ran = Rc::new(Cell::new(false));
+            let osr = own_sync_ran.clone();
+            let osr_check = own_sync_ran.clone();
+            let result = coordinator
+                .request_sync_until(
+                    "gate-timeout".to_string(),
+                    move || async move {
+                        osr.set(true);
+                        Ok(())
+                    },
+                    move || osr_check.get(),
+                )
+                .await;
+            assert!(result.is_ok());
+            assert!(own_sync_ran.get());
+        });
+    }
+
+    #[test]
+    fn sync_until_skips_everything_when_already_satisfied() {
+        run_with_glommio(|| async {
+            let coordinator: Coordinator<String> = Coordinator::new();
+            let own_sync_ran = Rc::new(Cell::new(false));
+            let osr = own_sync_ran.clone();
+            let result = coordinator
+                .request_sync_until(
+                    "gate-timeout".to_string(),
+                    move || async move {
+                        osr.set(true);
+                        Ok(())
+                    },
+                    || true,
+                )
+                .await;
+            assert!(result.is_ok());
+            assert!(!own_sync_ran.get());
         });
     }
 

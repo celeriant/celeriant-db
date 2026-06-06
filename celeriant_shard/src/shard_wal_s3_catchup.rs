@@ -656,7 +656,7 @@ async fn sync_applied_batch(
         .request_sync_two_phase(
             None,
             ShardFsyncError::WriteLockTimeout,
-            move || async move { capture_fsync_snapshot(&mc_capture) },
+            move || capture_fsync_snapshot(&mc_capture),
             move |captured| commit_fsync_with_rollback(NodeStatus::Standalone, lsc, smc, wa, captured, shard_id, dict_codec),
         )
         .await
@@ -3177,7 +3177,7 @@ mod tests {
     /// A file strictly ahead of an unfilled gap (start > next_wal_seq) is not a
     /// bridging predecessor and must not hold the drain barrier open. Otherwise an
     /// unfillable middle gap (corrupt/deleted batch) wedges catchup forever instead
-    /// of handing the gap to TCP extended catchup. See docs/s3-catchup-drain-wedge.md.
+    /// of handing the gap to TCP extended catchup.
     #[test]
     fn drain_barrier_ignores_file_beyond_gap() {
         glommio_test!({

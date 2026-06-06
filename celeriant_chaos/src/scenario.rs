@@ -63,6 +63,10 @@ pub struct ScenarioReport {
     /// loss count; `audit_overreported` is the audit's noise floor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_truth: Option<Vec<crate::disk_truth::DiskTruthEntry>>,
+    /// Residual S3 fallback objects post-quiesce (count + per-shard ranges).
+    /// Trended across soak iterations to catch fallback-object leaks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_lifecycle: Option<crate::s3_lifecycle::S3LifecycleReport>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -113,6 +117,9 @@ pub struct ClusterUp {
     pub scraper_start: Instant,
     pub bench_primary: String,
     pub bench_seed: String,
+    /// Per-host (fd count, RSS) taken right after stable-leader, compared
+    /// against a pre-teardown snapshot to catch fd/memory leaks per scenario.
+    pub resource_before: Vec<(String, crate::resource_baseline::ResourceSnapshot)>,
 }
 
 impl ClusterUp {
@@ -188,7 +195,18 @@ pub async fn bring_up_cluster(
         }
     };
 
-    Ok(ClusterUp { scraper, scraper_start, bench_primary, bench_seed })
+    // Baseline fd/RSS per node now that the cluster is stable — compared at
+    // tear-down to catch per-scenario leaks. Best-effort: a failed snapshot
+    // just means the leak check is skipped for that host.
+    let mut resource_before = Vec::new();
+    for host in [&cfg.leader_host, &cfg.follower_host] {
+        match crate::resource_baseline::snapshot(host).await {
+            Ok(s) => resource_before.push((host.clone(), s)),
+            Err(e) => println!("[{scenario_name}] resource baseline skipped for {host}: {e}"),
+        }
+    }
+
+    Ok(ClusterUp { scraper, scraper_start, bench_primary, bench_seed, resource_before })
 }
 
 /// Build the bench pool against the bench addresses resolved during bring-up.
@@ -217,6 +235,35 @@ pub async fn build_bench_pool(
 /// Per-op history recorder for the idempotent bench, writing
 /// `<run_dir>/<scenario>-history.jsonl`. Creation failure disables recording
 /// (warn, not abort) — the metric predicates still run.
+
+/// Pinned per-node pools for the RYW probe (one per config slot). Best-effort:
+/// a build failure just means the probe falls back to the un-pinned pool.
+pub async fn build_ryw_pinned(cfg: &ClusterConfig) -> Vec<(String, std::sync::Arc<Pool>)> {
+    let mut out = Vec::new();
+    for (host, addr) in [
+        (cfg.leader_host.clone(), cfg.leader_addr()),
+        (cfg.follower_host.clone(), cfg.follower_addr()),
+    ] {
+        let built = celeriant_bench::PoolBuilder {
+            address1: &addr,
+            address2: &addr, // pinned: no failover escape to the other node
+            server_name: Some(&host),
+            ca_cert: cfg.ca_cert.to_str().unwrap(),
+            client_cert: cfg.client_cert.to_str().unwrap(),
+            client_key: cfg.client_key.to_str().unwrap(),
+            plaintext: false,
+            max_connections: 64,
+        }
+        .build()
+        .await;
+        match built {
+            Ok(p) => out.push((host, p)),
+            Err(e) => println!("ryw pinned pool for {host} unavailable: {e}"),
+        }
+    }
+    out
+}
+
 pub fn new_history_recorder(scen: &str, run_dir: &std::path::Path) -> Option<Arc<HistoryRecorder>> {
     let path = run_dir.join(format!("{scen}-history.jsonl"));
     match HistoryRecorder::create(&path) {
@@ -264,12 +311,48 @@ pub async fn finish_history_and_check(
         Err(e) => eprintln!("[{scen}] final-read phase failed: {e}"),
     }
 
-    match celeriant_bench::history::read_history(&summary.path) {
-        Ok((lines, unparseable)) => {
-            crate::checkers::run_history_checks(&lines, summary.records_dropped + unparseable)
-        }
-        Err(e) => vec![CheckResult::fail("HistoryRecorded", format!("history unreadable: {e}"))],
+    let (lines, unparseable) = match celeriant_bench::history::read_history(&summary.path) {
+        Ok(v) => v,
+        Err(e) => return vec![CheckResult::fail("HistoryRecorded", format!("history unreadable: {e}"))],
+    };
+    let mut checks = crate::checkers::run_history_checks(&lines, summary.records_dropped + unparseable);
+
+    // Payload round-trip: the only byte-level content check in the suite —
+    // every other oracle is count/seq-based and would pass a consistent
+    // payload-corruption bug unnoticed.
+    if !acks.is_empty() {
+        checks.push(crate::final_read::verify_payload_roundtrip(scen, cfg, acks).await);
     }
+
+    // acked ⊆ durable-on-both: independent disk join over a sample of acked
+    // aggregates — does not trust the server's self-graded counters. The acked
+    // set comes from the history's actual `ok` records: workloads like
+    // cas_storm ack sparsely (most writes lose OCC), so a contiguous
+    // 1..=max_acked assumption over-claims and false-positives.
+    let mut acked_map: std::collections::HashMap<(u128, u128, u128, u128), Vec<u64>> =
+        std::collections::HashMap::new();
+    for line in &lines {
+        if let celeriant_bench::history::HistoryLine::Op(op) = line {
+            if matches!(op.outcome, celeriant_bench::history::OpOutcome::Ok) {
+                acked_map
+                    .entry((op.org_id, op.type_id, op.agg_id, op.client_id))
+                    .or_default()
+                    .push(op.client_seq);
+            }
+        }
+    }
+    let acked: Vec<crate::epoch_oracle::AckedAggregate> = acked_map
+        .into_iter()
+        .map(|((org_id, type_id, agg_id, client_id), mut acked_seqs)| {
+            acked_seqs.sort_unstable();
+            acked_seqs.dedup();
+            crate::epoch_oracle::AckedAggregate { org_id, type_id, agg_id, client_id, acked_seqs }
+        })
+        .collect();
+    if !acked.is_empty() {
+        checks.extend(crate::epoch_oracle::run_acked_durability_oracle(cfg, &acked, 0xce1e51a7).await);
+    }
+    checks
 }
 
 /// Standard tear-down: settle scraper one more tick, stop services, splice
@@ -378,6 +461,16 @@ pub async fn tear_down_and_evaluate_with_audit(
 
     let executor = ActionExecutor::new(cfg);
 
+    // Resource leak check: snapshot fd/RSS while services are still up and
+    // compare against the bring-up baseline.
+    let mut env_checks: Vec<CheckResult> = Vec::new();
+    for (host, before) in &up.resource_before {
+        match crate::resource_baseline::snapshot(host).await {
+            Ok(after) => env_checks.extend(crate::resource_baseline::baseline_checks(host, before, &after)),
+            Err(e) => println!("[{scenario_name}] resource after-snapshot skipped for {host}: {e}"),
+        }
+    }
+
     // Give the scraper one more tick before stopping it.
     sleep(Duration::from_millis(750)).await;
     let outcome = up.scraper.stop().await;
@@ -385,6 +478,18 @@ pub async fn tear_down_and_evaluate_with_audit(
 
     println!("[{scenario_name}] stop services");
     let _ = executor.run(&Action::StopAll);
+
+    // Post-stop oracles: WAL state is quiescent, MinIO is still up (teardown-data
+    // only runs at the NEXT scenario's bring-up).
+    env_checks.extend(crate::epoch_oracle::run_epoch_oracle(cfg, 4).await);
+    let s3_lifecycle_report = crate::s3_lifecycle::audit_s3_fallback().await;
+    if let Some(ref report) = s3_lifecycle_report {
+        println!(
+            "[{scenario_name}] s3-lifecycle: {} residual fallback objects across {} shards",
+            report.total_objects, report.per_shard.len()
+        );
+        env_checks.extend(crate::s3_lifecycle::checks(report));
+    }
 
     let (start_idx, end_idx) = sample_window(&samples, bench_window_start_ms, bench_window_end_ms);
 
@@ -403,6 +508,7 @@ pub async fn tear_down_and_evaluate_with_audit(
         bench_end_idx: end_idx,
         bench_actual_end_ms,
         bench_errors: bench_result.errors,
+        bench_total_requests: bench_result.total_requests,
         bench_throughput: bench_result.throughput,
         throughput_floor: params.throughput_floor,
     };
@@ -425,14 +531,25 @@ pub async fn tear_down_and_evaluate_with_audit(
         }
     }
 
-    let passed = checks.iter().all(|c| c.passed);
+    checks.extend(env_checks);
 
-    let log_files = if !passed {
-        println!("[{scenario_name}] FAIL — fetching journalctl from both nodes");
-        harvest_logs(cfg, scenario_name, outcome.wall_start, outcome.wall_end, run_dir)
-    } else {
-        Vec::new()
-    };
+    // Journals are now fetched on EVERY run (not just failures) so they can be
+    // asserted: panics, aborts, BorrowMutError, and error storms fail the run
+    // even when no metric or history check noticed.
+    let log_files = harvest_logs(cfg, scenario_name, outcome.wall_start, outcome.wall_end, run_dir);
+    for rel in &log_files {
+        let path = run_dir.join(rel);
+        let node = rel.split('.').nth(1).unwrap_or("node").to_string();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => checks.extend(crate::journal_assert::journal_checks(&node, &text)),
+            Err(e) => println!("[{scenario_name}] journal assert skipped for {rel}: {e}"),
+        }
+    }
+
+    let passed = checks.iter().all(|c| c.passed);
+    if !passed {
+        println!("[{scenario_name}] FAIL — journals already in run dir");
+    }
 
     Ok(ScenarioReport {
         name: scenario_name.into(),
@@ -453,6 +570,7 @@ pub async fn tear_down_and_evaluate_with_audit(
         integrity,
         deep_audit,
         disk_truth: disk_truth_report,
+        s3_lifecycle: s3_lifecycle_report,
     })
 }
 
@@ -681,18 +799,32 @@ async fn run_watch_storm_inner(
     let dur = params.duration_secs;
     let bench_handle = tokio::spawn(async move { run_benchmark(&pool_clone, tasks, dur).await });
 
+    // Record watch deliveries so the content checkers (per-connection
+    // ordering; delivered ⊆ durable) engage. Only the ordering checker fires
+    // here — there are no final-read records without an idempotent-bench
+    // history, and the durable checker skips gracefully.
+    let watch_history = new_history_recorder(SCEN, run_dir);
     let flood = if with_kill {
         let executor = ActionExecutor::new(cfg);
         let watch_addr2 = watch_addr.clone();
         let watch_tls2 = watch_tls.clone();
-        let flood_handle = tokio::spawn(async move { run_watch_flood(&watch_addr2, watch_tls2, flood_params).await });
+        let history2 = watch_history.clone();
+        let flood_handle = tokio::spawn(async move {
+            match history2 {
+                Some(h) => celeriant_bench::run_watch_flood_with_history(&watch_addr2, watch_tls2, flood_params, h).await,
+                None => run_watch_flood(&watch_addr2, watch_tls2, flood_params).await,
+            }
+        });
         // Kill ~40% into the window so there's storm both before and after.
         sleep(Duration::from_secs((params.duration_secs * 2 / 5).max(5))).await;
         println!("[{SCEN}] SIGKILL leader {leader_host} ({kill_leader:?}) mid-storm");
         executor.run(&kill_leader)?;
         flood_handle.await.map_err(|e| format!("flood join: {e}"))?
     } else {
-        run_watch_flood(&watch_addr, watch_tls.clone(), flood_params).await
+        match watch_history.clone() {
+            Some(h) => celeriant_bench::run_watch_flood_with_history(&watch_addr, watch_tls.clone(), flood_params, h).await,
+            None => run_watch_flood(&watch_addr, watch_tls.clone(), flood_params).await,
+        }
     };
 
     let bench_result = bench_handle.await.map_err(|e| format!("bench join: {e}"))?;
@@ -715,6 +847,7 @@ async fn run_watch_storm_inner(
     );
 
     let mut extra_checks: Vec<CheckResult> = Vec::new();
+    extra_checks.extend(finish_history_and_check(SCEN, cfg, watch_history, &[]).await);
 
     // 1) Delivery survived the churn.
     extra_checks.push(if flood.events_received > 0 {
@@ -783,6 +916,9 @@ async fn run_watch_storm_inner(
             max_s3_fallbacks: 1000,
             max_heartbeat_failures: 100,
             max_bench_errors: 500_000,
+            // Load-proportional ceiling: errors are retry attempts and scale
+            // with offered load (attempt-share of errors+completions).
+            max_bench_error_ratio: Some(0.75),
             max_role_flips: 4,
             max_node_starts: 1,
             max_split_brain_ticks: 40,
@@ -790,10 +926,14 @@ async fn run_watch_storm_inner(
         }
     } else {
         // Happy cluster: no elections/panics/restarts expected. The connection
-        // storm can induce a few transient write timeouts, so allow a small
-        // bench-error budget; the throughput floor is the real "didn't fall
-        // over" guard.
-        ScenarioExpectations { max_bench_errors: 200, ..Default::default() }
+        // storm can induce transient write timeouts that scale with task count
+        // (observed ~1% attempt-share at 25k under flood churn); the throughput
+        // floor is the real "didn't fall over" guard.
+        ScenarioExpectations {
+            max_bench_errors: 200,
+            max_bench_error_ratio: Some(0.03),
+            ..Default::default()
+        }
     };
     let mut params = params;
     if with_kill {
@@ -929,7 +1069,7 @@ pub async fn run_duplicate_replay(
         &pool,
         params.tasks,
         params.duration_secs,
-        celeriant_bench::IdempotentBenchOptions { history: history.clone(), duplicate_replay: true },
+        celeriant_bench::IdempotentBenchOptions { history: history.clone(), duplicate_replay: true, ryw_pinned: build_ryw_pinned(cfg).await },
     )
     .await;
     let bench_window_end_ms = up.elapsed_ms();
@@ -973,6 +1113,17 @@ pub async fn run_duplicate_replay(
     let mut scen_params = params;
     scen_params.throughput_floor = (params.throughput_floor * 0.4).max(50.0);
 
+    // No fault is injected, but the duplicate-heavy profile saturates the
+    // Pis at high task counts (observed transient attempt-share: ~0% @8k,
+    // 2% @12k, 3.2% @16k, 6.9% @25k — all with perfect integrity; the share
+    // scales with saturation). 10% ceiling — integrity is asserted
+    // independently by the audit + history checkers, and the recurring 60s
+    // max-latency double-connect-timeout signature is tracked separately.
+    let expectations = ScenarioExpectations {
+        max_bench_error_ratio: Some(0.10),
+        ..Default::default()
+    };
+
     tear_down_and_evaluate_with_audit(
         SCEN,
         cfg,
@@ -980,7 +1131,7 @@ pub async fn run_duplicate_replay(
         outcome.benchmark.clone(),
         bench_window_start_ms,
         bench_window_end_ms,
-        ScenarioExpectations::default(),
+        expectations,
         scen_params,
         extra_checks,
         Some(integrity),
@@ -1117,6 +1268,9 @@ pub async fn run_cas_storm_scenario(
             max_leader_elections: 2,
             max_role_flips: 8,
             max_bench_errors: 100_000,
+            // Load-proportional ceiling: errors are retry attempts and scale
+            // with offered load (attempt-share of errors+completions).
+            max_bench_error_ratio: Some(0.75),
             assert_eventual_progress: true,
             ..ScenarioExpectations::default()
         }
@@ -1240,6 +1394,9 @@ pub async fn run_bridge(
         max_s3_fallbacks: 1500,
         max_heartbeat_failures: 250,
         max_bench_errors: 500_000,
+        // Load-proportional ceiling: errors are retry attempts and scale
+        // with offered load (attempt-share of errors+completions).
+        max_bench_error_ratio: Some(0.75),
         // The bridge MUST NOT change leadership: S3 renewal beats the
         // follower's challenge by design.
         require_leader_retained: true,
@@ -1302,8 +1459,15 @@ pub async fn run_single_node_isolation(
     let history_clone = history.clone();
     let tasks = params.tasks;
     let dur = params.duration_secs;
+    // Pinned RYW probes: this scenario is the failover-window RYW testbed —
+    // per-node reads let the checker distinguish a stale-replica read
+    // (documented) from a cluster-wide invisible ack (real bug).
+    let ryw_pinned = build_ryw_pinned(cfg).await;
     let bench_handle = tokio::spawn(async move {
-        run_benchmark_idempotent_with_history(&pool_clone, tasks, dur, history_clone).await
+        celeriant_bench::run_benchmark_idempotent_opts(
+            &pool_clone, tasks, dur,
+            celeriant_bench::IdempotentBenchOptions { history: history_clone, duplicate_replay: false, ryw_pinned },
+        ).await
     });
 
     sleep(Duration::from_secs(15)).await;
@@ -1356,6 +1520,9 @@ pub async fn run_single_node_isolation(
         max_s3_fallbacks: 2000,
         max_heartbeat_failures: 250,
         max_bench_errors: 1_000_000,
+        // Load-proportional ceiling: errors are retry attempts and scale
+        // with offered load (attempt-share of errors+completions).
+        max_bench_error_ratio: Some(0.75),
         max_role_flips: 8,
         // The isolation necessarily opens a no-leader window: the isolated
         // leader fences at lease expiry, and the survivor waits its FULL TTL
@@ -1476,6 +1643,9 @@ pub async fn run_clock_scrambler(
         max_s3_fallbacks: 1500,
         max_heartbeat_failures: 400,
         max_bench_errors: 500_000,
+        // Load-proportional ceiling: errors are retry attempts and scale
+        // with offered load (attempt-share of errors+completions).
+        max_bench_error_ratio: Some(0.75),
         max_role_flips: 12,
         max_split_brain_ticks: 20,
         require_final_leader_write_progress: true,
@@ -1570,6 +1740,9 @@ pub async fn run_idempotency_audit_minio_outage(
         // counter checks — MinIO down briefly is the same shape of churn.
         max_s3_fallbacks: 10,
         max_bench_errors: 50_000,
+        // Load-proportional ceiling: errors are retry attempts and scale
+        // with offered load (attempt-share of errors+completions).
+        max_bench_error_ratio: Some(0.75),
         // The MinIO bounce can cost one lease re-election + one heartbeat
         // miss as the leader re-confirms its lease on S3's return. Measured
         // 1/1 in a 1-in-5 run; allow a small margin.
@@ -1677,6 +1850,9 @@ pub async fn run_follower_graceful_stop(
         // 60k headroom for the higher-load runs where bench errors climb
         // during the rollback-cooldown window.
         max_bench_errors: 60_000,
+        // Load-proportional ceiling: errors are retry attempts and scale
+        // with offered load (attempt-share of errors+completions).
+        max_bench_error_ratio: Some(0.75),
         // Under load the cluster can legitimately hand off leadership when
         // the original leader's S3 lease renewal contends with its own
         // S3 fallback uploads (during the follower-down gap). The
@@ -1783,6 +1959,9 @@ pub async fn run_follower_sigkill(
         // SIGKILL leaves no graceful close — bench errors run higher than
         // the graceful-stop case. Empirical run hit ~35k; 60k headroom.
         max_bench_errors: 60_000,
+        // Load-proportional ceiling: errors are retry attempts and scale
+        // with offered load (attempt-share of errors+completions).
+        max_bench_error_ratio: Some(0.75),
         // Same recovery-thrash tolerance as follower_graceful_stop: under
         // load the leader's S3 lease renewal may briefly lose to a freshly-
         // restarted follower's CAS attempt. CAS on lease_epoch keeps
@@ -1892,6 +2071,9 @@ pub async fn run_leader_graceful_stop(
         // because in those the leader can still commit via S3 fallback,
         // whereas here no writes succeed at all during the gap.
         max_bench_errors: 500_000,
+        // Load-proportional ceiling: errors are retry attempts and scale
+        // with offered load (attempt-share of errors+completions).
+        max_bench_error_ratio: Some(0.75),
         // cs1 leader→follower (or down→follower) and cs2 follower→leader.
         // Each node should flip exactly once in the simple path, but allow
         // some headroom for transient `BootCatchup` ticks on restart.
@@ -1995,6 +2177,9 @@ pub async fn run_leader_sigkill(
         max_heartbeat_failures: 60,
         // Same reasoning as SCEN-4 — see run_leader_graceful_stop.
         max_bench_errors: 500_000,
+        // Load-proportional ceiling: errors are retry attempts and scale
+        // with offered load (attempt-share of errors+completions).
+        max_bench_error_ratio: Some(0.75),
         max_role_flips: 8,
         max_split_brain_ticks: 10,
         require_leader_retained: false,
@@ -2159,6 +2344,9 @@ pub async fn run_leader_restart_loop(
         // In practice the windows overlap a restart, so the realised
         // count is typically well below the sum.
         max_bench_errors: 1_500_000,
+        // Load-proportional ceiling: errors are retry attempts and scale
+        // with offered load (attempt-share of errors+completions).
+        max_bench_error_ratio: Some(0.75),
         // Each cycle flips both nodes once (A→follower, B→leader OR
         // vice versa), so 3 cycles × 2 nodes = 6 flips minimum. Add
         // headroom for transient BootCatchup ticks on each restart.
@@ -2313,6 +2501,9 @@ pub async fn run_partition_leader_follower_replication(
         // leader is still committing via S3 fallback. Errors spike during
         // the partition transition and during heal-time role settlement.
         max_bench_errors: 500_000,
+        // Load-proportional ceiling: errors are retry attempts and scale
+        // with offered load (attempt-share of errors+completions).
+        max_bench_error_ratio: Some(0.75),
         // Both nodes may flip role if the S3 race goes unexpectedly.
         max_role_flips: 8,
         max_split_brain_ticks: 10,
@@ -2348,11 +2539,9 @@ pub async fn run_partition_leader_follower_replication(
 /// heartbeat path between the two data nodes are unaffected, so the leader
 /// keeps committing via TCP replication to the follower and heartbeats
 /// stay healthy. S3 lease renewal is skipped while heartbeats succeed, so
-/// the leader never actually needs to hit S3 during the partition. This
-/// tests the "priority inversion fix" from
-/// `docs/failover-stress-test-2026-04-06.md`: the leader should NOT lose
-/// leadership even if its S3 path is completely dead, as long as the
-/// cross-node TCP heartbeat path is still working.
+/// the leader never actually needs to hit S3 during the partition. The
+/// leader must NOT lose leadership while its S3 path is completely dead,
+/// as long as the cross-node TCP heartbeat path is still working.
 ///
 /// Expected: leader retained throughout, no elections, no S3 fallbacks
 /// (nothing triggers fallback because the follower is reachable and the
@@ -2694,6 +2883,9 @@ pub async fn run_network_flap(
         // significant headroom.
         max_heartbeat_failures: 120,
         max_bench_errors: 200_000,
+        // Load-proportional ceiling: errors are retry attempts and scale
+        // with offered load (attempt-share of errors+completions).
+        max_bench_error_ratio: Some(0.75),
         // Leadership may flip once or twice if the S3 race goes the
         // unlucky way during a flap. Not required to retain.
         max_role_flips: 8,
@@ -3065,6 +3257,9 @@ pub async fn run_partition_then_kill_minio(
         // the blackout. With 4000 tasks and ~40s of leader-fenced time,
         // this can get into the hundreds of thousands.
         max_bench_errors: 1_500_000,
+        // Errors are retry ATTEMPTS and scale with tasks × outage / backoff
+        // (observed: 75% attempt-share at 25k with healthy integrity).
+        max_bench_error_ratio: Some(0.85),
         // Recovery thrash: while both nodes do S3 catchup of each other's
         // divergent branches, the apply path on shard 0 transiently
         // delays heartbeat acks. The follower's TTL expires, it
@@ -3112,7 +3307,7 @@ pub async fn run_partition_then_kill_minio(
 /// Mirrors `run_partition_then_kill_minio` (kill follower + stop MinIO →
 /// 40s blackout → heal) but runs `run_benchmark_idempotent` so the audit
 /// can detect false-ack data loss caused by the orphan-snapshot path in
-/// `capture_replication_snapshot` (see `docs/missing-data.md`).
+/// `capture_replication_snapshot`.
 ///
 /// This scenario forces both follower-unreachable AND S3-unreachable for
 /// long enough that the leader self-fences and rollbacks fire. With the
@@ -3212,6 +3407,9 @@ pub async fn run_idempotency_audit_partition_then_kill_minio(
         max_s3_fallbacks: 1000,
         max_heartbeat_failures: 250,
         max_bench_errors: 1_500_000,
+        // Load-proportional ceiling: errors are retry attempts and scale
+        // with offered load (attempt-share of errors+completions).
+        max_bench_error_ratio: Some(0.75),
         max_role_flips: 20,
         max_split_brain_ticks: 60,
         require_leader_retained: false,
@@ -3350,6 +3548,9 @@ pub async fn run_idempotency_audit_fast_blackout(
         max_s3_fallbacks: 1000,
         max_heartbeat_failures: 250,
         max_bench_errors: 1_500_000,
+        // Load-proportional ceiling: errors are retry attempts and scale
+        // with offered load (attempt-share of errors+completions).
+        max_bench_error_ratio: Some(0.75),
         max_role_flips: 20,
         max_split_brain_ticks: 60,
         require_leader_retained: false,
@@ -3503,7 +3704,11 @@ pub async fn run_rolling_restart(
         max_heartbeat_failures: 120,
         // Phase 2 is a leader-loss window — similar error envelope to
         // SCEN-4 (~500k max). Phase 1 contributes a smaller burst.
+        // Error volume scales with offered load (12k tasks: 686k, 16k: 866k
+        // observed against healthy integrity), so the bound is a ratio of
+        // total requests; the absolute floor covers low-load runs.
         max_bench_errors: 600_000,
+        max_bench_error_ratio: Some(0.75),
         // At least two flips: original leader → follower (phase 2),
         // and the original follower promoted to leader.
         max_role_flips: 8,
@@ -3653,6 +3858,9 @@ pub async fn run_sigstop_leader(
         max_heartbeat_failures: 100,
         // Similar envelope to SCEN-4/5 leader-loss scenarios.
         max_bench_errors: 500_000,
+        // Load-proportional ceiling: errors are retry attempts and scale
+        // with offered load (attempt-share of errors+completions).
+        max_bench_error_ratio: Some(0.75),
         // Recovery-thrash window: while the resumed paused node drains
         // its un-replicated tail and rebuilds the hash chain via S3
         // catchup, both nodes' heartbeat path is intermittently delayed
@@ -3800,6 +4008,9 @@ pub async fn run_clock_skew_follower(
         // Both TCP and S3 paths work for the leader throughout;
         // rollbacks shouldn't fire.
         max_bench_errors: 50_000,
+        // Load-proportional ceiling: errors are retry attempts and scale
+        // with offered load (attempt-share of errors+completions).
+        max_bench_error_ratio: Some(0.75),
         // Under high concurrent load the clock-skew window plus S3
         // contention can occasionally let the skewed follower win the
         // S3 lease CAS during a heartbeat-renewal race. Both nodes flip
@@ -3975,6 +4186,9 @@ pub async fn run_follower_disk_full(
         // Bench error budget — conservative. Real writes should mostly
         // succeed because the leader has a healthy disk.
         max_bench_errors: 100_000,
+        // Load-proportional ceiling: errors are retry attempts and scale
+        // with offered load (attempt-share of errors+completions).
+        max_bench_error_ratio: Some(0.75),
         // Leader should not change.
         max_role_flips: 0,
         max_split_brain_ticks: 10,
@@ -4141,6 +4355,7 @@ pub async fn run_bench_load_sweep(
         idempotent_counters: None,
         integrity: None,
         deep_audit: None,
+        s3_lifecycle: None,
         disk_truth: None,
     };
     Ok(report)
@@ -4223,4 +4438,674 @@ fn sample_window(samples: &[NodeSample], start_ms: u64, end_ms: u64) -> (usize, 
 
 async fn sleep(d: Duration) {
     tokio::time::sleep(d).await;
+}
+
+/// SSH to both nodes and count WAL segment files matching
+/// `/var/lib/nvme/celeriant-data/shard_*/log_*.wal`.
+/// Returns (leader_count, follower_count). On SSH error returns (0, 0)
+/// for that host (best-effort; rotation check degrades to a "no rotation"
+/// pass-with-detail rather than a hard fail).
+fn ssh_count_wal_segments(leader: &str, follower: &str) -> (usize, usize) {
+    let cmd = "ls /var/lib/nvme/celeriant-data/shard_*/log_*.wal 2>/dev/null | wc -l";
+    let count_on = |host: &str| -> usize {
+        use std::process::{Command, Stdio};
+        let out = Command::new("ssh")
+            .arg(host)
+            .arg(cmd)
+            .stdin(Stdio::null())
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                String::from_utf8_lossy(&o.stdout).trim().parse().unwrap_or(0)
+            }
+            _ => 0,
+        }
+    };
+    (count_on(leader), count_on(follower))
+}
+
+/// `cold_segment_reads` (adversarial review finding): bloom-filter and
+/// sealed-segment scanner correctness is never exercised when the bench's
+/// hot set stays cache+active-segment resident.
+///
+/// **Disjoint range approach**: because `run_benchmark` hardcodes
+/// `AggregateKey::new(1, 1, id)` and the chaos crate cannot construct
+/// `AggregateKey` directly (not in Cargo.toml), phase 1 uses
+/// `run_benchmark_idempotent_with_history` with `wide_tasks` tasks. This
+/// returns `task_acks: Vec<TaskAckSummary>` already containing the correct
+/// `AggregateKey` for each task. The cold range
+/// `task_acks[params.tasks..params.tasks*2]` is the slice whose aggregates
+/// were only written in phase 1 and are never touched by phase 2 (which
+/// uses standard `run_benchmark` with `params.tasks` tasks, writing to
+/// agg_id 0..params.tasks only). Those cold aggregates go to sealed/cold
+/// segments after phase 2 advances the active segment.
+///
+/// **Structure**:
+///
+/// Phase 1 — wide idempotent bench: `wide_tasks = min(params.tasks * 4, 60_000)`
+/// concurrent tasks, each to a distinct aggregate. Returns `task_acks`.
+///
+/// Phase 2 — churn bench: plain `run_benchmark` with `params.tasks` tasks
+/// (agg_id 0..tasks). Advances active segment; leaves params.tasks..wide_tasks cold.
+///
+/// Cold-read: take a 256-aggregate sample from `task_acks[params.tasks..params.tasks*2]`,
+/// call `verify_no_seq_gaps` on both nodes. Any aggregate reading as absent
+/// or short is a scanner/bloom/visibility bug.
+///
+/// Rotation check: SSH to both nodes, count WAL files. If count > 4 on either
+/// node, rotation occurred. Otherwise, passes with a detail note — Pi write
+/// rates vary.
+pub async fn run_cold_segment_reads(
+    cfg: &ClusterConfig,
+    params: ScenarioParams,
+    run_dir: &PathBuf,
+) -> Result<ScenarioReport, String> {
+    const SCEN: &str = "cold_segment_reads";
+    // Aggregates sampled for the cold-read phase.
+    const COLD_READ_SAMPLE: usize = 256;
+    // Number of shards (one WAL file per shard at baseline, no rotation yet).
+    const BASELINE_WAL_COUNT: usize = 4;
+
+    let up = bring_up_cluster(cfg, SCEN, run_dir).await?;
+
+    let wide_tasks = (params.tasks * 4).min(60_000);
+    let wide_params = ScenarioParams { tasks: wide_tasks, ..params };
+    let wide_pool = build_bench_pool(cfg, &up, wide_params).await?;
+
+    println!("[{SCEN}] smoke test");
+    smoke_test(&wide_pool).await.map_err(|e| format!("smoke: {e}"))?;
+
+    let bench_window_start_ms = up.elapsed_ms();
+
+    // Phase 1: wide idempotent bench so we get TaskAckSummary back.
+    println!("[{SCEN}] phase 1: wide idempotent bench — {wide_tasks} aggregates, {}s", params.duration_secs);
+    let outcome1 = run_benchmark_idempotent_with_history(&wide_pool, wide_tasks, params.duration_secs, None).await;
+    println!(
+        "[{SCEN}] phase 1 done: {} req, {} err, {:.0} req/s (ok_acks={})",
+        outcome1.benchmark.total_requests,
+        outcome1.benchmark.errors,
+        outcome1.benchmark.throughput,
+        outcome1.counters.ok_acks,
+    );
+    drop(wide_pool);
+
+    // Brief settle so phase-1 writes replicate before phase-2 starts.
+    sleep(Duration::from_secs(5)).await;
+
+    // Phase 2: churn bench against agg 0..params.tasks — leaves
+    // params.tasks..wide_tasks cold.
+    println!(
+        "[{SCEN}] phase 2: churn bench — {} tasks, {}s (pushing phase-1 cold aggregates off active segment)",
+        params.tasks, params.duration_secs,
+    );
+    let narrow_pool = build_bench_pool(cfg, &up, params).await?;
+    let pool_clone = narrow_pool.clone();
+    let phase2_result = run_benchmark(&pool_clone, params.tasks, params.duration_secs).await;
+    println!(
+        "[{SCEN}] phase 2 done: {} req, {} err, {:.0} req/s",
+        phase2_result.total_requests, phase2_result.errors, phase2_result.throughput,
+    );
+
+    let bench_window_end_ms = up.elapsed_ms();
+
+    // Observe whether rotation happened WHILE SERVICES ARE STILL UP.
+    let (leader_seg_count, follower_seg_count) =
+        ssh_count_wal_segments(&cfg.leader_host, &cfg.follower_host);
+    let rotation_occurred =
+        leader_seg_count > BASELINE_WAL_COUNT || follower_seg_count > BASELINE_WAL_COUNT;
+    let rotation_check = if rotation_occurred {
+        CheckResult::pass_with_detail(
+            "SegmentRotationOccurred",
+            format!(
+                "WAL files: leader={leader_seg_count} follower={follower_seg_count} \
+                 (> baseline {BASELINE_WAL_COUNT} = rotated)",
+            ),
+        )
+    } else {
+        CheckResult::pass_with_detail(
+            "SegmentRotationOccurred",
+            format!(
+                "no rotation reached (leader={leader_seg_count} follower={follower_seg_count} \
+                 ≤ baseline {BASELINE_WAL_COUNT}) — cold path not exercised",
+            ),
+        )
+    };
+
+    // Build the cold-read sample: take up to COLD_READ_SAMPLE entries from
+    // the task_acks range [params.tasks .. params.tasks * 2] (capped to
+    // wide_tasks). These aggregates were only written in phase-1.
+    let cold_acks: Vec<TaskAckSummary> = {
+        let cold_start = params.tasks;
+        let cold_end = (params.tasks * 2).min(wide_tasks);
+        let slice = &outcome1.task_acks[cold_start.min(outcome1.task_acks.len())
+            ..cold_end.min(outcome1.task_acks.len())];
+        // Even stride so the sample covers the whole cold range.
+        let step = (slice.len() / COLD_READ_SAMPLE).max(1);
+        slice.iter().step_by(step).take(COLD_READ_SAMPLE).cloned().collect()
+    };
+
+    println!(
+        "[{SCEN}] cold-read: {} aggregates sampled from cold range [{}..{})",
+        cold_acks.len(), params.tasks, (params.tasks * 2).min(wide_tasks),
+    );
+
+    // Read the cold aggregates from BOTH nodes, each pinned pool so failover
+    // cannot redirect the read to the other node.
+    let cold_check = run_cold_read_check(SCEN, cfg, &cold_acks).await;
+
+    let extra_checks = vec![rotation_check, cold_check];
+
+    let expectations = ScenarioExpectations {
+        // Saturation transients from the wide bench at 60k tasks.
+        max_bench_error_ratio: Some(0.10),
+        assert_eventual_progress: true,
+        ..ScenarioExpectations::default()
+    };
+
+    // Use the phase-2 result as the representative bench result for the
+    // report window. Wide-bench throughput is not comparable to the narrow
+    // bench, and phase-2 is the load that exercises the cold path.
+    let mut scen_params = params;
+    // Throughput floor: phase-2 is a normal bench; relax slightly for
+    // the cold-path I/O overhead.
+    scen_params.throughput_floor = (params.throughput_floor * 0.5).max(50.0);
+
+    tear_down_and_evaluate_with_audit(
+        SCEN,
+        cfg,
+        up,
+        phase2_result,
+        bench_window_start_ms,
+        bench_window_end_ms,
+        expectations,
+        scen_params,
+        extra_checks,
+        None,
+        None,
+        None,
+        run_dir,
+    )
+    .await
+}
+
+/// Read a sample of cold aggregates from both nodes (pinned pools) and return
+/// a single `CheckResult`. Any aggregate with max_aggregate_version == 0 (not
+/// found) or < max_acked_client_seq (short) that had acked writes in phase-1
+/// is listed as unreadable. Fails if any unreadable aggregates are found.
+async fn run_cold_read_check(
+    scen: &str,
+    cfg: &ClusterConfig,
+    cold_acks: &[TaskAckSummary],
+) -> CheckResult {
+    const NAME: &str = "ColdSegmentReadable";
+    if cold_acks.is_empty() {
+        return CheckResult::pass_with_detail(NAME, "cold range empty — nothing to check");
+    }
+
+    // Build a pool pinned to each node.
+    let mut node_pools: Vec<(String, Arc<Pool>)> = Vec::new();
+    for (host, addr) in [
+        (cfg.leader_host.clone(), cfg.leader_addr()),
+        (cfg.follower_host.clone(), cfg.follower_addr()),
+    ] {
+        match (PoolBuilder {
+            address1: &addr,
+            address2: &addr,
+            server_name: Some(&host),
+            ca_cert: cfg.ca_cert.to_str().unwrap(),
+            client_cert: cfg.client_cert.to_str().unwrap(),
+            client_key: cfg.client_key.to_str().unwrap(),
+            plaintext: false,
+            max_connections: 32,
+        }
+        .build()
+        .await)
+        {
+            Ok(p) => node_pools.push((host, p)),
+            Err(e) => eprintln!("[{scen}] cold-read pool failed: {e}"),
+        }
+    }
+
+    let mut fail_samples: Vec<String> = Vec::new();
+    let mut total_checked = 0u64;
+    let mut total_unreadable = 0u64;
+
+    for (host, pool) in &node_pools {
+        // verify_no_seq_gaps uses aggregate_details to check version counts.
+        let report = celeriant_bench::verify_no_seq_gaps(pool, cold_acks, 10).await;
+        total_checked += report.tasks_audited;
+        total_unreadable += report.tasks_with_gaps + report.tasks_unreadable;
+        for gap in &report.sample_gaps {
+            if fail_samples.len() < 10 {
+                fail_samples.push(format!(
+                    "[{host}] agg={} max_acked={} server_version={} missing={}",
+                    gap.aggregate_key_str,
+                    gap.max_acked,
+                    gap.max_aggregate_version,
+                    gap.missing_count,
+                ));
+            }
+        }
+    }
+
+    if total_unreadable == 0 {
+        CheckResult::pass_with_detail(
+            NAME,
+            format!(
+                "{total_checked} cold aggregates readable on both nodes; rotation_check is separate",
+            ),
+        )
+    } else {
+        CheckResult::fail(
+            NAME,
+            format!(
+                "{total_unreadable} cold aggregate(s) unreadable or short out of {total_checked} checked; \
+                 sample (up to 10): [{}]",
+                fail_samples.join(", "),
+            ),
+        )
+    }
+}
+
+/// Seeded schedule for `nemesis_composition`. Generates a deterministic
+/// sequence of (duration_ms, pause_ms) pairs from the PRNG so the same
+/// seed always produces the same fault schedule. Each call to `next()`
+/// consumes two PRNG outputs.
+///
+/// Used only by `run_nemesis_composition` and unit-tested to confirm
+/// same-seed → same-schedule.
+struct NemesisPrng {
+    state: u64,
+}
+
+impl NemesisPrng {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    /// splitmix64 step.
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Duration in milliseconds in [lo_ms, hi_ms].
+    fn duration_ms(&mut self, lo_ms: u64, hi_ms: u64) -> u64 {
+        let range = hi_ms - lo_ms + 1;
+        lo_ms + self.next_u64() % range
+    }
+}
+
+#[cfg(test)]
+mod nemesis_prng_tests {
+    use super::NemesisPrng;
+
+    #[test]
+    fn same_seed_same_schedule() {
+        let seed = 0xDEAD_BEEF_C0DE_CAFEu64;
+        let mut a = NemesisPrng::new(seed);
+        let mut b = NemesisPrng::new(seed);
+        let seq_a: Vec<u64> = (0..20).map(|_| a.duration_ms(3_000, 8_000)).collect();
+        let seq_b: Vec<u64> = (0..20).map(|_| b.duration_ms(3_000, 8_000)).collect();
+        assert_eq!(seq_a, seq_b, "same seed must produce same schedule");
+    }
+
+    #[test]
+    fn all_outputs_in_range() {
+        let mut prng = NemesisPrng::new(0x1234_5678);
+        for _ in 0..1000 {
+            let v = prng.duration_ms(3_000, 8_000);
+            assert!(v >= 3_000 && v <= 8_000);
+        }
+        let mut prng2 = NemesisPrng::new(0xABCD_EF01);
+        for _ in 0..1000 {
+            let v = prng2.duration_ms(2_000, 6_000);
+            assert!(v >= 2_000 && v <= 6_000);
+        }
+    }
+}
+
+
+/// `nemesis_composition` (adversarial review finding: no concurrent multi-fault).
+///
+/// Two concurrent randomised nemesis loops over a 90s idempotent bench window:
+///
+/// Loop A — replication partition flap: Partition(leader → follower repl port)
+///   for rand 3-8s, heal, pause rand 2-6s, repeat.
+///
+/// Loop B — clock jitter: SkewClock on a random node ±1s, restore after
+///   rand 4-8s, repeat.
+///
+/// Both loops run as `tokio::spawn` tasks that each call `make` targets via
+/// `tokio::task::spawn_blocking`. They share a kill-switch channel so both
+/// loops exit cleanly when the bench window ends. Both loops **MUST** restore
+/// all faults before exiting — enforced by finally-style blocks at the end of
+/// each loop body.
+///
+/// The seeded schedule (printed at start) makes failures reproducible.
+/// The bench uses the idempotent path + finish_history_and_check so the
+/// epoch oracle, history checkers, and acked-durability oracle all engage.
+///
+/// Correctness counters (NoCaptureDroppedItems, NoTruncateDroppedSelfAcked,
+/// NoSameEpochDivergence) remain at zero. Timing budgets are loose.
+pub async fn run_nemesis_composition(
+    cfg: &ClusterConfig,
+    params: ScenarioParams,
+    run_dir: &PathBuf,
+) -> Result<ScenarioReport, String> {
+    const SCEN: &str = "nemesis_composition";
+    const NEMESIS_SEED: u64 = 0xDEAD_BEEF_C0DE_CAFEu64;
+    const BENCH_SECS: u64 = 90;
+
+    println!("[{SCEN}] nemesis seed: {NEMESIS_SEED:#x}");
+
+    let up = bring_up_cluster(cfg, SCEN, run_dir).await?;
+    let pool = build_bench_pool(cfg, &up, params).await?;
+
+    println!("[{SCEN}] smoke test");
+    smoke_test(&pool).await.map_err(|e| format!("smoke: {e}"))?;
+
+    let executor = ActionExecutor::new(cfg);
+
+    let (leader_host, follower_host) = if up.bench_primary == cfg.leader_addr() {
+        (cfg.leader_host.clone(), cfg.follower_host.clone())
+    } else {
+        (cfg.follower_host.clone(), cfg.leader_host.clone())
+    };
+
+    // Pre-build Action objects for the RAII cleanup path.
+    let heal_partition = Action::Heal {
+        src: leader_host.clone(),
+        dst: follower_host.clone(),
+        port: cfg.replication_port,
+    };
+    let restore_leader_clk = Action::RestoreClock { host: leader_host.clone() };
+    let restore_follower_clk = Action::RestoreClock { host: follower_host.clone() };
+
+    // Shared kill-switch: when the main task signals done, both nemesis loops exit.
+    let (done_tx, done_rx_a) = tokio::sync::watch::channel(false);
+    let done_rx_b = done_rx_a.clone();
+
+    // Capture values needed by the spawned tasks (must be Send + 'static).
+    // We replicate ActionExecutor's `run_make` behaviour directly so we don't
+    // need to borrow cfg across the spawn boundary.
+    let deploy_dir = cfg.deploy_dir.clone();
+    let replication_port = cfg.replication_port;
+    let leader_a = leader_host.clone();
+    let follower_a = follower_host.clone();
+    let leader_b = leader_host.clone();
+    let follower_b = follower_host.clone();
+
+    // Helper: run a make target with vars in deploy_dir, blocking.
+    // Returns Err if make exits non-zero.
+    fn make_blocking(deploy_dir: &std::path::Path, target: &str, vars: &[String]) -> Result<(), String> {
+        use std::process::{Command, Stdio};
+        let mut cmd = Command::new("make");
+        cmd.arg("-s").arg(target);
+        for v in vars {
+            cmd.arg(v);
+        }
+        let status = cmd
+            .current_dir(deploy_dir)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|e| format!("spawn make {target}: {e}"))?;
+        if !status.success() {
+            return Err(format!("make {target} exited with {status}"));
+        }
+        Ok(())
+    }
+
+    // --- Loop A: partition flap ---
+    let deploy_dir_a = deploy_dir.clone();
+    let loop_a = tokio::spawn(async move {
+        let mut prng = NemesisPrng::new(NEMESIS_SEED);
+        let mut partitioned = false;
+        let mut done_rx = done_rx_a;
+        loop {
+            if *done_rx.borrow() {
+                break;
+            }
+            // Partition.
+            let dd = deploy_dir_a.clone();
+            let lh = leader_a.clone();
+            let fh = follower_a.clone();
+            let port = replication_port;
+            let res = tokio::task::spawn_blocking(move || {
+                make_blocking(&dd, "partition-host", &[
+                    format!("SRC={lh}"),
+                    format!("DST={fh}"),
+                    format!("PORT={port}"),
+                ])
+            }).await;
+            match res {
+                Ok(Ok(())) => { partitioned = true; }
+                Ok(Err(e)) => {
+                    eprintln!("[{SCEN}] loop A partition failed: {e}");
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("[{SCEN}] loop A spawn_blocking join: {e}");
+                    break;
+                }
+            }
+
+            let fault_ms = prng.duration_ms(3_000, 8_000);
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(fault_ms)) => {}
+                _ = done_rx.changed() => {}
+            }
+
+            // Always heal before checking done.
+            let dd = deploy_dir_a.clone();
+            let lh = leader_a.clone();
+            let fh = follower_a.clone();
+            let port = replication_port;
+            let res = tokio::task::spawn_blocking(move || {
+                make_blocking(&dd, "heal-host", &[
+                    format!("SRC={lh}"),
+                    format!("DST={fh}"),
+                    format!("PORT={port}"),
+                ])
+            }).await;
+            match res {
+                Ok(Ok(())) => { partitioned = false; }
+                Ok(Err(e)) => { eprintln!("[{SCEN}] loop A heal failed (non-fatal): {e}"); partitioned = false; }
+                Err(e) => { eprintln!("[{SCEN}] loop A heal join: {e}"); break; }
+            }
+
+            if *done_rx.borrow() {
+                break;
+            }
+
+            let pause_ms = prng.duration_ms(2_000, 6_000);
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(pause_ms)) => {}
+                _ = done_rx.changed() => {}
+            }
+        }
+        // Exit heal: ensure partition is removed even if we broke early.
+        if partitioned {
+            let dd = deploy_dir_a.clone();
+            let lh = leader_a.clone();
+            let fh = follower_a.clone();
+            let port = replication_port;
+            let _ = tokio::task::spawn_blocking(move || {
+                make_blocking(&dd, "heal-host", &[
+                    format!("SRC={lh}"),
+                    format!("DST={fh}"),
+                    format!("PORT={port}"),
+                ])
+            }).await;
+        }
+    });
+
+    // --- Loop B: clock jitter ---
+    let deploy_dir_b = deploy_dir.clone();
+    let loop_b = tokio::spawn(async move {
+        let mut prng = NemesisPrng::new(NEMESIS_SEED.wrapping_add(0x0101_0101_0101_0101));
+        let mut skewed_host: Option<String> = None;
+        let mut done_rx = done_rx_b;
+        let hosts = [leader_b.clone(), follower_b.clone()];
+        loop {
+            if *done_rx.borrow() {
+                break;
+            }
+            let node_idx = (prng.next_u64() % 2) as usize;
+            let target = hosts[node_idx].clone();
+            let positive = (prng.next_u64() & 1) == 0;
+            let offset_sign = if positive { "+1" } else { "-1" };
+
+            let dd = deploy_dir_b.clone();
+            let t = target.clone();
+            let offset_str = format!("{offset_sign} seconds");
+            let res = tokio::task::spawn_blocking(move || {
+                make_blocking(&dd, "skew-clock", &[
+                    format!("HOST={t}"),
+                    format!("OFFSET={offset_str}"),
+                ])
+            }).await;
+            match res {
+                Ok(Ok(())) => { skewed_host = Some(target.clone()); }
+                Ok(Err(e)) => {
+                    eprintln!("[{SCEN}] loop B skew failed: {e}");
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("[{SCEN}] loop B spawn_blocking join: {e}");
+                    break;
+                }
+            }
+
+            let fault_ms = prng.duration_ms(4_000, 8_000);
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(fault_ms)) => {}
+                _ = done_rx.changed() => {}
+            }
+
+            // Restore clock before checking done.
+            if let Some(ref h) = skewed_host {
+                let dd = deploy_dir_b.clone();
+                let th = h.clone();
+                let res = tokio::task::spawn_blocking(move || {
+                    make_blocking(&dd, "restore-clock", &[format!("HOST={th}")])
+                }).await;
+                match res {
+                    Ok(Ok(())) => { skewed_host = None; }
+                    Ok(Err(e)) => { eprintln!("[{SCEN}] loop B restore failed (non-fatal): {e}"); skewed_host = None; }
+                    Err(e) => { eprintln!("[{SCEN}] loop B restore join: {e}"); break; }
+                }
+            }
+
+            if *done_rx.borrow() {
+                break;
+            }
+
+            let pause_ms = prng.duration_ms(2_000, 6_000);
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(pause_ms)) => {}
+                _ = done_rx.changed() => {}
+            }
+        }
+        // Exit restore: ensure clock is re-enabled even if we broke early.
+        if let Some(h) = skewed_host {
+            let dd = deploy_dir_b.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                make_blocking(&dd, "restore-clock", &[format!("HOST={h}")])
+            }).await;
+        }
+    });
+
+    let history = new_history_recorder(SCEN, run_dir);
+    let bench_window_start_ms = up.elapsed_ms();
+    println!("[{SCEN}] idempotent bench: {} tasks, {}s (seed {NEMESIS_SEED:#x})", params.tasks, BENCH_SECS);
+    let pool_clone = pool.clone();
+    let history_clone = history.clone();
+    let tasks = params.tasks;
+    let bench_handle = tokio::spawn(async move {
+        run_benchmark_idempotent_with_history(&pool_clone, tasks, BENCH_SECS, history_clone).await
+    });
+
+    // Wait for bench to complete, then signal nemesis loops to exit.
+    let outcome = bench_handle.await.map_err(|e| format!("bench join: {e}"))?;
+    println!(
+        "[{SCEN}] bench done: {} req, {} err, {:.0} req/s (ok_acks={} 2002_acks={} repl_retry={} transient_retry={} fatal={})",
+        outcome.benchmark.total_requests,
+        outcome.benchmark.errors,
+        outcome.benchmark.throughput,
+        outcome.counters.ok_acks,
+        outcome.counters.idempotency_acks,
+        outcome.counters.replication_retries,
+        outcome.counters.transient_retries,
+        outcome.counters.fatal_errors,
+    );
+
+    // Signal both loops to stop.
+    let _ = done_tx.send(true);
+
+    // Wait for both loops to exit (they drain their current sleep + heal/restore).
+    let (ra, rb) = tokio::join!(loop_a, loop_b);
+    if let Err(e) = ra { eprintln!("[{SCEN}] loop A join: {e}"); }
+    if let Err(e) = rb { eprintln!("[{SCEN}] loop B join: {e}"); }
+
+    // Defensive final cleanup — idempotent.
+    println!("[{SCEN}] final cleanup: heal partition + restore both clocks");
+    let _ = executor.run(&heal_partition);
+    let _ = executor.run(&heal_partition);
+    let _ = executor.run(&restore_leader_clk);
+    let _ = executor.run(&restore_follower_clk);
+
+    println!("[{SCEN}] settle 30s for NTP re-sync + replication catch-up");
+    sleep(Duration::from_secs(30)).await;
+    let bench_window_end_ms = up.elapsed_ms();
+
+    let (integrity, deep) = run_integrity_and_deep_audit(SCEN, &pool, &outcome.task_acks, 32).await;
+    let integrity_check = data_integrity_check(&integrity, (params.tasks as u64 / 50).max(5));
+
+    let mut extra_checks = vec![integrity_check];
+    extra_checks.extend(finish_history_and_check(SCEN, cfg, history, &outcome.task_acks).await);
+
+    // Loose timing bounds; strict correctness at zero.
+    let expectations = ScenarioExpectations {
+        max_leader_elections: 120,
+        max_s3_fallbacks: 2000,
+        max_heartbeat_failures: 500,
+        max_bench_errors: 1_500_000,
+        // Ratio ceiling: partition + clock-jitter concurrent error storms
+        // can be high; correctness is proven by the audit not by error count.
+        max_bench_error_ratio: Some(0.90),
+        max_role_flips: 30,
+        max_split_brain_ticks: 10,
+        require_leader_retained: false,
+        // Correctness at zero (defaults): NoCaptureDroppedItems,
+        // NoTruncateDroppedSelfAcked, NoSameEpochDivergence all stay 0.
+        assert_eventual_progress: true,
+        assert_no_divergent_tips: true,
+        ..ScenarioExpectations::default()
+    };
+
+    let mut scen_params = params;
+    scen_params.throughput_floor = (params.throughput_floor * 0.05).max(10.0);
+    scen_params.duration_secs = BENCH_SECS;
+
+    tear_down_and_evaluate_with_audit(
+        SCEN,
+        cfg,
+        up,
+        outcome.benchmark.clone(),
+        bench_window_start_ms,
+        bench_window_end_ms,
+        expectations,
+        scen_params,
+        extra_checks,
+        Some(integrity),
+        Some(outcome.counters),
+        deep,
+        run_dir,
+    )
+    .await
 }

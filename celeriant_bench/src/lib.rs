@@ -23,7 +23,7 @@ pub mod history;
 pub mod watch_flood;
 pub use cas_storm::{cas_storm_aggregate, run_cas_storm, CasStormOutcome};
 pub use history::{HistoryRecorder, HistorySummary};
-pub use watch_flood::{run_watch_flood, watch_dial_probe, WatchFloodParams, WatchFloodResult};
+pub use watch_flood::{run_watch_flood, run_watch_flood_with_history, watch_dial_probe, WatchFloodParams, WatchFloodResult};
 
 #[derive(Debug, Clone)]
 pub struct BenchmarkResult {
@@ -326,6 +326,12 @@ pub struct IdempotentBenchOptions {
     /// `HistoryIdempotency` validates the rejections, the
     /// `HistoryWalMonotonicity` upper bound catches duplicate acceptance.
     pub duplicate_replay: bool,
+    /// Pinned per-node pools for the RYW probe: (node label, single-node
+    /// pool). Empty = probe reads via the main (un-pinned) pool, which can
+    /// be served by a stale replica during failover — pinned probes read
+    /// from BOTH nodes so the checker can require all-below-acked before
+    /// calling a violation.
+    pub ryw_pinned: Vec<(String, Arc<CeleriantPool>)>,
 }
 
 pub async fn run_benchmark_idempotent_opts(
@@ -334,7 +340,7 @@ pub async fn run_benchmark_idempotent_opts(
     duration_secs: u64,
     opts: IdempotentBenchOptions,
 ) -> IdempotentBenchOutcome {
-    let IdempotentBenchOptions { history, duplicate_replay } = opts;
+    let IdempotentBenchOptions { history, duplicate_replay, ryw_pinned } = opts;
     let barrier = Arc::new(Barrier::new(num_tasks));
     let total_ok = Arc::new(AtomicU64::new(0));
     let total_err = Arc::new(AtomicU64::new(0));
@@ -364,6 +370,7 @@ pub async fn run_benchmark_idempotent_opts(
         let client_id: u128 = (id as u128) + 1;
         let aggregate_key = AggregateKey::new(1, 1, id as u128);
         let history = history.clone();
+        let ryw_pinned = ryw_pinned.clone();
 
         tasks.push(tokio::spawn(async move {
             let mut latencies = Vec::new();
@@ -410,6 +417,45 @@ pub async fn run_benchmark_idempotent_opts(
                         total_ok.fetch_add(1, Ordering::Relaxed);
                         ok_acks.fetch_add(1, Ordering::Relaxed);
                         max_acked = current_seq;
+
+                        // RYW probe: 1-in-16 sampling, no retry; one attempt
+                        // per target, record outcome and move on. With pinned
+                        // pools, read from EVERY node — the acking node has
+                        // visibility before the ack, so the checker requires
+                        // ALL nodes below acked before calling a violation.
+                        if let Some(h) = &history {
+                            if (id as u64).wrapping_mul(31).wrapping_add(current_seq) % 16 == 0 {
+                                if ryw_pinned.is_empty() {
+                                    let observed = read_max_aggregate_version(&pool, &aggregate_key)
+                                        .await
+                                        .map_err(|e| format!("{e}"));
+                                    h.record_ryw(
+                                        id as u32,
+                                        &aggregate_key,
+                                        client_id,
+                                        current_seq,
+                                        observed,
+                                        None,
+                                        current_seq,
+                                    );
+                                } else {
+                                    for (node, pinned) in ryw_pinned.iter() {
+                                        let observed = read_max_aggregate_version(pinned, &aggregate_key)
+                                            .await
+                                            .map_err(|e| format!("{e}"));
+                                        h.record_ryw(
+                                            id as u32,
+                                            &aggregate_key,
+                                            client_id,
+                                            current_seq,
+                                            observed,
+                                            Some(node.clone()),
+                                            current_seq,
+                                        );
+                                    }
+                                }
+                            }
+                        }
 
                         if duplicate_replay {
                             // Deliberate replay of the just-acked seq. Expect a

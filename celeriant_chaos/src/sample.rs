@@ -43,9 +43,8 @@ pub struct NodeSample {
     #[serde(default)]
     pub watch_subscribers_active: u64,
     /// Items popped from `pending_replication_batches` but dropped on the
-    /// floor because the rollback flag was set after the pop. Smoking gun
-    /// for the orphan-snapshot missing-data hypothesis
-    /// (`docs/missing-data.md`).
+    /// floor because the rollback flag was set after the pop. Nonzero means
+    /// an orphaned snapshot: a false ack in the making.
     pub capture_dropped_items_total: u64,
     pub capture_dropped_bytes_total: u64,
     /// Writes that passed idempotency validation because no prior

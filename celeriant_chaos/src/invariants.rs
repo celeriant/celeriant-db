@@ -41,6 +41,12 @@ pub struct ScenarioExpectations {
     pub max_shard_panics: u64,
     pub max_node_starts: u64,
     pub max_bench_errors: u64,
+    /// Optional load-proportional bench error budget: allowed errors =
+    /// max(max_bench_errors, ratio * total_requests). Fixed absolute budgets
+    /// fail spuriously as task count scales (errors during unavailability
+    /// windows grow with offered load); a ratio keeps the bound meaningful
+    /// at any load while still catching total-outage regressions.
+    pub max_bench_error_ratio: Option<f64>,
 
     /// Maximum number of scrape ticks where `node_role` summed across both
     /// nodes is not exactly 1. Brief split-brain windows are tolerated by
@@ -109,6 +115,7 @@ impl Default for ScenarioExpectations {
             max_shard_panics: 0,
             max_node_starts: 0,
             max_bench_errors: 0,
+            max_bench_error_ratio: None,
             max_split_brain_ticks: 0,
             max_role_flips: 0,
             assert_eventual_progress: false,
@@ -141,6 +148,7 @@ pub struct RunData<'a> {
     /// so "0 writes" is meaningless, not a fault.
     pub bench_actual_end_ms: u64,
     pub bench_errors: u64,
+    pub bench_total_requests: u64,
     pub bench_throughput: f64,
     pub throughput_floor: f64,
 }
@@ -318,12 +326,22 @@ fn check_counter(
 
 fn check_bench_errors(data: &RunData, expect: &ScenarioExpectations) -> CheckResult {
     const NAME: &str = "BenchErrorsBounded";
-    if data.bench_errors <= expect.max_bench_errors {
+    // `bench_errors` counts retry ATTEMPTS while `total_requests` counts
+    // completed ops, so errors can exceed requests during outage windows.
+    // The ratio is therefore a share of all attempts (errors + completions):
+    // bounded [0,1] and load-independent.
+    let attempts = data.bench_errors + data.bench_total_requests;
+    let ratio_allowance = expect
+        .max_bench_error_ratio
+        .map(|r| (r * attempts as f64) as u64)
+        .unwrap_or(0);
+    let allowed = expect.max_bench_errors.max(ratio_allowance);
+    if data.bench_errors <= allowed {
         CheckResult::pass(NAME)
     } else {
         CheckResult::fail(
             NAME,
-            format!("bench reported {} errors (allowed {})", data.bench_errors, expect.max_bench_errors),
+            format!("bench reported {} errors (allowed {})", data.bench_errors, allowed),
         )
     }
 }
@@ -767,6 +785,7 @@ mod tests {
             bench_end_idx: samples.len().saturating_sub(1),
             bench_actual_end_ms: u64::MAX,
             bench_errors: 0,
+            bench_total_requests: 0,
             bench_throughput: 1000.0,
             throughput_floor: 0.0,
         }

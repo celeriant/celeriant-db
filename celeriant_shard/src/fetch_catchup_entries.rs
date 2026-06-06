@@ -11,7 +11,13 @@ use celeriant_wire::disk::versioned_block::deserialise_metablock;
 use crate::collect_from_disk::{EventBatchFromLogSegmentFile, fetch_datablocks_for_metablocks};
 use crate::error::fetch_catchup_entries_error::FetchCatchupEntriesError;
 
-/// Reverse-scan the WAL for metablocks that are to be sent to the follower
+/// Reverse-scan the WAL for metablocks that are to be sent to the follower.
+///
+/// Scans to the WRITE cursor: catchup ships durable bytes, not reader-visible
+/// bytes. A SIGKILL can seal a segment with `read < write`: A fsynced,
+/// hash-chain-canonical tail the next tenure builds on. Scanning only to the
+/// read cursor silently skips that tail and emits a gapped batch the follower
+/// must reject (BatchWalSeqGap).
 pub(crate) async fn fetch_catchup_entries(
     log_segments_cache: &Rc<LogSegmentsCache>,
     follower_wal_seq: u64,
@@ -21,7 +27,8 @@ pub(crate) async fn fetch_catchup_entries(
     dict_codec: &DictCodec,
 ) -> Result<Vec<EventBatchFromLogSegmentFile>, FetchCatchupEntriesError> {
     let current_log_id = log_segments_cache.active_log_id();
-    let mut scanner = ReverseMetablockScanner::new(log_segments_cache, current_log_id, None, read_max_chunk_size);
+    let mut scanner = ReverseMetablockScanner::new(log_segments_cache, current_log_id, None, read_max_chunk_size)
+        .with_write_cursor_upper_bound();
 
     let mut replication_items: Vec<EventBatchFromLogSegmentFile> = vec![];
     let mut accumulated_size = 0u64;
@@ -126,11 +133,14 @@ mod tests {
     }
 
     /// Write `metablocks` consecutively to the active segment starting at the metablocks
-    /// region offset, then advance the read cursor so the scanner sees them as committed.
-    /// Tests need real bytes on disk because `ReverseMetablockScanner` reads via DMA.
-    async fn write_metablocks_and_set_read_cursor(
+    /// region offset, with the write cursor covering all of them and the read cursor
+    /// covering only the first `read_count` (read < write models a fsynced tail that is
+    /// not yet replication-committed). Tests need real bytes on disk because
+    /// `ReverseMetablockScanner` reads via DMA.
+    async fn write_metablocks_with_cursors(
         lsc: &Rc<LogSegmentsCache>,
         metablocks: &[Metablock],
+        read_count: usize,
     ) {
         let active = lsc.active();
         let guard = active.lock_writer("test_write_metablocks").await.unwrap();
@@ -154,22 +164,25 @@ mod tests {
         dma.fdatasync().await.unwrap();
         drop(guard);
 
-        // Advance the read cursor so the scanner sees these metablocks. The scanner uses
-        // `read.metablocks_position` as its upper bound; without `read = Some(..)` it skips
-        // the segment entirely.
-        let metablocks_end = HEADER_BLOCK_SIZE_BYTES as u64 + metablocks_bytes as u64;
-        let last_wal = metablocks.last().map(|m| m.wal_seq).unwrap_or(0);
-        let cursor = LogSegmentCursor {
-            log_id: lsc.active_log_id(),
-            metablocks_position: metablocks_end,
+        let log_id = lsc.active_log_id();
+        let cursor_at = |count: usize| LogSegmentCursor {
+            log_id,
+            metablocks_position: HEADER_BLOCK_SIZE_BYTES as u64 + (count * FIXED_BLOCK_SIZE_BYTES) as u64,
             datablocks_position: FILE_SIZE.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64),
-            wal_seq: last_wal,
+            wal_seq: metablocks[..count].last().map(|m| m.wal_seq).unwrap_or(0),
             aggregate_key_bloom: Default::default(),
             tip_hash: [0u8; 32],
         };
         let mut metadata = active.metadata.borrow_mut();
-        metadata.read = Some(cursor.clone());
-        metadata.write = cursor;
+        metadata.read = Some(cursor_at(read_count));
+        metadata.write = cursor_at(metablocks.len());
+    }
+
+    async fn write_metablocks_and_set_read_cursor(
+        lsc: &Rc<LogSegmentsCache>,
+        metablocks: &[Metablock],
+    ) {
+        write_metablocks_with_cursors(lsc, metablocks, metablocks.len()).await
     }
 
     fn test_codec() -> DictCodec {
@@ -252,6 +265,28 @@ mod tests {
             let result = fetch_catchup_entries(&lsc, 0, 5, Some(100 * 1024), 64 * 1024, &test_codec()).await;
             assert!(matches!(result, Err(FetchCatchupEntriesError::FollowerTooFarBehind)),
                 "expected FollowerTooFarBehind, got {:?}", result.err());
+
+            lsc.close().await;
+        });
+    }
+
+    /// SIGKILL can seal a segment with `read < write`: a fsynced, hash-chain-canonical
+    /// tail that is not replication-committed. Catchup must ship that tail. Scanning
+    /// only to the read cursor silently skips it and emits a gapped batch the follower
+    /// rejects with BatchWalSeqGap.
+    #[test]
+    fn includes_durable_tail_beyond_read_cursor() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let lsc = Rc::new(LogSegmentsCache::ready_up(dir, FILE_SIZE, 4, 0).await.unwrap());
+
+            // 5 durable metablocks; only the first 3 are replication-committed.
+            let blocks: Vec<Metablock> = (1..=5).map(|i| metablock_at(i, 0)).collect();
+            write_metablocks_with_cursors(&lsc, &blocks, 3).await;
+
+            let entries = fetch_catchup_entries(&lsc, 0, 6, Some(1024 * 1024), 64 * 1024, &test_codec()).await.unwrap();
+            let wal_seqs: Vec<u64> = entries.iter().map(|e| e.metablock.wal_seq).collect();
+            assert_eq!(wal_seqs, vec![1, 2, 3, 4, 5], "catchup ships durable bytes including the read<write tail");
 
             lsc.close().await;
         });

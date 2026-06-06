@@ -175,6 +175,9 @@ pub(crate) async fn commit_replication<R: ReplicationClient + 'static>(
             Ok(d) => break d,
             Err(e) => {
                 if matches!(trigger, ReplicationTrigger::Probe) {
+                    // A probe may have captured real pending items; dropping them
+                    // strands their writers into a NoCaptureRaceButOk false ack.
+                    shard_mem_cache.borrow_mut().return_to_pending_replication(replication_snapshot);
                     return Err(e);
                 }
                 if is_terminal_replication_error(&e) {
@@ -229,11 +232,12 @@ pub(crate) async fn commit_replication<R: ReplicationClient + 'static>(
     if bumped {
         let active = log_segments_cache.active();
         let fsync_start = Instant::now();
+        let active_for_sync = active.clone();
         let result = fsync_coordinator
-            .request_sync(
-                Some(Duration::from_millis(1)),
+            .request_sync_until(
                 ShardFsyncError::WriteLockTimeout,
-                || async move { sync_header_only(active).await },
+                || async move { sync_header_only(active_for_sync).await },
+                || active.last_self_acked_synced.get() >= acked_wal,
             )
             .await;
         metrics::histogram!("celeriant_barrier_sync_fsync_seconds", &shard_label)
@@ -779,6 +783,7 @@ fn err_kind_label(err: &ReplicateToFollowerError) -> &'static str {
     match err {
         ReplicateToFollowerError::FollowerNetworkError(_) => "NetworkError",
         ReplicateToFollowerError::FollowerRejected(_) => "Rejected",
+        ReplicateToFollowerError::FollowerBatchWalSeqGap(_) => "BatchWalSeqGap",
         ReplicateToFollowerError::FollowerUnexpectedResponse => "UnexpectedResponse",
         ReplicateToFollowerError::FollowerTooFarBehind => "TooFarBehind",
         ReplicateToFollowerError::LockTimeout => "LockTimeout",
@@ -1479,6 +1484,30 @@ mod tests {
             assert_eq!(
                 s3_calls.borrow().len(), 1,
                 "probe must do exactly one attempt, got {}", s3_calls.borrow().len()
+            );
+            h.close().await;
+        });
+    }
+
+    /// A failing probe cycle must return its captured snapshot to pending.
+    /// Dropping it strands the items' writers: their next capture comes up
+    /// empty and resolves NoCaptureRaceButOk — a false ack.
+    #[test]
+    fn probe_failure_returns_snapshot_to_pending() {
+        glommio_test!({
+            let h = Harness::new().await;
+            let (mock, _tcp_calls, _s3_calls) = MockClient::build();
+            let client = Rc::new(
+                mock.unreachable()
+                    .with_s3(|_| Err(ReplicateToS3Error::S3Unavailable)),
+            );
+            let result = h.commit_with_trigger(
+                client, make_captured(&[1, 2]), ReplicationTrigger::Probe, u64::MAX,
+            ).await;
+            assert!(result.is_err(), "probe should fail, got {result:?}");
+            assert_eq!(
+                h.smc.borrow().pending_replication_count(), 2,
+                "failed probe must return captured PCDs to pending, not drop them"
             );
             h.close().await;
         });

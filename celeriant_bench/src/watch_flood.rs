@@ -22,6 +22,8 @@ use celeriant_client_tokio::{WatchConnection, WatchOptions};
 use celeriant_msg::request::requests::WatchRequest;
 use tokio::time::Instant;
 
+use crate::history::HistoryRecorder;
+
 /// Operation discriminant for the operation-type filter (WRITE). Literal to avoid
 /// depending on the server-internal celeriant_watch crate.
 const OP_WRITE: u8 = 1;
@@ -87,6 +89,27 @@ pub async fn run_watch_flood(
     tls: ClientTlsConfig,
     params: WatchFloodParams,
 ) -> WatchFloodResult {
+    run_watch_flood_inner(address, tls, params, None).await
+}
+
+/// Like `run_watch_flood` but records each delivered watch event to `history`.
+/// Long-lived watchers emit a `WatchDelivery` line per event, enabling the
+/// `WatchPerConnectionOrdered` and `WatchDeliveredDurable` checkers.
+pub async fn run_watch_flood_with_history(
+    address: &str,
+    tls: ClientTlsConfig,
+    params: WatchFloodParams,
+    history: Arc<HistoryRecorder>,
+) -> WatchFloodResult {
+    run_watch_flood_inner(address, tls, params, Some(history)).await
+}
+
+async fn run_watch_flood_inner(
+    address: &str,
+    tls: ClientTlsConfig,
+    params: WatchFloodParams,
+    history: Option<Arc<HistoryRecorder>>,
+) -> WatchFloodResult {
     let running = Arc::new(AtomicBool::new(true));
     let attempts = Arc::new(AtomicU64::new(0));
     let errors = Arc::new(AtomicU64::new(0));
@@ -119,8 +142,9 @@ pub async fn run_watch_flood(
         let attempts = Arc::clone(&attempts);
         let errors = Arc::clone(&errors);
         let events = Arc::clone(&events);
+        let history = history.clone();
         handles.push(tokio::spawn(async move {
-            long_lived_watcher(i, address, tls, ids, running, attempts, errors, events).await;
+            long_lived_watcher(i, address, tls, ids, running, attempts, errors, events, history).await;
         }));
     }
 
@@ -224,6 +248,7 @@ async fn long_lived_watcher(
     attempts: Arc<AtomicU64>,
     errors: Arc<AtomicU64>,
     events: Arc<AtomicU64>,
+    history: Option<Arc<HistoryRecorder>>,
 ) {
     let agg = ids[index % ids.len().max(1)];
     let opts = watch_opts(&tls);
@@ -231,6 +256,9 @@ async fn long_lived_watcher(
     // with the churn tasks (which would make their single connect fragile).
     tokio::time::sleep(Duration::from_millis(50 * index as u64)).await;
 
+    // Bumped per successful connect: ordering guarantees hold per TCP stream,
+    // and reconnects legally re-deliver the boundary range.
+    let mut epoch: u32 = 0;
     while running.load(Ordering::Relaxed) {
         attempts.fetch_add(1, Ordering::Relaxed);
         let mut watch = match WatchConnection::connect(&address, watch_req(HashSet::from([agg]), false), opts.clone()).await {
@@ -241,11 +269,27 @@ async fn long_lived_watcher(
                 continue;
             }
         };
+        epoch = epoch.wrapping_add(1);
         while running.load(Ordering::Relaxed) {
             match watch.next_timeout(Duration::from_millis(200)).await {
                 Ok(Some(resp)) => {
                     if !resp.events.is_empty() {
                         events.fetch_add(resp.events.len() as u64, Ordering::Relaxed);
+                        if let Some(h) = &history {
+                            for ev in &resp.events {
+                                if let (Some(from), Some(to)) = (ev.from_aggregate_version, ev.to_aggregate_version) {
+                                    h.record_watch_delivery(
+                                        index as u32,
+                                        epoch,
+                                        ev.org_id,
+                                        ev.aggregate_type_id,
+                                        ev.aggregate_id,
+                                        from,
+                                        to,
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 Ok(None) => {}

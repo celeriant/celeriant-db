@@ -120,7 +120,10 @@ pub struct ShardWal<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
     /// Uses interior mutability with glommio RwLocks to select an fsync leader
     fsync_coordinator: Rc<Coordinator<ShardFsyncError>>,
 
-    /// Same pattern as fsync_coordinator, single leader, batched replication over tcp
+    /// Same pattern as fsync_coordinator, single leader, batched replication over tcp.
+    /// Lock order: commit_replication runs under THIS gate and awaits
+    /// fsync_coordinator (the ack-barrier header sync). One direction only:
+    /// nothing fsync-gated may await this coordinator, or the two deadlock.
     replication_coordinator: Rc<Coordinator<ReplicationError>>,
 
     /// Registry of watchers for aggregates in this shard, uses local channel broadcasting
@@ -193,6 +196,15 @@ pub struct ShardWal<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
     /// gated by a stale CAS confirmation. The heartbeat loop can stall in the kernel
     /// under load, so renewal must not depend on it
     pub lease_renewal_requester: OnceCell<Rc<dyn LeaseRenewalRequester>>,
+
+    /// One-shot eligibility for the demotion rewind-to-ack-barrier cull. The rewind
+    /// exists to drop a leader's OWN un-acked speculative tail (crash or demotion);
+    /// it is armed at boot (crash case) and on every successful replication commit
+    /// while leading, and consumed by the first rewind-eligible cull. Without this,
+    /// post-demotion status churn (Fenced<->Follower bounces, repeated kicks) re-runs
+    /// the cull and destroys peer-acked data applied by catchup since the demotion
+    /// (read advances on apply paths, last_self_acked does not).
+    ack_barrier_rewind_armed: Cell<bool>,
 }
 
 /// Lets the replication path (any data shard) ask shard 0 to re-CAS the S3 lease
@@ -374,6 +386,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             metrics_shard_label,
             s3_cas_confirmed_at_ms: Rc::new(Cell::new(0)),
             lease_renewal_requester: OnceCell::new(),
+            ack_barrier_rewind_armed: Cell::new(true),
         })
     }
 
@@ -2255,7 +2268,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             .request_sync_two_phase(
                 Some(self.config.fsync_delay),
                 ShardFsyncError::WriteLockTimeout,
-                move || async move { capture_fsync_snapshot(&mc_capture) },
+                move || capture_fsync_snapshot(&mc_capture),
                 move |captured| commit_fsync_with_rollback(node_status, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, shard_id, dict_codec),
             )
             .await
@@ -2352,23 +2365,47 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         let mc_capture = shard_mem_cache.clone();
         let dict_codec = self.dict_codec.clone();
-        self.replication_coordinator
+        let result = self.replication_coordinator
             .request_sync_two_phase(
                 delay,
                 ReplicationError::GateTimeout,
-                move || async move { capture_replication_snapshot(&mc_capture, trigger) },
+                move || capture_replication_snapshot(&mc_capture, trigger),
                 move |captured| commit_replication(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, node_status, captured, trigger, max_catchup_gap_bytes, max_request_size, read_max_chunk_size, max_clock_drift_ms, shard_id, s3_cas_confirmed_at_ms, s3_lease_duration_ms, dict_codec, lease_renewal_requester),
             )
-            .await
+            .await;
+        // A successful commit while leading may have created an own speculative
+        // tail (written, not yet committed entries above the new ack point), so a
+        // future demotion is again entitled to one rewind-to-ack-barrier cull.
+        if result.is_ok() && self.node_status.get().is_leader() {
+            self.ack_barrier_rewind_armed.set(true);
+        }
+        result
     }
     
     pub async fn handle_replication_batch(
         &self, request: celeriant_msg::request::requests::ReplicationBatchRequest
     ) -> Result<ReplicationBatchResponse, FollowerReplicationWriteError> {
-        let follower_timestamp_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("System time before Unix epoch")
-            .as_millis() as u64;
+        // A pre-epoch local clock must not panic the shard executor (externally
+        // reachable: any replication batch arriving while the clock is wrong).
+        // Reject as a time fault; same wire shape as the drift check below.
+        let follower_timestamp_ms = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(d) => d.as_millis() as u64,
+            Err(_) => {
+                metrics::counter!(
+                    "celeriant_replication_batch_rejected_total",
+                    &[("shard_id", self.metrics_shard_label[0].1.clone()), ("reason", "time_drift".to_string())],
+                ).increment(1);
+                return Ok(ReplicationBatchResponse {
+                    correlation_id: request.correlation_id,
+                    follower_timestamp_ms: 0,
+                    result: ReplicationResult::Rejected(FollowerRejection::TimeDriftTooHigh {
+                        leader_ms: request.leader_timestamp_ms,
+                        follower_ms: 0,
+                        max_allowed_ms: self.config.max_clock_drift_ms,
+                    }),
+                });
+            }
+        };
 
         let shard_id_label = self.metrics_shard_label[0].1.clone();
         let response = |result: ReplicationResult| {
@@ -2502,10 +2539,15 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     pub async fn cull_speculative_tail_for_promotion(&self, rewind_to_ack_barrier: bool) -> Result<bool, ShardFsyncError> {
         let active = self.log_segments_cache.active();
         // Snapshot the cursors without holding borrow_mut across the async scan.
-        let (write_seq, read_opt, last_acked) = {
+        let (write_seq, read_opt, last_acked, last_received) = {
             let meta = active.metadata.borrow();
-            (meta.write.wal_seq, meta.read.clone(), meta.last_self_acked_wal_seq)
+            (meta.write.wal_seq, meta.read.clone(), meta.last_self_acked_wal_seq, meta.last_received_replication_wal_seq)
         };
+        // One-shot: only the first rewind-eligible cull since boot/leadership may
+        // rewind to the ack barrier. Consumed even if the rewind arm doesn't fire,
+        // because after any demotion-path cull the remaining tail above the barrier
+        // is peer data, not own speculation.
+        let rewind_armed = rewind_to_ack_barrier && self.ack_barrier_rewind_armed.replace(false);
 
         enum CullTarget {
             // Rewind write cursor to read (promotion path): read stays, write = read.
@@ -2525,18 +2567,26 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     "cull_speculative_tail: rewinding write to read before promotion catchup"
                 );
                 Some(CullTarget::WriteToRead)
-            } else if rewind_to_ack_barrier && last_acked > 0 && last_acked < read.wal_seq {
-                // Demotion cull: read==write but ack barrier is below read.
-                // Drop the un-acked range (last_acked+1 .. read] by scanning backward.
-                // Do not drop if last_acked is set
+            } else if rewind_armed && last_acked > 0 && last_acked.max(last_received) < read.wal_seq {
+                // Demotion cull: read==write but the barrier is below read. Drop the
+                // own un-acked range (barrier+1 .. read] by scanning backward. The
+                // barrier is max(last_self_acked, last_received_replication_wal_seq):
+                // data above last_acked that arrived via TCP replication is peer-ACKED
+                // (the peer returned Ok to clients for it) and may exist nowhere else
+                // reachable (live-TCP ranges are never uploaded to S3) — culling it
+                // wedges convergence permanently. Only data above BOTH cursors is own
+                // speculation that no client was ever acked for.
+                let barrier = last_acked.max(last_received);
                 let log_id = active.metadata.borrow().log_id;
                 tracing::info!(
                     shard_id = self.config.shard_id,
                     read_wal_seq = read.wal_seq,
                     last_self_acked_wal_seq = last_acked,
+                    last_received_replication_wal_seq = last_received,
+                    barrier,
                     "cull_speculative_tail: demotion rewind to ack barrier"
                 );
-                let cursor = self.find_cursor_at_wal_seq(last_acked, read, log_id).await?;
+                let cursor = self.find_cursor_at_wal_seq(barrier, read, log_id).await?;
                 Some(CullTarget::BothToAckBarrier(cursor))
             } else {
                 None
@@ -4352,8 +4402,7 @@ mod tests {
         async fn send_kick(&self) -> Result<bool, crate::error::send_heartbeat_error::SendHeartbeatError> { Ok(true) }
     }
 
-    /// Regression for the rollback-vs-in-flight-future false-ack documented in
-    /// `docs/missing-data-progress.md` ("residual mechanism" section). A write's
+    /// Regression for the rollback-vs-in-flight-future false ack. A write's
     /// `replicate_durable` can return `Ok` via `NoCaptureRaceButOk` even when a
     /// concurrent rollback wiped the data the future thought it had committed.
     /// The `rollback_generation` snapshot/check in `write()` turns the silent
@@ -5066,6 +5115,88 @@ mod tests {
             assert_eq!(meta.write.wal_seq, 10, "write cursor must be preserved (no rewind to genesis)");
             assert_eq!(meta.read.as_ref().unwrap().wal_seq, 10, "read cursor must be preserved (no rewind to genesis)");
             drop(meta);
+
+            shard.close().await;
+        });
+    }
+
+    /// The demotion rewind floor is max(last_self_acked, last_received_replication_wal_seq).
+    /// Data above last_acked that arrived via TCP replication is peer-acked and must
+    /// survive the cull; rewinding it wedges convergence (the live-TCP range is never
+    /// in S3, and the chaos single_node_isolation wedge is exactly this).
+    #[test]
+    fn demotion_cull_floor_includes_last_received_replication() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let agg = key(1, 1, 1);
+
+            let shard = open_shard(&dir).await;
+            for _ in 0..10 {
+                write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            }
+
+            // Own acks stop at 5; seqs 6..=8 were received from a peer leader via TCP.
+            {
+                let active = shard.log_segments_cache.active();
+                let mut meta = active.metadata.borrow_mut();
+                meta.last_self_acked_wal_seq = 5;
+                meta.last_received_replication_wal_seq = 8;
+            }
+
+            let culled = shard.cull_speculative_tail_for_promotion(true).await.unwrap();
+            assert!(culled, "demotion cull must still fire for the range above both cursors");
+
+            let active = shard.log_segments_cache.active();
+            let meta = active.metadata.borrow();
+            assert_eq!(meta.write.wal_seq, 8, "write must rewind only to the received barrier, not last_self_acked");
+            assert_eq!(meta.read.as_ref().unwrap().wal_seq, 8, "read must rewind only to the received barrier, not last_self_acked");
+            drop(meta);
+
+            shard.close().await;
+        });
+    }
+
+    /// The rewind-to-ack-barrier arm is one-shot: post-demotion status churn
+    /// (Fenced<->Follower bounces, repeated kicks) re-runs the cull, but only the
+    /// first call since boot/leadership may rewind. A second rewind would destroy
+    /// data applied by catchup since the demotion.
+    #[test]
+    fn demotion_cull_rewind_is_one_shot_until_rearmed() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let agg = key(1, 1, 1);
+
+            let shard = open_shard(&dir).await;
+            for _ in 0..10 {
+                write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            }
+            {
+                let active = shard.log_segments_cache.active();
+                active.metadata.borrow_mut().last_self_acked_wal_seq = 5;
+            }
+
+            // First demotion cull: armed from boot, fires.
+            let culled = shard.cull_speculative_tail_for_promotion(true).await.unwrap();
+            assert!(culled, "first demotion cull must fire");
+            assert_eq!(shard.log_segments_cache.active().metadata.borrow().read.as_ref().unwrap().wal_seq, 5);
+
+            // Simulate catchup re-applying peer data above the barrier: read==write==5
+            // with acked dropped below would previously re-trigger the rewind on the
+            // next churn-driven cull. The flag is consumed, so it must be a no-op.
+            {
+                let active = shard.log_segments_cache.active();
+                active.metadata.borrow_mut().last_self_acked_wal_seq = 3;
+            }
+            let culled = shard.cull_speculative_tail_for_promotion(true).await.unwrap();
+            assert!(!culled, "second demotion cull must not rewind (flag consumed)");
+            assert_eq!(shard.log_segments_cache.active().metadata.borrow().read.as_ref().unwrap().wal_seq, 5, "churn cull must not destroy data above the stale ack barrier");
+
+            // Re-arm (as a successful leader replication commit would) and verify the
+            // rewind is available again.
+            shard.ack_barrier_rewind_armed.set(true);
+            let culled = shard.cull_speculative_tail_for_promotion(true).await.unwrap();
+            assert!(culled, "re-armed demotion cull must fire again");
+            assert_eq!(shard.log_segments_cache.active().metadata.borrow().read.as_ref().unwrap().wal_seq, 3);
 
             shard.close().await;
         });
