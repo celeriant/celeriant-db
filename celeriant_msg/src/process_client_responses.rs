@@ -12,8 +12,9 @@ use crate::{
     RESPONSE_COMPRESSION_THRESHOLD_BYTES,
     read_wire_data_error::ReadWireDataError,
     response::responses::{
-        AggregateDetailsResponse, ErrorResponse, ListAggregateTypesResponse, ListAggregatesResponse,
-        ListOrgsResponse, ProtocolErrorResponse, ReadResponse, SuccessResponse, WatchResponse,
+        AggregateDetailsResponse, DeleteResponse, ErrorResponse, ListAggregateTypesResponse,
+        ListAggregatesResponse, ListOrgsResponse, ProtocolErrorResponse, ReadResponse,
+        RegisterSchemaResponse, TrimStartResponse, WatchResponse, WriteResponse,
     },
 };
 
@@ -58,16 +59,16 @@ impl ClientResponseType {
 pub enum ClientResponse {
     AggregateDetails(AggregateDetailsResponse),
     Read(ReadResponse),
-    Write(SuccessResponse),
-    TrimStart(SuccessResponse),
-    Delete(SuccessResponse),
+    Write(WriteResponse),
+    TrimStart(TrimStartResponse),
+    Delete(DeleteResponse),
     ProtocolError(ProtocolErrorResponse),
     GenericError(ErrorResponse),
     Watch(WatchResponse),
     ListOrgs(ListOrgsResponse),
     ListAggregateTypes(ListAggregateTypesResponse),
     ListAggregates(ListAggregatesResponse),
-    RegisterSchema(SuccessResponse),
+    RegisterSchema(RegisterSchemaResponse),
 }
 
 impl ClientResponse {
@@ -361,13 +362,14 @@ mod tests {
                 event_batches: vec![],
                 next_aggregate_version: Some(100),
             }),
-            ClientResponseType::Write => ClientResponse::Write(SuccessResponse {
+            ClientResponseType::Write => ClientResponse::Write(WriteResponse {
                 correlation_id: Some(0xCAFE_D00D_BEEF_F00D),
+                max_aggregate_version: Some(7),
             }),
-            ClientResponseType::TrimStart => ClientResponse::TrimStart(SuccessResponse {
+            ClientResponseType::TrimStart => ClientResponse::TrimStart(TrimStartResponse {
                 correlation_id: Some(0xBAD_C0FFEE),
             }),
-            ClientResponseType::Delete => ClientResponse::Delete(SuccessResponse {
+            ClientResponseType::Delete => ClientResponse::Delete(DeleteResponse {
                 correlation_id: Some(0xDEAD_DEAD_DEAD_DEAD),
             }),
             ClientResponseType::ProtocolError => ClientResponse::ProtocolError(ProtocolErrorResponse {}),
@@ -392,7 +394,7 @@ mod tests {
                 aggregates: vec![],
                 next_cursor: Some(12345),
             }),
-            ClientResponseType::RegisterSchema => ClientResponse::RegisterSchema(SuccessResponse {
+            ClientResponseType::RegisterSchema => ClientResponse::RegisterSchema(RegisterSchemaResponse {
                 correlation_id: Some(0x5555_6666_7777_8888),
             }),
         }
@@ -521,15 +523,15 @@ mod tests {
         // Write, Delete, AggregateDetails, errors, RegisterSchema are never compressed.
         let large_size = RESPONSE_COMPRESSION_THRESHOLD_BYTES + 1;
         let none_variants: &[ClientResponse] = &[
-            ClientResponse::Write(SuccessResponse { correlation_id: None }),
-            ClientResponse::Delete(SuccessResponse { correlation_id: None }),
+            ClientResponse::Write(WriteResponse { correlation_id: None, max_aggregate_version: None }),
+            ClientResponse::Delete(DeleteResponse { correlation_id: None }),
             ClientResponse::AggregateDetails(AggregateDetailsResponse {
                 correlation_id: None, min_aggregate_version: 0, max_aggregate_version: 0,
                 max_event_seq: 0, is_deleted: false, allow_recreate: false,
                 allow_sequence_continuation: false, last_server_timestamp: 0,
                 last_client_id: 0, last_user_id: None,
             }),
-            ClientResponse::RegisterSchema(SuccessResponse { correlation_id: None }),
+            ClientResponse::RegisterSchema(RegisterSchemaResponse { correlation_id: None }),
             ClientResponse::GenericError(ErrorResponse { correlation_id: None, error_code: 0, error_message: String::new() }),
             ClientResponse::ProtocolError(ProtocolErrorResponse {}),
         ];

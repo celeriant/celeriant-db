@@ -22,11 +22,16 @@ pub struct ScenarioParams {
     pub tasks: usize,
     pub duration_secs: u64,
     pub throughput_floor: f64,
+    /// Spread bench task starts over this many seconds instead of releasing
+    /// one cold-connect herd. Only `baseline` consumes it (A/B for the
+    /// thundering-herd envelope); fault scenarios keep the herd — it is
+    /// part of their stress.
+    pub connect_ramp_secs: Option<u64>,
 }
 
 impl Default for ScenarioParams {
     fn default() -> Self {
-        Self { tasks: 4000, duration_secs: 60, throughput_floor: 500.0 }
+        Self { tasks: 4000, duration_secs: 60, throughput_floor: 500.0, connect_ramp_secs: None }
     }
 }
 
@@ -329,24 +334,29 @@ pub async fn finish_history_and_check(
     // set comes from the history's actual `ok` records: workloads like
     // cas_storm ack sparsely (most writes lose OCC), so a contiguous
     // 1..=max_acked assumption over-claims and false-positives.
-    let mut acked_map: std::collections::HashMap<(u128, u128, u128, u128), Vec<u64>> =
+    let mut acked_map: std::collections::HashMap<(u128, u128, u128, u128), (Vec<u64>, Vec<u64>)> =
         std::collections::HashMap::new();
     for line in &lines {
         if let celeriant_bench::history::HistoryLine::Op(op) = line {
             if matches!(op.outcome, celeriant_bench::history::OpOutcome::Ok) {
-                acked_map
+                let entry = acked_map
                     .entry((op.org_id, op.type_id, op.agg_id, op.client_id))
-                    .or_default()
-                    .push(op.client_seq);
+                    .or_default();
+                entry.0.push(op.client_seq);
+                if let Some(v) = op.acked_max_aggregate_version {
+                    entry.1.push(v);
+                }
             }
         }
     }
     let acked: Vec<crate::epoch_oracle::AckedAggregate> = acked_map
         .into_iter()
-        .map(|((org_id, type_id, agg_id, client_id), mut acked_seqs)| {
+        .map(|((org_id, type_id, agg_id, client_id), (mut acked_seqs, mut acked_versions))| {
             acked_seqs.sort_unstable();
             acked_seqs.dedup();
-            crate::epoch_oracle::AckedAggregate { org_id, type_id, agg_id, client_id, acked_seqs }
+            acked_versions.sort_unstable();
+            acked_versions.dedup();
+            crate::epoch_oracle::AckedAggregate { org_id, type_id, agg_id, client_id, acked_seqs, acked_versions }
         })
         .collect();
     if !acked.is_empty() {
@@ -677,7 +687,8 @@ pub async fn run_baseline(
 
     let bench_window_start_ms = up.elapsed_ms();
     println!("[baseline] bench: {} tasks, {}s", params.tasks, params.duration_secs);
-    let bench_result = run_benchmark(&pool, params.tasks, params.duration_secs).await;
+    let bench_result =
+        celeriant_bench::run_benchmark_ramped(&pool, params.tasks, params.duration_secs, params.connect_ramp_secs).await;
     let bench_window_end_ms = up.elapsed_ms();
     println!(
         "[baseline] bench done: {} req, {} err, {:.0} req/s, p50={}ms p99={}ms",
@@ -1000,8 +1011,14 @@ pub async fn run_idempotency_audit_baseline(
     let history = new_history_recorder(SCEN, run_dir);
     let bench_window_start_ms = up.elapsed_ms();
     println!("[{SCEN}] idempotent bench: {} tasks, {}s", params.tasks, params.duration_secs);
-    let outcome =
-        run_benchmark_idempotent_with_history(&pool, params.tasks, params.duration_secs, history.clone()).await;
+    let ryw_pinned = build_ryw_pinned(cfg).await;
+    let outcome = run_benchmark_idempotent_opts(
+        &pool,
+        params.tasks,
+        params.duration_secs,
+        celeriant_bench::IdempotentBenchOptions { history: history.clone(), duplicate_replay: false, ryw_pinned },
+    )
+    .await;
     let bench_window_end_ms = up.elapsed_ms();
     println!(
         "[{SCEN}] bench done: {} req, {} err, {:.0} req/s, p50={}ms p99={}ms (ok_acks={} 2002_acks={} repl_retry={} transient_retry={} fatal={})",
@@ -1026,6 +1043,14 @@ pub async fn run_idempotency_audit_baseline(
     let mut extra_checks = vec![integrity_check];
     extra_checks.extend(finish_history_and_check(SCEN, cfg, history, &outcome.task_acks).await);
 
+    // No fault is injected, but high task counts brush saturation: a stray
+    // retry attempt is bench noise, not a fault. Integrity is asserted
+    // independently by the audit + history checkers.
+    let expectations = ScenarioExpectations {
+        max_bench_error_ratio: Some(0.02),
+        ..ScenarioExpectations::default()
+    };
+
     tear_down_and_evaluate_with_audit(
         SCEN,
         cfg,
@@ -1033,7 +1058,7 @@ pub async fn run_idempotency_audit_baseline(
         outcome.benchmark.clone(),
         bench_window_start_ms,
         bench_window_end_ms,
-        ScenarioExpectations::default(),
+        expectations,
         params,
         extra_checks,
         Some(integrity),
@@ -1696,8 +1721,15 @@ pub async fn run_idempotency_audit_minio_outage(
     let history_clone = history.clone();
     let tasks = params.tasks;
     let dur = params.duration_secs;
+    let ryw_pinned = build_ryw_pinned(cfg).await;
     let bench_handle = tokio::spawn(async move {
-        run_benchmark_idempotent_with_history(&pool_clone, tasks, dur, history_clone).await
+        run_benchmark_idempotent_opts(
+            &pool_clone,
+            tasks,
+            dur,
+            celeriant_bench::IdempotentBenchOptions { history: history_clone, duplicate_replay: false, ryw_pinned },
+        )
+        .await
     });
 
     // Steady-state warm-up.
@@ -3349,8 +3381,15 @@ pub async fn run_idempotency_audit_partition_then_kill_minio(
     let pool_clone = pool.clone();
     let history_clone = history.clone();
     let tasks = params.tasks;
+    let ryw_pinned = build_ryw_pinned(cfg).await;
     let bench_handle = tokio::spawn(async move {
-        run_benchmark_idempotent_with_history(&pool_clone, tasks, AUDIT_BENCH_SECS, history_clone).await
+        run_benchmark_idempotent_opts(
+            &pool_clone,
+            tasks,
+            AUDIT_BENCH_SECS,
+            celeriant_bench::IdempotentBenchOptions { history: history_clone, duplicate_replay: false, ryw_pinned },
+        )
+        .await
     });
 
     sleep(Duration::from_secs(15)).await;
@@ -3490,8 +3529,15 @@ pub async fn run_idempotency_audit_fast_blackout(
     let pool_clone = pool.clone();
     let history_clone = history.clone();
     let tasks = params.tasks;
+    let ryw_pinned = build_ryw_pinned(cfg).await;
     let bench_handle = tokio::spawn(async move {
-        run_benchmark_idempotent_with_history(&pool_clone, tasks, FAST_BENCH_SECS, history_clone).await
+        run_benchmark_idempotent_opts(
+            &pool_clone,
+            tasks,
+            FAST_BENCH_SECS,
+            celeriant_bench::IdempotentBenchOptions { history: history_clone, duplicate_replay: false, ryw_pinned },
+        )
+        .await
     });
 
     sleep(Duration::from_secs(FAST_WARMUP_SECS)).await;
@@ -4091,23 +4137,14 @@ pub async fn run_follower_disk_full(
         cfg.leader_host.clone()
     };
 
-    // 200 MiB reserve: bigger than `SHARD_LOG_PREALLOCATE_BYTES` (128 MiB)
-    // so at least one log segment rotation can succeed under the fill.
-    // 50 MiB was too tight — any rotation during the fill window hit
-    // ENOSPC on preallocate, which propagates as `FsyncFailed` →
-    // `run_s3_catchup` returns error → shard panics in `shard.rs:780`
-    // (the `run_s3_catchup failed with fatal error` path). That path
-    // is the real bug — the shard should treat ENOSPC as transient
-    // and retry, not panic — but bumping the reserve first lets this
-    // test pass without gambling on whether a rotation happens during
-    // the bench window.
-    //
-    // Tracking the transient-fsync-error fix as a follow-up in
-    // status-log.md; it's a bigger change to the error handling in
-    // `run_s3_catchup` + `catchup_round`.
+    // 50 MiB reserve: well below SHARD_LOG_PREALLOCATE_BYTES, so any segment
+    // rotation during the fill window deterministically hits ENOSPC at
+    // create+preallocate. That path is the point of this scenario: the shard
+    // must surface it as a transient error (failed rotation removes its
+    // partial file, S3 catchup retries) — never panic, never shut down.
     let fill = Action::FillDisk {
         host: follower_host.clone(),
-        reserve_mb: 200,
+        reserve_mb: 50,
     };
     let clean = Action::CleanDisk {
         host: follower_host.clone(),
@@ -4132,10 +4169,11 @@ pub async fn run_follower_disk_full(
         return Err(format!("fill-disk failed: {e}"));
     }
 
-    // Hold the full-disk state for 20 seconds — enough for several
-    // commit cycles, potentially a rotation if load is high enough,
-    // and for the leader's S3 fallback path to fire if it's going to.
-    sleep(Duration::from_secs(20)).await;
+    // Hold the full-disk state for 45 seconds. A 256 MiB segment fills in
+    // ~30s of saturated writes per data shard, so this window reliably
+    // contains at least one ENOSPC rotation attempt — the path under test —
+    // plus the leader's S3 fallback once the follower's fsyncs start failing.
+    sleep(Duration::from_secs(45)).await;
 
     println!("[{SCEN}] cleaning up disk filler");
     if let Err(e) = executor.run(&clean) {
@@ -4153,18 +4191,20 @@ pub async fn run_follower_disk_full(
         bench_result.p99_ms,
     );
 
-    // Settle bumped 15s → 90s: ENOSPC panics shards 1/2 on cs2; in-process
-    // shard restart drops the active TCP replication, leaving the last
-    // in-flight batch (~1333 entries / 4MB) stranded. cs1's reconciliation
-    // probe gets LockTimeout under the S3 fallback storm. With bench halted,
-    // 90s of idle gives the storm time to clear and normal TCP replication
-    // to resume the gap-fill. EC2+S3 converges in <5s.
+    // 90s settle: the follower spent the fill window rejecting fsyncs while
+    // the leader rode the S3 fallback; with the bench halted this gives the
+    // catchup retry loop (5s cadence) and TCP replication time to drain the
+    // gap on slow infra. EC2+S3 converges in <5s.
     println!("[{SCEN}] settle 90s for catchup + disk-pressure recovery (slow-infra liveness window)");
     sleep(Duration::from_secs(90)).await;
     let bench_window_end_ms = up.elapsed_ms();
 
     // Defensive final cleanup.
     let _ = executor.run(&clean);
+
+    // Pre-teardown so SSH still has the service-managed mount warm; reads
+    // headers only, safe against a live service.
+    let orphan_check = check_no_orphan_segments(&follower_host).await;
 
     let expectations = ScenarioExpectations {
         // Leader may renew S3 lease during follower stress but no
@@ -4195,20 +4235,18 @@ pub async fn run_follower_disk_full(
         require_leader_retained: true,
         require_final_leader_write_progress: true,
         assert_eventual_progress: true,
-        // ENOSPC during rotation panics per Phase 5's invariant
-        // ("fail loudly on disk full"). 20 covers shards × rotations
-        // across the disk-pressure window.
-        max_shard_panics: 20,
-        // In-process restarts + systemd restarts across shards during
-        // disk-full window; 5 covers it.
-        max_node_starts: 5,
+        // Disk full is a transient the node must survive in place: a failed
+        // rotation fails the write and the catchup driver retries. Any panic
+        // or restart is a regression.
+        max_shard_panics: 0,
+        max_node_starts: 0,
         ..ScenarioExpectations::default()
     };
 
     let mut scen_params = params;
     scen_params.throughput_floor = (params.throughput_floor * 0.5).max(100.0);
 
-    tear_down_and_evaluate(
+    tear_down_and_evaluate_with_audit(
         SCEN,
         cfg,
         up,
@@ -4217,9 +4255,65 @@ pub async fn run_follower_disk_full(
         bench_window_end_ms,
         expectations,
         scen_params,
+        vec![orphan_check],
+        None,
+        None,
+        None,
         run_dir,
     )
     .await
+}
+
+/// Failed rotations must not leave segment files behind: the ENOSPC path
+/// deletes the partially created file before surfacing the error. A
+/// `log_*.wal` whose front AND rear headers are both unreadable is such a
+/// residue — a valid segment (even empty) always has at least one good
+/// header.
+async fn check_no_orphan_segments(host: &str) -> CheckResult {
+    const NAME: &str = "NoOrphanSegments";
+    let host = host.to_string();
+    tokio::task::spawn_blocking(move || {
+        let cmd = "for f in /var/lib/nvme/celeriant-data/shard_*/log_*.wal; do \
+                       [ -f \"$f\" ] || continue; \
+                       out=$(sudo /usr/local/bin/celeriant-wal-inspect \"$f\" header 2>/dev/null); \
+                       if echo \"$out\" | grep -q 'front_header: <corrupt or missing>' \
+                          && echo \"$out\" | grep -q 'rear_header: <corrupt or missing>'; then \
+                           echo \"ORPHAN $f\"; \
+                       else \
+                           echo \"OK $f\"; \
+                       fi; \
+                   done";
+        let out = match std::process::Command::new("ssh")
+            .arg(&host)
+            .arg(cmd)
+            .stdin(std::process::Stdio::null())
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            Ok(o) => {
+                return CheckResult::pass_with_detail(
+                    NAME,
+                    format!("(skipped: ssh to {host} exited {})", o.status),
+                );
+            }
+            Err(e) => {
+                return CheckResult::pass_with_detail(NAME, format!("(skipped: ssh to {host} failed: {e})"));
+            }
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let audited = text.lines().filter(|l| l.starts_with("OK ") || l.starts_with("ORPHAN ")).count();
+        let orphans: Vec<&str> = text.lines().filter(|l| l.starts_with("ORPHAN ")).collect();
+        if orphans.is_empty() {
+            CheckResult::pass_with_detail(NAME, format!("{audited} segment file(s) audited on {host}"))
+        } else {
+            CheckResult::fail(
+                NAME,
+                format!("failed rotation left residue on {host}: {}", orphans.join("; ")),
+            )
+        }
+    })
+    .await
+    .unwrap_or_else(|_| CheckResult::pass_with_detail(NAME, "(skipped: task panicked)"))
 }
 
 /// SCEN-18: bench load sweep. Not a chaos scenario — a
@@ -5026,8 +5120,15 @@ pub async fn run_nemesis_composition(
     let pool_clone = pool.clone();
     let history_clone = history.clone();
     let tasks = params.tasks;
+    let ryw_pinned = build_ryw_pinned(cfg).await;
     let bench_handle = tokio::spawn(async move {
-        run_benchmark_idempotent_with_history(&pool_clone, tasks, BENCH_SECS, history_clone).await
+        run_benchmark_idempotent_opts(
+            &pool_clone,
+            tasks,
+            BENCH_SECS,
+            celeriant_bench::IdempotentBenchOptions { history: history_clone, duplicate_replay: false, ryw_pinned },
+        )
+        .await
     });
 
     // Wait for bench to complete, then signal nemesis loops to exit.
@@ -5108,4 +5209,258 @@ pub async fn run_nemesis_composition(
         run_dir,
     )
     .await
+}
+
+/// Schema registration under partition (design-doc open question: divergent
+/// schema caches). A schema registered while leader→follower replication is
+/// partitioned must reach the follower through the recovery path, and a
+/// follower PROMOTED after the heal must enforce it: if the caches diverge,
+/// the new leader accepts a write the schema forbids.
+pub async fn run_schema_under_partition(
+    cfg: &ClusterConfig,
+    params: ScenarioParams,
+    run_dir: &PathBuf,
+) -> Result<ScenarioReport, String> {
+    const SCEN: &str = "schema_under_partition";
+    let up = bring_up_cluster(cfg, SCEN, run_dir).await?;
+    let pool = build_bench_pool(cfg, &up, params).await?;
+
+    println!("[{SCEN}] smoke test");
+    smoke_test(&pool).await.map_err(|e| format!("smoke: {e}"))?;
+
+    let executor = ActionExecutor::new(cfg);
+
+    let leader_is_cs1 = up.bench_primary == cfg.leader_addr();
+    let (leader_host, follower_host) = if leader_is_cs1 {
+        (cfg.leader_host.clone(), cfg.follower_host.clone())
+    } else {
+        (cfg.follower_host.clone(), cfg.leader_host.clone())
+    };
+    let (stop_leader, start_leader) = if leader_is_cs1 {
+        (Action::StopCs1, Action::StartCs1)
+    } else {
+        (Action::StopCs2, Action::StartCs2)
+    };
+    let partition = Action::Partition {
+        src: leader_host.clone(),
+        dst: follower_host.clone(),
+        port: cfg.replication_port,
+    };
+    let heal = Action::Heal {
+        src: leader_host.clone(),
+        dst: follower_host.clone(),
+        port: cfg.replication_port,
+    };
+
+    // Background load for the standard counter/throughput checks; the
+    // schema oracle below is the scenario's real subject.
+    let bench_window_start_ms = up.elapsed_ms();
+    println!("[{SCEN}] bench: {} tasks, {}s", params.tasks, params.duration_secs);
+    let pool_clone = pool.clone();
+    let tasks = params.tasks;
+    let dur = params.duration_secs;
+    let bench_handle = tokio::spawn(async move { run_benchmark(&pool_clone, tasks, dur).await });
+
+    sleep(Duration::from_secs(10)).await;
+
+    // Phase A — healthy cluster: schema major=7 registered and enforced.
+    let pre = assert_schema_enforced(&pool, 7, 70, "SchemaEnforcedPrePartition").await;
+
+    println!("[{SCEN}] partitioning {leader_host} -> {follower_host}:{}", cfg.replication_port);
+    executor.run(&partition)?;
+    sleep(Duration::from_secs(5)).await;
+
+    // Phase B — schema major=8 registered while the follower is unreachable.
+    let during = assert_schema_enforced(&pool, 8, 80, "SchemaEnforcedDuringPartition").await;
+
+    sleep(Duration::from_secs(10)).await;
+    println!("[{SCEN}] healing partition");
+    if let Err(e) = executor.run(&heal) {
+        let _ = executor.run(&heal);
+        return Err(format!("heal failed: {e}"));
+    }
+
+    // Post-heal settle: follower catches up (S3 round or TCP resume).
+    sleep(Duration::from_secs(20)).await;
+
+    // Phase C — promote the follower by stopping the leader; the promoted
+    // node must enforce the partition-era schema it never saw over live TCP.
+    println!("[{SCEN}] stopping leader {leader_host} to force promotion");
+    executor.run(&stop_leader)?;
+    sleep(Duration::from_secs(15)).await;
+    let after = assert_schema_enforced(&pool, 8, 81, "SchemaEnforcedAfterFailover").await;
+
+    println!("[{SCEN}] restarting former leader");
+    executor.run(&start_leader)?;
+
+    let bench_result = bench_handle.await.map_err(|e| format!("bench join: {e}"))?;
+    println!(
+        "[{SCEN}] bench done: {} req, {} err, {:.0} req/s, p50={}ms p99={}ms",
+        bench_result.total_requests,
+        bench_result.errors,
+        bench_result.throughput,
+        bench_result.p50_ms,
+        bench_result.p99_ms,
+    );
+
+    println!("[{SCEN}] settle 15s for catchup + role re-stabilisation");
+    sleep(Duration::from_secs(15)).await;
+    let bench_window_end_ms = up.elapsed_ms();
+
+    let _ = executor.run(&heal);
+
+    let expectations = ScenarioExpectations {
+        // Partition window: leader renews via S3; failover window: one real
+        // election plus renewals. Same envelope class as
+        // partition_leader_follower_replication + leader_graceful_stop.
+        max_leader_elections: 40,
+        max_s3_fallbacks: 500,
+        max_heartbeat_failures: 90,
+        max_bench_errors: 100_000,
+        max_bench_error_ratio: Some(0.75),
+        max_role_flips: 3,
+        max_split_brain_ticks: 10,
+        assert_eventual_progress: true,
+        // The leader stop+start is one node restart.
+        max_node_starts: 1,
+        ..ScenarioExpectations::default()
+    };
+
+    let mut scen_params = params;
+    scen_params.throughput_floor = (params.throughput_floor * 0.3).max(50.0);
+
+    tear_down_and_evaluate_with_audit(
+        SCEN,
+        cfg,
+        up,
+        bench_result,
+        bench_window_start_ms,
+        bench_window_end_ms,
+        expectations,
+        scen_params,
+        vec![pre, during, after],
+        None,
+        None,
+        None,
+        run_dir,
+    )
+    .await
+}
+
+/// Register schema (org=1, type=901, `major`, 0) requiring `{"name": string}`
+/// with no extra properties, then drive one conforming and one
+/// non-conforming write at it (aggregate id `agg_id`, fresh per phase so
+/// OCC/recreate state never bleeds between phases). Transient errors
+/// (failover windows) retry up to ~30s; only a definitive wrong outcome
+/// fails the check.
+async fn assert_schema_enforced(
+    pool: &Arc<Pool>,
+    major: u64,
+    agg_id: u128,
+    name: &'static str,
+) -> CheckResult {
+    use celeriant_bench::{
+        AggregateKey, ClientError, DatablockAggregateEvent, RegisterSchemaRequest, SchemaError,
+        SchemaKey, ServerError, WriteError, WriteEventsOptions,
+    };
+
+    const ORG: u128 = 1;
+    const TYPE_ID: u128 = 901;
+    const CLIENT_ID: u128 = 7_777;
+
+    let schema =
+        r#"{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}"#;
+
+    let register = RegisterSchemaRequest {
+        correlation_id: Some(0x5c11e3a0 + major as u128),
+        client_id: CLIENT_ID,
+        user_id: None,
+        schema_key: SchemaKey::new(ORG, TYPE_ID, major, 0),
+        schema_type: 0,
+        schema: schema.to_string(),
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match pool.register_schema(register.clone()).await {
+            Ok(_) => break,
+            Err(ClientError::Server(ServerError::Schema { kind: SchemaError::AlreadyExists, .. })) => break,
+            Err(ClientError::Server(ServerError::Schema { kind: SchemaError::Invalid | SchemaError::UnsupportedType, .. })) => {
+                return CheckResult::fail(name, "register_schema rejected the schema itself — oracle bug");
+            }
+            Err(e) if Instant::now() < deadline => {
+                println!("[schema-oracle] register major={major}: transient {e}, retrying");
+                sleep(Duration::from_secs(2)).await;
+            }
+            Err(e) => {
+                return CheckResult::fail(name, format!("register_schema major={major} never succeeded: {e}"));
+            }
+        }
+    }
+
+    let event = |payload: &str, seq: u64| DatablockAggregateEvent {
+        client_seq: seq,
+        event_seq: 0,
+        event_id: None,
+        event_timestamp: 0,
+        event_type_major: major,
+        event_type_minor: 0,
+        event_value: Arc::new(payload.as_bytes().to_vec()),
+        iv: None,
+    };
+    let agg = AggregateKey::new(ORG, TYPE_ID, agg_id);
+    let opts = || WriteEventsOptions {
+        allow_create: true,
+        expected_version: None,
+        enforce_client_idempotency: false,
+    };
+
+    // Conforming write: must eventually ack. Fsync/replication write errors
+    // are transient (may commit later); only validation-class rejections are
+    // definitive here.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match pool.write_events_with(agg.clone(), vec![event(r#"{"name":"ok"}"#, 1)], CLIENT_ID, opts()).await {
+            Ok(_) => break,
+            Err(ClientError::Server(ServerError::Schema { kind, .. })) => {
+                return CheckResult::fail(name, format!("conforming write rejected by schema layer: {kind:?}"));
+            }
+            Err(ClientError::Server(ServerError::Write {
+                kind: kind @ (WriteError::EmptyEventsList | WriteError::ZeroEventType | WriteError::AggregateRecreateNotAllowed),
+                ..
+            })) => {
+                return CheckResult::fail(name, format!("conforming write definitively rejected: {kind:?}"));
+            }
+            Err(e) if Instant::now() < deadline => {
+                println!("[schema-oracle] conforming write major={major}: transient {e}, retrying");
+                sleep(Duration::from_secs(2)).await;
+            }
+            Err(e) => return CheckResult::fail(name, format!("conforming write never acked: {e}")),
+        }
+    }
+
+    // Non-conforming write: must be definitively rejected by schema
+    // validation. An Ok is the divergent-cache bug this scenario exists for.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match pool.write_events_with(agg.clone(), vec![event(r#"{"nope":1}"#, 2)], CLIENT_ID, opts()).await {
+            Ok(_) => {
+                return CheckResult::fail(
+                    name,
+                    format!("non-conforming write ACCEPTED under schema major={major} — schema cache divergence"),
+                );
+            }
+            Err(ClientError::Server(ServerError::Schema { kind: SchemaError::ValidationFailed, .. })) => {
+                return CheckResult::pass_with_detail(
+                    name,
+                    format!("major={major} enforced: conforming acked, non-conforming rejected"),
+                );
+            }
+            Err(e) if Instant::now() < deadline => {
+                println!("[schema-oracle] non-conforming write major={major}: transient {e}, retrying");
+                sleep(Duration::from_secs(2)).await;
+            }
+            Err(e) => return CheckResult::fail(name, format!("non-conforming write never resolved: {e}")),
+        }
+    }
 }

@@ -159,15 +159,20 @@ fn check_idempotency(ops: &[&OpRecord], records_dropped: u64) -> CheckResult {
     }
 }
 
-/// OCC mutual exclusion, keyed on what the client SENT: among all attempts
-/// against the same `(aggregate, expected_version)`, at most one may be
-/// acked. (Write responses don't expose the committed version, so the sent
-/// CAS token is the groupable evidence; vacuous for workloads that write
-/// with `expected_version: None`.)
+/// OCC exclusivity, judged from both sides of the exchange:
+///
+/// 1. Sent side: among all attempts against the same
+///    `(aggregate, expected_version)` CAS token, at most one may be acked.
+/// 2. Told side: no two acks may report the same committed
+///    `(aggregate, max_aggregate_version)` — the server naming the same
+///    version twice is a duplicate commit regardless of what was sent.
+///    (Version reuse would be legal across a delete + non-continuation
+///    recreate; no workload deletes, so any collision here is a bug.)
 fn check_occ(ops: &[&OpRecord]) -> CheckResult {
     const NAME: &str = "HistoryOcc";
     let mut ok_counts: HashMap<(u128, u128, u128, u64), u64> = HashMap::new();
     let mut groups = 0u64;
+    let mut told_counts: HashMap<(u128, u128, u128, u64), u64> = HashMap::new();
     for op in ops {
         if let Some(ev) = op.expected_version {
             let key = (op.org_id, op.type_id, op.agg_id, ev);
@@ -179,19 +184,37 @@ fn check_occ(ops: &[&OpRecord]) -> CheckResult {
                 *e += 1;
             }
         }
+        if op.outcome == OpOutcome::Ok {
+            if let Some(v) = op.acked_max_aggregate_version {
+                *told_counts.entry((op.org_id, op.type_id, op.agg_id, v)).or_insert(0) += 1;
+            }
+        }
     }
-    let violations: Vec<String> = ok_counts
+    let mut violations: Vec<String> = ok_counts
         .iter()
         .filter(|(_, oks)| **oks > 1)
         .take(SAMPLE_CAP)
         .map(|((_, _, agg, ev), oks)| format!("agg={agg} expected_version={ev}: {oks} acked writes"))
         .collect();
+    let told_versions = told_counts.len() as u64;
+    violations.extend(
+        told_counts
+            .iter()
+            .filter(|(_, acks)| **acks > 1)
+            .take(SAMPLE_CAP)
+            .map(|((_, _, agg, v), acks)| {
+                format!("agg={agg} committed_version={v}: {acks} acks report the same version — duplicate commit")
+            }),
+    );
     if !violations.is_empty() {
-        CheckResult::fail(NAME, format!("CAS exclusivity broken: {}", violations.join("; ")))
-    } else if groups == 0 {
-        CheckResult::pass_with_detail(NAME, "no CAS ops in history (workload writes without expected_version)")
+        CheckResult::fail(NAME, format!("OCC exclusivity broken: {}", violations.join("; ")))
+    } else if groups == 0 && told_versions == 0 {
+        CheckResult::pass_with_detail(NAME, "no CAS ops and no server-told versions in history")
     } else {
-        CheckResult::pass_with_detail(NAME, format!("{groups} CAS groups audited"))
+        CheckResult::pass_with_detail(
+            NAME,
+            format!("{groups} CAS groups, {told_versions} server-told versions audited"),
+        )
     }
 }
 
@@ -306,10 +329,13 @@ fn check_final_read_parity(finals: &[&FinalReadRecord]) -> CheckResult {
     }
 }
 
-/// Read-your-writes: every probe that observed a version must have seen at
-/// least the version the preceding write was acked at. Probes inside any
+/// Read-your-writes: a probe group violates only when reads from BOTH nodes
+/// succeeded and BOTH observed below the acked version — a cluster-wide
+/// invisible ack. A group missing a successful read from either node cannot
+/// witness "cluster-wide": during fault windows the only reachable node may
+/// be a fenced one legally serving stale reads, so n=1 groups are skipped
+/// (counted, so coverage loss stays visible). Probes inside any
 /// `exclusion_windows` t_ns range are skipped (stale-read windows by design).
-/// Read errors are counted separately — they do not fail the check.
 fn check_ryw(ryws: &[&RywRecord], exclusion_windows: &[(u64, u64)]) -> CheckResult {
     const NAME: &str = "HistoryReadYourWrites";
     if ryws.is_empty() {
@@ -324,13 +350,10 @@ fn check_ryw(ryws: &[&RywRecord], exclusion_windows: &[(u64, u64)]) -> CheckResu
     let mut last_viol_ns: u64 = 0;
     let mut read_errors: u64 = 0;
     let mut skipped: u64 = 0;
+    let mut skipped_incomplete: u64 = 0;
     let mut checked: u64 = 0;
 
-    // Group multi-node pinned reads of one probe instant by (process,
-    // probe_id). A probe violates RYW only if EVERY successful read in the
-    // group is below the acked version: the acking node has visibility
-    // before the ack, so one stale replica read is documented behavior.
-    // Un-pinned single-read probes form groups of one (old semantics).
+    // Group multi-node pinned reads of one probe instant by (process, probe_id).
     let mut groups: HashMap<(u32, u64), Vec<&&RywRecord>> = HashMap::new();
     for r in ryws {
         if in_window(r.t_ns) {
@@ -342,7 +365,9 @@ fn check_ryw(ryws: &[&RywRecord], exclusion_windows: &[(u64, u64)]) -> CheckResu
     for ((_, _), recs) in groups {
         let successes: Vec<_> = recs.iter().filter_map(|r| r.observed_max_aggregate_version.map(|o| (o, *r))).collect();
         read_errors += (recs.len() - successes.len()) as u64;
-        if successes.is_empty() {
+        let nodes: HashSet<&str> = successes.iter().filter_map(|(_, r)| r.node.as_deref()).collect();
+        if nodes.len() < 2 {
+            skipped_incomplete += 1;
             continue;
         }
         checked += 1;
@@ -364,17 +389,14 @@ fn check_ryw(ryws: &[&RywRecord], exclusion_windows: &[(u64, u64)]) -> CheckResu
         CheckResult::pass_with_detail(
             NAME,
             format!(
-                "{checked} probes passed ({skipped} in exclusion windows, {read_errors} read errors)"
+                "{checked} full probe groups passed ({skipped_incomplete} incomplete groups skipped, {skipped} in exclusion windows, {read_errors} read errors)"
             ),
         )
     } else {
-        // Probes are node-pinned and grouped: a violation means EVERY node
-        // served below the acked version — a cluster-wide invisible ack.
-        // (Verified zero on 45,880 probe groups through isolation/failover.)
         CheckResult::fail(
             NAME,
             format!(
-                "{violation_count} RYW violations of {checked} probes, clustered {:.1}s–{:.1}s ({read_errors} read errors, {skipped} skipped): {}",
+                "{violation_count} RYW violations of {checked} full probe groups, clustered {:.1}s–{:.1}s ({skipped_incomplete} incomplete skipped, {read_errors} read errors, {skipped} in windows): {}",
                 first_viol_ns as f64 / 1e9,
                 last_viol_ns as f64 / 1e9,
                 violations.join("; ")
@@ -522,10 +544,16 @@ mod tests {
     }
 
     fn ryw(agg: u128, acked: u64, observed: Option<u64>, t_ns: u64) -> HistoryLine {
+        ryw_on(agg, acked, observed, t_ns, None, t_ns)
+    }
+
+    /// Pinned probe: one record per (node, probe_id); two records sharing a
+    /// probe_id form one group.
+    fn ryw_on(agg: u128, acked: u64, observed: Option<u64>, t_ns: u64, node: Option<&str>, probe_id: u64) -> HistoryLine {
         HistoryLine::Ryw(RywRecord {
             process: agg as u32,
-            node: None,
-            probe_id: t_ns,
+            node: node.map(str::to_string),
+            probe_id,
             org_id: 1,
             type_id: 1,
             agg_id: agg,
@@ -647,6 +675,33 @@ mod tests {
     }
 
     #[test]
+    fn occ_two_acks_reporting_same_version_fails() {
+        // Different seqs, different CAS tokens — but the server told both
+        // writers they committed version 5. Duplicate commit.
+        let mut a = op_for(7, 1, OpOutcome::Ok, None, Some(4));
+        let mut b = op_for(7, 2, OpOutcome::Ok, None, Some(5));
+        for line in [&mut a, &mut b] {
+            if let HistoryLine::Op(op) = line {
+                op.acked_max_aggregate_version = Some(5);
+            }
+        }
+        let r = results(&[a, b], 0);
+        assert!(!r["HistoryOcc"].passed);
+        assert!(r["HistoryOcc"].detail.contains("duplicate commit"), "{}", r["HistoryOcc"].detail);
+    }
+
+    #[test]
+    fn occ_distinct_told_versions_pass() {
+        let lines = vec![
+            op_for(7, 1, OpOutcome::Ok, None, Some(4)),  // told version 1 (op_for: = seq)
+            op_for(7, 2, OpOutcome::Ok, None, Some(5)),  // told version 2
+            op_for(8, 1, OpOutcome::Ok, None, None),     // same version, different aggregate
+        ];
+        let r = results(&lines, 0);
+        assert!(r["HistoryOcc"].passed, "{}", r["HistoryOcc"].detail);
+    }
+
+    #[test]
     fn monotonicity_lost_acked_write_fails() {
         let lines = vec![
             op(1, OpOutcome::Ok, None),
@@ -721,17 +776,21 @@ mod tests {
     #[test]
     fn ryw_observed_gte_acked_passes() {
         let lines = vec![
-            ryw(1, 5, Some(5), 1000),
-            ryw(1, 6, Some(7), 2000), // observed ahead — fine
+            ryw_on(1, 5, Some(5), 1000, Some("cs1"), 5),
+            ryw_on(1, 5, Some(5), 1010, Some("cs2"), 5),
+            ryw_on(1, 6, Some(7), 2000, Some("cs1"), 6), // observed ahead — fine
+            ryw_on(1, 6, Some(6), 2010, Some("cs2"), 6),
         ];
         let r = results(&lines, 0);
         assert!(r["HistoryReadYourWrites"].passed, "{}", r["HistoryReadYourWrites"].detail);
+        assert!(r["HistoryReadYourWrites"].detail.contains("2 full probe groups"), "{}", r["HistoryReadYourWrites"].detail);
     }
 
     #[test]
-    fn ryw_stale_read_fails() {
+    fn ryw_stale_on_both_nodes_fails() {
         let lines = vec![
-            ryw(1, 10, Some(9), 1000), // observed 9 but acked 10 — stale
+            ryw_on(1, 10, Some(9), 1000, Some("cs1"), 10), // both below acked —
+            ryw_on(1, 10, Some(8), 1010, Some("cs2"), 10), // cluster-wide invisible ack
         ];
         let r = results(&lines, 0);
         assert!(!r["HistoryReadYourWrites"].passed);
@@ -739,32 +798,60 @@ mod tests {
     }
 
     #[test]
-    fn ryw_read_error_does_not_fail() {
+    fn ryw_stale_on_one_node_passes() {
         let lines = vec![
-            ryw(1, 10, None, 1000), // read errored — not a violation
+            ryw_on(1, 10, Some(9), 1000, Some("cs1"), 10), // stale replica —
+            ryw_on(1, 10, Some(10), 1010, Some("cs2"), 10), // acking node visible
         ];
         let r = results(&lines, 0);
         assert!(r["HistoryReadYourWrites"].passed, "{}", r["HistoryReadYourWrites"].detail);
-        assert!(r["HistoryReadYourWrites"].detail.contains("1 read errors"));
+    }
+
+    #[test]
+    fn ryw_incomplete_group_skipped_not_judged() {
+        // Only one node answered (the other errored): a lone stale read on a
+        // possibly-fenced node cannot witness "cluster-wide".
+        let lines = vec![
+            ryw_on(1, 10, Some(9), 1000, Some("cs1"), 10),
+            ryw_on(1, 10, None, 1010, Some("cs2"), 10),
+        ];
+        let r = results(&lines, 0);
+        assert!(r["HistoryReadYourWrites"].passed, "{}", r["HistoryReadYourWrites"].detail);
+        assert!(r["HistoryReadYourWrites"].detail.contains("1 incomplete groups skipped"), "{}", r["HistoryReadYourWrites"].detail);
+        assert!(r["HistoryReadYourWrites"].detail.contains("1 read errors"), "{}", r["HistoryReadYourWrites"].detail);
+    }
+
+    #[test]
+    fn ryw_unpinned_groups_skipped_as_incomplete() {
+        // Un-pinned probes carry no node identity — they can never witness
+        // cluster-wide invisibility under the full-group rule.
+        let lines = vec![
+            ryw(1, 10, Some(9), 1000),
+        ];
+        let r = results(&lines, 0);
+        assert!(r["HistoryReadYourWrites"].passed, "{}", r["HistoryReadYourWrites"].detail);
+        assert!(r["HistoryReadYourWrites"].detail.contains("1 incomplete groups skipped"), "{}", r["HistoryReadYourWrites"].detail);
     }
 
     #[test]
     fn ryw_violation_in_exclusion_window_skipped() {
-        // Stale read at t=5000 is inside the exclusion window [4000, 6000].
+        // Stale full group at t=5000/5010 inside the exclusion window [4000, 6000].
         let lines = vec![
-            ryw(1, 10, Some(9), 5000),
+            ryw_on(1, 10, Some(9), 5000, Some("cs1"), 10),
+            ryw_on(1, 10, Some(9), 5010, Some("cs2"), 10),
         ];
         let checks = run_history_checks_with_windows(&lines, 0, &[(4000, 6000)]);
         let r: HashMap<String, CheckResult> = checks.into_iter().map(|c| (c.name.to_string(), c)).collect();
         assert!(r["HistoryReadYourWrites"].passed, "{}", r["HistoryReadYourWrites"].detail);
-        assert!(r["HistoryReadYourWrites"].detail.contains("1 in exclusion windows"));
+        assert!(r["HistoryReadYourWrites"].detail.contains("2 in exclusion windows"));
     }
 
     #[test]
     fn ryw_violation_outside_exclusion_window_fails() {
-        // Stale read at t=9000, exclusion window [4000, 6000] — should still fail.
+        // Stale full group at t=9000, exclusion window [4000, 6000] — still fails.
         let lines = vec![
-            ryw(1, 10, Some(9), 9000),
+            ryw_on(1, 10, Some(9), 9000, Some("cs1"), 10),
+            ryw_on(1, 10, Some(9), 9010, Some("cs2"), 10),
         ];
         let checks = run_history_checks_with_windows(&lines, 0, &[(4000, 6000)]);
         let r: HashMap<String, CheckResult> = checks.into_iter().map(|c| (c.name.to_string(), c)).collect();

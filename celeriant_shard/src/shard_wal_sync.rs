@@ -125,13 +125,19 @@ pub(crate) async fn commit_fsync_with_rollback(
                 shard_mem_cache,
                 watched_aggregates,
                 captured.sync_positions_snapshot,
-                active_log_segment,
+                active_log_segment.clone(),
                 updated_log_segment_file_metadata,
                 &dict_codec,
             );
             metrics::histogram!("celeriant_fsync_duration_seconds", &shard_label).record(start.elapsed().as_secs_f64());
             metrics::histogram!("celeriant_fsync_batch_size", &shard_label).record(batch_size as f64);
+            // Cursor gauges: advances set write before read so a scrape
+            // landing between the two can only see read lower than truth;
+            // read ≤ write holds in every interleaving. Rewind sites
+            // (truncate, demotion cull) set read first for the same reason.
             metrics::gauge!("celeriant_wal_seq", &shard_label).set(wal_seq as f64);
+            let read_wal_seq = active_log_segment.metadata.borrow().read.as_ref().map_or(0, |r| r.wal_seq);
+            metrics::gauge!("celeriant_read_wal_seq", &shard_label).set(read_wal_seq as f64);
             Ok(())
         }
         Err(e) => {

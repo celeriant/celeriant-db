@@ -22,6 +22,7 @@
 //! after the bench finishes (no concurrency with the writer thread).
 
 use celeriant_client_tokio::{ClientError, ServerError, WriteError};
+use celeriant_msg::response::responses::WriteResponse;
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -78,9 +79,10 @@ pub struct OpRecord {
     pub outcome: OpOutcome,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub error: Option<String>,
-    /// The `max_aggregate_version` recorded at ack time (= `client_seq` for the
-    /// idempotent bench, where one seq = one batch). `None` for non-Ok outcomes
-    /// and workloads that don't populate it.
+    /// The `max_aggregate_version` the server reported in the ack. `None`
+    /// for non-Ok outcomes or when the server reported none (multi-aggregate
+    /// writes). For the idempotent bench this equals `client_seq` (one seq =
+    /// one batch); for OCC workloads it is the committed version.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub acked_max_aggregate_version: Option<u64>,
     pub t_start_ns: u64,
@@ -205,26 +207,26 @@ impl HistoryRecorder {
 
     /// Record one write attempt. `req_start` is the `Instant` captured just
     /// before the pool call; the end timestamp is taken here.
-    /// `acked_max_aggregate_version` is `Some(client_seq)` on an Ok outcome
-    /// for the idempotent bench (one seq = one batch), `None` otherwise.
-    pub fn record_op<T>(
+    /// `acked_max_aggregate_version` on an Ok outcome is the version the
+    /// SERVER reported in the ack (single-aggregate writes); `None` for
+    /// non-Ok outcomes or if the server reported none.
+    pub fn record_op(
         &self,
         process: u32,
         key: &AggregateKey,
         client_id: u128,
         client_seq: u64,
         expected_version: Option<u64>,
-        res: &Result<T, ClientError>,
+        res: &Result<WriteResponse, ClientError>,
         req_start: Instant,
     ) {
         let (outcome, error) = match res {
             Ok(_) => (OpOutcome::Ok, None),
             Err(e) => classify_error(e),
         };
-        let acked_max_aggregate_version = if outcome == OpOutcome::Ok {
-            Some(client_seq)
-        } else {
-            None
+        let acked_max_aggregate_version = match res {
+            Ok(r) => r.max_aggregate_version,
+            Err(_) => None,
         };
         let record = HistoryLine::Op(OpRecord {
             process,

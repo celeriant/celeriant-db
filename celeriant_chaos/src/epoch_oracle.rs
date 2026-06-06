@@ -32,6 +32,10 @@ pub struct AckedAggregate {
     /// All client_seqs confirmed acked (outcome == ok, or idempotency rejection
     /// treated as ack). Must be non-empty.
     pub acked_seqs: Vec<u64>,
+    /// Committed versions the server reported in those acks. Joins against
+    /// the WAL's `agg_version` — the exact key for workloads whose writes
+    /// carry no client_seq on disk (OCC). Empty for pre-field histories.
+    pub acked_versions: Vec<u64>,
 }
 
 // --- Oracle 1: lease-epoch sanity ---
@@ -336,6 +340,7 @@ struct SampledAggregate {
     agg_id: u128,
     client_id: u128,
     acked_seqs: Vec<u64>,
+    acked_versions: Vec<u64>,
 }
 
 /// Sample up to `cap` aggregates uniformly from `aggs` using a seeded LCG.
@@ -349,6 +354,7 @@ fn sample_aggregates(aggs: &[AckedAggregate], seed: u64, cap: usize) -> Vec<Samp
             agg_id: a.agg_id,
             client_id: a.client_id,
             acked_seqs: a.acked_seqs.clone(),
+            acked_versions: a.acked_versions.clone(),
         }).collect();
     }
 
@@ -374,6 +380,7 @@ fn sample_aggregates(aggs: &[AckedAggregate], seed: u64, cap: usize) -> Vec<Samp
         agg_id: aggs[i].agg_id,
         client_id: aggs[i].client_id,
         acked_seqs: aggs[i].acked_seqs.clone(),
+        acked_versions: aggs[i].acked_versions.clone(),
     }).collect()
 }
 
@@ -387,20 +394,37 @@ fn run_acked_durability_sync(
 
     for agg in samples {
         // Scan shards 1..=3 on both nodes (disk_truth pattern).
-        let (leader_seqs, leader_batches) = scan_node_client_seqs(leader, agg.org_id, agg.type_id, agg.agg_id, agg.client_id);
-        let (follower_seqs, follower_batches) = scan_node_client_seqs(follower, agg.org_id, agg.type_id, agg.agg_id, agg.client_id);
+        let leader_scan = scan_node_client_seqs(leader, agg.org_id, agg.type_id, agg.agg_id, agg.client_id);
+        let follower_scan = scan_node_client_seqs(follower, agg.org_id, agg.type_id, agg.agg_id, agg.client_id);
 
         checked += 1;
 
         // Workloads that don't ride the idempotency mechanism (e.g. cas_storm's
         // OCC writes) persist client_seq=[0..0] in the metablock — the bench's
-        // bookkeeping seq has no on-disk counterpart to join on. Fall back to a
-        // count comparison: every acked write must still be a distinct durable
-        // batch on both nodes. Weaker (can't name WHICH seq is missing) but
-        // workload-agnostic and still catches loss.
-        let seq_join_valid = !leader_seqs.is_empty() || !follower_seqs.is_empty();
+        // bookkeeping seq has no on-disk counterpart to join on. For those,
+        // join on the committed version the server named in each ack against
+        // the WAL's agg_version: exact (names WHICH version is missing).
+        // Count comparison remains the last resort for histories that predate
+        // server-told versions.
+        let seq_join_valid = !leader_scan.seqs.is_empty() || !follower_scan.seqs.is_empty();
         if !seq_join_valid {
-            for (node, batches) in [(leader, leader_batches), (follower, follower_batches)] {
+            if !agg.acked_versions.is_empty() {
+                for &v in &agg.acked_versions {
+                    if issues.len() >= 10 {
+                        break;
+                    }
+                    for (node, scan) in [(leader, &leader_scan), (follower, &follower_scan)] {
+                        if !scan.versions.contains(&v) {
+                            issues.push(format!(
+                                "node={node} agg={}/{}/{} client={} missing acked version={v}",
+                                agg.org_id, agg.type_id, agg.agg_id, agg.client_id
+                            ));
+                        }
+                    }
+                }
+                continue;
+            }
+            for (node, batches) in [(leader, leader_scan.batches), (follower, follower_scan.batches)] {
                 if issues.len() >= 10 {
                     break;
                 }
@@ -418,13 +442,13 @@ fn run_acked_durability_sync(
             if issues.len() >= 10 {
                 break;
             }
-            if !leader_seqs.contains(&acked_seq) {
+            if !leader_scan.seqs.contains(&acked_seq) {
                 issues.push(format!(
                     "node={leader} agg={}/{}/{} client={} missing acked seq={}",
                     agg.org_id, agg.type_id, agg.agg_id, agg.client_id, acked_seq
                 ));
             }
-            if !follower_seqs.contains(&acked_seq) {
+            if !follower_scan.seqs.contains(&acked_seq) {
                 issues.push(format!(
                     "node={follower} agg={}/{}/{} client={} missing acked seq={}",
                     agg.org_id, agg.type_id, agg.agg_id, agg.client_id, acked_seq
@@ -446,6 +470,17 @@ fn run_acked_durability_sync(
     vec![result]
 }
 
+/// One node's durable batches for a (org, type, agg, client) tuple.
+struct NodeScan {
+    /// Union of client_seqs across shards (empty for OCC workloads, which
+    /// persist client_seq=[0..0]).
+    seqs: std::collections::BTreeSet<u64>,
+    /// agg_version of every batch found — the join key for OCC workloads.
+    versions: std::collections::BTreeSet<u64>,
+    /// Total batch lines, for the count-join fallback.
+    batches: usize,
+}
+
 /// Scan shards 1..=3 for a (org, type, agg, client) tuple on one node.
 /// Returns the union of all client_seqs found across shards. Mirrors
 /// `disk_truth::scan_node` exactly: same path pattern, same binary, same
@@ -456,9 +491,12 @@ fn scan_node_client_seqs(
     type_id: u128,
     agg_id: u128,
     client_id: u128,
-) -> (std::collections::BTreeSet<u64>, usize) {
-    let mut seqs = std::collections::BTreeSet::new();
-    let mut batches = 0usize;
+) -> NodeScan {
+    let mut scan = NodeScan {
+        seqs: std::collections::BTreeSet::new(),
+        versions: std::collections::BTreeSet::new(),
+        batches: 0,
+    };
     for shard in 1u32..=3 {
         let cmd = format!(
             "for f in /var/lib/nvme/celeriant-data/shard_{shard}/log_*.wal; do \
@@ -474,19 +512,23 @@ fn scan_node_client_seqs(
             Ok(o) if o.status.success() => o,
             _ => continue,
         };
-        let (shard_seqs, shard_batches) = parse_wal_inspect_client(&String::from_utf8_lossy(&out.stdout));
-        seqs.extend(shard_seqs);
-        batches += shard_batches;
+        let shard_scan = parse_wal_inspect_client(&String::from_utf8_lossy(&out.stdout));
+        scan.seqs.extend(shard_scan.seqs);
+        scan.versions.extend(shard_scan.versions);
+        scan.batches += shard_scan.batches;
     }
-    (seqs, batches)
+    scan
 }
 
 /// Parse wal-inspect `client` output. Identical logic to `disk_truth::parse_wal_inspect`.
 /// Each batch line:
 ///   wal_seq=N agg_version=N client_seq=[A..B] offset=N within_read=true
-fn parse_wal_inspect_client(text: &str) -> (std::collections::BTreeSet<u64>, usize) {
-    let mut seqs = std::collections::BTreeSet::new();
-    let mut total = 0usize;
+fn parse_wal_inspect_client(text: &str) -> NodeScan {
+    let mut scan = NodeScan {
+        seqs: std::collections::BTreeSet::new(),
+        versions: std::collections::BTreeSet::new(),
+        batches: 0,
+    };
     for line in text.lines() {
         let Some(pos) = line.find("client_seq=[") else { continue };
         let after = &line[pos + "client_seq=[".len()..];
@@ -498,13 +540,20 @@ fn parse_wal_inspect_client(text: &str) -> (std::collections::BTreeSet<u64>, usi
         if let (Some(lo), Some(hi)) = (lo, hi) {
             for s in lo..=hi {
                 if s > 0 {
-                    seqs.insert(s);
+                    scan.seqs.insert(s);
                 }
             }
-            total += 1;
+            scan.batches += 1;
+            if let Some(vp) = line.find("agg_version=") {
+                let after_v = &line[vp + "agg_version=".len()..];
+                let v_end = after_v.find(' ').unwrap_or(after_v.len());
+                if let Ok(v) = after_v[..v_end].trim().parse::<u64>() {
+                    scan.versions.insert(v);
+                }
+            }
         }
     }
-    (seqs, total)
+    scan
 }
 
 // --- Unit tests ---
@@ -645,6 +694,7 @@ mod tests {
             agg_id: i,
             client_id: i + 1,
             acked_seqs: vec![1, 2, 3],
+            acked_versions: vec![],
         }).collect();
         let s1 = sample_aggregates(&aggs, 42, 24);
         let s2 = sample_aggregates(&aggs, 42, 24);
@@ -661,6 +711,7 @@ mod tests {
             agg_id: i,
             client_id: i + 1,
             acked_seqs: vec![1],
+            acked_versions: vec![],
         }).collect();
         let s1 = sample_aggregates(&aggs, 0, 24);
         let s2 = sample_aggregates(&aggs, 9999, 24);
@@ -677,6 +728,7 @@ mod tests {
             agg_id: i,
             client_id: i + 1,
             acked_seqs: vec![1],
+            acked_versions: vec![],
         }).collect();
         let samples = sample_aggregates(&aggs, 7, 24);
         assert_eq!(samples.len(), 10);
@@ -690,6 +742,7 @@ mod tests {
             agg_id: i,
             client_id: i + 1,
             acked_seqs: vec![1],
+            acked_versions: vec![],
         }).collect();
         let samples = sample_aggregates(&aggs, 1, 24);
         assert_eq!(samples.len(), 24);
@@ -703,6 +756,7 @@ mod tests {
             agg_id: i,
             client_id: i + 1,
             acked_seqs: vec![1],
+            acked_versions: vec![],
         }).collect();
         let samples = sample_aggregates(&aggs, 42, 24);
         assert_eq!(samples.len(), 24);
@@ -743,15 +797,29 @@ mod tests {
         let text = "wal_seq=10 agg_version=1 client_seq=[1..1] offset=100 within_read=true\n\
                     wal_seq=20 agg_version=2 client_seq=[2..5] offset=200 within_read=true\n\
                     summary: ignored\n";
-        let (seqs, total) = parse_wal_inspect_client(text);
-        assert_eq!(total, 2);
-        assert_eq!(seqs.iter().copied().collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
+        let scan = parse_wal_inspect_client(text);
+        assert_eq!(scan.batches, 2);
+        assert_eq!(scan.seqs.iter().copied().collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
+        assert_eq!(scan.versions.iter().copied().collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    #[test]
+    fn parse_wal_inspect_client_occ_batches_carry_versions_only() {
+        // OCC workloads persist client_seq=[0..0]: no seq join key, but every
+        // batch still names its committed agg_version.
+        let text = "wal_seq=10 agg_version=7 client_seq=[0..0] offset=100 within_read=true\n\
+                    wal_seq=11 agg_version=8 client_seq=[0..0] offset=200 within_read=true\n";
+        let scan = parse_wal_inspect_client(text);
+        assert_eq!(scan.batches, 2);
+        assert!(scan.seqs.is_empty());
+        assert_eq!(scan.versions.iter().copied().collect::<Vec<_>>(), vec![7, 8]);
     }
 
     #[test]
     fn parse_wal_inspect_client_empty_input() {
-        let (seqs, total) = parse_wal_inspect_client("");
-        assert_eq!(total, 0);
-        assert!(seqs.is_empty());
+        let scan = parse_wal_inspect_client("");
+        assert_eq!(scan.batches, 0);
+        assert!(scan.seqs.is_empty());
+        assert!(scan.versions.is_empty());
     }
 }

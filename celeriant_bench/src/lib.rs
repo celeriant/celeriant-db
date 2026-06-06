@@ -5,15 +5,18 @@ use std::time::Duration;
 
 use celeriant_client_tokio::ClientTlsConfig;
 use celeriant_client_tokio::pool::{CeleriantPool, PoolOptions};
-use celeriant_client_tokio::{ClientError, ServerError, WriteError, WriteEventsOptions};
 
 /// Re-exported so consumers (the chaos runner) don't need a direct dependency
 /// on `celeriant_client_tokio` just to name the pool type returned by
-/// `PoolBuilder::build`.
+/// `PoolBuilder::build` — likewise the protocol types its schema oracle
+/// drives through the pool.
 pub use celeriant_client_tokio::pool::CeleriantPool as Pool;
+pub use celeriant_client_tokio::{ClientError, SchemaError, ServerError, WriteError, WriteEventsOptions};
+pub use celeriant_msg::request::requests::RegisterSchemaRequest;
+pub use celeriant_wal::aggregate_key::AggregateKey;
+pub use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
+pub use celeriant_wal::schema_key::SchemaKey;
 use celeriant_crypto::pki::PkiManager;
-use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 use rustls_pki_types::ServerName;
 use tokio::sync::Barrier;
 use tokio::time::Instant;
@@ -124,6 +127,20 @@ pub async fn run_benchmark(
     num_tasks: usize,
     duration_secs: u64,
 ) -> BenchmarkResult {
+    run_benchmark_ramped(pool, num_tasks, duration_secs, None).await
+}
+
+/// `run_benchmark` with task starts spread linearly over `connect_ramp_secs`
+/// instead of released as one herd. Pool connections are created on first
+/// request, so the ramp paces the TLS/identify handshake storm — realistic
+/// clients don't all cold-connect in the same instant. The deadline still
+/// runs from barrier release, so late tasks get a shorter writing window.
+pub async fn run_benchmark_ramped(
+    pool: &Arc<CeleriantPool>,
+    num_tasks: usize,
+    duration_secs: u64,
+    connect_ramp_secs: Option<u64>,
+) -> BenchmarkResult {
     let barrier = Arc::new(Barrier::new(num_tasks));
     let total_ok = Arc::new(AtomicU64::new(0));
     let total_err = Arc::new(AtomicU64::new(0));
@@ -141,6 +158,9 @@ pub async fn run_benchmark(
             let mut latencies = Vec::new();
             barrier.wait().await;
             let deadline = Instant::now() + Duration::from_secs(duration_secs);
+            if let Some(ramp) = connect_ramp_secs {
+                tokio::time::sleep(Duration::from_millis(ramp * 1000 * id as u64 / num_tasks.max(1) as u64)).await;
+            }
             let mut seq = 0u64;
             // Jittered exponential backoff on repeated errors. Without this,
             // 4000 concurrent tasks hammer a broken leader during the failover
@@ -412,11 +432,16 @@ pub async fn run_benchmark_idempotent_opts(
                 }
 
                 match res {
-                    Ok(_) => {
+                    Ok(ack) => {
                         latencies.push(req_start.elapsed().as_millis() as u64);
                         total_ok.fetch_add(1, Ordering::Relaxed);
                         ok_acks.fetch_add(1, Ordering::Relaxed);
                         max_acked = current_seq;
+                        // Probe against what the server SAID it committed, not
+                        // the client-side inference; the two are equal here by
+                        // construction (one batch per seq), so a divergence is
+                        // itself server misbehavior the checkers can see.
+                        let acked_version = ack.max_aggregate_version.unwrap_or(current_seq);
 
                         // RYW probe: 1-in-16 sampling, no retry; one attempt
                         // per target, record outcome and move on. With pinned
@@ -433,7 +458,7 @@ pub async fn run_benchmark_idempotent_opts(
                                         id as u32,
                                         &aggregate_key,
                                         client_id,
-                                        current_seq,
+                                        acked_version,
                                         observed,
                                         None,
                                         current_seq,
@@ -447,7 +472,7 @@ pub async fn run_benchmark_idempotent_opts(
                                             id as u32,
                                             &aggregate_key,
                                             client_id,
-                                            current_seq,
+                                            acked_version,
                                             observed,
                                             Some(node.clone()),
                                             current_seq,

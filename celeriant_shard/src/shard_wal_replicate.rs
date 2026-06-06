@@ -348,6 +348,7 @@ async fn replicate_loop<R: ReplicationClient + 'static>(
             for pcd in pcds {
                 commit_pcd(log_segments_cache, shard_mem_cache, watched_aggregates, pcd);
             }
+            set_read_cursor_gauge(log_segments_cache, shard_id);
             Ok(ReplicationDetails::ReplicatedToFollower)
         }
         SnapshotSendOutcome::FallbackToS3 => {
@@ -547,6 +548,7 @@ async fn run_s3_fallback<R: ReplicationClient + 'static>(
     for pcd in pcds {
         commit_pcd(log_segments_cache, shard_mem_cache, watched_aggregates, pcd);
     }
+    set_read_cursor_gauge(log_segments_cache, shard_id);
     Ok(())
 }
 
@@ -803,6 +805,19 @@ fn log_replication_outcome(initial_batch_count: usize, details: &ReplicationDeta
     } else {
         debug!(shard_id, batch_count = initial_batch_count, path, duration_ms = commit_ms, "Replication batch committed");
     }
+}
+
+/// Publish the active segment's read cursor. Pairs with the write-cursor
+/// gauge set at fsync; called after every batch of read-cursor advances.
+fn set_read_cursor_gauge(log_segments_cache: &Rc<LogSegmentsCache>, shard_id: u32) {
+    let read_wal_seq = log_segments_cache
+        .active()
+        .metadata
+        .borrow()
+        .read
+        .as_ref()
+        .map_or(0, |r| r.wal_seq);
+    metrics::gauge!("celeriant_read_wal_seq", &[("shard_id", shard_id.to_string())]).set(read_wal_seq as f64);
 }
 
 /// Advance the read cursor in-memory, update caches, broadcast watch events

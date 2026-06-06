@@ -36,7 +36,7 @@ use crate::scenario::{
     run_rolling_restart, run_sigstop_leader,
     run_partition_leader_follower_replication, run_partition_leader_minio,
     run_watch_storm, run_watch_storm_failover,
-    run_cold_segment_reads, run_nemesis_composition,
+    run_cold_segment_reads, run_nemesis_composition, run_schema_under_partition,
 };
 
 #[derive(Parser)]
@@ -53,6 +53,11 @@ struct Args {
     /// Concurrent bench tasks.
     #[arg(long, default_value = "4000")]
     tasks: usize,
+
+    /// Spread bench task starts over this many seconds (baseline scenario
+    /// only). Default: off — the cold-connect herd is part of the test.
+    #[arg(long)]
+    connect_ramp: Option<u64>,
 
     /// Bench duration in seconds.
     #[arg(long, default_value = "60")]
@@ -106,6 +111,7 @@ async fn main() -> Result<(), String> {
         tasks: args.tasks,
         duration_secs: args.duration,
         throughput_floor: args.throughput_floor,
+        connect_ramp_secs: args.connect_ramp,
     };
 
     let scenarios_to_run: Vec<&str> = match args.scenario.as_deref() {
@@ -141,6 +147,7 @@ async fn main() -> Result<(), String> {
         Some("watch_storm_failover") => vec!["watch_storm_failover"],
         Some("cold_segment_reads") => vec!["cold_segment_reads"],
         Some("nemesis_composition") => vec!["nemesis_composition"],
+        Some("schema_under_partition") => vec!["schema_under_partition"],
         Some(other) => return Err(format!("unknown scenario: {other}")),
         None if args.full => vec![
             "baseline",
@@ -180,6 +187,7 @@ async fn main() -> Result<(), String> {
             // `1775886847` passed all 13 checks (25567 req/s, 0 errors).
             "cold_segment_reads",
             "nemesis_composition",
+            "schema_under_partition",
         ],
         None => vec!["baseline"],
     };
@@ -212,6 +220,7 @@ async fn run_one_iteration(
             "watch_storm_failover" => run_watch_storm_failover(cfg, params, &dir.root).await?,
             "cold_segment_reads" => run_cold_segment_reads(cfg, params, &dir.root).await?,
             "nemesis_composition" => run_nemesis_composition(cfg, params, &dir.root).await?,
+            "schema_under_partition" => run_schema_under_partition(cfg, params, &dir.root).await?,
             "follower_graceful_stop" => run_follower_graceful_stop(cfg, params, &dir.root).await?,
             "follower_sigkill" => run_follower_sigkill(cfg, params, &dir.root).await?,
             "leader_graceful_stop" => run_leader_graceful_stop(cfg, params, &dir.root).await?,

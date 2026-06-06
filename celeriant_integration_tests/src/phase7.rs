@@ -37,7 +37,7 @@ enum Outcome {
     Other(String),
 }
 
-fn classify(res: Result<celeriant_msg::response::responses::SuccessResponse, ClientError>) -> Outcome {
+fn classify(res: Result<celeriant_msg::response::responses::WriteResponse, ClientError>) -> Outcome {
     match res {
         Ok(_) => Outcome::Won,
         Err(ClientError::Server(ServerError::Write {

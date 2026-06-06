@@ -1050,7 +1050,7 @@ async fn write_cluster_response_with_timeout(
 async fn handle_schema_registration_coordination<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     ctx: &ConnectionContext<R, D, S>,
     request: celeriant_msg::request::requests::RegisterSchemaRequest,
-) -> Result<celeriant_msg::response::responses::SuccessResponse, celeriant_shard::error::shard_schema_error::ShardSchemaError> {
+) -> Result<celeriant_msg::response::responses::RegisterSchemaResponse, celeriant_shard::error::shard_schema_error::ShardSchemaError> {
     use celeriant_shard::error::shard_schema_error::ShardSchemaError;
     use glommio::channels::local_channel;
 

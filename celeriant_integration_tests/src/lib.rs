@@ -113,6 +113,8 @@ pub mod segment_summary_correctness;
 pub mod single;
 pub mod standalone_to_distributed;
 pub mod storage_corruption_header_recovery;
+pub mod s3_to_tcp_failback;
+pub mod wal_mid_datablock_truncation;
 pub mod typed_operations;
 pub mod watch_failover;
 pub mod watch_test;
@@ -313,6 +315,10 @@ impl TestServer {
     }
 
     /// Get the server configuration.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     pub fn config(&self) -> &ServerConfig {
         &self.config
     }

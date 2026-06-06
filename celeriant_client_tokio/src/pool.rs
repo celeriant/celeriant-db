@@ -151,7 +151,9 @@ use celeriant_msg::response::responses::{AggregateListItem, AggregateTypeListIte
 use celeriant_wal::aggregate_type_key::AggregateTypeKey;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
-use celeriant_msg::response::responses::{AggregateDetailsResponse, ReadResponse, SuccessResponse};
+use celeriant_msg::response::responses::{
+    AggregateDetailsResponse, DeleteResponse, ReadResponse, RegisterSchemaResponse, TrimStartResponse, WriteResponse,
+};
 use celeriant_wal::aggregate_key::AggregateKey;
 use tokio::time::Duration;
 
@@ -588,7 +590,7 @@ impl CeleriantPool {
         read_route!(self, c => c.read(request.clone()))
     }
 
-    pub async fn write(&self, request: WriteRequest) -> Result<SuccessResponse, ClientError> {
+    pub async fn write(&self, request: WriteRequest) -> Result<WriteResponse, ClientError> {
         self.write_leader(request).await
     }
 
@@ -601,7 +603,7 @@ impl CeleriantPool {
         aggregate_key: AggregateKey,
         events: Vec<DatablockAggregateEvent>,
         client_id: u128,
-    ) -> Result<SuccessResponse, ClientError> {
+    ) -> Result<WriteResponse, ClientError> {
         self.write_events_with(aggregate_key, events, client_id, WriteEventsOptions::default()).await
     }
 
@@ -612,7 +614,7 @@ impl CeleriantPool {
         events: Vec<DatablockAggregateEvent>,
         client_id: u128,
         options: WriteEventsOptions,
-    ) -> Result<SuccessResponse, ClientError> {
+    ) -> Result<WriteResponse, ClientError> {
         let mut writes = HashMap::new();
         writes.insert(aggregate_key, SingleAggregateWrite {
             events,
@@ -629,11 +631,11 @@ impl CeleriantPool {
         .await
     }
 
-    pub async fn delete(&self, request: DeleteRequest) -> Result<SuccessResponse, ClientError> {
+    pub async fn delete(&self, request: DeleteRequest) -> Result<DeleteResponse, ClientError> {
         self.delete_leader(request).await
     }
 
-    pub async fn trim_start(&self, request: TrimStartRequest) -> Result<SuccessResponse, ClientError> {
+    pub async fn trim_start(&self, request: TrimStartRequest) -> Result<TrimStartResponse, ClientError> {
         self.trim_start_leader(request).await
     }
 
@@ -647,7 +649,7 @@ impl CeleriantPool {
     pub async fn register_schema(
         &self,
         request: RegisterSchemaRequest,
-    ) -> Result<SuccessResponse, ClientError> {
+    ) -> Result<RegisterSchemaResponse, ClientError> {
         self.register_schema_leader(request).await
     }
 
@@ -758,7 +760,7 @@ impl CeleriantPool {
     // 2. On NotLeader { Some(addr) } → update cache, retry once.
     // 3. On NotLeader { None } / ConnectionFailed → try each seed address.
 
-    async fn write_leader(&self, request: WriteRequest) -> Result<SuccessResponse, ClientError> {
+    async fn write_leader(&self, request: WriteRequest) -> Result<WriteResponse, ClientError> {
         macro_rules! try_addr {
             ($addr:expr) => {{
                 let node = self.get_or_create_node($addr);
@@ -782,7 +784,7 @@ impl CeleriantPool {
         leader_route!(self, try_addr)
     }
 
-    async fn delete_leader(&self, request: DeleteRequest) -> Result<SuccessResponse, ClientError> {
+    async fn delete_leader(&self, request: DeleteRequest) -> Result<DeleteResponse, ClientError> {
         macro_rules! try_addr {
             ($addr:expr) => {{
                 let node = self.get_or_create_node($addr);
@@ -806,7 +808,7 @@ impl CeleriantPool {
         leader_route!(self, try_addr)
     }
 
-    async fn trim_start_leader(&self, request: TrimStartRequest) -> Result<SuccessResponse, ClientError> {
+    async fn trim_start_leader(&self, request: TrimStartRequest) -> Result<TrimStartResponse, ClientError> {
         macro_rules! try_addr {
             ($addr:expr) => {{
                 let node = self.get_or_create_node($addr);
@@ -833,7 +835,7 @@ impl CeleriantPool {
     async fn register_schema_leader(
         &self,
         request: RegisterSchemaRequest,
-    ) -> Result<SuccessResponse, ClientError> {
+    ) -> Result<RegisterSchemaResponse, ClientError> {
         macro_rules! try_addr {
             ($addr:expr) => {{
                 let node = self.get_or_create_node($addr);

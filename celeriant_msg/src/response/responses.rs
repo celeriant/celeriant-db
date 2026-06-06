@@ -84,7 +84,25 @@ pub struct WatchResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub struct SuccessResponse {
+pub struct WriteResponse {
+    pub correlation_id: Option<u128>,
+    /// Highest aggregate version committed by this request. `Some` only when
+    /// the request wrote exactly one aggregate; `None` for multi-aggregate writes.
+    pub max_aggregate_version: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct TrimStartResponse {
+    pub correlation_id: Option<u128>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct DeleteResponse {
+    pub correlation_id: Option<u128>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct RegisterSchemaResponse {
     pub correlation_id: Option<u128>,
 }
 

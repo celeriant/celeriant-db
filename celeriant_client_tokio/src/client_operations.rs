@@ -6,7 +6,9 @@ use celeriant_msg::request::requests::{
     AggregateDetailsRequest, DeleteRequest, ReadRequest, RegisterSchemaRequest, SingleAggregateWrite,
     TrimStartRequest, WriteRequest,
 };
-use celeriant_msg::response::responses::{AggregateDetailsResponse, ReadResponse, SuccessResponse};
+use celeriant_msg::response::responses::{
+    AggregateDetailsResponse, DeleteResponse, ReadResponse, RegisterSchemaResponse, TrimStartResponse, WriteResponse,
+};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 
@@ -42,21 +44,21 @@ impl CeleriantClient {
         }
     }
 
-    pub async fn write(&mut self, request: WriteRequest) -> Result<SuccessResponse, ClientError> {
+    pub async fn write(&mut self, request: WriteRequest) -> Result<WriteResponse, ClientError> {
         match self.send_request(&ClientRequest::Write(request)).await? {
             ClientResponse::Write(r) => Ok(r),
             _ => Err(ClientError::ProtocolError),
         }
     }
 
-    pub async fn delete(&mut self, request: DeleteRequest) -> Result<SuccessResponse, ClientError> {
+    pub async fn delete(&mut self, request: DeleteRequest) -> Result<DeleteResponse, ClientError> {
         match self.send_request(&ClientRequest::Delete(request)).await? {
             ClientResponse::Delete(r) => Ok(r),
             _ => Err(ClientError::ProtocolError),
         }
     }
 
-    pub async fn trim_start(&mut self, request: TrimStartRequest) -> Result<SuccessResponse, ClientError> {
+    pub async fn trim_start(&mut self, request: TrimStartRequest) -> Result<TrimStartResponse, ClientError> {
         match self.send_request(&ClientRequest::TrimStart(request)).await? {
             ClientResponse::TrimStart(r) => Ok(r),
             _ => Err(ClientError::ProtocolError),
@@ -82,7 +84,7 @@ impl CeleriantClient {
         aggregate_key: AggregateKey,
         events: Vec<DatablockAggregateEvent>,
         client_id: u128,
-    ) -> Result<SuccessResponse, ClientError> {
+    ) -> Result<WriteResponse, ClientError> {
         self.write_events_with(aggregate_key, events, client_id, WriteEventsOptions::default()).await
     }
 
@@ -93,7 +95,7 @@ impl CeleriantClient {
         events: Vec<DatablockAggregateEvent>,
         client_id: u128,
         options: WriteEventsOptions,
-    ) -> Result<SuccessResponse, ClientError> {
+    ) -> Result<WriteResponse, ClientError> {
         let mut writes = HashMap::new();
         writes.insert(aggregate_key, SingleAggregateWrite {
             events,
@@ -113,7 +115,7 @@ impl CeleriantClient {
     pub async fn register_schema(
         &mut self,
         request: RegisterSchemaRequest,
-    ) -> Result<SuccessResponse, ClientError> {
+    ) -> Result<RegisterSchemaResponse, ClientError> {
         match self.send_request(&ClientRequest::RegisterSchema(request)).await? {
             ClientResponse::RegisterSchema(r) => Ok(r),
             _ => Err(ClientError::ProtocolError),

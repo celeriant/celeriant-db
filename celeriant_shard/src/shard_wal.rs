@@ -29,7 +29,7 @@ use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_msg::request::read_filters::ReadFilters;
 use celeriant_msg::request::requests::{DeleteRequest, AggregateDetailsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest, SingleAggregateWrite, TrimStartRequest, WriteRequest};
 use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
-use celeriant_msg::response::responses::{AggregateListItem, AggregateTypeListItem, AggregateDetailsResponse, FollowerRejection, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, OrgListItem, ReadResponse, ReplicationBatchResponse, ReplicationResult, SuccessResponse};
+use celeriant_msg::response::responses::{AggregateListItem, AggregateTypeListItem, AggregateDetailsResponse, DeleteResponse, FollowerRejection, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, OrgListItem, ReadResponse, RegisterSchemaResponse, ReplicationBatchResponse, ReplicationResult, TrimStartResponse, WriteResponse};
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
 use celeriant_wal::aggregate_client_key::AggregateClientKey;
@@ -360,6 +360,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         let recovered_wal_seq = log_segments_cache.active().metadata.borrow().write.wal_seq;
         metrics::gauge!("celeriant_wal_seq", &metrics_shard_label).set(recovered_wal_seq as f64);
+        let recovered_read_wal_seq = log_segments_cache.active().metadata.borrow().read.as_ref().map_or(0, |r| r.wal_seq);
+        metrics::gauge!("celeriant_read_wal_seq", &metrics_shard_label).set(recovered_read_wal_seq as f64);
 
         Ok(Self {
             dict_codec,
@@ -1056,7 +1058,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         Ok((metablock.server_timestamp, client_id, user_id))
     }
 
-    pub async fn trim_start(&self, trim_request: TrimStartRequest) -> Result<SuccessResponse, ShardTrimError> {
+    pub async fn trim_start(&self, trim_request: TrimStartRequest) -> Result<TrimStartResponse, ShardTrimError> {
 
         let lease_epoch = match self.node_status.get().effective_node_status() {
             NodeStatus::Leader { lease_epoch } => lease_epoch,
@@ -1076,7 +1078,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         // Validate trim index is within valid range
         if trim_request.keep_from_aggregate_version <= current_indexes.min_aggregate_version {
             // Already trimmed to this point or beyond, nothing to do
-            return Ok(SuccessResponse {
+            return Ok(TrimStartResponse {
                 correlation_id: trim_request.correlation_id,
             });
         }
@@ -1133,12 +1135,12 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         // wait on durable replication, also batched
         self.replicate_durable().await?;
 
-        Ok(SuccessResponse {
+        Ok(TrimStartResponse {
             correlation_id: trim_request.correlation_id,
         })
     }
 
-    pub async fn delete(&self, delete_request: DeleteRequest) -> Result<SuccessResponse, ShardDeleteError> {
+    pub async fn delete(&self, delete_request: DeleteRequest) -> Result<DeleteResponse, ShardDeleteError> {
 
         let lease_epoch = match self.node_status.get().effective_node_status() {
             NodeStatus::Leader { lease_epoch } => lease_epoch,
@@ -1222,7 +1224,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         // wait on durable replication, also batched
         self.replicate_durable().await?;
 
-        Ok(SuccessResponse {
+        Ok(DeleteResponse {
             correlation_id: delete_request.correlation_id,
         })
     }
@@ -1235,7 +1237,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     /// 3. Add to pending queue, assigning indexes (not yet visible for reads)
     /// 4. Wait for durability
     /// 5. Return response with assigned indexes
-    pub async fn write(&self, write_request: WriteRequest) -> Result<SuccessResponse, ShardWriteError> {
+    pub async fn write(&self, write_request: WriteRequest) -> Result<WriteResponse, ShardWriteError> {
         
         let status = self.node_status.get();
         let lease_epoch = match status.effective_node_status() {
@@ -1373,6 +1375,14 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             total_payload_bytes,
             "Write request accepted",
         );
+        // The committed version is fixed at enqueue; it is only returned after
+        // the fsync + replication waits below succeed, so a returned value
+        // always names a durably committed batch.
+        let max_aggregate_version = match prepared_writes.as_slice() {
+            [single] => Some(single.aggregate_version),
+            _ => None,
+        };
+
         let rollback_gen_at_submit = self.shard_mem_cache.borrow().rollback_generation();
         self.append_prepared_writes_to_queue(prepared_writes);
 
@@ -1410,8 +1420,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         metrics::counter!("celeriant_write_events_total", shard_label).increment(total_events as u64);
         metrics::counter!("celeriant_write_bytes_total", shard_label).increment(total_payload_bytes as u64);
 
-        Ok(SuccessResponse {
+        Ok(WriteResponse {
             correlation_id,
+            max_aggregate_version,
         })
     }
 
@@ -2597,7 +2608,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         let demotion_cull = if let Some(target) = cull_target {
             let mut meta = active.metadata.borrow_mut();
-            match target {
+            let culled = match target {
                 CullTarget::WriteToRead => {
                     let read = read_opt.as_ref().expect("read must be Some when WriteToRead");
                     meta.write = read.clone();
@@ -2609,7 +2620,13 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     meta.read = Some(cursor);
                     true
                 }
-            }
+            };
+            // Rewinds refresh both cursor gauges, read first: a scrape
+            // between the two sets must never see read above write.
+            metrics::gauge!("celeriant_read_wal_seq", &self.metrics_shard_label)
+                .set(meta.read.as_ref().map_or(0, |r| r.wal_seq) as f64);
+            metrics::gauge!("celeriant_wal_seq", &self.metrics_shard_label).set(meta.write.wal_seq as f64);
+            culled
         } else {
             return Ok(false);
         };
@@ -3176,7 +3193,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
     }
 
-    pub async fn register_schema(&self, request: celeriant_msg::request::requests::RegisterSchemaRequest) -> Result<SuccessResponse, ShardSchemaError> {
+    pub async fn register_schema(&self, request: celeriant_msg::request::requests::RegisterSchemaRequest) -> Result<RegisterSchemaResponse, ShardSchemaError> {
         use celeriant_wal::SchemaType;
         use celeriant_memcache::cached_schema::CachedSchema;
 
@@ -3296,7 +3313,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         // Replicate if leader
         self.replicate_durable().await?;
 
-        Ok(SuccessResponse {
+        Ok(RegisterSchemaResponse {
             correlation_id: request.correlation_id,
         })
     }

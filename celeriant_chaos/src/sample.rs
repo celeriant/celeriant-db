@@ -18,6 +18,11 @@ pub struct NodeSample {
     /// Per-shard wal_seq from `celeriant_wal_seq{shard_id="N"}`. Label key is "shard_id".
     #[serde(default)]
     pub wal_seq_by_shard: BTreeMap<u32, u64>,
+    /// Per-shard read cursor from `celeriant_read_wal_seq{shard_id="N"}`.
+    /// A read cursor above the same tick's write cursor is a regression that
+    /// can self-heal before quiesce — only visible here.
+    #[serde(default)]
+    pub read_wal_seq_by_shard: BTreeMap<u32, u64>,
     pub writes_total: u64,
     pub write_errors_total: u64,
     pub leader_elections_total: u64,
@@ -106,6 +111,7 @@ impl NodeSample {
             node_role: 0.0,
             wal_seq_max: 0,
             wal_seq_by_shard: BTreeMap::new(),
+            read_wal_seq_by_shard: BTreeMap::new(),
             writes_total: 0,
             write_errors_total: 0,
             leader_elections_total: 0,
@@ -154,6 +160,7 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
     let mut node_role = 0.0_f64;
     let mut wal_seq_max: u64 = 0;
     let mut wal_seq_by_shard: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut read_wal_seq_by_shard: BTreeMap<u32, u64> = BTreeMap::new();
     let mut client_connections_active: u64 = 0;
     let mut watch_subscribers_active: u64 = 0;
 
@@ -226,6 +233,15 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
             }
             continue;
         }
+        if name == "celeriant_read_wal_seq" {
+            if let Ok(v) = value_str.parse::<f64>()
+                && let Some(shard_id) = extract_label(name_part, "shard_id")
+                && let Ok(id) = shard_id.parse::<u32>()
+            {
+                read_wal_seq_by_shard.insert(id, v as u64);
+            }
+            continue;
+        }
         if name == "celeriant_client_connections_active" {
             if let Ok(v) = value_str.parse::<f64>() {
                 client_connections_active = client_connections_active.saturating_add(v as u64);
@@ -255,6 +271,7 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         node_role,
         wal_seq_max,
         wal_seq_by_shard,
+        read_wal_seq_by_shard,
         writes_total: get("celeriant_writes_total"),
         write_errors_total: get("celeriant_write_errors_total"),
         leader_elections_total: get("celeriant_leader_elections_total"),

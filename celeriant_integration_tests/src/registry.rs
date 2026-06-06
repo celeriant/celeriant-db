@@ -741,6 +741,20 @@ pub fn all_tests() -> &'static [TestEntry] {
             distributed: false,
         },
         TestEntry {
+            name: "wal_mid_datablock_truncation",
+            description: "Torn uncommitted datablock bytes are invisible on restart and safely overwritten",
+            estimated_secs: 8,
+            categories: &[Durability],
+            distributed: false,
+        },
+        TestEntry {
+            name: "s3_to_tcp_failback",
+            description: "Follower booting into S3 catchup with S3 dead fails back to TCP bridging",
+            estimated_secs: 60,
+            categories: &[Replication, Durability],
+            distributed: true,
+        },
+        TestEntry {
             name: "p2_4_s3_capacity",
             description: "S3 degraded-mode capacity with large-volume fallback and follower catchup",
             estimated_secs: 42,

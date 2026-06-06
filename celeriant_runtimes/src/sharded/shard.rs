@@ -423,9 +423,13 @@ async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'stati
         }
 
         // Split so a pure-S3-error round (no contact) counts toward the unreachable bound, while
-        // any S3 contact (undrained) resets it.
+        // any S3 contact (undrained) resets it. Disk-full is its own class:
+        // retried indefinitely (space gets recovered; rotation already alarms
+        // via celeriant_rotation_out_of_space_total) and never counted toward
+        // the unreachable bound; S3 is fine, the local disk isn't.
         let mut has_undrained = false;
         let mut has_s3_error = false;
+        let mut has_disk_full = false;
         let mut has_fatal = false;
 
         for msg in &results {
@@ -451,6 +455,10 @@ async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'stati
                         has_undrained = true;
                     }
                 },
+                Err(e) if e.is_disk_full() => {
+                    warn!(shard_id = msg.shard_id, error = ?e, "S3 catchup blocked on full disk, will retry");
+                    has_disk_full = true;
+                }
                 Err(e) if e.is_retriable() => {
                     warn!(shard_id = msg.shard_id, error = ?e, "S3 catchup retriable error, will retry");
                     has_s3_error = true;
@@ -468,7 +476,7 @@ async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'stati
             return CatchupRunOutcome::Shutdown;
         }
 
-        if !has_undrained && !has_s3_error {
+        if !has_undrained && !has_s3_error && !has_disk_full {
             return CatchupRunOutcome::Caught;
         }
 

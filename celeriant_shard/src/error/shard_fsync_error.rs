@@ -70,4 +70,8 @@ impl ShardFsyncError {
             | Self::TruncateRefusedByAckBarrier { .. }
         )
     }
+
+    pub fn is_disk_full(&self) -> bool {
+        matches!(self, Self::UnableToRotateToNewLogSegmentFile(OpenOrCreateError::OutOfSpace { .. }))
+    }
 }

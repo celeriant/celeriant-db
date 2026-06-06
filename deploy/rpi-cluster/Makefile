@@ -210,14 +210,14 @@ fill-disk: ## Fill HOST's data disk to within RESERVE_MB of full via fallocate. 
 	fi
 	$(eval RESERVE_MB ?= 50)
 	@printf "$(RED)>>> Filling data disk on $(HOST) to within $(RESERVE_MB) MiB of full$(RESET)\n"
-	@ssh $(HOST) "sudo sh -c 'FREE=\$$(df --output=avail -B1 /var/lib/celeriant | tail -n1); RESERVE=\$$(($(RESERVE_MB)*1024*1024)); FILL=\$$((FREE - RESERVE)); if [ \$$FILL -gt 0 ]; then fallocate -l \$$FILL /var/lib/celeriant/.chaos_filler && echo \"Allocated \$$FILL bytes\"; else echo \"Already at or below reserve threshold\"; fi'"
+	@ssh $(HOST) "sudo sh -c 'FREE=\$$(df --output=avail -B1 $(REMOTE_DATA_ROOT) | tail -n1); RESERVE=\$$(($(RESERVE_MB)*1024*1024)); FILL=\$$((FREE - RESERVE)); if [ \$$FILL -gt 0 ]; then fallocate -l \$$FILL $(REMOTE_DATA_ROOT)/.chaos_filler && echo \"Allocated \$$FILL bytes\"; else echo \"Already at or below reserve threshold\"; fi'"
 
 clean-disk: ## Remove the chaos filler file from HOST. Safe to run repeatedly. Requires HOST.
 	@if [ -z "$(HOST)" ]; then \
 		printf "$(RED)ERROR: clean-disk requires HOST$(RESET)\n"; exit 2; \
 	fi
 	@printf "$(GREEN)>>> Removing chaos filler on $(HOST)$(RESET)\n"
-	@ssh $(HOST) 'sudo rm -f /var/lib/celeriant/.chaos_filler'
+	@ssh $(HOST) 'sudo rm -f $(REMOTE_DATA_ROOT)/.chaos_filler'
 
 partition-host: ## One-way nftables drop on SRC blocking outbound TCP to DST:PORT. Requires SRC, DST, PORT.
 	@if [ -z "$(SRC)" ] || [ -z "$(DST)" ] || [ -z "$(PORT)" ]; then \

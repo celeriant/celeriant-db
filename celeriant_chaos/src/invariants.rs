@@ -1,6 +1,7 @@
 use serde::Serialize;
 
 use crate::sample::NodeSample;
+use std::collections::HashMap;
 use crate::tip_fork;
 
 /// Result of a single check against the captured run data.
@@ -194,6 +195,7 @@ pub fn run_all(data: &RunData, expect: &ScenarioExpectations) -> Vec<CheckResult
         check_bench_errors(data, expect),
         check_bench_throughput_floor(data),
         check_wal_seq_advanced(data),
+        check_read_within_write(data),
         // Fsynced PCDs popped after rollback then dropped without commit or re-queue.
         check_counter("NoCaptureDroppedItems", data, |s| s.capture_dropped_items_total, 0),
         // Truncate dropped wal_seqs this node acked as leader. Should be impossible
@@ -700,6 +702,56 @@ fn check_failover_within_budget(data: &RunData, max_ms: u64) -> CheckResult {
     }
 }
 
+/// Per tick, per shard: the read cursor must never exceed the write cursor.
+/// A regression here can self-heal before quiesce, so only the during-run
+/// samples can see it. Gauge update ordering on the server (advances write
+/// first, rewinds read first) makes a mid-update SET safe, but the metrics
+/// exporter renders the two gauges at different instants — a fsync batch
+/// landing between the renders shows stale-write/fresh-read for exactly one
+/// tick (observed: single-tick deltas of one batch at 25k). A real cursor
+/// regression persists across scrapes, a render race cannot: fail only on
+/// two or more CONSECUTIVE violating ticks per (host, shard); lone ticks
+/// are counted in the detail.
+fn check_read_within_write(data: &RunData) -> CheckResult {
+    const NAME: &str = "ReadCursorWithinWrite";
+    let mut violations: Vec<String> = Vec::new();
+    let mut ticks_audited = 0u64;
+    let mut single_tick_races = 0u64;
+    // (host, shard) → t_ms of the previous violating tick.
+    let mut pending: HashMap<(String, u32), (u64, String)> = HashMap::new();
+    for s in &data.samples[data.bench_start_idx..=data.bench_end_idx] {
+        if !s.ok || s.read_wal_seq_by_shard.is_empty() {
+            continue;
+        }
+        ticks_audited += 1;
+        for (&shard, &read) in &s.read_wal_seq_by_shard {
+            let Some(&write) = s.wal_seq_by_shard.get(&shard) else { continue };
+            let key = (s.host.clone(), shard);
+            if read > write {
+                let msg = format!(
+                    "{} t={}ms shard_{shard}: read {read} > write {write}",
+                    s.host, s.t_ms
+                );
+                if let Some((_, prev_msg)) = pending.insert(key, (s.t_ms, msg.clone())) {
+                    if violations.len() < 10 {
+                        violations.push(format!("{prev_msg}; then {msg}"));
+                    }
+                }
+            } else if pending.remove(&key).is_some() {
+                single_tick_races += 1;
+            }
+        }
+    }
+    if violations.is_empty() {
+        CheckResult::pass_with_detail(
+            NAME,
+            format!("{ticks_audited} ticks audited ({single_tick_races} single-tick render races ignored)"),
+        )
+    } else {
+        CheckResult::fail(NAME, violations.join("; "))
+    }
+}
+
 fn check_wal_seq_advanced(data: &RunData) -> CheckResult {
     const NAME: &str = "WalSeqAdvanced";
     let Some((first, last)) = data.leader_first_last() else {
@@ -739,6 +791,7 @@ mod tests {
             node_role: if host == LEADER { 1.0 } else { 0.0 },
             wal_seq_max,
             wal_seq_by_shard,
+            read_wal_seq_by_shard: BTreeMap::new(),
             writes_total: 0,
             write_errors_total: 0,
             leader_elections_total: 0,
@@ -850,5 +903,73 @@ mod tests {
         let data = run_data(&samples);
         let result = check_eventual_convergence(&data);
         assert!(result.passed, "expected PASS but got FAIL: {}", result.detail);
+    }
+
+    #[test]
+    fn read_within_write_passes_and_counts_ticks() {
+        let mut a = sample(LEADER, 0, &[(1, 100), (2, 50)]);
+        a.read_wal_seq_by_shard = [(1u32, 90u64), (2, 50)].into_iter().collect();
+        let mut b = sample(LEADER, 500, &[(1, 110), (2, 60)]);
+        b.read_wal_seq_by_shard = [(1u32, 110u64), (2, 55)].into_iter().collect();
+        let samples = vec![a, b];
+        let data = run_data(&samples);
+        let r = check_read_within_write(&data);
+        assert!(r.passed, "{}", r.detail);
+        assert!(r.detail.contains("2 ticks"), "{}", r.detail);
+    }
+
+    #[test]
+    fn read_above_write_single_tick_is_render_race_not_violation() {
+        let mut a = sample(LEADER, 0, &[(1, 100)]);
+        a.read_wal_seq_by_shard = [(1u32, 101u64)].into_iter().collect();
+        let mut b = sample(LEADER, 500, &[(1, 200)]);
+        b.read_wal_seq_by_shard = [(1u32, 200u64)].into_iter().collect();
+        let samples = vec![a, b];
+        let data = run_data(&samples);
+        let r = check_read_within_write(&data);
+        assert!(r.passed, "{}", r.detail);
+        assert!(r.detail.contains("1 single-tick render races ignored"), "{}", r.detail);
+    }
+
+    #[test]
+    fn read_above_write_two_consecutive_ticks_fails() {
+        let mut a = sample(LEADER, 0, &[(1, 100)]);
+        a.read_wal_seq_by_shard = [(1u32, 101u64)].into_iter().collect();
+        let mut b = sample(LEADER, 500, &[(1, 100)]);
+        b.read_wal_seq_by_shard = [(1u32, 102u64)].into_iter().collect();
+        let samples = vec![a, b];
+        let data = run_data(&samples);
+        let r = check_read_within_write(&data);
+        assert!(!r.passed);
+        assert!(r.detail.contains("read 101 > write 100"), "{}", r.detail);
+        assert!(r.detail.contains("then"), "{}", r.detail);
+    }
+
+    #[test]
+    fn read_above_write_alternating_ticks_pass_as_races() {
+        // violation, clean, violation: never two in a row — both are races.
+        let mut a = sample(LEADER, 0, &[(1, 100)]);
+        a.read_wal_seq_by_shard = [(1u32, 101u64)].into_iter().collect();
+        let mut b = sample(LEADER, 500, &[(1, 150)]);
+        b.read_wal_seq_by_shard = [(1u32, 150u64)].into_iter().collect();
+        let mut c = sample(LEADER, 1000, &[(1, 200)]);
+        c.read_wal_seq_by_shard = [(1u32, 201u64)].into_iter().collect();
+        let mut d = sample(LEADER, 1500, &[(1, 300)]);
+        d.read_wal_seq_by_shard = [(1u32, 300u64)].into_iter().collect();
+        let samples = vec![a, b, c, d];
+        let data = run_data(&samples);
+        let r = check_read_within_write(&data);
+        assert!(r.passed, "{}", r.detail);
+        assert!(r.detail.contains("2 single-tick render races ignored"), "{}", r.detail);
+    }
+
+    #[test]
+    fn read_check_skips_samples_without_read_gauges() {
+        // Pre-upgrade binaries export no read cursor: vacuous pass, 0 ticks.
+        let samples = vec![sample(LEADER, 0, &[(1, 100)])];
+        let data = run_data(&samples);
+        let r = check_read_within_write(&data);
+        assert!(r.passed);
+        assert!(r.detail.contains("0 ticks"), "{}", r.detail);
     }
 }

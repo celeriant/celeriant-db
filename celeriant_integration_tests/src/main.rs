@@ -321,6 +321,8 @@ async fn dispatch_test(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         "single" => single::run().await,
         "standalone_to_distributed" => standalone_to_distributed::run().await,
         "storage_corruption_header_recovery" => storage_corruption_header_recovery::run().await,
+        "wal_mid_datablock_truncation" => wal_mid_datablock_truncation::run().await,
+        "s3_to_tcp_failback" => s3_to_tcp_failback::run().await,
         "typed_operations" => typed_operations::run().await,
         "watch_failover" => watch_failover::run().await,
         "watch_test" => watch_test::run().await,

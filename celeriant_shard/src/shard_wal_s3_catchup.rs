@@ -1195,6 +1195,7 @@ async fn truncate_wal(
             read.metablocks_position = new_metablocks_position;
         }
     }
+    log_segments_cache.publish_cursor_gauges();
 
     // Step 4: Write dual headers and fsync
     let dma_file_writer = active.lock_writer("truncate_wal").await.map_err(|_| ShardFsyncError::WriteLockTimeout)?;

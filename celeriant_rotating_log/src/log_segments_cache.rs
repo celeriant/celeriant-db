@@ -127,6 +127,17 @@ impl LogSegmentsCache {
     }
 
     /// Called when starting up a shard, ensures we always have an active log file to write to
+    /// Refresh both cursor gauges from the active segment, read first: a
+    /// rewind must never expose read above write to a scrape landing between
+    /// the two sets.
+    pub fn publish_cursor_gauges(&self) {
+        let active = self.active();
+        let meta = active.metadata.borrow();
+        metrics::gauge!("celeriant_read_wal_seq", &self.shard_label)
+            .set(meta.read.as_ref().map_or(0, |r| r.wal_seq) as f64);
+        metrics::gauge!("celeriant_wal_seq", &self.shard_label).set(meta.write.wal_seq as f64);
+    }
+
     pub async fn ready_up(shard_dir: PathBuf, preallocate_bytes: u64, max_cached_files: usize, shard_id: u32) -> Result<Self, ReadyUpError> {
         if preallocate_bytes <= HEADER_BLOCK_SIZE_BYTES as u64 * 2 || preallocate_bytes % HEADER_BLOCK_SIZE_BYTES as u64 != 0 {
             return Err(ReadyUpError::InvalidPreallocatedBytes(preallocate_bytes));

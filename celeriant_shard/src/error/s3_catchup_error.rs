@@ -22,6 +22,10 @@ impl S3CatchupError {
         || matches!(self, Self::FsyncFailed(e) if e.is_retriable())
         || matches!(self, Self::TruncationFailed(e) if e.is_retriable())
     }
+
+    pub fn is_disk_full(&self) -> bool {
+        matches!(self, Self::FsyncFailed(e) | Self::TruncationFailed(e) if e.is_disk_full())
+    }
 }
 
 #[cfg(test)]
@@ -62,5 +66,23 @@ mod tests {
             ShardFsyncError::ActiveWriteFileUnavailable
         );
         assert!(!err.is_retriable());
+    }
+
+    #[test]
+    fn enospc_rotation_is_disk_full_not_fatal() {
+        use celeriant_rotating_log::errors::open_or_create_error::OpenOrCreateError;
+        let inner = ShardFsyncError::UnableToRotateToNewLogSegmentFile(
+            OpenOrCreateError::OutOfSpace { log_id: 2, path: "log_2.wal".into(), preallocate_bytes: 1 << 27 },
+        );
+        assert!(inner.is_disk_full());
+        for err in [S3CatchupError::FsyncFailed(inner.clone()), S3CatchupError::TruncationFailed(inner)] {
+            assert!(err.is_disk_full(), "{err:?}");
+        }
+        // Other rotation failures stay fatal: corrupt target ≠ transient.
+        let other = ShardFsyncError::UnableToRotateToNewLogSegmentFile(
+            OpenOrCreateError::RotationTargetUnsafe { log_id: 2, path: "log_2.wal".into(), source: "x".into() },
+        );
+        assert!(!other.is_disk_full());
+        assert!(!S3CatchupError::FsyncFailed(other).is_disk_full());
     }
 }
