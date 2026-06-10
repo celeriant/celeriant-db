@@ -263,6 +263,7 @@ async fn dispatch_test(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         "invariant_concurrent_write" => invariant_concurrent_write::run().await,
         "invariant_held_seq_sibling_recovery" => invariant_held_seq_sibling_recovery::run().await,
         "invariant_occ_before_idempotency" => invariant_occ_before_idempotency::run().await,
+        "reference_account_service" => reference_account_service::run().await,
         "invariant_read_count" => invariant_read_count::run().await,
         "invariant_replication_convergence" => invariant_replication_convergence::run().await,
         "invariant_replication_queue_pressure" => invariant_replication_queue_pressure::run().await,

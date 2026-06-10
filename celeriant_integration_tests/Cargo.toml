@@ -24,6 +24,7 @@ small-metablock = [
 [dependencies]
 celeriant_lib = { package = "celeriant", path = "../celeriant" }
 celeriant_client_tokio = { path = "../celeriant_client_tokio" }
+celeriant_reference = { path = "../celeriant_reference" }
 celeriant_msg = { path = "../celeriant_msg" }
 celeriant_runtimes = { path = "../celeriant_runtimes" }
 celeriant_wire = { path = "../celeriant_wire" }
@@ -54,3 +55,4 @@ serde_json.workspace = true
 hex.workspace = true
 clap.workspace = true
 wait-timeout.workspace = true
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }

@@ -456,6 +456,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             distributed: false,
         },
         TestEntry {
+            name: "reference_account_service",
+            description: "Reference BFF: request dedup across replicas, in-memory and Postgres projections",
+            estimated_secs: 5,
+            categories: &[Invariant, Correctness],
+            distributed: false,
+        },
+        TestEntry {
             name: "invariant_read_count",
             description: "count_events accurately returns the exact number of events written",
             estimated_secs: 36,

@@ -53,6 +53,7 @@ pub mod invariant_clock_drift_rejection;
 pub mod invariant_concurrent_write;
 pub mod invariant_held_seq_sibling_recovery;
 pub mod invariant_occ_before_idempotency;
+pub mod reference_account_service;
 pub mod invariant_read_count;
 pub mod invariant_replication_convergence;
 pub mod invariant_replication_queue_pressure;
