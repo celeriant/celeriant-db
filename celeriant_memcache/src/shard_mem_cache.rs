@@ -283,6 +283,50 @@ impl<V: Validate> ShardMemCache<V> {
         self.pending_append_queue.push(shard_log_queue_item);
     }
 
+    /// Commit a SoftTrim into the snapshot cache. Unlike
+    /// `update_aggregate_min_aggregate_version`, a cache miss INSERTS the
+    /// snapshot from the trim's recorded state; the SoftTrim metablock
+    /// carries full aggregate state, and a silently-skipped floor bump on an
+    /// LRU-evicted snapshot loses an acked trim: the next write embeds the
+    /// stale floor and every node that rebuilds from it inherits the loss.
+    /// Version/event_seq/min all max-merge so a late replay can't regress.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_trim_snapshot(
+        &mut self,
+        aggregate_key: &AggregateKey,
+        keep_from_aggregate_version: u64,
+        aggregate_version: u64,
+        event_seq: u64,
+        log_id: u64,
+        metablock_absolute_pos: u64,
+        cache_path: CachePath,
+    ) {
+        let cache = match cache_path {
+            CachePath::Read => &mut self.aggregate_read_snapshots,
+            CachePath::Write => &mut self.aggregate_write_snapshots,
+        };
+        if let Some(snapshot) = cache.get_mut(aggregate_key) {
+            if keep_from_aggregate_version > snapshot.min_aggregate_version {
+                snapshot.min_aggregate_version = keep_from_aggregate_version;
+            }
+            if aggregate_version > snapshot.aggregate_version {
+                snapshot.aggregate_version = aggregate_version;
+            }
+            if event_seq > snapshot.event_seq {
+                snapshot.event_seq = event_seq;
+            }
+        } else {
+            cache.put(aggregate_key.clone(), MemSnapshotAggregate::found(
+                log_id,
+                metablock_absolute_pos,
+                event_seq,
+                aggregate_version,
+                keep_from_aggregate_version,
+            ));
+        }
+        self.evict_trimmed_recent_writes(aggregate_key, keep_from_aggregate_version, cache_path);
+    }
+
     /// Update min_aggregate_version in the aggregate snapshot cache
     pub fn update_aggregate_min_aggregate_version(&mut self, aggregate_key: &AggregateKey, min_aggregate_version: u64, cache_path: CachePath) {
         let cache = match cache_path {
@@ -295,6 +339,10 @@ impl<V: Validate> ShardMemCache<V> {
             }
         }
 
+        self.evict_trimmed_recent_writes(aggregate_key, min_aggregate_version, cache_path);
+    }
+
+    fn evict_trimmed_recent_writes(&mut self, aggregate_key: &AggregateKey, min_aggregate_version: u64, cache_path: CachePath) {
         if cache_path == CachePath::Read {
             // Also evict any cached writes that are now trimmed
             if let Some(writes) = self.aggregate_recent_writes.get_mut(aggregate_key) {
@@ -616,6 +664,9 @@ impl<V: Validate> ShardMemCache<V> {
             if event_batch.max_event_seq > existing.event_seq {
                 existing.event_seq = event_batch.max_event_seq;
             }
+            if event_batch.trimmed_below_version > existing.min_aggregate_version {
+                existing.min_aggregate_version = event_batch.trimmed_below_version;
+            }
             existing.log_id = log_id;
             existing.metablock_absolute_pos = metablock_absolute_pos;
         } else {
@@ -624,7 +675,7 @@ impl<V: Validate> ShardMemCache<V> {
                 metablock_absolute_pos,
                 event_seq: event_batch.max_event_seq,
                 aggregate_version: event_batch.aggregate_version,
-                min_aggregate_version: 0,
+                min_aggregate_version: event_batch.trimmed_below_version,
                 status: AggregateStatus::Found,
                 allow_sequence_continuation: false,
                 allow_recreate: false,
@@ -940,6 +991,10 @@ impl<V: Validate> ShardMemCache<V> {
 
     pub fn clear_aggregate_write_snapshots_for_test(&mut self) {
         self.aggregate_write_snapshots.clear();
+    }
+
+    pub fn clear_aggregate_read_snapshots_for_test(&mut self) {
+        self.aggregate_read_snapshots.clear();
     }
 
     pub fn aggregate_read_snapshots_len(&self) -> usize {

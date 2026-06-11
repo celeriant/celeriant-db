@@ -712,6 +712,88 @@ fn client_load_status_queue_takes_precedence() {
     assert_eq!(last_idx, Some(10)); // Queue wins
 }
 
+/// Chaos 16k finding A: a node rebuilding state from applied event batches
+/// (follower catchup / leader PCD commit) must carry the trim floor the
+/// batch metablock embeds. Dropping it leaves min=0/stale, and a SoftTrim's
+/// min bump is a silent no-op whenever the snapshot was evicted in between —
+/// reads below an acked trim floor come back on that node.
+#[test]
+fn commit_position_snapshot_fresh_carries_embedded_trim_floor() {
+    let mut c = cache();
+    let k = agg(1, 1, 1);
+
+    let mut eb = test_event_batch(k.clone(), 7, 7);
+    eb.trimmed_below_version = 5;
+    c.commit_position_snapshot(&eb, 1, 0, CachePath::Write);
+
+    let idx = c.get_write_event_seqes(&k);
+    assert_eq!(idx.aggregate_version, 7);
+    assert_eq!(
+        idx.min_aggregate_version, 5,
+        "fresh snapshot from an applied batch must carry the embedded trim floor",
+    );
+}
+
+/// The SoftTrim metablock carries full aggregate state, so committing a trim
+/// must establish the floor even when the snapshot was LRU-evicted. The
+/// silent no-op variant lost acked floors under 16k churn: the next write
+/// then embeds floor=1 and every node that rebuilds from it inherits the loss.
+#[test]
+fn commit_trim_snapshot_inserts_when_snapshot_absent() {
+    let mut c = cache();
+    let k = agg(1, 1, 1);
+
+    c.commit_trim_snapshot(&k, 94, 95, 95, 7, 1234, CachePath::Write);
+
+    let idx = c.get_write_event_seqes(&k);
+    assert_eq!(idx.min_aggregate_version, 94, "trim commit must establish the floor on a cache miss");
+    assert_eq!(idx.aggregate_version, 95);
+    assert_eq!(idx.event_seq, 95);
+}
+
+#[test]
+fn commit_trim_snapshot_bumps_existing_and_never_regresses() {
+    let mut c = cache();
+    let k = agg(1, 1, 1);
+
+    let snap = MemSnapshotAggregate::found(1, 0, 99, 99, 2);
+    c.put_aggregate_into_cache(k.clone(), snap, 1, 1, false, CachePath::Write);
+
+    c.commit_trim_snapshot(&k, 94, 95, 95, 7, 1234, CachePath::Write);
+    let idx = c.get_write_event_seqes(&k);
+    assert_eq!(idx.min_aggregate_version, 94);
+    assert_eq!(idx.aggregate_version, 99, "trim commit must not regress a newer version");
+    assert_eq!(idx.event_seq, 99);
+
+    // Stale trim replayed late must not lower the floor.
+    c.commit_trim_snapshot(&k, 50, 60, 60, 7, 1234, CachePath::Write);
+    assert_eq!(c.get_write_event_seqes(&k).min_aggregate_version, 94);
+}
+
+#[test]
+fn commit_position_snapshot_existing_max_merges_trim_floor() {
+    let mut c = cache();
+    let k = agg(1, 1, 1);
+
+    let snap = MemSnapshotAggregate::found(1, 0, 4, 4, 2);
+    c.put_aggregate_into_cache(k.clone(), snap, 1, 1, false, CachePath::Write);
+
+    // Newer batch carries a higher floor — must bump.
+    let mut eb = test_event_batch(k.clone(), 7, 7);
+    eb.trimmed_below_version = 5;
+    c.commit_position_snapshot(&eb, 1, 0, CachePath::Write);
+    assert_eq!(c.get_write_event_seqes(&k).min_aggregate_version, 5);
+
+    // Stale batch with a lower embedded floor must NOT regress it.
+    let mut eb = test_event_batch(k.clone(), 8, 8);
+    eb.trimmed_below_version = 1;
+    c.commit_position_snapshot(&eb, 1, 0, CachePath::Write);
+    assert_eq!(
+        c.get_write_event_seqes(&k).min_aggregate_version, 5,
+        "embedded floors are write-time values — min only ever rises",
+    );
+}
+
 #[test]
 fn get_write_event_seqes_queue_over_snapshot() {
     let mut c = cache();

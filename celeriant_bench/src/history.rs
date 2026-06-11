@@ -360,7 +360,9 @@ pub fn classify_error(e: &ClientError) -> (OpOutcome, Option<String>) {
                 // Rejected against an existing in-flight attempt: THIS
                 // attempt did not commit (the earlier one, recorded info,
                 // may).
-                | WriteError::InflightDuplicateWrite { .. } => OpOutcome::Fail,
+                | WriteError::InflightDuplicateWrite { .. }
+                // Rejected at the gate, before enqueue means never submitted
+                | WriteError::ReplicationBackpressure => OpOutcome::Fail,
                 WriteError::ReplicationError
                 | WriteError::FsyncError
                 | WriteError::CacheAggregateClientError
@@ -397,6 +399,7 @@ fn write_error_label(kind: &WriteError) -> String {
         WriteError::CacheAggregateClientError => "CacheAggregateClientError",
         WriteError::AggregateExistsCacheError => "AggregateExistsCacheError",
         WriteError::InflightDuplicateWrite { .. } => "InflightDuplicateWrite",
+        WriteError::ReplicationBackpressure => "ReplicationBackpressure",
     }
     .to_string()
 }

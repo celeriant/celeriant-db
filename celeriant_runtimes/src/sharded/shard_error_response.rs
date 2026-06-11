@@ -166,6 +166,7 @@ fn trim_error(e: ShardTrimError) -> (u32, String) {
             format!(r#"{{"requested":{},"max_aggregate_version":{}}}"#, requested, max_aggregate_version),
         ),
         ShardTrimError::ShardCannotAcceptWrites { leader_address } => (TRIM_NOT_LEADER, cannot_accept_writes_message(leader_address)),
+        ShardTrimError::ReplicationBackpressure => (TRIM_REPLICATION_BACKPRESSURE, "{}".into()),
     }
 }
 
@@ -181,6 +182,7 @@ fn delete_error(e: ShardDeleteError) -> (u32, String) {
         ShardDeleteError::ReplicationError(e) => (DELETE_REPLICATION_ERROR, replication_message(e)),
         ShardDeleteError::ShardFsyncError(e) => (DELETE_FSYNC_ERROR, fsync_message(e)),
         ShardDeleteError::ShardCannotAcceptWrites { leader_address } => (DELETE_NOT_LEADER, cannot_accept_writes_message(leader_address)),
+        ShardDeleteError::ReplicationBackpressure => (DELETE_REPLICATION_BACKPRESSURE, "{}".into()),
     }
 }
 

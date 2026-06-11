@@ -44,6 +44,8 @@ pub enum WriteError {
         last_client_seq: Option<u64>,
         attempted_client_seq: Option<u64>,
     },
+    /// Shard is shedding load (rollback cooldown or wedged follower); retry later.
+    ReplicationBackpressure,
 }
 
 #[derive(Debug)]
@@ -71,6 +73,7 @@ pub enum DeleteError {
     CacheError,
     ReplicationError,
     FsyncError,
+    ReplicationBackpressure,
 }
 
 #[derive(Debug)]
@@ -80,6 +83,7 @@ pub enum TrimError {
     ReplicationError,
     FsyncError,
     IndexOutOfRange,
+    ReplicationBackpressure,
 }
 
 #[derive(Debug)]
@@ -177,6 +181,7 @@ impl From<ErrorResponse> for ServerError {
                 },
                 error_message: msg,
             },
+            WRITE_REPLICATION_BACKPRESSURE => ServerError::Write { kind: WriteError::ReplicationBackpressure, error_message: msg },
 
             REGISTER_SCHEMA_ALREADY_EXISTS => ServerError::Schema { kind: SchemaError::AlreadyExists, error_message: msg },
             REGISTER_SCHEMA_INVALID => ServerError::Schema { kind: SchemaError::Invalid, error_message: msg },
@@ -194,6 +199,7 @@ impl From<ErrorResponse> for ServerError {
             TRIM_REPLICATION_ERROR => ServerError::Trim { kind: TrimError::ReplicationError, error_message: msg },
             TRIM_FSYNC_ERROR => ServerError::Trim { kind: TrimError::FsyncError, error_message: msg },
             TRIM_INDEX_OUT_OF_RANGE => ServerError::Trim { kind: TrimError::IndexOutOfRange, error_message: msg },
+            TRIM_REPLICATION_BACKPRESSURE => ServerError::Trim { kind: TrimError::ReplicationBackpressure, error_message: msg },
 
             DELETE_AGGREGATE_NOT_EXISTS => ServerError::Delete { kind: DeleteError::AggregateNotExists, error_message: msg },
             DELETE_EMPTY_DELETE_LIST => ServerError::Delete { kind: DeleteError::EmptyDeleteList, error_message: msg },
@@ -207,6 +213,7 @@ impl From<ErrorResponse> for ServerError {
             DELETE_CACHE_ERROR => ServerError::Delete { kind: DeleteError::CacheError, error_message: msg },
             DELETE_REPLICATION_ERROR => ServerError::Delete { kind: DeleteError::ReplicationError, error_message: msg },
             DELETE_FSYNC_ERROR => ServerError::Delete { kind: DeleteError::FsyncError, error_message: msg },
+            DELETE_REPLICATION_BACKPRESSURE => ServerError::Delete { kind: DeleteError::ReplicationBackpressure, error_message: msg },
 
             LIST_ORGS_DISK_READ | LIST_AGGREGATE_TYPES_DISK_READ | LIST_AGGREGATES_DISK_READ => {
                 ServerError::List { error_code: code, error_message: msg }
@@ -280,6 +287,7 @@ impl std::fmt::Display for WriteError {
             WriteError::CacheAggregateClientError => write!(f, "cache aggregate client error"),
             WriteError::AggregateExistsCacheError => write!(f, "aggregate exists cache error"),
             WriteError::InflightDuplicateWrite { .. } => write!(f, "inflight duplicate write"),
+            WriteError::ReplicationBackpressure => write!(f, "replication backpressure"),
         }
     }
 }
@@ -310,6 +318,7 @@ impl std::fmt::Display for DeleteError {
             DeleteError::CacheError => write!(f, "cache error"),
             DeleteError::ReplicationError => write!(f, "replication error"),
             DeleteError::FsyncError => write!(f, "fsync error"),
+            DeleteError::ReplicationBackpressure => write!(f, "replication backpressure"),
         }
     }
 }
@@ -322,6 +331,7 @@ impl std::fmt::Display for TrimError {
             TrimError::ReplicationError => write!(f, "replication error"),
             TrimError::FsyncError => write!(f, "fsync error"),
             TrimError::IndexOutOfRange => write!(f, "index out of range"),
+            TrimError::ReplicationBackpressure => write!(f, "replication backpressure"),
         }
     }
 }

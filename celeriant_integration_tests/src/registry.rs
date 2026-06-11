@@ -513,6 +513,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             distributed: true,
         },
         TestEntry {
+            name: "metamorphic_delete_trim_parity",
+            description: "Standalone and 2-node cluster make identical delete/trim accept/reject decisions; sequence-continuation recreate resumes at the same version",
+            estimated_secs: 30,
+            categories: &[Metamorphic],
+            distributed: true,
+        },
+        TestEntry {
             name: "metamorphic_standalone_vs_cluster",
             description: "Standalone and 2-node cluster produce identical event lists modulo cross-run time/UUID artefacts",
             estimated_secs: 30,

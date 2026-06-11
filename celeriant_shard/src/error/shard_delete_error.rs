@@ -12,6 +12,7 @@ pub enum ShardDeleteError {
     ReplicationError(ReplicationError),
     ShardFsyncError(ShardFsyncError),
     ShardCannotAcceptWrites { leader_address: Option<String> },
+    ReplicationBackpressure,
 }
 
 impl ShardDeleteError {
@@ -24,6 +25,7 @@ impl ShardDeleteError {
             Self::ReplicationError(_) => "replication_error",
             Self::ShardFsyncError(_) => "fsync_error",
             Self::ShardCannotAcceptWrites { .. } => "shard_cannot_accept_writes",
+            Self::ReplicationBackpressure => "replication_backpressure",
         }
     }
 }

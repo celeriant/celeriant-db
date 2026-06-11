@@ -62,6 +62,7 @@ pub mod leader_read_visibility;
 pub mod debug_demotion_cull_acked_loss;
 pub mod metamorphic_common;
 pub mod metamorphic_cull_parity;
+pub mod metamorphic_delete_trim_parity;
 pub mod metamorphic_divergence_recovery_parity;
 pub mod metamorphic_follower_crash_catchup_parity;
 pub mod metamorphic_leader_follower_parity;

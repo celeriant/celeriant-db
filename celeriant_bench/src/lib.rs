@@ -22,9 +22,11 @@ use tokio::sync::Barrier;
 use tokio::time::Instant;
 
 pub mod cas_storm;
+pub mod delete_trim;
 pub mod history;
 pub mod watch_flood;
 pub use cas_storm::{cas_storm_aggregate, run_cas_storm, CasStormOutcome};
+pub use delete_trim::{audit_delete_trim, audit_delete_trim_pinned, run_delete_trim_workload, DeleteTrimAuditReport, DeleteTrimCounters, DeleteTrimOutcome};
 pub use history::{HistoryRecorder, HistorySummary};
 pub use watch_flood::{run_watch_flood, run_watch_flood_with_history, watch_dial_probe, WatchFloodParams, WatchFloodResult};
 

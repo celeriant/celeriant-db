@@ -7,6 +7,7 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 ## Durability
 
 - Client ACK is withheld until local `fdatasync()` succeeds AND replication succeeds (TCP or S3 fallback). Both must complete before the response is sent.
+- A delete/trim ACK implies the SoftDelete/SoftTrim tombstone is durable on two storage systems — same contract as the write ACK. Delete and trim snapshot `rollback_generation` before enqueue and re-check it after each durability wait; a rollback crossing either wait surfaces as `RollbackInProgress`, never a silent false ack. False acks are least recoverable here: there is no client_seq idempotency on deletes, so a client can't distinguish "my delete was lost" from "someone else wrote".
 - All I/O uses Direct I/O (`O_DIRECT` via glommio `DmaFile`). The OS page cache is never used for WAL files.
 - Disk write order within a single fsync: datablocks first (so offsets are known), then metablocks (referencing those offsets), then dual headers, then `fdatasync()`.
 - Both the primary header (offset 0) and backup header (offset `file_len - 512KB`) are written on every fsync. If the primary is corrupt on open, the backup is used.
@@ -40,6 +41,8 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 - OCC checks use the write-ahead snapshot (not the read snapshot). A concurrent write that has been fsynced but not yet replicated still triggers an OCC conflict.
 - Client idempotency checks use write-ahead state. A duplicate write is rejected even if the original is not yet visible to readers.
 - A write is rejected with `ClientIdempotencyViolation` if any event's `client_seq <= max stored client_seq` for that `(aggregate_key, client_id)`.
+- No two batches of one aggregate incarnation ever share an `aggregate_version` OR `event_seq`, including across delete/recreate with sequence continuation. A tombstone recording regressed indexes would make the continuation recreate re-issue already-acked versions — WAL corruption.
+- Multi-aggregate delete validates in two phases mirroring the write path: an async warm loop (existence + cache loads, the only awaits), then one synchronous pass that re-checks OCC and `pending_delete_or_deleted` and rebuilds tombstone fields from current indexes immediately before enqueue. Validation done across await points is stale by construction.
 
 ## Leader Election
 
@@ -105,7 +108,7 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 - Dual headers are rewritten at the rolled-back positions and `fdatasync()` completes before the lock is released. Rollback is durable before any new writes.
 - Datablocks carry-over bytes are re-read from the new write position to recalculate metablock padding alignment.
 - Rollback flags (`fsync_rollback_occurred`, `replication_rollback_occurred`) are one-time-consumption. The next capture phase reads and resets the flag.
-- After rollback, writes are rejected with `ReplicationBackpressure` for `replication_rollback_cooldown` (default 500ms). Gives the pending queue time to drain via TCP/S3 before accepting new load; prevents the rollback → rewrite → rollback storm that produces overlapping S3 batch generations. Rollback does not permanently disable the shard; writes resume after the cooldown.
+- After rollback, writes, deletes, and trims are rejected with `ReplicationBackpressure` for `replication_rollback_cooldown` (default 500ms). Gives the pending queue time to drain via TCP/S3 before accepting new load; prevents the rollback → rewrite → rollback storm that produces overlapping S3 batch generations. Deletes and trims gate here for the same reason writes do — don't accept destructive operations into a WAL that just rolled back. Rollback does not permanently disable the shard; operations resume after the cooldown.
 - The leader re-checks `is_leader()` on every loop iteration in `commit_replication` and once more before the final `commit_replication`. If the lease expired mid-pipeline (slow S3 upload, retry backoff), rolls back local WAL and returns `LeaderFenced` instead of committing with an expired lease.
 - WAL divergence rollback (during S3 catchup): truncates both read and write cursors to the common ancestor, clears all caches including read-side, rewrites dual headers, and fsyncs. There is no window where read cursor is ahead of write cursor.
 

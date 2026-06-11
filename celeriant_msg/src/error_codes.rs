@@ -57,6 +57,7 @@ pub const TRIM_FSYNC_ERROR: u32 = 3003;
 pub const TRIM_INDEX_OUT_OF_RANGE: u32 = 3004;
 /// Returned when a trim is sent to a non-leader node.
 pub const TRIM_NOT_LEADER: u32 = 3005;
+pub const TRIM_REPLICATION_BACKPRESSURE: u32 = 3006;
 
 // --- Delete errors: 4xxx ---
 pub const DELETE_AGGREGATE_NOT_EXISTS: u32 = 4000;
@@ -67,6 +68,7 @@ pub const DELETE_REPLICATION_ERROR: u32 = 4004;
 pub const DELETE_FSYNC_ERROR: u32 = 4005;
 /// Returned when a delete is sent to a non-leader node.
 pub const DELETE_NOT_LEADER: u32 = 4006;
+pub const DELETE_REPLICATION_BACKPRESSURE: u32 = 4007;
 
 // --- Listing errors: 5xxx ---
 pub const LIST_ORGS_DISK_READ: u32 = 5000;

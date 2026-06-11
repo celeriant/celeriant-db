@@ -8,6 +8,7 @@ pub enum ShardTrimError {
     ShardFsyncError(ShardFsyncError),
     TrimIndexOutOfRange { requested: u64, max_aggregate_version: u64 },
     ShardCannotAcceptWrites { leader_address: Option<String> },
+    ReplicationBackpressure,
 }
 
 impl ShardTrimError {
@@ -19,6 +20,7 @@ impl ShardTrimError {
             Self::ShardFsyncError(_) => "fsync_error",
             Self::TrimIndexOutOfRange { .. } => "trim_index_out_of_range",
             Self::ShardCannotAcceptWrites { .. } => "shard_cannot_accept_writes",
+            Self::ReplicationBackpressure => "replication_backpressure",
         }
     }
 }

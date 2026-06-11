@@ -860,14 +860,22 @@ fn commit_pcd(
                 );
             }
             MetablockKind::SoftTrim(soft_trim) => {
-                shard_mem_cache.update_aggregate_min_aggregate_version(
+                shard_mem_cache.commit_trim_snapshot(
                     &soft_trim.aggregate_key,
                     soft_trim.keep_from_aggregate_version,
+                    soft_trim.aggregate_version,
+                    soft_trim.event_seq,
+                    log_id,
+                    item.metablock_absolute_pos,
                     CachePath::Write,
                 );
-                shard_mem_cache.update_aggregate_min_aggregate_version(
+                shard_mem_cache.commit_trim_snapshot(
                     &soft_trim.aggregate_key,
                     soft_trim.keep_from_aggregate_version,
+                    soft_trim.aggregate_version,
+                    soft_trim.event_seq,
+                    log_id,
+                    item.metablock_absolute_pos,
                     CachePath::Read,
                 );
                 event_collector.add_trim_event(soft_trim.aggregate_key.clone(), soft_trim.keep_from_aggregate_version);

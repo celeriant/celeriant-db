@@ -670,6 +670,95 @@ pub fn data_integrity_check(report: &DataIntegrityReport, max_unreadable: u64) -
     CheckResult::pass(NAME)
 }
 
+/// Delete/trim side-load run concurrently with a scenario's main bench:
+/// 1/16th of the main task count cycling write → trim → OCC delete →
+/// sequence-continuation recreate on its own aggregate population (org 2).
+/// Proves the destructive-op ACK contract under the scenario's fault — the
+/// false-ack and stale-tombstone failure modes the rollback-generation and
+/// two-phase-delete fixes exist to prevent.
+pub fn spawn_delete_trim_sideload(
+    scenario: &str,
+    pool: &std::sync::Arc<Pool>,
+    params: ScenarioParams,
+) -> tokio::task::JoinHandle<celeriant_bench::DeleteTrimOutcome> {
+    let dt_tasks = (params.tasks / 16).clamp(8, 128);
+    let dur = params.duration_secs;
+    let pool = pool.clone();
+    println!("[{scenario}] delete/trim side-load: {dt_tasks} tasks, {dur}s");
+    tokio::spawn(async move { celeriant_bench::run_delete_trim_workload(&pool, dt_tasks, dur).await })
+}
+
+/// Await the side-load and convert its outcome + post-settle audit into
+/// checks. Call AFTER the scenario's settle window so read staleness can't
+/// masquerade as a false ack.
+pub async fn delete_trim_checks(
+    scenario: &str,
+    cfg: &ClusterConfig,
+    pool: &std::sync::Arc<Pool>,
+    handle: tokio::task::JoinHandle<celeriant_bench::DeleteTrimOutcome>,
+) -> Vec<CheckResult> {
+    let outcome = match handle.await {
+        Ok(o) => o,
+        Err(e) => return vec![CheckResult::fail("DeleteTrimSideload", format!("join: {e}"))],
+    };
+    let c = outcome.counters.clone();
+    println!(
+        "[{scenario}] delete/trim done: writes={} trims={} deletes={} recreates={} retries={} resyncs={} regressions={} fatal={}",
+        c.write_acks, c.trim_acks, c.delete_acks, c.recreate_acks,
+        c.retries, c.occ_resyncs, c.version_regressions, c.fatal_errors,
+    );
+    let pinned = build_ryw_pinned(cfg).await;
+    let audit = celeriant_bench::audit_delete_trim_pinned(pool, &outcome, &pinned).await;
+    println!(
+        "[{scenario}] delete/trim audit: tasks={} false_acked_deletes={} trim_floor_breaches={} version_loss={} unacked_landed={} ambiguous_recreates={} node_divergences={} unreadable={}",
+        audit.tasks_audited, audit.false_acked_deletes, audit.trim_floor_breaches,
+        audit.acked_version_loss, audit.unacked_deletes_landed, audit.ambiguous_recreates_landed, audit.node_divergences, audit.tasks_unreadable,
+    );
+    for s in &audit.samples {
+        println!("[{scenario}]   delete/trim sample: {s}");
+    }
+
+    vec![
+        if c.delete_acks + c.trim_acks > 0 {
+            CheckResult::pass_with_detail(
+                "DeleteTrimExercised",
+                format!("{} deletes, {} trims acked ({} retries)", c.delete_acks, c.trim_acks, c.retries),
+            )
+        } else {
+            CheckResult::fail(
+                "DeleteTrimExercised",
+                "no delete or trim was ever acked — side-load not exercising the destructive paths",
+            )
+        },
+        if c.version_regressions == 0 {
+            CheckResult::pass("DeleteTrimVersionMonotonicity")
+        } else {
+            CheckResult::fail(
+                "DeleteTrimVersionMonotonicity",
+                format!(
+                    "{} acked writes returned a non-increasing aggregate_version — stale-tombstone corruption signature",
+                    c.version_regressions,
+                ),
+            )
+        },
+        if audit.violations() == 0 {
+            CheckResult::pass_with_detail(
+                "DeleteTrimAckContract",
+                format!("{} tasks audited clean", audit.tasks_audited),
+            )
+        } else {
+            CheckResult::fail(
+                "DeleteTrimAckContract",
+                format!(
+                    "false_acked_deletes={} trim_floor_breaches={} acked_version_loss={}; samples: {:?}",
+                    audit.false_acked_deletes, audit.trim_floor_breaches,
+                    audit.acked_version_loss, audit.samples,
+                ),
+            )
+        },
+    ]
+}
+
 /// The single happy-path scenario. Drives a clean cluster bring-up, runs the
 /// bench against the actual leader with no chaos, then evaluates invariants
 /// with strict zero-tolerance expectations. Any non-zero counter delta or
@@ -687,6 +776,7 @@ pub async fn run_baseline(
 
     let bench_window_start_ms = up.elapsed_ms();
     println!("[baseline] bench: {} tasks, {}s", params.tasks, params.duration_secs);
+    let dt_handle = spawn_delete_trim_sideload("baseline", &pool, params);
     let bench_result =
         celeriant_bench::run_benchmark_ramped(&pool, params.tasks, params.duration_secs, params.connect_ramp_secs).await;
     let bench_window_end_ms = up.elapsed_ms();
@@ -699,7 +789,9 @@ pub async fn run_baseline(
         bench_result.p99_ms,
     );
 
-    tear_down_and_evaluate(
+    let extra_checks = delete_trim_checks("baseline", cfg, &pool, dt_handle).await;
+
+    tear_down_and_evaluate_with_audit(
         "baseline",
         cfg,
         up,
@@ -708,6 +800,10 @@ pub async fn run_baseline(
         bench_window_end_ms,
         ScenarioExpectations::default(),
         params,
+        extra_checks,
+        None,
+        None,
+        None,
         run_dir,
     )
     .await
@@ -1949,6 +2045,7 @@ pub async fn run_follower_sigkill(
     let tasks = params.tasks;
     let dur = params.duration_secs;
     let bench_handle = tokio::spawn(async move { run_benchmark(&pool_clone, tasks, dur).await });
+    let dt_handle = spawn_delete_trim_sideload(SCEN, &pool, params);
 
     sleep(Duration::from_secs(30)).await;
     println!("[{SCEN}] killing follower ({:?})", kill);
@@ -1975,6 +2072,8 @@ pub async fn run_follower_sigkill(
     println!("[{SCEN}] settle 90s for follower catchup (slow-infra liveness window)");
     sleep(Duration::from_secs(90)).await;
     let bench_window_end_ms = up.elapsed_ms();
+
+    let extra_checks = delete_trim_checks(SCEN, cfg, &pool, dt_handle).await;
 
     // Expectations mirror SCEN-2. The one material difference from SCEN-2
     // is that SIGKILL leaves no graceful shutdown window, so the follower
@@ -2008,7 +2107,7 @@ pub async fn run_follower_sigkill(
     let mut scen_params = params;
     scen_params.throughput_floor = (params.throughput_floor * 0.5).max(100.0);
 
-    tear_down_and_evaluate(
+    tear_down_and_evaluate_with_audit(
         SCEN,
         cfg,
         up,
@@ -2017,6 +2116,10 @@ pub async fn run_follower_sigkill(
         bench_window_end_ms,
         expectations,
         scen_params,
+        extra_checks,
+        None,
+        None,
+        None,
         run_dir,
     )
     .await
@@ -2178,6 +2281,7 @@ pub async fn run_leader_sigkill(
     let tasks = params.tasks;
     let dur = params.duration_secs;
     let bench_handle = tokio::spawn(async move { run_benchmark(&pool_clone, tasks, dur).await });
+    let dt_handle = spawn_delete_trim_sideload(SCEN, &pool, params);
 
     sleep(Duration::from_secs(20)).await;
     println!("[{SCEN}] killing real leader ({:?})", kill);
@@ -2199,6 +2303,8 @@ pub async fn run_leader_sigkill(
     println!("[{SCEN}] settle 60s for catchup + role re-stabilisation");
     sleep(Duration::from_secs(60)).await;
     let bench_window_end_ms = up.elapsed_ms();
+
+    let extra_checks = delete_trim_checks(SCEN, cfg, &pool, dt_handle).await;
 
     // Same envelope as SCEN-4. SIGKILL skips the graceful drain so the new
     // leader may see slightly more in-flight error noise; the bounds are
@@ -2231,7 +2337,7 @@ pub async fn run_leader_sigkill(
     let mut scen_params = params;
     scen_params.throughput_floor = (params.throughput_floor * 0.3).max(50.0);
 
-    tear_down_and_evaluate(
+    tear_down_and_evaluate_with_audit(
         SCEN,
         cfg,
         up,
@@ -2240,6 +2346,10 @@ pub async fn run_leader_sigkill(
         bench_window_end_ms,
         expectations,
         scen_params,
+        extra_checks,
+        None,
+        None,
+        None,
         run_dir,
     )
     .await
@@ -2474,6 +2584,9 @@ pub async fn run_partition_leader_follower_replication(
     let tasks = params.tasks;
     let dur = params.duration_secs;
     let bench_handle = tokio::spawn(async move { run_benchmark(&pool_clone, tasks, dur).await });
+    // The partition forces commits onto S3 fallback and drives rollbacks —
+    // exactly the window the delete/trim ACK contract is most exposed in.
+    let dt_handle = spawn_delete_trim_sideload(SCEN, &pool, params);
 
     // Steady-state warm-up before the partition so the bench has a clean
     // pre-partition window in the sample stream.
@@ -2510,6 +2623,8 @@ pub async fn run_partition_leader_follower_replication(
     println!("[{SCEN}] settle 15s for catchup + role re-stabilisation");
     sleep(Duration::from_secs(15)).await;
     let bench_window_end_ms = up.elapsed_ms();
+
+    let extra_checks = delete_trim_checks(SCEN, cfg, &pool, dt_handle).await;
 
     // Defensive final heal in case the scenario short-circuited — nftables
     // rules don't survive a reboot but will persist across chaos runs.
@@ -2553,7 +2668,7 @@ pub async fn run_partition_leader_follower_replication(
     let mut scen_params = params;
     scen_params.throughput_floor = (params.throughput_floor * 0.3).max(50.0);
 
-    tear_down_and_evaluate(
+    tear_down_and_evaluate_with_audit(
         SCEN,
         cfg,
         up,
@@ -2562,6 +2677,10 @@ pub async fn run_partition_leader_follower_replication(
         bench_window_end_ms,
         expectations,
         scen_params,
+        extra_checks,
+        None,
+        None,
+        None,
         run_dir,
     )
     .await

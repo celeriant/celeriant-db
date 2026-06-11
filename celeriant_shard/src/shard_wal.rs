@@ -1048,7 +1048,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let (client_id, user_id) = match &metablock.wal_metablock_type {
             MetablockKind::EventBatchMetadata(eb) => (eb.client_id, eb.user_id),
             MetablockKind::SoftDelete(sd) => (sd.client_id, sd.user_id),
-            other @ (MetablockKind::SoftTrim(_) | MetablockKind::SchemaRegistration(_)) => {
+            MetablockKind::SoftTrim(st) => (st.client_id, st.user_id),
+            other @ MetablockKind::SchemaRegistration(_) => {
                 return Err(ShardAggregateDetailsError::MetablockReadError(
                     format!("unexpected metablock kind: {:?}", std::mem::discriminant(other)),
                 ))
@@ -1058,6 +1059,70 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         Ok((metablock.server_timestamp, client_id, user_id))
     }
 
+    /// Replication backpressure gate, shared by write/delete/trim. True means
+    /// reject: a rollback just fired (cooldown) or the follower is wedged.
+    /// Deletes and trims gate here for the same reason writes do — don't
+    /// accept destructive operations into a WAL that just rolled back.
+    fn replication_backpressure_rejects(&self, rejected_counter: &'static str) -> bool {
+        let hb_started_unix_ms = self.replication_client.current_heartbeat_started_at_unix_ms();
+        let (now_for_rollback, now_unix_ms) = if hb_started_unix_ms.is_some() || self.last_rollback_at.get().is_some() {
+            (
+                Some(std::time::Instant::now()),
+                Some(validated_node_status::unix_epoch_now_ms()),
+            )
+        } else {
+            (None, None)
+        };
+        let Some(cause) = crate::replication_backpressure::check_replication_backpressure(
+            self.shard_mem_cache.borrow().is_inflight_pressured(),
+            self.last_rollback_at.get(),
+            self.config.replication_rollback_cooldown,
+            hb_started_unix_ms,
+            now_unix_ms,
+            self.replication_client.is_follower_reachable(),
+            self.config.heartbeat_starve_threshold,
+            now_for_rollback,
+        ) else {
+            return false;
+        };
+        metrics::counter!(
+            rejected_counter,
+            &[("cause", cause.metric_label())],
+        ).increment(1);
+        // log only when we transition into the cooldown window
+        match cause {
+            crate::replication_backpressure::BackpressureCause::RollbackCooldown { remaining_ms } => {
+                let rb_at = self.last_rollback_at.get();
+                if self.last_logged_rollback_at.get() != rb_at {
+                    self.last_logged_rollback_at.set(rb_at);
+                    warn!(
+                        shard_id = self.config.shard_id,
+                        remaining_ms,
+                        cooldown_ms = self.config.replication_rollback_cooldown.as_millis() as u64,
+                        "ReplicationBackpressure: rollback cooldown active — rejecting writes/deletes/trims",
+                    );
+                }
+            }
+            crate::replication_backpressure::BackpressureCause::FollowerHeartbeatStarved { in_flight_ms } => {
+                // One-shot per starvation episode: log once per in-flight
+                // heartbeat that crosses the threshold. The next heartbeat
+                // starts at a different unix_ms, so a fresh starvation
+                // cycle re-arms the warn.
+                if self.last_logged_starve_at.get() != hb_started_unix_ms {
+                    self.last_logged_starve_at.set(hb_started_unix_ms);
+                    warn!(
+                        shard_id = self.config.shard_id,
+                        in_flight_ms,
+                        threshold_ms = self.config.heartbeat_starve_threshold.as_millis() as u64,
+                        "ReplicationBackpressure: follower heartbeat in flight too long — rejecting writes/deletes/trims",
+                    );
+                }
+            }
+            crate::replication_backpressure::BackpressureCause::InflightPressure => {}
+        }
+        true
+    }
+
     pub async fn trim_start(&self, trim_request: TrimStartRequest) -> Result<TrimStartResponse, ShardTrimError> {
 
         let lease_epoch = match self.node_status.get().effective_node_status() {
@@ -1065,6 +1130,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             NodeStatus::Standalone => 0,
             _ => return Err(ShardTrimError::ShardCannotAcceptWrites { leader_address: self.leader_client_address.borrow().clone() }),
         };
+
+        if self.replication_backpressure_rejects("celeriant_trims_rejected_backpressure_total") {
+            return Err(ShardTrimError::ReplicationBackpressure);
+        }
 
         let aggregate_key = &trim_request.aggregate_key;
 
@@ -1118,6 +1187,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         let shard_log_queue_item = ShardLogQueueItem::new(None, None, metablock);
 
+        // A rollback crossing the waits below wipes the queued trim; without
+        // these checks the client gets a false ack on a data-destruction op.
+        let rollback_gen_at_submit = self.shard_mem_cache.borrow().rollback_generation();
+
         // Add to queue
         {
             let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
@@ -1131,9 +1204,17 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         // Wait for durable write
         self.sync_durable().await?;
 
+        if self.shard_mem_cache.borrow().rollback_generation() != rollback_gen_at_submit {
+            return Err(ShardTrimError::ReplicationError(ReplicationError::RollbackInProgress));
+        }
+
         // Same deal for replication, if we are the leader,
         // wait on durable replication, also batched
         self.replicate_durable().await?;
+
+        if self.shard_mem_cache.borrow().rollback_generation() != rollback_gen_at_submit {
+            return Err(ShardTrimError::ReplicationError(ReplicationError::RollbackInProgress));
+        }
 
         Ok(TrimStartResponse {
             correlation_id: trim_request.correlation_id,
@@ -1148,19 +1229,95 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             _ => return Err(ShardDeleteError::ShardCannotAcceptWrites { leader_address: self.leader_client_address.borrow().clone() }),
         };
 
+        if self.replication_backpressure_rejects("celeriant_deletes_rejected_backpressure_total") {
+            return Err(ShardDeleteError::ReplicationBackpressure);
+        }
+
         // Make sure we have at least one aggregate to write
         if delete_request.deletes.is_empty() {
             return Err(ShardDeleteError::EmptyDeleteList);
         }
 
-        let mut prepared_deletes = Vec::with_capacity(delete_request.deletes.len());
-        for (aggregate_key, single_delete) in &delete_request.deletes {
-            // Ensure aggregate snapshot is in memcache, loading from disk if necessary
+        // Phase 1: warm the write cache — existence checks and disk loads,
+        // the only awaits before the durability waits.
+        for aggregate_key in delete_request.deletes.keys() {
             if !self.aggregate_exists_and_cache(aggregate_key, CachePath::Write).await? {
                 return Err(ShardDeleteError::AggregateNotExists);
             }
+        }
 
+        let mut retried_for_visibility_gap = false;
+        let prepared_deletes = loop {
+            match self.validate_and_prepare_deletes(lease_epoch, &delete_request) {
+                Ok(prepared) => break prepared,
+                Err(ShardDeleteError::OptimisticConcurrencyViolation { .. }) if !retried_for_visibility_gap => {
+                    retried_for_visibility_gap = true;
+                    let _ = self.replicate_durable().await;
+                }
+                Err(e) => return Err(e),
+            }
+        };
+
+        // A rollback crossing the waits below wipes the queued tombstones;
+        // without these checks the client gets a false ack on a delete it
+        // can't safely retry (no client_seq idempotency on this path).
+        let rollback_gen_at_submit = self.shard_mem_cache.borrow().rollback_generation();
+
+        // Phase 2: Append all prepared deletes to queue - cannot fail
+        {
+            let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
+            for (aggregate_key, soft_delete, shard_log_queue_item) in prepared_deletes {
+                shard_mem_cache.add_pending_delete_to_queue(
+                    &aggregate_key,
+                    soft_delete.event_seq,
+                    soft_delete.aggregate_version,
+                    soft_delete.allow_recreate,
+                    soft_delete.allow_sequence_continuation,
+                    shard_log_queue_item,
+                );
+            }
+        }
+
+        // Now we wait on disk write before ack to client
+        self.sync_durable().await?;
+
+        if self.shard_mem_cache.borrow().rollback_generation() != rollback_gen_at_submit {
+            return Err(ShardDeleteError::ReplicationError(ReplicationError::RollbackInProgress));
+        }
+
+        // Same deal for replication, if we are the leader,
+        // wait on durable replication, also batched
+        self.replicate_durable().await?;
+
+        if self.shard_mem_cache.borrow().rollback_generation() != rollback_gen_at_submit {
+            return Err(ShardDeleteError::ReplicationError(ReplicationError::RollbackInProgress));
+        }
+
+        Ok(DeleteResponse {
+            correlation_id: delete_request.correlation_id,
+        })
+    }
+
+    /// Synchronous validate-and-prepare for delete: validation and tombstone
+    /// construction see one frozen queue state. Runs after the async warm
+    /// loop; must stay await-free so nothing can move between the OCC check
+    /// and enqueue. Tombstone fields are rebuilt from current indexes here,
+    /// not carried over from the warm loop — that also covers the no-OCC
+    /// case, where no check would fail but a carried-over tombstone would
+    /// still record stale indexes.
+    fn validate_and_prepare_deletes(
+        &self,
+        lease_epoch: u64,
+        delete_request: &DeleteRequest,
+    ) -> Result<Vec<(AggregateKey, MetablockSoftDelete, ShardLogQueueItem)>, ShardDeleteError> {
+        let mut prepared_deletes = Vec::with_capacity(delete_request.deletes.len());
+        for (aggregate_key, single_delete) in &delete_request.deletes {
             let aggregate_current_indexes = self.shard_mem_cache.borrow_mut().get_write_event_seqes(aggregate_key);
+
+            if aggregate_current_indexes.pending_delete_or_deleted
+                || aggregate_current_indexes.aggregate_version == 0 {
+                return Err(ShardDeleteError::AggregateNotExists);
+            }
 
             // Validate optimistic concurrency
             if let Some(expected) = single_delete.expected_version {
@@ -1201,32 +1358,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             let shard_log_queue_item = ShardLogQueueItem::new(None, None, metablock);
             prepared_deletes.push((aggregate_key.clone(), metablock_soft_delete, shard_log_queue_item));
         }
-
-        // Phase 2: Append all prepared deletes to queue - cannot fail
-        {
-            let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
-            for (aggregate_key, soft_delete, shard_log_queue_item) in prepared_deletes {
-                shard_mem_cache.add_pending_delete_to_queue(
-                    &aggregate_key,
-                    soft_delete.event_seq,
-                    soft_delete.aggregate_version,
-                    soft_delete.allow_recreate,
-                    soft_delete.allow_sequence_continuation,
-                    shard_log_queue_item,
-                );
-            }
-        }
-
-        // Now we wait on disk write before ack to client
-        self.sync_durable().await?;
-
-        // Same deal for replication, if we are the leader,
-        // wait on durable replication, also batched
-        self.replicate_durable().await?;
-
-        Ok(DeleteResponse {
-            correlation_id: delete_request.correlation_id,
-        })
+        Ok(prepared_deletes)
     }
 
     /// Write events to an aggregate.
@@ -1249,60 +1381,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             }
         };
 
-        let hb_started_unix_ms = self.replication_client.current_heartbeat_started_at_unix_ms();
-        let (now_for_rollback, now_unix_ms) = if hb_started_unix_ms.is_some() || self.last_rollback_at.get().is_some() {
-            (
-                Some(std::time::Instant::now()),
-                Some(validated_node_status::unix_epoch_now_ms()),
-            )
-        } else {
-            (None, None)
-        };
-        if let Some(cause) = crate::replication_backpressure::check_replication_backpressure(
-            self.shard_mem_cache.borrow().is_inflight_pressured(),
-            self.last_rollback_at.get(),
-            self.config.replication_rollback_cooldown,
-            hb_started_unix_ms,
-            now_unix_ms,
-            self.replication_client.is_follower_reachable(),
-            self.config.heartbeat_starve_threshold,
-            now_for_rollback,
-        ) {
-            metrics::counter!(
-                "celeriant_writes_rejected_backpressure_total",
-                &[("cause", cause.metric_label())],
-            ).increment(1);
-            // log only when we transition into the cooldown window
-            match cause {
-                crate::replication_backpressure::BackpressureCause::RollbackCooldown { remaining_ms } => {
-                    let rb_at = self.last_rollback_at.get();
-                    if self.last_logged_rollback_at.get() != rb_at {
-                        self.last_logged_rollback_at.set(rb_at);
-                        warn!(
-                            shard_id = self.config.shard_id,
-                            remaining_ms,
-                            cooldown_ms = self.config.replication_rollback_cooldown.as_millis() as u64,
-                            "ReplicationBackpressure: rollback cooldown active — rejecting writes",
-                        );
-                    }
-                }
-                crate::replication_backpressure::BackpressureCause::FollowerHeartbeatStarved { in_flight_ms } => {
-                    // One-shot per starvation episode: log once per in-flight
-                    // heartbeat that crosses the threshold. The next heartbeat
-                    // starts at a different unix_ms, so a fresh starvation
-                    // cycle re-arms the warn.
-                    if self.last_logged_starve_at.get() != hb_started_unix_ms {
-                        self.last_logged_starve_at.set(hb_started_unix_ms);
-                        warn!(
-                            shard_id = self.config.shard_id,
-                            in_flight_ms,
-                            threshold_ms = self.config.heartbeat_starve_threshold.as_millis() as u64,
-                            "ReplicationBackpressure: follower heartbeat in flight too long — rejecting writes",
-                        );
-                    }
-                }
-                crate::replication_backpressure::BackpressureCause::InflightPressure => {}
-            }
+        if self.replication_backpressure_rejects("celeriant_writes_rejected_backpressure_total") {
             return Err(ShardWriteError::ReplicationBackpressure);
         }
 
@@ -2831,21 +2910,65 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7])
             })
             .unwrap_or_else(|| "<empty>".to_string());
+
+        // Chunk into internode_max_request_size-bounded objects. A drained
+        // tail can run to 100k+ entries. One object that big times out the
+        // S3 PUT and the range never reaches S3, leaving the demoted peer's
+        // gap permanently unbridgeable (TCP catchup refuses oversized gaps
+        // and steady-state fallback only covers fresh commits). Catchup
+        // stitches contiguous batch files, so chunking is transparent to it,
+        // and chunks that landed before a failure are usable immediately.
+        let max_object_bytes = self.config.internode_max_request_size;
+        let mut chunks: Vec<Vec<celeriant_msg::request::requests::ReplicationBatchItem>> = Vec::new();
+        let mut current_chunk: Vec<celeriant_msg::request::requests::ReplicationBatchItem> = Vec::new();
+        let mut current_bytes: u64 = 0;
+        for item in batch_items {
+            let item_bytes = FIXED_BLOCK_SIZE_BYTES as u64 + item.metablock.uncompressed_size as u64;
+            if !current_chunk.is_empty() && current_bytes.saturating_add(item_bytes) > max_object_bytes {
+                chunks.push(std::mem::take(&mut current_chunk));
+                current_bytes = 0;
+            }
+            current_bytes += item_bytes;
+            current_chunk.push(item);
+        }
+        if !current_chunk.is_empty() {
+            chunks.push(current_chunk);
+        }
+
+        let chunk_count = chunks.len();
         info!(
-            shard_id, lease_epoch, batch_count, start_wal_seq, current_wal_seq,
+            shard_id, lease_epoch, batch_count, chunk_count, start_wal_seq, current_wal_seq,
             first_wal, last_wal, first_prev_hash = %first_prev_hash,
             "promotion_batch_upload uploading"
         );
 
-        match self.replication_client.replicate_to_s3(batch_items).await {
-            Ok(()) => {
-                info!(shard_id, lease_epoch, batch_count, first_wal, last_wal, "promotion_batch_upload succeeded");
-            }
-            Err(e) => {
-                tracing::warn!(shard_id, lease_epoch, batch_count, first_wal, last_wal, error = ?e, "promotion_batch_upload failed");
-                return Err(e);
+        const UPLOAD_ATTEMPTS_PER_CHUNK: u32 = 3;
+        for (chunk_index, chunk) in chunks.into_iter().enumerate() {
+            let chunk_first = chunk.first().map(|i| i.metablock.wal_seq).unwrap_or(0);
+            let chunk_last = chunk.last().map(|i| i.metablock.wal_seq).unwrap_or(0);
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                match self.replication_client.replicate_to_s3(chunk.clone()).await {
+                    Ok(()) => break,
+                    Err(e) if attempt < UPLOAD_ATTEMPTS_PER_CHUNK => {
+                        tracing::warn!(
+                            shard_id, lease_epoch, chunk_index, chunk_count, chunk_first, chunk_last,
+                            attempt, error = ?e, "promotion_batch_upload chunk failed — retrying"
+                        );
+                        glommio::timer::Timer::new(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            shard_id, lease_epoch, chunk_index, chunk_count, chunk_first, chunk_last,
+                            error = ?e, "promotion_batch_upload failed"
+                        );
+                        return Err(e);
+                    }
+                }
             }
         }
+        info!(shard_id, lease_epoch, batch_count, chunk_count, first_wal, last_wal, "promotion_batch_upload succeeded");
 
         // Clear the field now that S3 has the data
         {
@@ -3773,6 +3896,51 @@ mod tests {
         });
     }
 
+    /// Delete/trim gate on the same cooldown as writes: a retrying delete
+    /// client must not hammer straight into a window writes are barred from.
+    #[test]
+    fn delete_rejected_during_rollback_cooldown() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let mut cfg = test_config(&dir);
+            cfg.replication_rollback_cooldown = Duration::from_secs(10);
+            let shard = ShardWal::open(cfg, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap();
+
+            let agg = key(1, 1, 1);
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+
+            shard.last_rollback_at.set(Some(std::time::Instant::now()));
+
+            let result = process(&shard, delete_req(agg)).await;
+            assert!(matches!(result, Err(ShardError::Delete(ShardDeleteError::ReplicationBackpressure))),
+                "expected ReplicationBackpressure while inside cooldown, got {result:?}");
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn trim_rejected_during_rollback_cooldown() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let mut cfg = test_config(&dir);
+            cfg.replication_rollback_cooldown = Duration::from_secs(10);
+            let shard = ShardWal::open(cfg, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap();
+
+            let agg = key(1, 1, 1);
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+
+            shard.last_rollback_at.set(Some(std::time::Instant::now()));
+
+            let result = process(&shard, trim_req(agg, 2)).await;
+            assert!(matches!(result, Err(ShardError::TrimStart(ShardTrimError::ReplicationBackpressure))),
+                "expected ReplicationBackpressure while inside cooldown, got {result:?}");
+
+            shard.close().await;
+        });
+    }
+
     #[test]
     fn write_accepted_after_rollback_cooldown_expires() {
         glommio_test!({
@@ -4367,8 +4535,10 @@ mod tests {
     /// Replication client that bumps `rollback_generation` *during*
     /// `replicate_to_follower`, simulating a concurrent rollback that wipes
     /// state out from under an in-flight `write()`. The first replicate call
-    /// runs the bump; subsequent calls are passthrough so any test that wants
-    /// a recovery write after the bump can still get one.
+    /// after `attach` runs the bump; subsequent calls are passthrough so any
+    /// test that wants a recovery write after the bump can still get one.
+    /// Calls before `attach` are passthrough too — lets a test set up
+    /// aggregates first, then arm the bump for the operation under test.
     struct BumpGenerationDuringReplicateClient {
         shard_mem_cache: RefCell<Option<Rc<RefCell<MemCache>>>>,
         bumped: Cell<bool>,
@@ -4402,8 +4572,8 @@ mod tests {
                     // and wipes pending state, mirroring what happens when a
                     // different replication cycle fails while ours is in flight.
                     mc.borrow_mut().execute_replication_rollback();
+                    self.bumped.set(true);
                 }
-                self.bumped.set(true);
             }
             Ok(())
         }
@@ -4446,6 +4616,371 @@ mod tests {
                 "write that crossed a rollback must return RollbackInProgress, got {:?}",
                 result,
             );
+
+            shard.close().await;
+        });
+    }
+
+    /// Delete twin of `write_returns_err_when_rollback_crosses_replicate`.
+    /// A rollback crossing the delete's replicate wipes the SoftDelete
+    /// tombstone — acking `Ok` here tells the client the aggregate is gone
+    /// while it still exists with full history. Worse than the write case:
+    /// no client_seq idempotency on deletes, so a blind retry isn't
+    /// well-defined. Must surface as RollbackInProgress.
+    #[test]
+    fn delete_returns_err_when_rollback_crosses_replicate() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let client = BumpGenerationDuringReplicateClient::new();
+            let shard = ShardWal::open(
+                test_config(&dir),
+                ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 0 }, 500, now_ms() + 10_000),
+                client,
+                StubS3Downloader,
+            ).await.unwrap();
+
+            let agg = key(1, 1, 1);
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+
+            // Arm the bump now: only the delete's replicate crosses the rollback.
+            shard.replication_client.attach(shard.shard_mem_cache.clone());
+
+            let result = process(&shard, delete_req(agg.clone())).await;
+            assert!(
+                matches!(result, Err(ShardError::Delete(ShardDeleteError::ReplicationError(ReplicationError::RollbackInProgress)))),
+                "delete that crossed a rollback must return RollbackInProgress, got {:?}",
+                result,
+            );
+
+            shard.close().await;
+        });
+    }
+
+    /// Trim twin. A falsely-acked trim is a retention/compliance lie: the
+    /// client believes history below keep_from is gone while it stays readable.
+    #[test]
+    fn trim_returns_err_when_rollback_crosses_replicate() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let client = BumpGenerationDuringReplicateClient::new();
+            let shard = ShardWal::open(
+                test_config(&dir),
+                ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 0 }, 500, now_ms() + 10_000),
+                client,
+                StubS3Downloader,
+            ).await.unwrap();
+
+            let agg = key(1, 1, 1);
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+
+            shard.replication_client.attach(shard.shard_mem_cache.clone());
+
+            let result = process(&shard, trim_req(agg.clone(), 2)).await;
+            assert!(
+                matches!(result, Err(ShardError::TrimStart(ShardTrimError::ReplicationError(ReplicationError::RollbackInProgress)))),
+                "trim that crossed a rollback must return RollbackInProgress, got {:?}",
+                result,
+            );
+
+            shard.close().await;
+        });
+    }
+
+    /// Chaos 16k finding A repro: post-trim event batches must embed the trim
+    /// floor in `trimmed_below_version`, and a snapshot rebuilt from disk must
+    /// recover it. On the rpi cluster the SoftTrim was durable on both nodes
+    /// yet post-trim batches embedded 1 — a restarted node rebuilding from
+    /// the batch metablocks resurrects min=1 and the floor is lost on that
+    /// node (reads below the floor come back).
+    #[test]
+    fn post_trim_batches_embed_floor_and_disk_rebuild_recovers_it() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            for _ in 0..4 {
+                write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            }
+            let result = process(&shard, trim_req(agg.clone(), 3)).await;
+            assert!(matches!(result, Ok(ClientResponse::TrimStart(_))), "trim failed: {result:?}");
+
+            // In-memory floor on the serving node.
+            let idx = shard.shard_mem_cache.borrow_mut().get_write_event_seqes(&agg);
+            assert_eq!(idx.min_aggregate_version, 3, "in-memory floor after trim");
+
+            // Post-trim write must embed the floor in its metablock.
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+
+            // Rebuild from disk: this is what a restarted/caught-up node sees.
+            shard.shard_mem_cache.borrow_mut().clear_aggregate_write_snapshots_for_test();
+            assert!(shard.aggregate_exists_and_cache(&agg, CachePath::Write).await.unwrap());
+            let idx = shard.shard_mem_cache.borrow_mut().get_write_event_seqes(&agg);
+            assert_eq!(
+                idx.min_aggregate_version, 3,
+                "disk-rebuilt snapshot must recover the trim floor — a post-trim batch embedding \
+                 trimmed_below_version=1 resurrects pre-trim visibility on rebuilt nodes",
+            );
+
+            shard.close().await;
+        });
+    }
+
+    /// Finding-A (chaos 16k): aggregate_details must work when the
+    /// aggregate's newest WAL record is a SoftTrim. The details handler's
+    /// last-metablock read only accepted EventBatch/SoftDelete and errored
+    /// with "unexpected metablock kind: Discriminant(3)" — reproduced on
+    /// both rpi nodes after a fresh boot over a trim-tailed WAL.
+    #[test]
+    fn aggregate_details_works_when_newest_record_is_a_trim() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            for _ in 0..4 {
+                write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            }
+            let result = process(&shard, trim_req(agg.clone(), 3)).await;
+            assert!(matches!(result, Ok(ClientResponse::TrimStart(_))), "trim failed: {result:?}");
+
+            // Cold details read: snapshot rebuilt from disk, last record is the trim.
+            shard.shard_mem_cache.borrow_mut().clear_aggregate_write_snapshots_for_test();
+            shard.shard_mem_cache.borrow_mut().clear_aggregate_read_snapshots_for_test();
+            let details = unwrap_exists(process(&shard, exists_req(agg)).await);
+            assert_eq!(details.max_aggregate_version, 4);
+            assert_eq!(details.min_aggregate_version, 3, "floor must come back from the SoftTrim record");
+            assert!(!details.is_deleted);
+
+            shard.close().await;
+        });
+    }
+
+    /// Finding-A variant: the trim floor must survive a delete +
+    /// sequence-continuation recreate cycle (the chaos side-load's exact op
+    /// mix). The deleting task's aggregates on the rpi embedded
+    /// trimmed_below_version=1 in every post-recreate batch.
+    #[test]
+    fn trim_floor_survives_delete_recreate_continuation() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            for _ in 0..4 {
+                write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            }
+            let result = process(&shard, trim_req(agg.clone(), 3)).await;
+            assert!(matches!(result, Ok(ClientResponse::TrimStart(_))), "trim failed: {result:?}");
+
+            let result = process(&shard, delete_req_full(agg.clone(), true, true, Some(4))).await;
+            assert!(matches!(result, Ok(ClientResponse::Delete(_))), "delete failed: {result:?}");
+
+            // Continuation recreate: v5, then another append.
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+
+            // Trim the new incarnation.
+            let result = process(&shard, trim_req(agg.clone(), 6)).await;
+            assert!(matches!(result, Ok(ClientResponse::TrimStart(_))), "trim2 failed: {result:?}");
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+
+            let idx = shard.shard_mem_cache.borrow_mut().get_write_event_seqes(&agg);
+            assert_eq!(idx.min_aggregate_version, 6, "in-memory floor after post-recreate trim");
+
+            // Rebuild from disk — what a restarted/caught-up node sees.
+            shard.shard_mem_cache.borrow_mut().clear_aggregate_write_snapshots_for_test();
+            assert!(shard.aggregate_exists_and_cache(&agg, CachePath::Write).await.unwrap());
+            let idx = shard.shard_mem_cache.borrow_mut().get_write_event_seqes(&agg);
+            assert_eq!(
+                idx.min_aggregate_version, 6,
+                "disk-rebuilt floor after delete/recreate/trim — embedded trimmed_below_version \
+                 must track the live floor through the recreate",
+            );
+
+            shard.close().await;
+        });
+    }
+
+    /// Delete fsyncs, replication fails, the real rollback runs. The client
+    /// must get an error and the aggregate must remain fully live: exists-scan
+    /// agrees, history readable.
+    #[test]
+    fn delete_rolled_back_by_replication_failure_leaves_aggregate_live() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let client = SwitchableReplicationClient::new();
+            let shard = ShardWal::open(
+                test_config(&dir),
+                ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 0 }, 500, now_ms() + 10_000),
+                client,
+                StubS3Downloader,
+            ).await.unwrap();
+
+            let agg = key(1, 1, 1);
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+
+            shard.replication_client.should_fail.set(true);
+            let result = process(&shard, delete_req(agg.clone())).await;
+            assert!(result.is_err(), "delete whose replication failed must not ack, got {:?}", result);
+
+            shard.replication_client.should_fail.set(false);
+            let details = unwrap_exists(process(&shard, exists_req(agg.clone())).await);
+            assert!(!details.is_deleted, "rolled-back delete must leave the aggregate live");
+            assert_eq!(details.max_aggregate_version, 1);
+
+            let read = unwrap_read(process(&shard, read_req(agg)).await);
+            assert_eq!(read.event_batches.len(), 1);
+
+            shard.close().await;
+        });
+    }
+
+    /// Trim twin: a rolled-back trim must leave the full history readable —
+    /// retention logic acting on a trim ack while the data stays readable is
+    /// the compliance failure mode.
+    #[test]
+    fn trim_rolled_back_by_replication_failure_leaves_history_readable() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let client = SwitchableReplicationClient::new();
+            let shard = ShardWal::open(
+                test_config(&dir),
+                ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 0 }, 500, now_ms() + 10_000),
+                client,
+                StubS3Downloader,
+            ).await.unwrap();
+
+            let agg = key(1, 1, 1);
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+
+            shard.replication_client.should_fail.set(true);
+            let result = process(&shard, trim_req(agg.clone(), 2)).await;
+            assert!(result.is_err(), "trim whose replication failed must not ack, got {:?}", result);
+
+            shard.replication_client.should_fail.set(false);
+            // ≤1 = no effective floor (batches embed the normalized
+            // FIRST_AGGREGATE_VERSION); a committed trim would report 2 here.
+            let details = unwrap_exists(process(&shard, exists_req(agg.clone())).await);
+            assert!(details.min_aggregate_version <= 1, "rolled-back trim must not move min_aggregate_version, got {}", details.min_aggregate_version);
+
+            let read = unwrap_read(process(&shard, read_req(agg)).await);
+            assert_eq!(read.event_batches.len(), 2, "rolled-back trim must leave both batches readable");
+
+            shard.close().await;
+        });
+    }
+
+    /// Issue-2 TOCTOU: multi-aggregate delete awaits between entries (cold
+    /// snapshot loads) but enqueues prepared tombstones with no sync
+    /// re-validation. A write landing in that window gets silently overwritten
+    /// by a stale tombstone: OCC is bypassed AND the tombstone's regressed
+    /// aggregate_version/event_seq feed a sequence-continuation recreate that
+    /// re-issues already-acked versions — WAL corruption.
+    ///
+    /// Both delete entries are identical so the HashMap's iteration order
+    /// (which delete() follows) picks the roles: first key = contended (kept
+    /// warm, raced by the write), second = cold (its disk scan opens the
+    /// await window).
+    #[test]
+    fn multi_aggregate_delete_toctou_rejects_concurrent_write() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+
+            let mut deletes = HashMap::new();
+            for k in [key(1, 1, 1), key(1, 1, 2)] {
+                deletes.insert(k, SingleAggregateDelete {
+                    allow_recreate: true,
+                    allow_sequence_continuation: true,
+                    expected_version: Some(5),
+                });
+            }
+            let contended = deletes.keys().next().unwrap().clone();
+            let cold = deletes.keys().nth(1).unwrap().clone();
+
+            // cold's batches go in first so contended's newest batch is the
+            // newest block in the WAL: the warm-up reverse scan below stops
+            // there and never walks past (and eagerly caches) cold's blocks.
+            for _ in 0..5 {
+                write_ok(&shard, write_req(cold.clone(), events(1))).await;
+            }
+            for _ in 0..5 {
+                write_ok(&shard, write_req(contended.clone(), events(1))).await;
+            }
+
+            // Evict everything, re-warm only the contended aggregate.
+            shard.shard_mem_cache.borrow_mut().clear_aggregate_write_snapshots_for_test();
+            assert!(shard.aggregate_exists_and_cache(&contended, CachePath::Write).await.unwrap());
+            let (cold_loaded, _) = shard.shard_mem_cache.borrow_mut().aggregate_load_status(&cold, CachePath::Write);
+            assert!(!cold_loaded, "precondition: cold must be a cache miss or the delete never parks and this test is vacuous");
+
+            // Hold the cold aggregate's loading lock so the delete parks on
+            // it deterministically — racing the actual disk scan is flaky
+            // (a page-cache-fast scan lets the delete win and the window
+            // never opens).
+            let cold_lock = shard.aggregate_loading.acquire(&cold);
+            let cold_lock_guard = cold_lock.write().await.unwrap();
+
+            let delete_request = ClientRequest::Delete(DeleteRequest {
+                correlation_id: None,
+                client_id: 1,
+                user_id: None,
+                deletes,
+            });
+            let delete_fut = process(&shard, delete_request);
+            futures_lite::pin!(delete_fut);
+            assert!(
+                futures_lite::future::poll_once(delete_fut.as_mut()).await.is_none(),
+                "delete must park on the cold aggregate's loading lock",
+            );
+
+            // The window: enqueue v6 on the contended aggregate while the
+            // delete is parked. One poll validates and enqueues (the delete's
+            // sync re-check reads queue positions, so a pending v6 is
+            // enough); the fsync completes after the lock releases, keeping
+            // the parked delete's 1s lock-deadlock budget out of play.
+            // client_id 1 keeps the write's client snapshot warm from setup —
+            // a fresh client_id would park this write on its own dedup disk
+            // scan before it enqueues.
+            let write_fut = process(&shard, write_req_full(contended.clone(), events(1), false, Some(5), 1, false));
+            futures_lite::pin!(write_fut);
+            let write_early = futures_lite::future::poll_once(write_fut.as_mut()).await;
+
+            drop(cold_lock_guard);
+            drop(cold_lock);
+            let (delete_result, write_result) = match write_early {
+                // Write completed in one poll — already committed v6.
+                Some(result) => (delete_fut.await, result),
+                None => futures_lite::future::zip(delete_fut, write_fut).await,
+            };
+
+            let write_resp = match write_result {
+                Ok(ClientResponse::Write(w)) => w,
+                other => panic!("concurrent write should commit v6, got {other:?}"),
+            };
+            assert_eq!(write_resp.max_aggregate_version, Some(6));
+
+            // Version-uniqueness probe: a recreate with sequence continuation
+            // continues from whatever the tombstone recorded. Probe before
+            // asserting so a pre-fix run shows the duplicate too.
+            let recreate_resp = match process(&shard, write_req_full(contended.clone(), events(1), true, None, 3, false)).await {
+                Ok(ClientResponse::Write(w)) => w,
+                other => panic!("recreate write should succeed, got {other:?}"),
+            };
+
+            assert!(
+                matches!(delete_result, Err(ShardError::Delete(ShardDeleteError::OptimisticConcurrencyViolation { .. }))),
+                "delete validated at v5 but v6 committed before enqueue — must fail OCC, got {delete_result:?} \
+                 (an Ok here means a stale v5 tombstone was acked over the committed v6 write)",
+            );
+            assert_ne!(
+                recreate_resp.max_aggregate_version, Some(6),
+                "aggregate_version 6 was already acked to the concurrent writer — re-issuing it is WAL corruption",
+            );
+            assert_eq!(recreate_resp.max_aggregate_version, Some(7), "delete failed, so this is a plain append after v6");
 
             shard.close().await;
         });
@@ -5671,6 +6206,47 @@ mod tests {
         async fn send_kick(&self) -> Result<bool, crate::error::send_heartbeat_error::SendHeartbeatError> { Ok(true) }
     }
 
+    /// Capturing client whose first `fail_first` replicate_to_s3 calls fail —
+    /// exercises the promotion upload's per-chunk retry.
+    struct FailingThenCapturingS3Client {
+        s3_uploads: RefCell<Vec<Vec<ReplicationBatchItem>>>,
+        failures_remaining: Cell<u32>,
+        attempts: Cell<u32>,
+    }
+
+    impl FailingThenCapturingS3Client {
+        fn new(fail_first: u32) -> Self {
+            Self {
+                s3_uploads: RefCell::new(vec![]),
+                failures_remaining: Cell::new(fail_first),
+                attempts: Cell::new(0),
+            }
+        }
+    }
+
+    impl ReplicationClient for FailingThenCapturingS3Client {
+        fn set_follower_address(&self, _address: Option<String>) {}
+        fn set_follower_reachable(&self, _: bool) {}
+        fn is_follower_reachable(&self) -> bool { true }
+        fn current_heartbeat_started_at_unix_ms(&self) -> Option<u64> { None }
+        fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
+        fn reset_heartbeat_state(&self) {}
+        async fn replicate_to_follower(&self, _batches: Vec<ReplicationBatchItem>, _leader_confirmed_wal_seq: u64) -> Result<(), ReplicateToFollowerError> { Ok(()) }
+        async fn replicate_to_s3(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error> {
+            self.attempts.set(self.attempts.get() + 1);
+            if self.failures_remaining.get() > 0 {
+                self.failures_remaining.set(self.failures_remaining.get() - 1);
+                return Err(ReplicateToS3Error::S3NotConfigured);
+            }
+            self.s3_uploads.borrow_mut().push(batches);
+            Ok(())
+        }
+        async fn send_heartbeat(&self, unix_epoch_now_ms: u64, _lease_epoch: u64) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
+            Ok(celeriant_msg::response::responses::HeartbeatResult::Ack { follower_timestamp_ms: unix_epoch_now_ms + 10, follower_can_accept_tcp_replication: true })
+        }
+        async fn send_kick(&self) -> Result<bool, crate::error::send_heartbeat_error::SendHeartbeatError> { Ok(true) }
+    }
+
     async fn open_follower_shard_capturing(dir: &std::path::Path, client: CapturingReplicationClient) -> ShardWal<CapturingReplicationClient, StubS3Downloader> {
         ShardWal::open(test_config(dir), ValidatedNodeStatus::create_custom_status(NodeStatus::Follower { leader_lease_epoch: 0 }, 500, now_ms() + 10_000), client, StubS3Downloader)
             .await
@@ -5893,6 +6469,89 @@ mod tests {
             assert_eq!(uploads.len(), 1);
             assert_eq!(uploads[0].len(), 1, "should only upload from last_received index");
             assert_eq!(uploads[0][0].metablock.wal_seq, 2);
+
+            shard.close().await;
+        });
+    }
+
+    /// Chaos 16k finding C: a promotion batch covering a long drained tail
+    /// went up as ONE S3 object (105k entries) and the PUT timed out; the
+    /// range never reached S3, the demoted peer's gap was unbridgeable, and
+    /// EventualConvergence livelocked. The upload must chunk into
+    /// internode_max_request_size-bounded objects — catchup already stitches
+    /// contiguous ranges.
+    #[test]
+    fn upload_promotion_batch_chunks_by_internode_request_size() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let client = CapturingReplicationClient::new();
+            let mut cfg = test_config(&dir);
+            // One metablock per chunk: every item is FIXED_BLOCK_SIZE_BYTES.
+            cfg.internode_max_request_size = FIXED_BLOCK_SIZE_BYTES as u64 + 1;
+            let shard = ShardWal::open(
+                cfg,
+                ValidatedNodeStatus::create_custom_status(NodeStatus::Follower { leader_lease_epoch: 0 }, 500, now_ms() + 10_000),
+                client,
+                StubS3Downloader,
+            ).await.unwrap();
+
+            // Three single-item batches, all claiming leader_confirmed=0 so the
+            // floor holds at 1 and the promotion range covers all three.
+            let mut tip = GENESIS_HASH;
+            for seq in 1..=3 {
+                let resp = unwrap_replication(
+                    shard.handle_replication_batch(
+                        replication_batch_req_with_leader_confirmed(vec![replication_item_no_datablock(seq, tip)], 0)
+                    ).await,
+                );
+                assert!(matches!(resp.result, ReplicationResult::Success { .. }), "replication {seq} failed: {resp:?}");
+                tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
+            }
+
+            shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 1 }, 500, now_ms() + 10_000));
+            shard.upload_s3_promotion_batch().await.unwrap();
+
+            let uploads = shard.replication_client.s3_uploads.borrow();
+            assert_eq!(uploads.len(), 3, "3 items at 1-per-chunk cap must produce 3 S3 objects, got {}", uploads.len());
+            assert_eq!(uploads[0][0].metablock.wal_seq, 1);
+            assert_eq!(uploads[1][0].metablock.wal_seq, 2);
+            assert_eq!(uploads[2][0].metablock.wal_seq, 3);
+            drop(uploads);
+
+            let idx = shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_seq;
+            assert_eq!(idx, 0, "field cleared only after ALL chunks landed");
+
+            shard.close().await;
+        });
+    }
+
+    /// One failed PUT must not strand the promotion range — each chunk
+    /// retries before the upload gives up.
+    #[test]
+    fn upload_promotion_batch_retries_failed_chunk() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let client = FailingThenCapturingS3Client::new(1);
+            let shard = ShardWal::open(
+                test_config(&dir),
+                ValidatedNodeStatus::create_custom_status(NodeStatus::Follower { leader_lease_epoch: 0 }, 500, now_ms() + 10_000),
+                client,
+                StubS3Downloader,
+            ).await.unwrap();
+
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(replication_batch_req(vec![replication_item_no_datablock(1, GENESIS_HASH)])).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+
+            shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 1 }, 500, now_ms() + 10_000));
+            shard.upload_s3_promotion_batch().await.unwrap();
+
+            assert_eq!(shard.replication_client.attempts.get(), 2, "first PUT fails, retry succeeds");
+            assert_eq!(shard.replication_client.s3_uploads.borrow().len(), 1);
+
+            let idx = shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_seq;
+            assert_eq!(idx, 0, "field cleared after retried upload landed");
 
             shard.close().await;
         });

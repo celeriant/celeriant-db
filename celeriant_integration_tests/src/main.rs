@@ -270,6 +270,7 @@ async fn dispatch_test(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         "invariant_s3_fallback_dedup" => invariant_s3_fallback_dedup::run().await,
         "leader_read_visibility" => leader_read_visibility::run().await,
         "metamorphic_cull_parity" => metamorphic_cull_parity::run().await,
+        "metamorphic_delete_trim_parity" => metamorphic_delete_trim_parity::run().await,
         "metamorphic_divergence_recovery_parity" => metamorphic_divergence_recovery_parity::run().await,
         "metamorphic_follower_crash_catchup_parity" => metamorphic_follower_crash_catchup_parity::run().await,
         "metamorphic_leader_follower_parity" => metamorphic_leader_follower_parity::run().await,
