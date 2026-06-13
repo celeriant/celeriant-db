@@ -688,6 +688,42 @@ pub fn spawn_delete_trim_sideload(
     tokio::spawn(async move { celeriant_bench::run_delete_trim_workload(&pool, dt_tasks, dur).await })
 }
 
+/// On a version regression, the WAL holding the duplicate is wiped by the next
+/// scenario's bring-up — capture raw wal-inspect output for exactly the
+/// violating aggregates into the run dir while the evidence still exists.
+fn capture_regression_disk_truth(
+    scenario: &str,
+    cfg: &ClusterConfig,
+    run_dir: &PathBuf,
+    regression_aggs: &[(u128, u128, u64)],
+) {
+    use std::collections::BTreeSet;
+    let unique: BTreeSet<(u128, u128)> = regression_aggs.iter().map(|(a, c, _)| (*a, *c)).collect();
+    let mut out = String::new();
+    for (agg_id, client_id) in unique.iter().take(8) {
+        for host in [&cfg.leader_host, &cfg.follower_host] {
+            out.push_str(&format!("===== host={host} org=2 type=1 agg={agg_id} client={client_id} =====\n"));
+            let cmd = format!(
+                "for n in 1 2 3; do for f in /var/lib/nvme/celeriant-data/shard_$n/log_*.wal; do \
+                 [ -f \"$f\" ] && {{ echo \"--- $f\"; sudo /usr/local/bin/celeriant-wal-inspect \"$f\" client 2 1 {agg_id} {client_id} 2>&1; }}; done; done"
+            );
+            match std::process::Command::new("ssh").arg(host).arg(&cmd).output() {
+                Ok(o) => {
+                    out.push_str(&String::from_utf8_lossy(&o.stdout));
+                    out.push_str(&String::from_utf8_lossy(&o.stderr));
+                }
+                Err(e) => out.push_str(&format!("(ssh failed: {e})\n")),
+            }
+        }
+    }
+    let path = run_dir.join(format!("{scenario}.regression-walinspect.txt"));
+    if let Err(e) = std::fs::write(&path, out) {
+        eprintln!("[{scenario}] failed to write regression wal-inspect capture: {e}");
+    } else {
+        println!("[{scenario}] regression disk truth captured: {}", path.display());
+    }
+}
+
 /// Await the side-load and convert its outcome + post-settle audit into
 /// checks. Call AFTER the scenario's settle window so read staleness can't
 /// masquerade as a false ack.
@@ -695,6 +731,7 @@ pub async fn delete_trim_checks(
     scenario: &str,
     cfg: &ClusterConfig,
     pool: &std::sync::Arc<Pool>,
+    run_dir: &PathBuf,
     handle: tokio::task::JoinHandle<celeriant_bench::DeleteTrimOutcome>,
 ) -> Vec<CheckResult> {
     let outcome = match handle.await {
@@ -707,6 +744,9 @@ pub async fn delete_trim_checks(
         c.write_acks, c.trim_acks, c.delete_acks, c.recreate_acks,
         c.retries, c.occ_resyncs, c.version_regressions, c.fatal_errors,
     );
+    if !outcome.regression_aggs.is_empty() {
+        capture_regression_disk_truth(scenario, cfg, run_dir, &outcome.regression_aggs);
+    }
     let pinned = build_ryw_pinned(cfg).await;
     let audit = celeriant_bench::audit_delete_trim_pinned(pool, &outcome, &pinned).await;
     println!(
@@ -789,7 +829,7 @@ pub async fn run_baseline(
         bench_result.p99_ms,
     );
 
-    let extra_checks = delete_trim_checks("baseline", cfg, &pool, dt_handle).await;
+    let extra_checks = delete_trim_checks("baseline", cfg, &pool, run_dir, dt_handle).await;
 
     tear_down_and_evaluate_with_audit(
         "baseline",
@@ -1083,6 +1123,44 @@ async fn scrape_watch_subscribers(metrics_url: &str, host: &str) -> Result<u64, 
     Ok(crate::sample::parse_metrics(host.to_string(), 0, &body).watch_subscribers_active)
 }
 
+/// Poll both nodes until per-shard wal_seq matches, or `max_wait` expires.
+/// A fixed settle suffices on a clean run, but a mid-bench heartbeat blip
+/// kicks the follower into catchup that can outlast any fixed sleep — and
+/// pinned parity reads against a catching-up node report stale state by
+/// design. Timing out is not fatal: the audit proceeds and the existing
+/// checks judge whatever state the cluster reached.
+async fn wait_for_wal_convergence(scen: &str, cfg: &ClusterConfig, max_wait: Duration) {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("reqwest client");
+    let start = Instant::now();
+    loop {
+        let fetch = |host: String, url: String| {
+            let client = client.clone();
+            async move {
+                let body = client.get(&url).send().await.ok()?.text().await.ok()?;
+                Some(crate::sample::parse_metrics(host, 0, &body))
+            }
+        };
+        let (l, f) = tokio::join!(
+            fetch(cfg.leader_host.clone(), cfg.metrics_url(&cfg.leader_host)),
+            fetch(cfg.follower_host.clone(), cfg.metrics_url(&cfg.follower_host)),
+        );
+        if let (Some(l), Some(f)) = (l, f) {
+            if l.ok && f.ok && !l.wal_seq_by_shard.is_empty() && l.wal_seq_by_shard == f.wal_seq_by_shard {
+                println!("[{scen}] wal converged after {:.1}s", start.elapsed().as_secs_f32());
+                return;
+            }
+        }
+        if start.elapsed() >= max_wait {
+            println!("[{scen}] WARNING: wal not converged after {:.0}s — proceeding to audit reads", max_wait.as_secs());
+            return;
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
 /// Idempotency audit on a quiet cluster. Drives the same bench as `baseline`
 /// but with `enforce_client_idempotency: true` and tracked `client_seq` per
 /// task, then reads every aggregate back and checks that the WAL contains
@@ -1130,8 +1208,11 @@ pub async fn run_idempotency_audit_baseline(
         outcome.counters.fatal_errors,
     );
 
-    // Allow a brief settle for replication catch-up before the audit reads.
+    // Settle, then wait for actual wal convergence: a heartbeat blip under
+    // high task counts can kick the follower into a catchup that outlasts
+    // any fixed sleep, and parity reads are only meaningful once converged.
     sleep(Duration::from_secs(2)).await;
+    wait_for_wal_convergence(SCEN, cfg, Duration::from_secs(60)).await;
 
     let (integrity, deep) = run_integrity_and_deep_audit(SCEN, &pool, &outcome.task_acks, 32).await;
     let integrity_check = data_integrity_check(&integrity, 0);
@@ -2073,7 +2154,7 @@ pub async fn run_follower_sigkill(
     sleep(Duration::from_secs(90)).await;
     let bench_window_end_ms = up.elapsed_ms();
 
-    let extra_checks = delete_trim_checks(SCEN, cfg, &pool, dt_handle).await;
+    let extra_checks = delete_trim_checks(SCEN, cfg, &pool, run_dir, dt_handle).await;
 
     // Expectations mirror SCEN-2. The one material difference from SCEN-2
     // is that SIGKILL leaves no graceful shutdown window, so the follower
@@ -2304,7 +2385,7 @@ pub async fn run_leader_sigkill(
     sleep(Duration::from_secs(60)).await;
     let bench_window_end_ms = up.elapsed_ms();
 
-    let extra_checks = delete_trim_checks(SCEN, cfg, &pool, dt_handle).await;
+    let extra_checks = delete_trim_checks(SCEN, cfg, &pool, run_dir, dt_handle).await;
 
     // Same envelope as SCEN-4. SIGKILL skips the graceful drain so the new
     // leader may see slightly more in-flight error noise; the bounds are
@@ -2624,7 +2705,7 @@ pub async fn run_partition_leader_follower_replication(
     sleep(Duration::from_secs(15)).await;
     let bench_window_end_ms = up.elapsed_ms();
 
-    let extra_checks = delete_trim_checks(SCEN, cfg, &pool, dt_handle).await;
+    let extra_checks = delete_trim_checks(SCEN, cfg, &pool, run_dir, dt_handle).await;
 
     // Defensive final heal in case the scenario short-circuited — nftables
     // rules don't survive a reboot but will persist across chaos runs.

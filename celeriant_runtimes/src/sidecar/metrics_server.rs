@@ -99,6 +99,15 @@ fn register_metric_descriptions() {
     describe_histogram!("celeriant_probe_duration_seconds", "Probe round-trip duration");
     describe_histogram!("celeriant_probe_gap_size", "Detected probe gap size in WAL entries");
 
+    // TCP catchup
+    describe_counter!("celeriant_catchup_fallback_total", "TCP catchup abandoned for S3 fallback (label: reason)");
+    describe_counter!("celeriant_catchup_fetch_error_total", "Catchup entry fetch errors (persistent growth while a follower lags = convergence livelock)");
+    describe_counter!("celeriant_catchup_empty_fetch_total", "Catchup fetch returned no entries for a nonzero gap (livelock signature when nothing was compacted)");
+
+    // Delete / recreate integrity signals
+    describe_counter!("celeriant_tombstone_snapshot_regression_total", "Tombstone cache writes that regressed a newer cached version (stale-tombstone signature)");
+    describe_counter!("celeriant_position_snapshot_stale_commit_total", "Committed batches carrying a version at or below the cached one");
+
     // Cache
     describe_gauge!("celeriant_cache_recent_write_bytes", "Recent write cache usage");
     describe_counter!("celeriant_cache_recent_write_hits_total", "Recent write cache hits");

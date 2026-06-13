@@ -131,6 +131,7 @@ mod tests {
                 shard_id: 2,
                 leader_timestamp_ms: 9999999,
                 leader_confirmed_wal_seq: 12345,
+                sender_lease_epoch: 7,
                 batches: vec![],
             }),
             ClusterRequestType::Heartbeat => ClusterRequest::Heartbeat(HeartbeatRequest {

@@ -422,12 +422,15 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let starting_log_id = log_segments_cache.active_log_id();
         let mut active_segment_metablocks: Vec<Metablock> = Vec::new();
 
+        // Warm to the write tip so the cache can serve the write path; culls
+        // clear these caches when dropping an un-acked tip anyway.
         let mut scanner = ReverseMetablockScanner::new(
             log_segments_cache,
             starting_log_id,
             None,
             config.read_max_chunk_size,
-        );
+        )
+        .with_write_cursor_upper_bound();
 
         let mut deferred_schema_blocks: Vec<(u64, SchemaKey, Metablock)> = Vec::new();
 
@@ -1197,6 +1200,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             shard_mem_cache.add_pending_trim_to_queue(
                 aggregate_key,
                 trim_request.keep_from_aggregate_version,
+                current_indexes.aggregate_version,
+                current_indexes.event_seq,
                 shard_log_queue_item,
             );
         }
@@ -1461,7 +1466,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             [single] => Some(single.aggregate_version),
             _ => None,
         };
-
+        
         let rollback_gen_at_submit = self.shard_mem_cache.borrow().rollback_generation();
         self.append_prepared_writes_to_queue(prepared_writes);
 
@@ -2538,7 +2543,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             return Ok(response(ReplicationResult::Rejected(FollowerRejection::EmptyBatch)));
         }
 
-        let batch_lease_epoch = request.batches[0].metablock.lease_epoch;
+        // Fence stale leaders on the sender's current epoch, not the entries' own
+        // lease_epoch: catchup replays history authored under previous tenures, so
+        // the metablock epoch is legitimately older.
+        let batch_lease_epoch = request.sender_lease_epoch;
         if batch_lease_epoch < leader_lease_epoch {
             return Ok(response(ReplicationResult::Rejected(FollowerRejection::StaleLease {
                 follower_lease_epoch: leader_lease_epoch,
@@ -3978,6 +3986,149 @@ mod tests {
         });
     }
 
+    // ── Pending-trim window ──
+    // A trim-only QueueAggregatePositions entry shadows the durable snapshot in
+    // get_write_event_seqes, so concurrent ops read aggregate_version=0 until commit.
+
+    /// Mirror do_trim's enqueue half without awaiting sync, holding the
+    /// pending-trim window open for the duration of the test.
+    fn enqueue_pending_trim<R: ReplicationClient, D: S3Downloader>(
+        shard: &ShardWal<R, D>,
+        agg: &AggregateKey,
+        keep_from: u64,
+    ) {
+        let idx = shard.shard_mem_cache.borrow_mut().get_write_event_seqes(agg);
+        assert!(idx.aggregate_version > 0, "test setup: aggregate must exist before trim");
+        let metablock = Metablock {
+            wal_seq: 0,
+            server_timestamp: 1000,
+            lease_epoch: 0,
+            node_id: 1,
+            compressed_size: 0,
+            uncompressed_size: 0,
+            datablock_version: 0,
+            datablock_compression_type: 0,
+            datablock: DatablockStorageKind::None,
+            wal_metablock_type: MetablockKind::SoftTrim(MetablockSoftTrim {
+                aggregate_key: agg.clone(),
+                keep_from_aggregate_version: keep_from,
+                aggregate_version: idx.aggregate_version,
+                event_seq: idx.event_seq,
+                client_id: 1,
+                user_id: None,
+            }),
+            previous_tip_hash: GENESIS_HASH,
+            datablock_position: 0,
+        };
+        shard.shard_mem_cache.borrow_mut().add_pending_trim_to_queue(
+            agg, keep_from, idx.aggregate_version, idx.event_seq,
+            ShardLogQueueItem::new(None, None, metablock),
+        );
+    }
+
+    #[test]
+    fn occ_write_during_pending_trim_window_sees_real_version() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            write_ok(&shard, write_req(agg.clone(), events(2))).await;
+            write_ok(&shard, write_req(agg.clone(), events(2))).await; // version 2
+
+            enqueue_pending_trim(&shard, &agg, 1);
+
+            let result = process(&shard, write_req_full(agg.clone(), events(1), false, Some(2), 1, false)).await;
+            assert!(
+                matches!(result, Ok(ClientResponse::Write(_))),
+                "OCC write against the real version must pass during a pending-trim window, got {:?}",
+                result.err()
+            );
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn write_during_pending_trim_window_continues_version_sequence() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            write_ok(&shard, write_req(agg.clone(), events(2))).await;
+            write_ok(&shard, write_req(agg.clone(), events(2))).await; // version 2
+
+            enqueue_pending_trim(&shard, &agg, 1);
+
+            let resp = match process(&shard, write_req(agg.clone(), events(1))).await {
+                Ok(ClientResponse::Write(w)) => w,
+                other => panic!("expected Write response, got {other:?}"),
+            };
+            assert_eq!(
+                resp.max_aggregate_version,
+                Some(3),
+                "write during a pending-trim window must continue from version 2, not restart"
+            );
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn trim_during_pending_trim_window_accepts_valid_range() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            write_ok(&shard, write_req(agg.clone(), events(2))).await;
+            write_ok(&shard, write_req(agg.clone(), events(2))).await; // version 2
+
+            enqueue_pending_trim(&shard, &agg, 1);
+
+            // keep_from=2 is within the real range; must not be rejected as out of range
+            let result = process(&shard, trim_req(agg.clone(), 2)).await;
+            assert!(
+                matches!(result, Ok(ClientResponse::TrimStart(_))),
+                "valid trim during a pending-trim window rejected: {:?}",
+                result.err()
+            );
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn delete_during_pending_trim_window_records_real_version() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            write_ok(&shard, write_req(agg.clone(), events(2))).await;
+            write_ok(&shard, write_req(agg.clone(), events(2))).await; // version 2
+
+            enqueue_pending_trim(&shard, &agg, 1);
+
+            let result = process(&shard, delete_req(agg.clone())).await;
+            assert!(
+                matches!(result, Ok(ClientResponse::Delete(_))),
+                "delete during a pending-trim window failed: {:?}",
+                result.err()
+            );
+
+            let indexes = shard.shard_mem_cache.borrow_mut().get_write_event_seqes(&agg);
+            assert!(indexes.pending_delete_or_deleted);
+            assert_eq!(
+                indexes.aggregate_version, 2,
+                "tombstone must carry the real version, not the trim-window zero"
+            );
+
+            shard.close().await;
+        });
+    }
+
     #[test]
     fn write_empty_events_fails() {
         glommio_test!({
@@ -4153,6 +4304,25 @@ mod tests {
 
             let result = process(&shard, read_req(agg)).await;
             assert!(matches!(result, Err(ShardError::Read(ShardReadError::AggregateNotExists))));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn exists_after_delete_reports_deleted() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+
+            let result = process(&shard, delete_req(agg.clone())).await;
+            assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+
+            let resp = unwrap_exists(process(&shard, exists_req(agg)).await);
+            assert!(resp.is_deleted, "soft-deleted aggregate must report is_deleted");
 
             shard.close().await;
         });
@@ -4458,7 +4628,7 @@ mod tests {
         fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
         fn reset_heartbeat_state(&self) {}
 
-        async fn replicate_to_follower(&self, _batches: Vec<celeriant_msg::request::requests::ReplicationBatchItem>, _leader_confirmed_wal_seq: u64) -> Result<(), ReplicateToFollowerError> {
+        async fn replicate_to_follower(&self, _batches: Vec<celeriant_msg::request::requests::ReplicationBatchItem>, _leader_confirmed_wal_seq: u64, _sender_lease_epoch: u64) -> Result<(), ReplicateToFollowerError> {
             let remaining = self.follower_failures_remaining.get();
             if remaining > 0 {
                 self.follower_failures_remaining.set(remaining - 1);
@@ -4511,7 +4681,7 @@ mod tests {
         fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
         fn reset_heartbeat_state(&self) {}
 
-        async fn replicate_to_follower(&self, _: Vec<celeriant_msg::request::requests::ReplicationBatchItem>, _: u64) -> Result<(), ReplicateToFollowerError> {
+        async fn replicate_to_follower(&self, _: Vec<celeriant_msg::request::requests::ReplicationBatchItem>, _: u64, _: u64) -> Result<(), ReplicateToFollowerError> {
             if self.should_fail.get() {
                 return Err(ReplicateToFollowerError::FollowerUnexpectedResponse);
             }
@@ -4565,7 +4735,7 @@ mod tests {
         fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
         fn reset_heartbeat_state(&self) {}
 
-        async fn replicate_to_follower(&self, _: Vec<celeriant_msg::request::requests::ReplicationBatchItem>, _: u64) -> Result<(), ReplicateToFollowerError> {
+        async fn replicate_to_follower(&self, _: Vec<celeriant_msg::request::requests::ReplicationBatchItem>, _: u64, _: u64) -> Result<(), ReplicateToFollowerError> {
             if !self.bumped.get() {
                 if let Some(mc) = self.shard_mem_cache.borrow().as_ref() {
                     // Mid-replicate concurrent rollback: bumps rollback_generation
@@ -5493,6 +5663,134 @@ mod tests {
         });
     }
 
+    /// write → trim → delete(continuation) → acked recreate, then the process
+    /// dies without a graceful close and restarts with empty caches. The next
+    /// write must derive from the acked recreate, not from the tombstone below
+    /// it — minting the recreate's version twice corrupts the WAL.
+    #[test]
+    fn no_duplicate_version_after_kill_restart_with_recreate_tail() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let agg = key(1, 1, 1);
+
+            let evt_at = |seq: u64| {
+                vec![DatablockAggregateEvent {
+                    client_seq: seq,
+                    event_type_major: 1,
+                    event_value: Arc::new(vec![seq as u8; 8]),
+                    ..Default::default()
+                }]
+            };
+
+            let recreate_version = {
+                let shard = open_shard(&dir).await;
+                write_ok(&shard, write_req_full(agg.clone(), evt_at(1), true, None, 7, true)).await; // v1
+                write_ok(&shard, write_req_full(agg.clone(), evt_at(2), true, None, 7, true)).await; // v2
+                let trim = process(&shard, trim_req(agg.clone(), 2)).await;
+                assert!(matches!(trim, Ok(ClientResponse::TrimStart(_))), "trim failed: {trim:?}");
+                let del = process(&shard, delete_req_full(agg.clone(), true, true, None)).await;
+                assert!(matches!(del, Ok(ClientResponse::Delete(_))), "delete failed: {del:?}");
+                let recreate = match process(&shard, write_req_full(agg.clone(), evt_at(3), true, None, 7, true)).await {
+                    Ok(ClientResponse::Write(w)) => w,
+                    other => panic!("recreate write failed: {other:?}"),
+                };
+                let v = recreate.max_aggregate_version.expect("single-aggregate write carries a version");
+                // SIGKILL: drop without close() — disk state is whatever the last
+                // fsync persisted, in-memory caches are gone.
+                drop(shard);
+                v
+            };
+
+            let shard = open_shard(&dir).await;
+            let resp = match process(&shard, write_req_full(agg.clone(), evt_at(4), true, None, 7, true)).await {
+                Ok(ClientResponse::Write(w)) => w,
+                other => panic!("post-restart write failed: {other:?}"),
+            };
+            let v = resp.max_aggregate_version.expect("single-aggregate write carries a version");
+            assert!(
+                v > recreate_version,
+                "post-restart write minted v{v} but v{recreate_version} was already acked before the kill — duplicate version issuance",
+            );
+
+            shard.close().await;
+        });
+    }
+
+    /// Kill leaves a fsynced read<write tail (replication not yet committed).
+    /// Warmup scanning only to read seeds the tombstone below the tail; the next
+    /// write re-mints the tail's version — cache hit, so no disk load corrects it.
+    #[test]
+    fn warmup_must_not_seed_stale_state_below_fsynced_tail() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let agg = key(1, 1, 1);
+            let evt_at = |seq: u64| {
+                vec![DatablockAggregateEvent {
+                    client_seq: seq,
+                    event_type_major: 1,
+                    event_value: Arc::new(vec![seq as u8; 8]),
+                    ..Default::default()
+                }]
+            };
+
+            let recreate_version = {
+                let shard = open_leader_shard(&dir, FailThenSucceedReplicationClient::new(0, 0)).await;
+                write_ok(&shard, write_req_full(agg.clone(), evt_at(1), true, None, 7, true)).await;
+                write_ok(&shard, write_req_full(agg.clone(), evt_at(2), true, None, 7, true)).await;
+                let trim = process(&shard, trim_req(agg.clone(), 2)).await;
+                assert!(matches!(trim, Ok(ClientResponse::TrimStart(_))), "trim failed: {trim:?}");
+                let del = process(&shard, delete_req_full(agg.clone(), true, true, None)).await;
+                assert!(matches!(del, Ok(ClientResponse::Delete(_))), "delete failed: {del:?}");
+                let recreate = match process(&shard, write_req_full(agg.clone(), evt_at(3), true, None, 7, true)).await {
+                    Ok(ClientResponse::Write(w)) => w,
+                    other => panic!("recreate write failed: {other:?}"),
+                };
+                let v = recreate.max_aggregate_version.expect("single-aggregate write carries a version");
+
+                drop(shard); // SIGKILL: no graceful close
+                v
+            };
+
+            // Quiet test world header-syncs read==write on every ack; rewind the
+            // persisted read one entry to stage a kill-time read<write tail.
+            {
+                use celeriant_rotating_log::log_segment_file::log_segment_file::{LogSegmentFile, write_dual_shard_log_header};
+                let f = LogSegmentFile::open_existing(&dir.to_path_buf(), 1).await.unwrap();
+                {
+                    let mut meta = f.metadata.borrow_mut();
+                    let mut read = meta.read.clone().expect("read cursor persisted");
+                    assert_eq!(read.wal_seq, meta.write.wal_seq, "expected quiet-world read==write before staging");
+                    read.metablocks_position -= FIXED_BLOCK_SIZE_BYTES as u64;
+                    read.wal_seq -= 1;
+                    meta.read = Some(read);
+                }
+                let meta = f.metadata.borrow().clone();
+                let header = meta.to_shard_log_header();
+                let pos = meta.file_len.saturating_sub(celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES as u64);
+                {
+                    let guard = f.lock_writer("test_stage_barrier_lag").await.unwrap();
+                    let dma = guard.as_ref().unwrap();
+                    write_dual_shard_log_header(dma, pos, &header).await.unwrap();
+                    dma.fdatasync().await.unwrap();
+                }
+                f.close().await;
+            }
+
+            let shard = open_shard(&dir).await;
+            let resp = match process(&shard, write_req_full(agg.clone(), evt_at(4), true, None, 7, true)).await {
+                Ok(ClientResponse::Write(w)) => w,
+                other => panic!("post-restart write failed: {other:?}"),
+            };
+            let v = resp.max_aggregate_version.expect("single-aggregate write carries a version");
+            assert!(
+                v > recreate_version,
+                "post-restart write minted v{v} but v{recreate_version} was already acked before the kill — warmup seeded stale state below the fsynced tail",
+            );
+
+            shard.close().await;
+        });
+    }
+
     #[test]
     fn last_self_acked_persists_across_restart() {
         glommio_test!({
@@ -6000,6 +6298,7 @@ mod tests {
             shard_id: 0,
             leader_timestamp_ms: now_ms(),
             leader_confirmed_wal_seq,
+            sender_lease_epoch: 0,
             batches,
         }
     }
@@ -6055,6 +6354,52 @@ mod tests {
                     Err(crate::error::follower_replication_write_error::FollowerReplicationWriteError::ShardFSyncError(_))
                 ),
                 "fsync failure must surface as an error, never a Success ack; got: {result:?}",
+            );
+
+            shard.close().await;
+        });
+    }
+
+    /// A current leader replaying historical entries authored under a previous
+    /// lease epoch must not be rejected as StaleLease. Gating on the authorship
+    /// epoch (first metablock) instead of the sender's current epoch livelocks
+    /// any catchup gap spanning a leadership change: TCP reject forever, S3
+    /// fallback only covers fresh commits.
+    #[test]
+    fn replication_accepts_historical_entries_from_current_leader() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = ShardWal::open(
+                test_config(&dir),
+                ValidatedNodeStatus::create_custom_status(NodeStatus::Follower { leader_lease_epoch: 2 }, 500, now_ms() + 10_000),
+                StubReplicationClient,
+                StubS3Downloader,
+            ).await.unwrap();
+
+            // Entry authored under the previous leadership (epoch 1), replayed by
+            // the legitimate epoch-2 leader during catchup.
+            let mut item = replication_item(1, GENESIS_HASH);
+            item.metablock.lease_epoch = 1;
+            let mut req = replication_batch_req(vec![item]);
+            req.sender_lease_epoch = 2;
+            let resp = unwrap_replication(shard.handle_replication_batch(req).await);
+            assert!(
+                matches!(resp.result, ReplicationResult::Success { .. }),
+                "historical entries from the current leader must be accepted, got {:?}",
+                resp.result,
+            );
+
+            // Zombie fencing must still hold: a sender claiming a stale current
+            // epoch is rejected regardless of its entries' epochs.
+            let mut zombie_item = replication_item(2, shard.log_segments_cache.active().metadata.borrow().write.tip_hash);
+            zombie_item.metablock.lease_epoch = 2;
+            let mut zombie_req = replication_batch_req(vec![zombie_item]);
+            zombie_req.sender_lease_epoch = 1;
+            let resp = unwrap_replication(shard.handle_replication_batch(zombie_req).await);
+            assert!(
+                matches!(resp.result, ReplicationResult::Rejected(FollowerRejection::StaleLease { .. })),
+                "a stale sender epoch must still be fenced, got {:?}",
+                resp.result,
             );
 
             shard.close().await;
@@ -6167,6 +6512,7 @@ mod tests {
                 shard_id: 0,
                 leader_timestamp_ms: 1000, // ancient timestamp
                 leader_confirmed_wal_seq: 0,
+                sender_lease_epoch: 0,
                 batches: vec![replication_item(1, GENESIS_HASH)],
             };
             let resp = unwrap_replication(shard.handle_replication_batch(stale_request).await);
@@ -6195,7 +6541,7 @@ mod tests {
         fn current_heartbeat_started_at_unix_ms(&self) -> Option<u64> { None }
         fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
         fn reset_heartbeat_state(&self) {}
-        async fn replicate_to_follower(&self, _batches: Vec<ReplicationBatchItem>, _leader_confirmed_wal_seq: u64) -> Result<(), ReplicateToFollowerError> { Ok(()) }
+        async fn replicate_to_follower(&self, _batches: Vec<ReplicationBatchItem>, _leader_confirmed_wal_seq: u64, _sender_lease_epoch: u64) -> Result<(), ReplicateToFollowerError> { Ok(()) }
         async fn replicate_to_s3(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error> {
             self.s3_uploads.borrow_mut().push(batches);
             Ok(())
@@ -6231,7 +6577,7 @@ mod tests {
         fn current_heartbeat_started_at_unix_ms(&self) -> Option<u64> { None }
         fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
         fn reset_heartbeat_state(&self) {}
-        async fn replicate_to_follower(&self, _batches: Vec<ReplicationBatchItem>, _leader_confirmed_wal_seq: u64) -> Result<(), ReplicateToFollowerError> { Ok(()) }
+        async fn replicate_to_follower(&self, _batches: Vec<ReplicationBatchItem>, _leader_confirmed_wal_seq: u64, _sender_lease_epoch: u64) -> Result<(), ReplicateToFollowerError> { Ok(()) }
         async fn replicate_to_s3(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error> {
             self.attempts.set(self.attempts.get() + 1);
             if self.failures_remaining.get() > 0 {

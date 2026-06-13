@@ -260,7 +260,7 @@ fn pending_trim_updates_min_aggregate_version() {
     queue_write(&mut c, &k, 5, 5, 1, 1);
 
     let trim_item = test_queue_item(k.clone(), 0, 0, 0);
-    c.add_pending_trim_to_queue(&k, 3, trim_item);
+    c.add_pending_trim_to_queue(&k, 3, 5, 5, trim_item);
 
     let indexes = c.get_write_event_seqes(&k);
     assert_eq!(indexes.min_aggregate_version, 3);
@@ -274,11 +274,11 @@ fn trim_only_increases_min_aggregate_version() {
     queue_write(&mut c, &k, 5, 5, 1, 1);
 
     let item1 = test_queue_item(k.clone(), 0, 0, 0);
-    c.add_pending_trim_to_queue(&k, 5, item1);
+    c.add_pending_trim_to_queue(&k, 5, 5, 5, item1);
 
     // Lower trim should not decrease
     let item2 = test_queue_item(k.clone(), 0, 0, 0);
-    c.add_pending_trim_to_queue(&k, 3, item2);
+    c.add_pending_trim_to_queue(&k, 3, 5, 5, item2);
 
     let indexes = c.get_write_event_seqes(&k);
     assert_eq!(indexes.min_aggregate_version, 5);
@@ -303,7 +303,7 @@ fn trim_commit_does_not_corrupt_snapshot_log_id() {
 
     // Now add a trim (creates QueueAggregatePositions with default log_id=0)
     let trim_item = test_queue_item(k.clone(), 0, 0, 0);
-    c.add_pending_trim_to_queue(&k, 2, trim_item);
+    c.add_pending_trim_to_queue(&k, 2, 3, 10, trim_item);
     sync_and_commit_standalone(&mut c);
 
     // log_id and metablock_absolute_pos must NOT have been overwritten to 0
@@ -312,6 +312,22 @@ fn trim_commit_does_not_corrupt_snapshot_log_id() {
         assert_eq!(pos.log_id, 5, "trim must not corrupt log_id on {:?}", path);
         assert_eq!(pos.metablock_absolute_pos, 2048, "trim must not corrupt metablock_absolute_pos on {:?}", path);
     }
+}
+
+#[test]
+fn pending_trim_does_not_shadow_durable_state() {
+    let mut c = cache();
+    let k = agg(1, 1, 1);
+
+    // Durable state: version 50, event_seq 10. Then a trim-only pending window.
+    queue_write(&mut c, &k, 10, 50, 100, 1);
+    sync_and_commit_standalone(&mut c);
+    c.add_pending_trim_to_queue(&k, 30, 50, 10, test_queue_item(k.clone(), 0, 0, 0));
+
+    let indexes = c.get_write_event_seqes(&k);
+    assert_eq!(indexes.min_aggregate_version, 30);
+    assert_eq!(indexes.aggregate_version, 50, "trim-only queue entry must not shadow durable aggregate_version");
+    assert_eq!(indexes.event_seq, 10, "trim-only queue entry must not shadow durable event_seq");
 }
 
 #[test]
@@ -2094,3 +2110,4 @@ fn fsync_rollback_preserves_segment_summary() {
     assert_eq!(c.peek_segment_summary_types().len(), 2);
     assert_eq!(c.peek_segment_summary().len(), 2);
 }
+

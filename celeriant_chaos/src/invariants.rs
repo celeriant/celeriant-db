@@ -205,6 +205,13 @@ pub fn run_all(data: &RunData, expect: &ScenarioExpectations) -> Vec<CheckResult
         // the content-immutability invariant violated (cull-skip regressed). Should
         // be impossible.
         check_counter("NoSameEpochDivergence", data, |s| s.s3_catchup_same_epoch_divergence_total, 0),
+        // TCP catchup fetch errored — retried as transient on every write, so a
+        // persistent error is a convergence livelock.
+        check_counter("NoCatchupFetchErrors", data, |s| s.catchup_fetch_error_total, 0),
+        // Catchup resolved a nonzero follower gap to zero entries and declared the
+        // follower caught up. With no compaction in chaos scenarios this is always
+        // a livelock signature.
+        check_counter("NoCatchupEmptyFetch", data, |s| s.catchup_empty_fetch_total, 0),
     ];
     if expect.require_leader_retained {
         out.push(check_leader_retained(data));
@@ -826,6 +833,14 @@ mod tests {
             read_bloom_short_circuit_total: 0,
             barrier_sync_fsync_total: 0,
             barrier_sync_fsync_failed_total: 0,
+            probe_gap_detected_total: 0,
+            probe_gap_send_success_total: 0,
+            probe_gap_send_failed_total: 0,
+            catchup_empty_fetch_total: 0,
+            catchup_fallback_total: 0,
+            catchup_fetch_error_total: 0,
+            tombstone_snapshot_regression_total: 0,
+            position_snapshot_stale_commit_total: 0,
         }
     }
 

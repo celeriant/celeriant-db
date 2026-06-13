@@ -31,7 +31,7 @@ pub trait ReplicationClient {
     fn reset_heartbeat_state(&self);
     fn try_acquire_kick(&self) -> bool { true }
     fn release_kick(&self) {}
-    async fn replicate_to_follower(&self, batches: Vec<ReplicationBatchItem>, leader_confirmed_wal_seq: u64) -> Result<(), ReplicateToFollowerError>;
+    async fn replicate_to_follower(&self, batches: Vec<ReplicationBatchItem>, leader_confirmed_wal_seq: u64, sender_lease_epoch: u64) -> Result<(), ReplicateToFollowerError>;
     async fn replicate_to_s3(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error>;
     async fn send_heartbeat(&self, unix_epoch_now_ms: u64, lease_epoch: u64) -> Result<HeartbeatResult, SendHeartbeatError>;
     async fn send_kick(&self) -> Result<bool, SendHeartbeatError>;
@@ -47,7 +47,7 @@ impl ReplicationClient for StubReplicationClient {
     fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
     fn reset_heartbeat_state(&self) {}
 
-    async fn replicate_to_follower(&self, _batches: Vec<ReplicationBatchItem>, _leader_confirmed_wal_seq: u64) -> Result<(), ReplicateToFollowerError> {
+    async fn replicate_to_follower(&self, _batches: Vec<ReplicationBatchItem>, _leader_confirmed_wal_seq: u64, _sender_lease_epoch: u64) -> Result<(), ReplicateToFollowerError> {
         glommio::timer::sleep(std::time::Duration::from_millis(30)).await;
         Ok(())
     }
@@ -226,7 +226,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
         self.kick_in_flight.set(false);
     }
 
-    async fn replicate_to_follower(&self, batches: Vec<ReplicationBatchItem>, leader_confirmed_wal_seq: u64) -> Result<(), ReplicateToFollowerError> {
+    async fn replicate_to_follower(&self, batches: Vec<ReplicationBatchItem>, leader_confirmed_wal_seq: u64, sender_lease_epoch: u64) -> Result<(), ReplicateToFollowerError> {
         if batches.is_empty() {
             return Ok(());
         }
@@ -244,6 +244,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
             shard_id,
             leader_timestamp_ms: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
             leader_confirmed_wal_seq,
+            sender_lease_epoch,
             batches,
         });
 

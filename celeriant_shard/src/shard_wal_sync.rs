@@ -423,9 +423,17 @@ pub(crate) async fn sync(
         let metablock_absolute_pos = log_segment_file_metadata.write.metablocks_position + position as u64;
         item.metablock_absolute_pos = metablock_absolute_pos;
 
-        // Update aggregate positions tracking for event batches (only if entry exists)
-        if let MetablockKind::EventBatchMetadata(event_batch) = &item.metablock.wal_metablock_type {
-            if let Some(aggregate_positions) = sync_positions_snapshot.aggregate_queue_positions.get_mut(&event_batch.aggregate_key) {
+        // Update aggregate positions tracking (only if entry exists). SoftDelete must
+        // record its position too: the commit path's deleted_positions map reads it,
+        // and a delete-only window otherwise leaves the or_insert default (0, 0) —
+        // exists() then chases a metablock at log_0/pos_0 and errors.
+        let positions_key = match &item.metablock.wal_metablock_type {
+            MetablockKind::EventBatchMetadata(event_batch) => Some(&event_batch.aggregate_key),
+            MetablockKind::SoftDelete(soft_delete) => Some(&soft_delete.aggregate_key),
+            _ => None,
+        };
+        if let Some(key) = positions_key {
+            if let Some(aggregate_positions) = sync_positions_snapshot.aggregate_queue_positions.get_mut(key) {
                 aggregate_positions.log_id = log_segment_file_metadata.log_id;
                 aggregate_positions.metablock_absolute_pos = metablock_absolute_pos;
                 aggregate_positions.wal_seq = item.metablock.wal_seq;
@@ -844,6 +852,47 @@ mod tests {
                     let pos = smc.borrow_mut().get_aggregate_last_metablock_pos(&k, path);
                     assert_eq!(pos.min_aggregate_version, 2,
                         "{:?} min_aggregate_version should be 2 on {:?}", node_status, path);
+                }
+
+                lsc.close().await;
+            }
+        });
+    }
+
+    /// Leader-style write path (add_pending_trim_to_queue populates
+    /// aggregate_queue_positions) with COLD snapshot caches at commit —
+    /// simulates the LRU evicting the snapshot between trim validation and
+    /// fsync commit. The positions loop must not manufacture a (0,0) Found
+    /// snapshot from the trim-only entry; the SoftTrim commit arm owns the
+    /// insert, with the metablock's real disk position.
+    #[test]
+    fn trim_only_window_cache_miss_commits_real_snapshot() {
+        glommio_test!({
+            for node_status in non_leader_statuses() {
+                let (_tmp, dir) = test_dir();
+                let lsc = Rc::new(
+                    LogSegmentsCache::ready_up(dir, 4 * 1024 * 1024, 4, 0).await.unwrap()
+                );
+                let smc = Rc::new(RefCell::new(
+                    MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
+                ));
+                let watched = Rc::new(AggregateWatchers::new());
+                let log_segment = lsc.active();
+
+                let k = AggregateKey::new(1, 1, 1);
+
+                let mut trim_item = queue_item(soft_trim_metablock(k.clone(), 2));
+                trim_item.metablock_absolute_pos = 4096;
+                smc.borrow_mut().add_pending_trim_to_queue(&k, 2, 0, 0, trim_item);
+                non_leader_commit_sync(node_status, &smc, &watched, &log_segment);
+
+                for path in [CachePath::Read, CachePath::Write] {
+                    let snap = smc.borrow_mut().get_aggregate_snapshot(&k, path)
+                        .unwrap_or_else(|| panic!("{:?} snapshot must exist on {:?}", node_status, path));
+                    assert_eq!(snap.metablock_absolute_pos, 4096,
+                        "{:?} trim-only commit must carry the trim metablock's position on {:?}", node_status, path);
+                    assert_eq!(snap.min_aggregate_version, 2,
+                        "{:?} trim floor must land on {:?}", node_status, path);
                 }
 
                 lsc.close().await;

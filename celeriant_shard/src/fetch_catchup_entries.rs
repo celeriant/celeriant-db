@@ -292,6 +292,82 @@ mod tests {
         });
     }
 
+    /// A catchup gap spanning a segment-rotation boundary must bridge both segments:
+    /// entries below the rotation point live in the sealed segment, the rest in the
+    /// active one.
+    #[test]
+    fn bridges_gap_across_rotated_segment() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let lsc = Rc::new(LogSegmentsCache::ready_up(dir, FILE_SIZE, 4, 0).await.unwrap());
+
+            let old_blocks: Vec<Metablock> = (1..=10).map(|i| metablock_at(i, 0)).collect();
+            write_metablocks_and_set_read_cursor(&lsc, &old_blocks).await;
+
+            lsc.rotate_to_next_log().await.unwrap();
+
+            let new_blocks: Vec<Metablock> = (11..=15).map(|i| metablock_at(i, 0)).collect();
+            write_metablocks_and_set_read_cursor(&lsc, &new_blocks).await;
+
+            // Gap spans the boundary: (5, 16) → 6..=15 across both segments.
+            let entries = fetch_catchup_entries(&lsc, 5, 16, Some(1024 * 1024), 64 * 1024, &test_codec()).await.unwrap();
+            let wal_seqs: Vec<u64> = entries.iter().map(|e| e.metablock.wal_seq).collect();
+            assert_eq!(wal_seqs, (6..=15).collect::<Vec<u64>>(), "gap must bridge the rotated segment");
+
+            // Gap entirely inside the sealed segment: (5, 11) → 6..=10.
+            let entries = fetch_catchup_entries(&lsc, 5, 11, Some(1024 * 1024), 64 * 1024, &test_codec()).await.unwrap();
+            let wal_seqs: Vec<u64> = entries.iter().map(|e| e.metablock.wal_seq).collect();
+            assert_eq!(wal_seqs, (6..=10).collect::<Vec<u64>>(), "gap inside the sealed segment must be served");
+
+            lsc.close().await;
+        });
+    }
+
+    /// Same as above but the sealed segment is evicted from the LRU and reopened from
+    /// its on-disk dual header. The header is persisted explicitly because the test
+    /// write helper bypasses the product fsync path.
+    #[test]
+    fn bridges_gap_across_rotated_segment_after_eviction() {
+        glommio_test!({
+            use celeriant_rotating_log::log_segment_file::log_segment_file::write_dual_shard_log_header;
+            use celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES;
+
+            let (_tmp, dir) = test_dir();
+            let lsc = Rc::new(LogSegmentsCache::ready_up(dir, FILE_SIZE, 4, 0).await.unwrap());
+
+            let old_blocks: Vec<Metablock> = (1..=10).map(|i| metablock_at(i, 0)).collect();
+            write_metablocks_and_set_read_cursor(&lsc, &old_blocks).await;
+
+            // Persist the sealed segment's final header the way the product fsync does.
+            let sealed = lsc.active();
+            let sealed_log_id = lsc.active_log_id();
+            {
+                let metadata = sealed.metadata.borrow().clone();
+                let header = metadata.to_shard_log_header();
+                let header_pos = metadata.file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64);
+                let guard = sealed.lock_writer("test_persist_header").await.unwrap();
+                let dma = guard.as_ref().unwrap();
+                write_dual_shard_log_header(dma, header_pos, &header).await.unwrap();
+                dma.fdatasync().await.unwrap();
+            }
+
+            lsc.rotate_to_next_log().await.unwrap();
+
+            let new_blocks: Vec<Metablock> = (11..=15).map(|i| metablock_at(i, 0)).collect();
+            write_metablocks_and_set_read_cursor(&lsc, &new_blocks).await;
+
+            lsc.evict_from_lru(sealed_log_id);
+            sealed.close().await;
+            drop(sealed);
+
+            let entries = fetch_catchup_entries(&lsc, 5, 16, Some(1024 * 1024), 64 * 1024, &test_codec()).await.unwrap();
+            let wal_seqs: Vec<u64> = entries.iter().map(|e| e.metablock.wal_seq).collect();
+            assert_eq!(wal_seqs, (6..=15).collect::<Vec<u64>>(), "gap must bridge a reopened sealed segment");
+
+            lsc.close().await;
+        });
+    }
+
     /// Half-open semantics: the boundary metablocks (wal == follower, wal == leader) must
     /// NOT appear in the result. Wal=follower is the entry the follower already has;
     /// wal=leader is the one that triggered the catchup and is sent on the next attempt.

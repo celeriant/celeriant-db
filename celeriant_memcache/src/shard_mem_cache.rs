@@ -262,11 +262,15 @@ impl<V: Validate> ShardMemCache<V> {
         true
     }
 
-    /// Add a pending trim to the queue
+    /// Add a pending trim to the queue. Carries the aggregate's current
+    /// version/event_seq so a trim-only entry doesn't shadow durable state
+    /// in `get_write_event_seqes` (it returns the queue entry early).
     pub fn add_pending_trim_to_queue(
         &mut self,
         aggregate_key: &AggregateKey,
         keep_from_aggregate_version: u64,
+        aggregate_version: u64,
+        event_seq: u64,
         shard_log_queue_item: ShardLogQueueItem,
     ) {
         let aggregate = self
@@ -277,6 +281,12 @@ impl<V: Validate> ShardMemCache<V> {
         // Update min_aggregate_version if the new trim is higher
         if keep_from_aggregate_version > aggregate.min_aggregate_version {
             aggregate.min_aggregate_version = keep_from_aggregate_version;
+        }
+        if aggregate_version > aggregate.aggregate_version {
+            aggregate.aggregate_version = aggregate_version;
+        }
+        if event_seq > aggregate.event_seq {
+            aggregate.event_seq = event_seq;
         }
 
         self.pending_append_bytes = self.pending_append_bytes.saturating_add(shard_log_queue_item.size_bytes());
@@ -440,6 +450,7 @@ impl<V: Validate> ShardMemCache<V> {
 
         aggregate.min_aggregate_version = min_aggregate_version;
         aggregate.pending_delete = false;
+        aggregate.had_event_batch = true;
 
         aggregate
             .client_seqes
@@ -592,6 +603,13 @@ impl<V: Validate> ShardMemCache<V> {
             CachePath::Read => &mut self.aggregate_read_snapshots,
             CachePath::Write => &mut self.aggregate_write_snapshots,
         };
+        // A tombstone landing over a snapshot with a higher version regresses cached
+        // state; the stale-tombstone corruption signature. Detect, don't block.
+        if let Some(existing) = cache.peek(&aggregate_key) {
+            if existing.aggregate_version > aggregate_version {
+                metrics::counter!("celeriant_tombstone_snapshot_regression_total").increment(1);
+            }
+        }
         put_with_priority(cache, aggregate_key.clone(), snapshot, false);
 
         if cache_path == CachePath::Read {
@@ -657,6 +675,11 @@ impl<V: Validate> ShardMemCache<V> {
         };
         if let Some(existing) = cache.get_mut(&event_batch.aggregate_key)
             && existing.status != AggregateStatus::NotFound {
+            // A commit carrying a version at or below the cached one means a stale
+            // batch was fsynced after newer state; upstream of the max-merge clamp.
+            if event_batch.aggregate_version <= existing.aggregate_version && cache_path == CachePath::Write {
+                metrics::counter!("celeriant_position_snapshot_stale_commit_total").increment(1);
+            }
             existing.status = AggregateStatus::Found;
             if event_batch.aggregate_version > existing.aggregate_version {
                 existing.aggregate_version = event_batch.aggregate_version;
@@ -691,42 +714,18 @@ impl<V: Validate> ShardMemCache<V> {
                 continue; // Will be handled by put_aggregate_into_cache_as_deleted
             }
 
-            // Only update disk position when this batch had an EventBatch write.
-            // Trim-only batches have default log_id=0 which would corrupt the position.
-            let has_event_batch = queue_positions.aggregate_version > 0;
+            // Trim-only entries never get disk positions assigned during sync
+            // (log_id/pos stay default) — touching the snapshot caches from one
+            // manufactures a (0,0) Found snapshot on a cache miss, which exists()
+            // then chases to a MetablockReadError. The SoftTrim commit arm owns
+            // the snapshot instead, with the trim metablock's full state and real
+            // position. Client-seq tracking and the queue-entry cleanup below
+            // still run for every entry.
+            let has_event_batch = queue_positions.had_event_batch;
 
-            // Always update write cache
-            if let Some(existing) = self.aggregate_write_snapshots.get_mut(&key)
-            && existing.status != AggregateStatus::NotFound {
-                existing.status = AggregateStatus::Found;
-                if queue_positions.aggregate_version > existing.aggregate_version {
-                    existing.aggregate_version = queue_positions.aggregate_version;
-                }
-                if queue_positions.event_seq > existing.event_seq {
-                    existing.event_seq = queue_positions.event_seq;
-                }
-                if has_event_batch {
-                    existing.log_id = queue_positions.log_id;
-                    existing.metablock_absolute_pos = queue_positions.metablock_absolute_pos;
-                }
-            } else {
-                let snapshot = MemSnapshotAggregate {
-                    log_id: queue_positions.log_id,
-                    metablock_absolute_pos: queue_positions.metablock_absolute_pos,
-                    event_seq: queue_positions.event_seq,
-                    aggregate_version: queue_positions.aggregate_version,
-                    min_aggregate_version: queue_positions.min_aggregate_version,
-                    status: AggregateStatus::Found,
-                    allow_sequence_continuation: false,
-                    allow_recreate: false,
-                };
-                self.aggregate_write_snapshots.put(key.clone(), snapshot);
-            }
-
-            if !node_status.is_leader() {
-                // Single-node: update read cache immediately.
-                // Follower does not enter here as aggregate_queue_positions is not populated during replication
-                if let Some(existing) = self.aggregate_read_snapshots.get_mut(&key)
+            if has_event_batch {
+                // Always update write cache
+                if let Some(existing) = self.aggregate_write_snapshots.get_mut(&key)
                 && existing.status != AggregateStatus::NotFound {
                     existing.status = AggregateStatus::Found;
                     if queue_positions.aggregate_version > existing.aggregate_version {
@@ -735,12 +734,10 @@ impl<V: Validate> ShardMemCache<V> {
                     if queue_positions.event_seq > existing.event_seq {
                         existing.event_seq = queue_positions.event_seq;
                     }
-                    if has_event_batch {
-                        existing.log_id = queue_positions.log_id;
-                        existing.metablock_absolute_pos = queue_positions.metablock_absolute_pos;
-                    }
+                    existing.log_id = queue_positions.log_id;
+                    existing.metablock_absolute_pos = queue_positions.metablock_absolute_pos;
                 } else {
-                    self.aggregate_read_snapshots.put(key.clone(), MemSnapshotAggregate {
+                    let snapshot = MemSnapshotAggregate {
                         log_id: queue_positions.log_id,
                         metablock_absolute_pos: queue_positions.metablock_absolute_pos,
                         event_seq: queue_positions.event_seq,
@@ -749,7 +746,36 @@ impl<V: Validate> ShardMemCache<V> {
                         status: AggregateStatus::Found,
                         allow_sequence_continuation: false,
                         allow_recreate: false,
-                    });
+                    };
+                    self.aggregate_write_snapshots.put(key.clone(), snapshot);
+                }
+
+                if !node_status.is_leader() {
+                    // Single-node: update read cache immediately.
+                    // Follower does not enter here as aggregate_queue_positions is not populated during replication
+                    if let Some(existing) = self.aggregate_read_snapshots.get_mut(&key)
+                    && existing.status != AggregateStatus::NotFound {
+                        existing.status = AggregateStatus::Found;
+                        if queue_positions.aggregate_version > existing.aggregate_version {
+                            existing.aggregate_version = queue_positions.aggregate_version;
+                        }
+                        if queue_positions.event_seq > existing.event_seq {
+                            existing.event_seq = queue_positions.event_seq;
+                        }
+                        existing.log_id = queue_positions.log_id;
+                        existing.metablock_absolute_pos = queue_positions.metablock_absolute_pos;
+                    } else {
+                        self.aggregate_read_snapshots.put(key.clone(), MemSnapshotAggregate {
+                            log_id: queue_positions.log_id,
+                            metablock_absolute_pos: queue_positions.metablock_absolute_pos,
+                            event_seq: queue_positions.event_seq,
+                            aggregate_version: queue_positions.aggregate_version,
+                            min_aggregate_version: queue_positions.min_aggregate_version,
+                            status: AggregateStatus::Found,
+                            allow_sequence_continuation: false,
+                            allow_recreate: false,
+                        });
+                    }
                 }
             }
 

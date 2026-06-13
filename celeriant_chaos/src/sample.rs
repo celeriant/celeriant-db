@@ -99,6 +99,22 @@ pub struct NodeSample {
     /// Header-only fsync at replication commit, persisting last_self_acked_wal_seq.
     pub barrier_sync_fsync_total: u64,
     pub barrier_sync_fsync_failed_total: u64,
+    /// Reconciliation probe detected a behind follower (WalSeqMismatch on the tip send).
+    pub probe_gap_detected_total: u64,
+    /// Probe-triggered catchup outcomes: Caught vs FallbackToS3. A failed count that
+    /// grows while a follower stays behind is the convergence-livelock signature.
+    pub probe_gap_send_success_total: u64,
+    pub probe_gap_send_failed_total: u64,
+    /// Catchup fetch returned no entries for a nonzero gap (treated as Caught).
+    pub catchup_empty_fetch_total: u64,
+    /// Catchup gave up on TCP and fell back to S3 (sum over reasons).
+    pub catchup_fallback_total: u64,
+    /// Catchup fetch errored (ExtendedCatchupFailure path).
+    pub catchup_fetch_error_total: u64,
+    /// A tombstone cache put regressed a newer snapshot — stale-tombstone signature.
+    pub tombstone_snapshot_regression_total: u64,
+    /// A committed batch carried a version at/below the cached one on the write path.
+    pub position_snapshot_stale_commit_total: u64,
 }
 
 impl NodeSample {
@@ -146,6 +162,14 @@ impl NodeSample {
             read_bloom_short_circuit_total: 0,
             barrier_sync_fsync_total: 0,
             barrier_sync_fsync_failed_total: 0,
+            probe_gap_detected_total: 0,
+            probe_gap_send_success_total: 0,
+            probe_gap_send_failed_total: 0,
+            catchup_empty_fetch_total: 0,
+            catchup_fallback_total: 0,
+            catchup_fetch_error_total: 0,
+            tombstone_snapshot_regression_total: 0,
+            position_snapshot_stale_commit_total: 0,
         }
     }
 }
@@ -197,6 +221,14 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         "celeriant_read_bloom_short_circuit_total",
         "celeriant_barrier_sync_fsync_total",
         "celeriant_barrier_sync_fsync_failed_total",
+        "celeriant_probe_outcome_gap_detected_total",
+        "celeriant_probe_gap_send_success_total",
+        "celeriant_probe_gap_send_failed_total",
+        "celeriant_catchup_empty_fetch_total",
+        "celeriant_catchup_fallback_total",
+        "celeriant_catchup_fetch_error_total",
+        "celeriant_tombstone_snapshot_regression_total",
+        "celeriant_position_snapshot_stale_commit_total",
     ];
 
     for line in body.lines() {
@@ -304,6 +336,14 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         truncate_divergence_advanced_total: get("celeriant_truncate_divergence_advanced_total"),
         truncate_divergence_advanced_wal_seqs_total: get("celeriant_truncate_divergence_advanced_wal_seqs_total"),
         read_bloom_short_circuit_total: get("celeriant_read_bloom_short_circuit_total"),
+        probe_gap_detected_total: get("celeriant_probe_outcome_gap_detected_total"),
+        probe_gap_send_success_total: get("celeriant_probe_gap_send_success_total"),
+        probe_gap_send_failed_total: get("celeriant_probe_gap_send_failed_total"),
+        catchup_empty_fetch_total: get("celeriant_catchup_empty_fetch_total"),
+        catchup_fallback_total: get("celeriant_catchup_fallback_total"),
+        catchup_fetch_error_total: get("celeriant_catchup_fetch_error_total"),
+        tombstone_snapshot_regression_total: get("celeriant_tombstone_snapshot_regression_total"),
+        position_snapshot_stale_commit_total: get("celeriant_position_snapshot_stale_commit_total"),
         barrier_sync_fsync_total: get("celeriant_barrier_sync_fsync_total"),
         barrier_sync_fsync_failed_total: get("celeriant_barrier_sync_fsync_failed_total"),
     }

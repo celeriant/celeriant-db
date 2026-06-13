@@ -1620,6 +1620,7 @@ mod tests {
             shard_id: 2,
             leader_timestamp_ms: 0,
             leader_confirmed_wal_seq: 0,
+            sender_lease_epoch: 0,
             batches: vec![],
         });
         let shard = determine_cluster_shard(&request, &config).unwrap();
@@ -1634,6 +1635,7 @@ mod tests {
             shard_id: 10,
             leader_timestamp_ms: 0,
             leader_confirmed_wal_seq: 0,
+            sender_lease_epoch: 0,
             batches: vec![],
         });
         let result = determine_cluster_shard(&request, &config);

@@ -438,7 +438,10 @@ async fn run_probe_send<R: ReplicationClient + 'static>(
                 replication_client, log_segments_cache, node_status,
                 max_follower_wal_seq, leader_wal_seq.saturating_add(1),
                 max_catchup_gap_bytes, max_request_size, read_max_chunk_size, shard_id, dict_codec,
-            ).await? {
+            ).await.inspect_err(|e| {
+                // Retried as transient by the orchestrator; log or it's invisible.
+                warn!(shard_id, follower_wal = max_follower_wal_seq, leader_wal = leader_wal_seq, error = ?e, "Probe catchup errored");
+            })? {
                 crate::replicate_follower_catchup::CatchupOutcome::Caught => {
                     metrics::counter!("celeriant_probe_gap_send_success_total").increment(1);
                 }
@@ -615,16 +618,19 @@ async fn single_send<R: ReplicationClient + 'static>(
     max_clock_drift_ms: u64,
     shard_id: u32,
 ) -> Result<SingleSendOutcome, ReplicationError> {
-    if !node_status.get().is_leader() {
-        return Err(ReplicationError::LeaderFenced);
-    }
+    // The request carries our current epoch; item authorship epochs may be older
+    // (replay of a previous tenure's entries) and must not be used for fencing.
+    let sender_lease_epoch = match node_status.get().effective_node_status().lease_epoch() {
+        Some(e) => e,
+        None => return Err(ReplicationError::LeaderFenced),
+    };
 
     // Pre-flight lease check; bail if already fenced before starting the TCP send.
     let _ = acquire_lease_budget(node_status, "replicate", shard_id)?;
     let tcp_start = Instant::now();
     debug!(shard_id, batch_count = items.len(), "TCP replication attempt starting");
     // Save as s3 replication, no with_budget
-    let send = replication_client.replicate_to_follower(items, leader_confirmed_wal_seq).await;
+    let send = replication_client.replicate_to_follower(items, leader_confirmed_wal_seq, sender_lease_epoch).await;
 
     let err = match send {
         Ok(()) => return Ok(SingleSendOutcome::Ok),
@@ -654,12 +660,12 @@ async fn single_send<R: ReplicationClient + 'static>(
             Ok(SingleSendOutcome::Failed)
         }
         FollowerRejection::StaleLease { follower_lease_epoch, received_lease_epoch } => {
+            // received_lease_epoch is the sender epoch we claimed at send time.
             // (a) our_lease < follower_lease_epoch — genuine split-brain. Some
             //     other node took leadership and the follower learned about it;
             //     fence self so we stop writing under a dead lease.
-            // (b) our_lease >= follower_lease_epoch — benign rejection of an
-            //     OLD metablock (queued under a previous leader / lease).
-            //     Leadership is still valid, no action.
+            // (b) our_lease >= follower_lease_epoch — our lease advanced between
+            //     send and response. Leadership is still valid, no action.
             let current = node_status.get();
             let raw = current.raw();
             let our_lease = raw.lease_epoch().unwrap_or(0);
@@ -1171,7 +1177,7 @@ mod tests {
         fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
         fn reset_heartbeat_state(&self) {}
 
-        async fn replicate_to_follower(&self, b: Vec<ReplicationBatchItem>, _leader_confirmed_wal_seq: u64) -> Result<(), ReplicateToFollowerError> {
+        async fn replicate_to_follower(&self, b: Vec<ReplicationBatchItem>, _leader_confirmed_wal_seq: u64, _sender_lease_epoch: u64) -> Result<(), ReplicateToFollowerError> {
             if let Some(d) = self.tcp_pre_delay.get() {
                 glommio::timer::sleep(d).await;
             }

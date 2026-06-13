@@ -88,6 +88,10 @@ pub struct DeleteTrimLedger {
 pub struct DeleteTrimOutcome {
     pub counters: DeleteTrimCounters,
     pub ledgers: Vec<DeleteTrimLedger>,
+    /// (aggregate_id, client_id, acked_version) per version regression, so the
+    /// harness can capture disk truth for exactly the violating aggregates
+    /// before the next scenario wipes the cluster.
+    pub regression_aggs: Vec<(u128, u128, u64)>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -159,6 +163,7 @@ pub async fn run_delete_trim_workload(
     let c_resyncs = Arc::new(AtomicU64::new(0));
     let c_regressions = Arc::new(AtomicU64::new(0));
     let c_fatal = Arc::new(AtomicU64::new(0));
+    let regression_aggs = Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let mut tasks = Vec::with_capacity(num_tasks);
     for id in 0..num_tasks {
@@ -172,6 +177,7 @@ pub async fn run_delete_trim_workload(
         let c_resyncs = c_resyncs.clone();
         let c_regressions = c_regressions.clone();
         let c_fatal = c_fatal.clone();
+        let regression_aggs = regression_aggs.clone();
 
         // org 2 keeps these aggregates disjoint from the main bench (org 1);
         // the client_id offset keeps the server-side idempotency cache
@@ -240,6 +246,9 @@ pub async fn run_delete_trim_workload(
                                 // load noise.
                                 if v <= ledger.highest_server_acked_version {
                                     c_regressions.fetch_add(1, Ordering::Relaxed);
+                                    if let Ok(mut aggs) = regression_aggs.lock() {
+                                        aggs.push((id as u128, client_id, v));
+                                    }
                                     eprintln!(
                                         "[delete-trim {id}] VERSION REGRESSION: acked v{v} after acked v{}",
                                         ledger.highest_server_acked_version
@@ -440,6 +449,7 @@ pub async fn run_delete_trim_workload(
             fatal_errors: c_fatal.load(Ordering::Relaxed),
         },
         ledgers,
+        regression_aggs: regression_aggs.lock().map(|v| v.clone()).unwrap_or_default(),
     }
 }
 
@@ -502,7 +512,7 @@ pub async fn audit_delete_trim_pinned(
         // On a violation, re-read from every pinned node: "durably lost"
         // (all nodes agree) and "invisible on one node" have entirely
         // different root causes, and the sample must say which.
-        let mut flag = |report: &mut DeleteTrimAuditReport, base: String, per_node: Option<(String, bool)>| {
+        let flag = |report: &mut DeleteTrimAuditReport, base: String, per_node: Option<(String, bool)>| {
             let s = match per_node {
                 Some((nodes, disagree)) => {
                     if disagree {

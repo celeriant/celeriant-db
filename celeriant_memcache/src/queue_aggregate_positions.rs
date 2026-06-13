@@ -15,4 +15,7 @@ pub struct QueueAggregatePositions {
     pub aggregate_version: u64,
     pub min_aggregate_version: u64,
     pub client_seqes: HashMap<u128, u64>,
+    /// True once an event-batch write lands in this window. Gates the
+    /// snapshot-from-entry commit path; trim-only entries leave it false.
+    pub had_event_batch: bool,
 }

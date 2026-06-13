@@ -1,8 +1,6 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use tracing::debug;
-
 use celeriant_distributed::validated_node_status::ValidatedNodeStatus;
 use celeriant_msg::request::requests::ReplicationBatchItem;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
@@ -43,14 +41,28 @@ pub(crate) async fn replicate_follower_catchup<R: ReplicationClient + 'static>(
     ).await {
         Ok(entries) => entries,
         Err(FetchCatchupEntriesError::FollowerTooFarBehind) => {
+            tracing::debug!(shard_id, follower_wal_seq, leader_wal_seq, "Catchup gap exceeds byte budget; falling back to S3");
+            metrics::counter!("celeriant_catchup_fallback_total", &[("reason", "too_far_behind".to_string())]).increment(1);
             return Ok(CatchupOutcome::FallbackToS3);
         }
-        Err(e) => return Err(ReplicationError::ExtendedCatchupFailure(e)),
+        Err(e) => {
+            tracing::warn!(shard_id, follower_wal_seq, leader_wal_seq, error = ?e, "Catchup fetch failed");
+            metrics::counter!("celeriant_catchup_fetch_error_total").increment(1);
+            return Err(ReplicationError::ExtendedCatchupFailure(e));
+        }
     };
 
     if entries.is_empty() {
         // Leader no longer holds the gap range (compacted/trimmed). The follower's
         // position is implicitly current; let the caller retry the original send.
+        // Loud on purpose: a nonzero gap resolving to nothing stalls convergence
+        // silently if it's wrong.
+        tracing::warn!(
+            shard_id, follower_wal_seq, leader_wal_seq,
+            gap = leader_wal_seq.saturating_sub(follower_wal_seq),
+            "Catchup fetch returned empty for a nonzero gap; treating follower as caught up"
+        );
+        metrics::counter!("celeriant_catchup_empty_fetch_total").increment(1);
         return Ok(CatchupOutcome::Caught);
     }
 
@@ -59,13 +71,16 @@ pub(crate) async fn replicate_follower_catchup<R: ReplicationClient + 'static>(
         .map(|e| ReplicationBatchItem { metablock: e.metablock, datablock: e.datablock })
         .collect();
 
-    debug!(shard_id, follower_wal_seq, leader_wal_seq, count = items.len(), "Catchup entries fetched");
+    tracing::debug!(shard_id, follower_wal_seq, leader_wal_seq, count = items.len(), "Catchup entries fetched");
 
     let mut sent: usize = 0;
     while sent < items.len() {
-        if !node_status.get().is_leader() {
-            return Err(ReplicationError::LeaderFenced);
-        }
+        // The request carries our current epoch; the items' own authorship epochs
+        // may be older (historical replay) and must not be used for fencing.
+        let sender_lease_epoch = match node_status.get().effective_node_status().lease_epoch() {
+            Some(e) => e,
+            None => return Err(ReplicationError::LeaderFenced),
+        };
 
         let end_idx = batch_end_index(&items[sent..], max_request_size);
         // Pre-flight lease check; bail if fenced or zero remaining before starting.
@@ -80,7 +95,7 @@ pub(crate) async fn replicate_follower_catchup<R: ReplicationClient + 'static>(
 
         let chunk = items[sent..sent + end_idx].to_vec();
         let leader_confirmed_wal_seq = current_leader_confirmed_wal_seq(log_segments_cache);
-        let send_result = replication_client.replicate_to_follower(chunk, leader_confirmed_wal_seq).await;
+        let send_result = replication_client.replicate_to_follower(chunk, leader_confirmed_wal_seq, sender_lease_epoch).await;
 
         match send_result {
             Ok(()) => {
@@ -88,11 +103,13 @@ pub(crate) async fn replicate_follower_catchup<R: ReplicationClient + 'static>(
             }
             Err(e @ (ReplicateToFollowerError::FollowerNetworkError(_) | ReplicateToFollowerError::LockTimeout)) => {
                 replication_client.set_follower_reachable(false);
-                debug!(shard_id, sent, chunk_len = end_idx, error = ?e, "Catchup TCP failed; falling back to S3");
+                tracing::debug!(shard_id, sent, chunk_len = end_idx, error = ?e, "Catchup TCP failed; falling back to S3");
+                metrics::counter!("celeriant_catchup_fallback_total", &[("reason", "network".to_string())]).increment(1);
                 return Ok(CatchupOutcome::FallbackToS3);
             }
             Err(e) => {
-                debug!(shard_id, sent, chunk_len = end_idx, error = ?e, "Catchup TCP rejected; falling back to S3");
+                tracing::debug!(shard_id, sent, chunk_len = end_idx, error = ?e, "Catchup TCP rejected; falling back to S3");
+                metrics::counter!("celeriant_catchup_fallback_total", &[("reason", "rejected".to_string())]).increment(1);
                 return Ok(CatchupOutcome::FallbackToS3);
             }
         }

@@ -125,6 +125,10 @@ pub struct ReplicationBatchRequest {
     /// Leader's `read.wal_seq` at send time. Follower uses this as the
     /// promotion-batch upload floor (sets `last_received_replication_wal_seq = this + 1`).
     pub leader_confirmed_wal_seq: u64,
+    /// The sender's current lease epoch, proving present leadership. The follower's
+    /// StaleLease gate compares this, not the per-metablock authorship epoch, which
+    /// is legitimately older when catchup replays entries from previous tenures.
+    pub sender_lease_epoch: u64,
     /// If there are batches to replicate, they are provided to the follower
     /// Otherwise it's just a heartbeat message
     pub batches: Vec<ReplicationBatchItem>,
