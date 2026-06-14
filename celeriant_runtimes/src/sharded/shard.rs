@@ -11,7 +11,7 @@ use celeriant_shard::{error::send_heartbeat_error::SendHeartbeatError, replicati
 use glommio::{
     channels::{
         channel_mesh::{Receivers, Senders},
-        local_channel::LocalReceiver,
+        local_channel::{self, LocalReceiver},
         shared_channel::ConnectedReceiver,
     },
     net::TcpListener,
@@ -23,7 +23,7 @@ use crate::sharded::{
     connection_handler::{
         CatchupCompletionMsg, ConnectionContext, PortType, handle_enter_s3_catchup, handle_new_connection, handle_redirected_client_connection, handle_redirected_cluster_connection,
     },
-    intrashard_messages::IntrashardMessages,
+    intrashard_messages::{ExtensionMesh, IntrashardMessages, RedirectedConnection},
     shard_config::ShardConfig,
     signal_handler::SignalHandler,
     tls_config::{TlsConfig, TlsMode},
@@ -31,6 +31,8 @@ use crate::sharded::{
 };
 
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+const EXTENSION_REDIRECT_CHANNEL_CAP: usize = 1024;
 
 /// Enable TCP keepalive on a socket to detect dead peers at the OS level.
 /// Uses a 10-second idle time and 3-second probe interval — if a peer is
@@ -57,6 +59,7 @@ pub struct Shard<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: L
     shutdown_requested: Rc<Cell<bool>>,
     shard_wal: Rc<ShardWal<R, D>>,
     shard_failed: Arc<AtomicBool>,
+    extension_inbound: Option<LocalReceiver<RedirectedConnection>>,
 }
 
 impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static> Shard<R, D, S> {
@@ -77,6 +80,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
         let shard_wal = Rc::new(shard_wal);
 
         let dict_codec = shard_wal.dict_codec.clone();
+        let (extension_redirect_tx, extension_inbound) = local_channel::new_bounded::<RedirectedConnection>(EXTENSION_REDIRECT_CHANNEL_CAP);
         let ctx = ConnectionContext {
             config: Rc::new(config),
             current_shard_id,
@@ -87,6 +91,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
             schema_registration_pending: None,
             lease_manager: lease_manager.map(Rc::new),
             dict_codec,
+            extension_redirect_sink: Some(Rc::new(extension_redirect_tx)),
         };
 
         // Wire the out-of-band lease-renewal hook: lets the replication path nudge shard 0
@@ -105,7 +110,19 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
             shutdown_requested,
             shard_wal,
             shard_failed,
+            extension_inbound: Some(extension_inbound),
         }
+    }
+
+    pub fn take_extension_mesh(&mut self) -> ExtensionMesh {
+        let inbound = self.extension_inbound.take()
+            .expect("take_extension_mesh called more than once");
+        ExtensionMesh::new(
+            self.ctx.current_shard_id,
+            self.ctx.config.num_shards as usize,
+            self.ctx.intrashard_sender.clone(),
+            inbound,
+        )
     }
 
     /// Read-only access to the per-shard WAL. Used by external runtime
@@ -1274,6 +1291,14 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
                 message_version,
                 ctx.clone(),
             );
+        }
+        IntrashardMessages::ExtensionConnectionRedirect { accepted_tcp_stream, payload } => {
+            if let Some(sink) = ctx.extension_redirect_sink.as_ref() {
+                if sink.try_send(RedirectedConnection { accepted_tcp_stream, payload }).is_err() {
+                    metrics::counter!("celeriant_extension_redirect_dropped_total").increment(1);
+                    warn!(shard_id = ctx.current_shard_id, "Extension redirect dropped — sink closed");
+                }
+            }
         }
         IntrashardMessages::CullSpeculativeTail { rewind_to_ack_barrier } => {
             if let Err(e) = ctx.shard_wal.cull_speculative_tail_for_promotion(rewind_to_ack_barrier).await {

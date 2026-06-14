@@ -26,7 +26,7 @@ use glommio::{channels::{channel_mesh::Senders, local_channel::LocalSender}, net
 use tracing::{debug, info, warn};
 
 use super::{
-    intrashard_messages::IntrashardMessages,
+    intrashard_messages::{IntrashardMessages, RedirectedConnection},
     shard::try_send_with_retry,
     shard_config::ShardConfig,
     shard_error_response::{shard_error_to_client_response, shard_error_to_cluster_response, shard_routing_error_to_code, watch_read_error_to_client_response, watch_session_error_to_client_response},
@@ -65,6 +65,7 @@ pub struct ConnectionContext<R: ReplicationClient + 'static, D: S3Downloader + '
     pub schema_registration_pending: Option<Rc<RefCell<HashMap<u64, LocalSender<SchemaRegistrationCompletionMsg>>>>>,
     pub lease_manager: Option<Rc<S3LeaseManager<S>>>,
     pub dict_codec: Rc<DictCodec>,
+    pub extension_redirect_sink: Option<Rc<LocalSender<RedirectedConnection>>>,
 }
 
 /// Connection-level state for identity verification and access control
@@ -86,6 +87,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
             schema_registration_pending: self.schema_registration_pending.clone(),
             lease_manager: self.lease_manager.clone(),
             dict_codec: self.dict_codec.clone(),
+            extension_redirect_sink: self.extension_redirect_sink.clone(),
         }
     }
 }
@@ -662,8 +664,16 @@ async fn check_cluster_redirect<R: ReplicationClient + 'static, D: S3Downloader 
 /// Route a routing_id to a data shard. When `reserve_coordinator_shard` is true,
 /// shard 0 is reserved for coordination and data routes to shards 1..num_shards-1.
 fn data_shard(routing_id: u128, config: &ShardConfig) -> usize {
-    let num_shards = config.num_shards as u128;
-    if config.reserve_coordinator_shard {
+    data_shard_for_routing_id(routing_id, config.num_shards, config.reserve_coordinator_shard)
+}
+
+pub fn data_shard_for_routing_id(routing_id: u128, num_shards: u32, reserve_coordinator_shard: bool) -> usize {
+    let num_shards = num_shards as u128;
+
+    if num_shards <= 1 {
+        return 0;
+    }
+    if reserve_coordinator_shard {
         let data_shards = num_shards - 1;
         (routing_id % data_shards + 1) as usize
     } else {

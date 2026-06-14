@@ -1,6 +1,10 @@
+use std::rc::Rc;
+
 use celeriant_distributed::validated_node_status::ValidatedNodeStatus;
 use celeriant_msg::{process_client_requests::ClientRequest, process_cluster_requests::ClusterRequest, request::requests::RegisterSchemaRequest, response::responses::AccessLevel};
 use celeriant_shard::{error::{s3_catchup_error::S3CatchupError, shard_schema_error::ShardSchemaError}, shard_wal_s3_catchup::S3CatchupResult};
+use glommio::channels::channel_mesh::Senders;
+use glommio::channels::local_channel::LocalReceiver;
 use glommio::net::AcceptedTcpStream;
 
 #[derive(Clone, Debug)]
@@ -17,6 +21,10 @@ pub enum IntrashardMessages {
         accepted_tcp_stream: AcceptedTcpStream,
         request: ClusterRequest,
         message_version: u32,
+    },
+    ExtensionConnectionRedirect {
+        accepted_tcp_stream: AcceptedTcpStream,
+        payload: Vec<u8>,
     },
     CullSpeculativeTail { rewind_to_ack_barrier: bool },
     RenewS3LeaseNow { requesting_shard: usize },
@@ -45,4 +53,61 @@ pub enum IntrashardMessages {
         request_id: u64,
         result: Result<(), ShardSchemaError>,
     },
+}
+
+pub struct RedirectedConnection {
+    pub accepted_tcp_stream: AcceptedTcpStream,
+    pub payload: Vec<u8>,
+}
+
+pub struct ExtensionMesh {
+    shard_id: usize,
+    num_shards: usize,
+    sender: Rc<Senders<IntrashardMessages>>,
+    inbound: LocalReceiver<RedirectedConnection>,
+}
+
+impl ExtensionMesh {
+    pub(crate) fn new(
+        shard_id: usize,
+        num_shards: usize,
+        sender: Rc<Senders<IntrashardMessages>>,
+        inbound: LocalReceiver<RedirectedConnection>,
+    ) -> Self {
+        Self { shard_id, num_shards, sender, inbound }
+    }
+
+    pub fn shard_id(&self) -> usize { self.shard_id }
+    pub fn num_shards(&self) -> usize { self.num_shards }
+
+    pub fn try_redirect(
+        &self,
+        target_shard: usize,
+        stream: AcceptedTcpStream,
+        payload: Vec<u8>,
+    ) -> Result<(), Option<AcceptedTcpStream>> {
+        if target_shard == self.shard_id {
+            return Err(Some(stream));
+        }
+        let msg = IntrashardMessages::ExtensionConnectionRedirect {
+            accepted_tcp_stream: stream,
+            payload,
+        };
+        match self.sender.try_send_to(target_shard, msg) {
+            Ok(()) => {
+                metrics::counter!("celeriant_extension_redirects_total").increment(1);
+                Ok(())
+            }
+            Err(e) => match e.into_inner() {
+                Some(IntrashardMessages::ExtensionConnectionRedirect { accepted_tcp_stream, .. }) => {
+                    Err(Some(accepted_tcp_stream))
+                }
+                _ => Err(None),
+            },
+        }
+    }
+
+    pub async fn recv(&self) -> Option<RedirectedConnection> {
+        self.inbound.recv().await
+    }
 }

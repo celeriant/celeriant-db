@@ -428,6 +428,20 @@ pub fn hash_api_key(key: &[u8; 32]) -> [u8; 32] {
     Sha256::digest(key).into()
 }
 
+/// SHA-256 of `bytes` as a lowercase hex string. Used to content-address a
+/// compression dictionary so a client can advertise the sha it already holds
+/// (`known_dict_sha256`) and skip re-downloading the bytes.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    use std::fmt::Write;
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 pub fn constant_time_compare(a: &[u8; 32], b: &[u8; 32]) -> bool {
     use subtle::ConstantTimeEq;
     a.ct_eq(b).into()

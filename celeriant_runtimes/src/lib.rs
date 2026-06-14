@@ -25,6 +25,9 @@ pub use {sharded::shard_config::{ApiKeyHashes, ShardConfig, TlsCertPaths}, sidec
 pub use sidecar::sidecar_s3_uploader::SidecarS3Uploader;
 pub use sidecar::sidecar_s3_downloader::SidecarS3Downloader;
 
+pub use sharded::intrashard_messages::{ExtensionMesh, RedirectedConnection};
+pub use sharded::connection_handler::data_shard_for_routing_id;
+
 const MAX_SHARD_RESTARTS: u32 = 3;
 const SHARD_RESTART_DELAY: Duration = Duration::from_secs(5);
 const RESTART_BUDGET_RESET: Duration = Duration::from_secs(600);
@@ -32,18 +35,26 @@ const RESTART_BUDGET_RESET: Duration = Duration::from_secs(600);
 /// Extension point for per-shard "bolt-on" tasks. Implementations spawn
 /// glommio-local tasks on the same executor that owns the shard's WAL
 /// typical use is binding an additional listener port
+pub struct ShardExtensionContext {
+    pub shard_id: usize,
+    pub num_shards: usize,
+    pub routing_rule: RoutingRule,
+    pub reserve_coordinator_shard: bool,
+    pub shard_wal: Rc<ShardWal<FollowerConnection<SidecarS3Uploader>, SidecarS3Downloader>>,
+    pub shutdown: Rc<Cell<bool>>,
+    pub mesh: ExtensionMesh,
+    pub tls_config: Option<Arc<TlsConfig>>,
+    pub api_key_hashes: Option<Arc<ApiKeyHashes>>,
+    pub data_root: std::path::PathBuf,
+}
+
 pub trait PerShardExtension: Send + Sync + 'static {
     /// Called once per shard after the WAL is open and before
     /// `Shard::run()` enters its main loop. Implementations should
     /// `glommio::spawn_local` whatever background tasks they need and
-    /// return immediately. The tasks should observe `shutdown` and exit
-    /// when it flips true.
-    fn spawn_for_shard(
-        &self,
-        shard_id: usize,
-        shard_wal: Rc<ShardWal<FollowerConnection<SidecarS3Uploader>, SidecarS3Downloader>>,
-        shutdown: Rc<Cell<bool>>,
-    );
+    /// return immediately. The tasks should observe `ctx.shutdown` and
+    /// exit when it flips true.
+    fn spawn_for_shard(&self, ctx: ShardExtensionContext);
 }
 
 pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig, sidecar_config: SidecarConfig, mesh_channel_size: usize, node_id: u128, sidecar_store: S) {
@@ -218,9 +229,28 @@ pub fn run_executors_and_sidecar_with_extension<S: SidecarStoreTrait>(
                     None
                 };
 
+                // Capture routing config before shard_config is moved into Shard::new.
+                let ext_num_shards = shard_config.num_shards as usize;
+                let ext_routing_rule = shard_config.routing_rule;
+                let ext_reserve_coordinator = shard_config.reserve_coordinator_shard;
+                let ext_tls_config = shard_config.tls_config.clone();
+                let ext_api_key_hashes = shard_config.api_key_hashes.borrow().clone();
+                let ext_data_root = shard_config.data_root.clone();
                 let mut shard = Shard::new(shard_config, current_shard_id, sender, receivers, client_tcp_listener, replication_tcp_listener, filesystem, lease_manager, shard_failed);
                 if let Some(ext) = extension.as_ref() {
-                    ext.spawn_for_shard(current_shard_id, shard.shard_wal_rc(), shard.shutdown_flag());
+                    let ext_ctx = ShardExtensionContext {
+                        shard_id: current_shard_id,
+                        num_shards: ext_num_shards,
+                        routing_rule: ext_routing_rule,
+                        reserve_coordinator_shard: ext_reserve_coordinator,
+                        shard_wal: shard.shard_wal_rc(),
+                        shutdown: shard.shutdown_flag(),
+                        mesh: shard.take_extension_mesh(),
+                        tls_config: ext_tls_config,
+                        api_key_hashes: ext_api_key_hashes,
+                        data_root: ext_data_root,
+                    };
+                    ext.spawn_for_shard(ext_ctx);
                 }
                 shard.run().await;
 
