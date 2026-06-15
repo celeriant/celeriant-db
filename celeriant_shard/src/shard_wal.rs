@@ -1519,7 +1519,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         // 1. Ensure aggregate exists and is cached
         if !self.aggregate_exists_and_cache(aggregate_key, CachePath::Read).await? {
-            let visible_wal_seq = self.log_segments_cache.get_latest_read_cursor().wal_seq;
+            let visible_wal_seq = self.log_segments_cache.get_latest_read_cursor_wal_seq();
             debug!(
                 shard_id = self.config.shard_id,
                 aggregate_key = %aggregate_key,
@@ -2038,7 +2038,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     let inflight = match status {
                         ClientSeqStatus::InflightInQueue { .. } => true,
                         ClientSeqStatus::Fsynced { wal_seq, .. } => {
-                            let read_cursor_wal_seq = self.log_segments_cache.get_latest_read_cursor().wal_seq;
+                            let read_cursor_wal_seq = self.log_segments_cache.get_latest_read_cursor_wal_seq();
                             wal_seq > 0 && wal_seq > read_cursor_wal_seq
                         }
                     };
@@ -2146,7 +2146,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     let inflight = match status {
                         ClientSeqStatus::InflightInQueue { .. } => true,
                         ClientSeqStatus::Fsynced { wal_seq, .. } => {
-                            let read_cursor_wal_seq = self.log_segments_cache.get_latest_read_cursor().wal_seq;
+                            let read_cursor_wal_seq = self.log_segments_cache.get_latest_read_cursor_wal_seq();
                             wal_seq > 0 && wal_seq > read_cursor_wal_seq
                         }
                     };
@@ -3134,11 +3134,11 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         evicted_version: &mut Option<u64>,
     ) {
         let shard_mem_cache = self.shard_mem_cache.borrow();
-        let log_segments_cache = self.log_segments_cache.get_latest_read_cursor();
+        let read_cursor_wal_seq = self.log_segments_cache.get_latest_read_cursor_wal_seq();
         let kept_before = kept.len();
 
         // Cache iterates forward (ascending aggregate version) from from_aggregate_version
-        for (batch_idx, write) in shard_mem_cache.get_cached_writes_from(aggregate_key, filters.from_aggregate_version, log_segments_cache.wal_seq) {
+        for (batch_idx, write) in shard_mem_cache.get_cached_writes_from(aggregate_key, filters.from_aggregate_version, read_cursor_wal_seq) {
             // Stop if past upper bound
             if filters.to_aggregate_version.map_or(false, |to| batch_idx > to) {
                 break;

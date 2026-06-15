@@ -102,6 +102,32 @@ impl LogSegmentsCache {
             .unwrap_or(write_cursor)
     }
 
+    /// The `wal_seq` of the latest read cursor; same
+    /// as `get_latest_read_cursor` but no clones (hurts with 256KB bloom)
+    pub fn get_latest_read_cursor_wal_seq(&self) -> u64 {
+        let (read_wal_seq, write_wal_seq, prev_log_id) = {
+            let active_file = self.active_file.borrow();
+            let metadata = active_file.metadata.borrow();
+            (
+                metadata.read.as_ref().map(|c| c.wal_seq),
+                metadata.write.wal_seq,
+                metadata.log_id.saturating_sub(1),
+            )
+        };
+
+        if let Some(read_wal_seq) = read_wal_seq {
+            return read_wal_seq;
+        }
+
+        self.lru_cache.borrow_mut()
+            .get(&prev_log_id)
+            .map(|prev_file| {
+                let metadata = prev_file.metadata.borrow();
+                metadata.read.as_ref().map(|c| c.wal_seq).unwrap_or(metadata.write.wal_seq)
+            })
+            .unwrap_or(write_wal_seq)
+    }
+
     pub fn active_log_available_space(&self) -> u64 {
         let active_file = self.active_file.borrow();
         let metadata = active_file.metadata.borrow();
@@ -547,6 +573,63 @@ mod tests {
 
             assert!(dir.join("log_2.wal").exists());
             assert!(cache.get_if_cached(1).is_some());
+
+            cache.close().await;
+        });
+    }
+
+    /// The cheap `get_latest_read_cursor_wal_seq()` (no 256 KB bloom clone) must
+    /// return EXACTLY `get_latest_read_cursor().wal_seq` in every branch:
+    /// active-read present, active-read absent (fallback to active write), and
+    /// the just-rotated fallback to the previous segment's read/write. Locks the
+    /// perf optimisation to behavioural equivalence with the original.
+    #[test]
+    fn read_cursor_wal_seq_matches_full_cursor_every_branch() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let cache = LogSegmentsCache::ready_up(dir.clone(), FILE_SIZE, 4, 0).await.unwrap();
+
+            let equiv = |c: &LogSegmentsCache| {
+                assert_eq!(
+                    c.get_latest_read_cursor_wal_seq(),
+                    c.get_latest_read_cursor().wal_seq,
+                    "cheap wal_seq accessor must equal full-cursor wal_seq"
+                );
+            };
+
+            // Initial state.
+            equiv(&cache);
+
+            // 1. Active READ present with a distinct wal_seq → must win over write.
+            {
+                let active = cache.active();
+                let mut md = active.metadata.borrow_mut();
+                if let Some(r) = md.read.as_mut() { r.wal_seq = 4242; } else { md.read = Some(LogSegmentCursor { wal_seq: 4242, ..Default::default() }); }
+                md.write.wal_seq = 9999;
+            }
+            assert_eq!(cache.get_latest_read_cursor_wal_seq(), 4242);
+            equiv(&cache);
+
+            // 2. Active READ absent → fallback to active WRITE.
+            {
+                let active = cache.active();
+                let mut md = active.metadata.borrow_mut();
+                md.read = None;
+                md.write.wal_seq = 7777;
+            }
+            assert_eq!(cache.get_latest_read_cursor_wal_seq(), 7777);
+            equiv(&cache);
+
+            // 3. Just-rotated: new active READ absent → fall back to the PREVIOUS
+            //    segment's read (else its write).
+            cache.rotate_to_next_log().await.unwrap();
+            {
+                cache.active().metadata.borrow_mut().read = None;
+                let prev = cache.get_if_cached(1).expect("prev segment cached");
+                let mut pmd = prev.metadata.borrow_mut();
+                if let Some(r) = pmd.read.as_mut() { r.wal_seq = 5151; } else { pmd.write.wal_seq = 5151; }
+            }
+            equiv(&cache);
 
             cache.close().await;
         });
