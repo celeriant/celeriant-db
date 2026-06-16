@@ -170,11 +170,7 @@ mod tests {
         // A typical sealed segment holds far fewer than 200k distinct aggregates.
         // At 50k the filter should be effectively perfect at rejecting absentees.
         let fp = measure_fp_rate(50_000, 200_000);
-        assert!(
-            fp < 0.001,
-            "FP rate at 50k entries was {:.4}% — expected effectively zero",
-            fp * 100.0
-        );
+        assert!(fp < 0.001, "FP rate at 50k entries was {:.4}% — expected effectively zero", fp * 100.0);
     }
 
     #[test]

@@ -63,8 +63,16 @@ pub enum OpenOrCreateError {
 impl fmt::Display for OpenOrCreateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnableToCreateLogSegmentFile { log_id, path, preallocate_bytes, source } => {
-                write!(f, "Unable to create log segment file: log_id={log_id}, path={path}, preallocate_bytes={preallocate_bytes}, source={source}")
+            Self::UnableToCreateLogSegmentFile {
+                log_id,
+                path,
+                preallocate_bytes,
+                source,
+            } => {
+                write!(
+                    f,
+                    "Unable to create log segment file: log_id={log_id}, path={path}, preallocate_bytes={preallocate_bytes}, source={source}"
+                )
             }
             Self::UnableToOpenExistingFile { log_id, path, source } => {
                 write!(f, "Unable to open existing log file: log_id={log_id}, path={path}, source={source}")
@@ -85,13 +93,23 @@ impl fmt::Display for OpenOrCreateError {
                 write!(f, "Fsync error on new file: log_id={log_id}, source={source}")
             }
             Self::DirectoryFSyncErrorOnNewFile { log_id, source, path, step } => {
-                write!(f, "Directory fsync error on new file: log_id={log_id}, path={path}, step={step}, source={source}")
+                write!(
+                    f,
+                    "Directory fsync error on new file: log_id={log_id}, path={path}, step={step}, source={source}"
+                )
             }
             Self::RotationTargetUnsafe { log_id, path, source } => {
                 write!(f, "Rotation target unsafe to overwrite: log_id={log_id}, path={path}, source={source}")
             }
-            Self::OutOfSpace { log_id, path, preallocate_bytes } => {
-                write!(f, "Out of disk space rotating log: log_id={log_id}, path={path}, preallocate_bytes={preallocate_bytes}")
+            Self::OutOfSpace {
+                log_id,
+                path,
+                preallocate_bytes,
+            } => {
+                write!(
+                    f,
+                    "Out of disk space rotating log: log_id={log_id}, path={path}, preallocate_bytes={preallocate_bytes}"
+                )
             }
         }
     }

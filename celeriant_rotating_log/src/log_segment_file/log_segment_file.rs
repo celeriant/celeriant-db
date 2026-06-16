@@ -1,13 +1,20 @@
-use std::{cell::{Cell, RefCell}, path::{Path, PathBuf}, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    path::{Path, PathBuf},
+    rc::Rc,
+};
 
-use celeriant_disk::files::{open_dma_files::{create_file_dma, existing_file_dma}, rwlock_timeout::{LockTimeoutError, read_with_timeout, write_with_timeout}};
+use celeriant_disk::files::{
+    open_dma_files::{create_file_dma, existing_file_dma},
+    rwlock_timeout::{LockTimeoutError, read_with_timeout, write_with_timeout},
+};
 use celeriant_wal::{
+    aggregate_key::AggregateKey,
     constants::{AGGREGATE_BLOOM_BYTES, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_SHARD_LOG_HEADER},
     shard_log_header::{HeaderCursor, ShardLogHeader},
 };
-use celeriant_wire::disk::{
-    versioned_block::{deserialise_shard_log_header, serialize_versioned_message},
-};
+use celeriant_wire::disk::versioned_block::{deserialise_shard_log_header, serialize_versioned_message};
 use glommio::{
     GlommioError,
     io::DmaFile,
@@ -15,7 +22,8 @@ use glommio::{
 };
 
 use crate::{
-    errors::{open_or_create_error::OpenOrCreateError, write_dual_header_error::WriteDualHeaderError}, log_segment_file::log_segment_file_metadata::LogSegmentFileMetadata
+    errors::{open_or_create_error::OpenOrCreateError, write_dual_header_error::WriteDualHeaderError},
+    log_segment_file::log_segment_file_metadata::LogSegmentFileMetadata,
 };
 
 /// Represents a physical log file on disk, with its associated metadata.
@@ -35,6 +43,11 @@ pub struct LogSegmentFile {
     /// Conservative (only bumped after a successful header fdatasync); lets the
     /// replication barrier skip its own fsync when a data fsync already covered it.
     pub last_self_acked_synced: Cell<u64>,
+
+    /// Last metablock file-offset written for each aggregate in THIS segment.
+    /// Feeds the per-aggregate backlink at append time; node-local, never persisted,
+    /// dropped with the segment. Updated only after a sync commits (transactional).
+    pub aggregate_chain_tips: RefCell<HashMap<AggregateKey, u64>>,
 }
 
 impl LogSegmentFile {
@@ -43,6 +56,12 @@ impl LogSegmentFile {
         if last_self_acked > self.last_self_acked_synced.get() {
             self.last_self_acked_synced.set(last_self_acked);
         }
+    }
+
+    /// Release the per-aggregate chain tips when a segment is sealed. Only the active
+    /// segment's tips are read; re-activation rebuilds them, so dropping is safe.
+    pub fn seal_aggregate_chain_tips(&self) {
+        *self.aggregate_chain_tips.borrow_mut() = HashMap::new();
     }
 
     pub async fn lock_reader(&self, location: &'static str) -> Result<RwLockReadGuard<'_, Option<Rc<DmaFile>>>, LockTimeoutError> {
@@ -76,8 +95,13 @@ impl LogSegmentFile {
     pub async fn rotate(&self, shard_dir: &PathBuf, preallocate_bytes: u64) -> Result<Self, OpenOrCreateError> {
         let (new_log_id, wal_seq, tip_hash, last_received_replication_wal_seq, last_self_acked_wal_seq) = {
             let meta = self.metadata.borrow();
-            (meta.log_id + 1, meta.write.wal_seq, meta.write.tip_hash,
-             meta.last_received_replication_wal_seq, meta.last_self_acked_wal_seq)
+            (
+                meta.log_id + 1,
+                meta.write.wal_seq,
+                meta.write.tip_hash,
+                meta.last_received_replication_wal_seq,
+                meta.last_self_acked_wal_seq,
+            )
         };
 
         let log_path = shard_dir.join(log_file_name(new_log_id));
@@ -161,13 +185,30 @@ impl LogSegmentFile {
             }
         };
 
-        create_new_file(new_log_id, &log_path, writer, preallocate_bytes, shard_dir, false, wal_seq, tip_hash, last_received_replication_wal_seq, last_self_acked_wal_seq).await
+        create_new_file(
+            new_log_id,
+            &log_path,
+            writer,
+            preallocate_bytes,
+            shard_dir,
+            false,
+            wal_seq,
+            tip_hash,
+            last_received_replication_wal_seq,
+            last_self_acked_wal_seq,
+        )
+        .await
     }
 
     /// Open a log file, if it doesn't exist, create it.
     /// Used for opening the active writing last log file.
     /// Errors if the file is corrupt and needs repair.
-    pub async fn open_or_create_first_file_for_shard(shard_dir: &PathBuf, preallocate_bytes: u64, log_id: u64, advance_read: bool) -> Result<Self, OpenOrCreateError> {
+    pub async fn open_or_create_first_file_for_shard(
+        shard_dir: &PathBuf,
+        preallocate_bytes: u64,
+        log_id: u64,
+        advance_read: bool,
+    ) -> Result<Self, OpenOrCreateError> {
         let log_path = shard_dir.join(log_file_name(log_id));
         let exists = log_path.exists();
 
@@ -196,7 +237,19 @@ impl LogSegmentFile {
         if exists {
             load_existing_file(log_id, &log_path, writer, file_len, advance_read).await
         } else {
-            create_new_file(log_id, &log_path, writer, preallocate_bytes, shard_dir, advance_read, 0, GENESIS_HASH, 0, 0).await
+            create_new_file(
+                log_id,
+                &log_path,
+                writer,
+                preallocate_bytes,
+                shard_dir,
+                advance_read,
+                0,
+                GENESIS_HASH,
+                0,
+                0,
+            )
+            .await
         }
     }
 
@@ -216,7 +269,6 @@ impl LogSegmentFile {
     }
 }
 
-
 async fn build_log_segment(
     log_id: u64,
     log_path: &PathBuf,
@@ -231,7 +283,8 @@ async fn build_log_segment(
         source: e.to_string(),
     })?;
 
-    let datablocks_carry_over = read_datablocks_carry_over_bytes(&reader, header.write.datablocks_position).await
+    let datablocks_carry_over = read_datablocks_carry_over_bytes(&reader, header.write.datablocks_position)
+        .await
         .map_err(|source| OpenOrCreateError::LogSegmentFileReadError {
             log_id,
             source: source.to_string(),
@@ -242,9 +295,8 @@ async fn build_log_segment(
         writer: RwLock::new(Some(Rc::new(writer))),
         reader: RwLock::new(Some(Rc::new(reader))),
         last_self_acked_synced: Cell::new(header.last_self_acked_wal_seq),
-        metadata: RefCell::new(LogSegmentFileMetadata::new(
-            log_id, file_len, datablocks_carry_over, header, advance_read,
-        )),
+        metadata: RefCell::new(LogSegmentFileMetadata::new(log_id, file_len, datablocks_carry_over, header, advance_read)),
+        aggregate_chain_tips: RefCell::new(HashMap::new()),
     })
 }
 
@@ -279,7 +331,18 @@ async fn create_new_file(
     last_received_replication_wal_seq: u64,
     last_self_acked_wal_seq: u64,
 ) -> Result<LogSegmentFile, OpenOrCreateError> {
-    let header = setup_new_file(&mut writer, log_id, dir_path, file_len, wal_seq, tip_hash, last_received_replication_wal_seq, last_self_acked_wal_seq, advance_read).await?;
+    let header = setup_new_file(
+        &mut writer,
+        log_id,
+        dir_path,
+        file_len,
+        wal_seq,
+        tip_hash,
+        last_received_replication_wal_seq,
+        last_self_acked_wal_seq,
+        advance_read,
+    )
+    .await?;
     build_log_segment(log_id, log_path, writer, file_len, &header, advance_read).await
 }
 
@@ -350,7 +413,17 @@ async fn load_header_detecting_corruption(dma_file: &mut DmaFile, file_len: u64,
 /// Setup a new file, writing the header to the start and end of the file
 /// Assumes the file already is preallocated to file_len. Will fsync the
 /// file and fsync the parent directory.
-async fn setup_new_file(dma_file: &mut DmaFile, log_id: u64, dir_path: &PathBuf, file_len: u64, wal_seq: u64, tip_hash: [u8; 32], last_received_replication_wal_seq: u64, last_self_acked_wal_seq: u64, advance_read: bool) -> Result<ShardLogHeader, OpenOrCreateError> {
+async fn setup_new_file(
+    dma_file: &mut DmaFile,
+    log_id: u64,
+    dir_path: &PathBuf,
+    file_len: u64,
+    wal_seq: u64,
+    tip_hash: [u8; 32],
+    last_received_replication_wal_seq: u64,
+    last_self_acked_wal_seq: u64,
+    advance_read: bool,
+) -> Result<ShardLogHeader, OpenOrCreateError> {
     let write = HeaderCursor {
         metablocks_position: HEADER_BLOCK_SIZE_BYTES as u64,
         datablocks_position: file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64),
@@ -382,10 +455,10 @@ async fn setup_new_file(dma_file: &mut DmaFile, log_id: u64, dir_path: &PathBuf,
         .await
         .map_err(|source| OpenOrCreateError::LogSegmentFileHeaderWriteFailure { log_id, source })?;
 
-    dma_file
-        .fdatasync()
-        .await
-        .map_err(|source| OpenOrCreateError::FSyncErrorOnNewFile { log_id, source: source.to_string() })?;
+    dma_file.fdatasync().await.map_err(|source| OpenOrCreateError::FSyncErrorOnNewFile {
+        log_id,
+        source: source.to_string(),
+    })?;
 
     // Folder fsync - fsync the parent directory to ensure the file entry is durable
     let dir = glommio::io::Directory::open(dir_path)
@@ -474,7 +547,9 @@ mod tests {
     fn create_new_file() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
-            let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true).await.unwrap();
+            let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true)
+                .await
+                .unwrap();
 
             let meta = file.metadata.borrow();
             assert_eq!(meta.log_id, 1);
@@ -492,7 +567,11 @@ mod tests {
         glommio_test!({
             let (_tmp, dir) = test_dir();
 
-            LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 5, true).await.unwrap().close().await;
+            LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 5, true)
+                .await
+                .unwrap()
+                .close()
+                .await;
 
             let file = LogSegmentFile::open_existing(&dir, 5).await.unwrap();
             assert_eq!(file.metadata.borrow().log_id, 5);
@@ -514,11 +593,15 @@ mod tests {
         glommio_test!({
             let (_tmp, dir) = test_dir();
 
-            let with_advance = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true).await.unwrap();
+            let with_advance = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true)
+                .await
+                .unwrap();
             assert!(with_advance.metadata.borrow().read.is_some());
             with_advance.close().await;
 
-            let without_advance = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 2, false).await.unwrap();
+            let without_advance = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 2, false)
+                .await
+                .unwrap();
             assert!(without_advance.metadata.borrow().read.is_none());
             without_advance.close().await;
         });
@@ -528,7 +611,9 @@ mod tests {
     fn dual_fd_independence() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
-            let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true).await.unwrap();
+            let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true)
+                .await
+                .unwrap();
 
             let reader = file.lock_reader("test").await.unwrap();
             let writer = file.lock_writer("test").await.unwrap();
@@ -548,7 +633,9 @@ mod tests {
             let (_tmp, dir) = test_dir();
 
             for log_id in [1, 5, 100, u64::MAX - 1] {
-                let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, log_id, true).await.unwrap();
+                let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, log_id, true)
+                    .await
+                    .unwrap();
                 assert_eq!(file.metadata.borrow().log_id, log_id);
                 assert!(dir.join(format!("log_{log_id}.wal")).exists());
                 file.close().await;
@@ -562,7 +649,11 @@ mod tests {
             let (_tmp, dir) = test_dir();
             let path = dir.join("log_1.wal");
 
-            LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true).await.unwrap().close().await;
+            LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true)
+                .await
+                .unwrap()
+                .close()
+                .await;
 
             {
                 let mut contents = std::fs::read(&path).unwrap();
@@ -582,7 +673,11 @@ mod tests {
             let (_tmp, dir) = test_dir();
             let path = dir.join("log_1.wal");
 
-            LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true).await.unwrap().close().await;
+            LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true)
+                .await
+                .unwrap()
+                .close()
+                .await;
 
             {
                 let mut contents = std::fs::read(&path).unwrap();
@@ -601,7 +696,9 @@ mod tests {
     fn close_is_idempotent() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
-            let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true).await.unwrap();
+            let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true)
+                .await
+                .unwrap();
 
             file.close().await;
             file.close().await;
@@ -613,7 +710,9 @@ mod tests {
     fn rotate_carries_wal_state() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
-            let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true).await.unwrap();
+            let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true)
+                .await
+                .unwrap();
 
             let tip: [u8; 32] = [0xAB; 32];
             {
@@ -688,7 +787,9 @@ mod tests {
             // case 1: orphan at target is deleted, rotation succeeds
             {
                 let (_tmp, dir) = test_dir();
-                let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true).await.unwrap();
+                let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true)
+                    .await
+                    .unwrap();
                 make_zero_file(&dir.join("log_2.wal"), MIN_FILE_SIZE);
 
                 let rotated = file.rotate(&dir, MIN_FILE_SIZE).await.unwrap();
@@ -700,7 +801,9 @@ mod tests {
             // case 2: target with non-zero header is refused, file preserved
             {
                 let (_tmp, dir) = test_dir();
-                let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true).await.unwrap();
+                let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true)
+                    .await
+                    .unwrap();
                 let target = dir.join("log_2.wal");
                 make_zero_file(&target, MIN_FILE_SIZE);
                 write_nonzero_at(&target, 0);
@@ -714,7 +817,9 @@ mod tests {
             // case 3: inspection failure (target is a directory) is refused
             {
                 let (_tmp, dir) = test_dir();
-                let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true).await.unwrap();
+                let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true)
+                    .await
+                    .unwrap();
                 let target = dir.join("log_2.wal");
                 std::fs::create_dir_all(&target).unwrap();
 
@@ -732,7 +837,9 @@ mod tests {
             let (_tmp, dir) = test_dir();
 
             {
-                let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true).await.unwrap();
+                let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true)
+                    .await
+                    .unwrap();
                 file.metadata.borrow_mut().write.wal_seq = 42;
                 file.close().await;
             }

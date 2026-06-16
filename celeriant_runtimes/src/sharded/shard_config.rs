@@ -65,6 +65,7 @@ pub struct ShardConfig {
     pub replication_port: u16,
     pub max_open_files: u64,
     pub read_max_chunk_size: u64,
+    pub chain_read_window_bytes: u64,
     pub write_max_chunk_size: u64,
     pub max_request_size: u64,
     pub internode_max_request_size: u64,

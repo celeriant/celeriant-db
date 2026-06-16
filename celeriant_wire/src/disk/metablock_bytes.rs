@@ -45,6 +45,11 @@ pub fn read_uncompressed_size(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
+pub fn read_previous_aggregate_metablock_pos(bytes: &[u8]) -> u64 {
+    let offset = HEADER_SIZE + Metablock::OFFSET_PREVIOUS_AGGREGATE_METABLOCK_POS;
+    u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
 #[inline]
 pub fn is_metablock_kind_soft_delete(bytes: &[u8]) -> bool {
     read_metablock_kind_discriminant(bytes) == DISCRIMINANT_SOFT_DELETE
@@ -238,6 +243,21 @@ pub fn read_event_batch_aggregate_key(bytes: &[u8]) -> AggregateKey {
     AggregateKey::new(read_event_batch_org_id(bytes), read_event_batch_aggregate_type_id(bytes), read_event_batch_aggregate_id(bytes))
 }
 
+pub fn read_soft_trim_aggregate_key(bytes: &[u8]) -> AggregateKey {
+    AggregateKey::new(read_soft_trim_org_id(bytes), read_soft_trim_aggregate_type_id(bytes), read_soft_trim_aggregate_id(bytes))
+}
+
+/// Aggregate key of any metablock in the per-aggregate backlink chain
+/// (event batch, soft delete, soft trim). None for schema registrations.
+pub fn read_chain_aggregate_key(bytes: &[u8]) -> Option<AggregateKey> {
+    match read_metablock_kind_discriminant(bytes) {
+        DISCRIMINANT_EVENT_BATCH_METADATA => Some(read_event_batch_aggregate_key(bytes)),
+        DISCRIMINANT_SOFT_DELETE => Some(read_soft_delete_aggregate_key(bytes)),
+        DISCRIMINANT_SOFT_TRIM => Some(read_soft_trim_aggregate_key(bytes)),
+        _ => None,
+    }
+}
+
 // --- SchemaRegistration helpers ---
 
 #[inline]
@@ -338,6 +358,7 @@ mod tests {
             datablock,
             previous_tip_hash: GENESIS_HASH,
             datablock_position: 0,
+            previous_aggregate_metablock_pos: 0,
         }
     }
 
@@ -369,6 +390,7 @@ mod tests {
             datablock: DatablockStorageKind::None,
             previous_tip_hash: GENESIS_HASH,
             datablock_position: 0,
+            previous_aggregate_metablock_pos: 0,
         }
     }
 
@@ -400,6 +422,7 @@ mod tests {
             datablock: DatablockStorageKind::None,
             previous_tip_hash: GENESIS_HASH,
             datablock_position: 0,
+            previous_aggregate_metablock_pos: 0,
         }
     }
 
@@ -1075,6 +1098,7 @@ mod tests {
             datablock: DatablockStorageKind::None,
             previous_tip_hash: GENESIS_HASH,
             datablock_position: 0,
+            previous_aggregate_metablock_pos: 0,
         }
     }
 

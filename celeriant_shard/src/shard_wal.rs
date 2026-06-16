@@ -223,6 +223,46 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> AggregateReader 
     }
 }
 
+/// Rebuild the active segment's in-memory per-aggregate backlink tips by scanning
+/// it once (newest position per aggregate). The map is not persisted, so the next
+/// append after open or a truncation would otherwise back-link to 0 and the reverse
+/// scan would stop short of older same-segment metablocks. Active segment only.
+pub(crate) async fn rebuild_active_segment_chain_tips(
+    log_segments_cache: &LogSegmentsCache,
+    scan_chunk_size: u64,
+) -> Result<usize, std::io::Error> {
+    use celeriant_disk::files::read_fixed_records_visit_const::{read_fixed_records_visit_const, ReadVisitError};
+
+    let active = log_segments_cache.active();
+    let metablocks_start = celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES as u64;
+    let metablocks_end = active.metadata.borrow().write.metablocks_position;
+
+    let mut tips: HashMap<AggregateKey, u64> = HashMap::new();
+    if metablocks_end > metablocks_start {
+        let guard = active.lock_reader("rebuild_chain_tips").await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, e.to_string()))?;
+        let dma_file = guard.as_ref()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "active segment has no file handle"))?;
+
+        let result = read_fixed_records_visit_const::<FIXED_BLOCK_SIZE_BYTES, ()>(
+            dma_file, false, metablocks_start, metablocks_end, scan_chunk_size,
+            |pos, block| {
+                if let Some(key) = metablock_bytes::read_chain_aggregate_key(block) {
+                    tips.insert(key, pos); // forward scan: last (newest) write wins
+                }
+                Ok(false)
+            },
+        ).await;
+        if let Err(ReadVisitError::Io(e)) = result {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()));
+        }
+    }
+
+    let count = tips.len();
+    *active.aggregate_chain_tips.borrow_mut() = tips;
+    Ok(count)
+}
+
 /// Read the segment summary from a closed log segment's sidecar `.summary` file.
 /// Returns `None` for legacy segments that don't have a summary, or if the file is corrupt.
 /// Opens and closes the file each time — no LRU involvement, OS page cache handles repeats.
@@ -357,6 +397,13 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         );
 
         Self::pre_warm_cache(&log_segments_cache, &shard_mem_cache, &config, &dict_codec).await?;
+
+        rebuild_active_segment_chain_tips(&log_segments_cache, config.read_max_chunk_size)
+            .await
+            .map_err(|source| ReadyUpError::UnableToAccessDirectory {
+                directory: "active-segment backlink rebuild".to_string(),
+                source,
+            })?;
 
         let recovered_wal_seq = log_segments_cache.active().metadata.borrow().write.wal_seq;
         metrics::gauge!("celeriant_wal_seq", &metrics_shard_label).set(recovered_wal_seq as f64);
@@ -1186,6 +1233,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             wal_metablock_type: MetablockKind::SoftTrim(metablock_soft_trim),
             previous_tip_hash: GENESIS_HASH,
             datablock_position: 0,
+            previous_aggregate_metablock_pos: 0,
         };
 
         let shard_log_queue_item = ShardLogQueueItem::new(None, None, metablock);
@@ -1358,6 +1406,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 wal_metablock_type: MetablockKind::SoftDelete(metablock_soft_delete.clone()),
                 previous_tip_hash: GENESIS_HASH,
                 datablock_position: 0,
+                previous_aggregate_metablock_pos: 0,
             };
 
             let shard_log_queue_item = ShardLogQueueItem::new(None, None, metablock);
@@ -1669,14 +1718,16 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             )
         };
 
-        // Begin the search from the chosen start, moving backwards
+        // Begin the search from the chosen start, moving backwards. Chain-follow: this
+        // walks several of THIS aggregate's per-client versions, so skipping interleaved
+        // foreign metablocks via backlinks beats reading every block.
         let mut scanner = ReverseMetablockScanner::new(
             &self.log_segments_cache,
             start_log_id,
             start_from_position,
             self.config.read_max_chunk_size,
         )
-        .with_bloom_filter(aggregate_key)
+        .with_aggregate_chain(aggregate_key.clone(), self.config.chain_read_window_bytes)
         .with_write_cursor_upper_bound();
 
         let find_result = scanner
@@ -2311,6 +2362,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             wal_metablock_type: MetablockKind::EventBatchMetadata(metablock_event_batch),
             previous_tip_hash: GENESIS_HASH,
             datablock_position: 0,
+            previous_aggregate_metablock_pos: 0,
         };
 
         let shard_log_queue_item = ShardLogQueueItem::new(Some(datablock), serialized_datablock.external_data, metablock);
@@ -2717,6 +2769,12 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         } else {
             return Ok(false);
         };
+
+        // The rewind orphaned the in-segment backlink tips (still pointing into the culled
+        // tail); rebuild so the next append back-links to a live committed block, not a culled one.
+        rebuild_active_segment_chain_tips(&self.log_segments_cache, self.config.read_max_chunk_size)
+            .await
+            .map_err(|e| ShardFsyncError::MetablockSerialisationError(format!("chain-tips rebuild after cull failed: {e:?}")))?;
 
         {
             let (lru_client_len, lru_agg_len, drained) = {
@@ -3198,7 +3256,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             Some(scanner_start_pos),
             self.config.read_max_chunk_size,
         )
-        .with_bloom_filter(aggregate_key);
+        .with_aggregate_chain(aggregate_key.clone(), self.config.chain_read_window_bytes);
 
         // Budget remaining after cache entries
         let budget_for_disk = max_bytes.saturating_sub(*cumulative_size);
@@ -3412,6 +3470,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             wal_metablock_type: MetablockKind::SchemaRegistration(metablock_schema_registration),
             previous_tip_hash: GENESIS_HASH,
             datablock_position: 0,
+            previous_aggregate_metablock_pos: 0,
         };
 
         let shard_log_queue_item = ShardLogQueueItem::new(Some(datablock), serialized_datablock.external_data, metablock);
@@ -3514,6 +3573,7 @@ mod tests {
             aggregate_snapshots_cache_bytes: 64 * 1024 * 1024,
             aggregate_client_snapshots_cache_bytes: 32 * 1024 * 1024,
             read_max_chunk_size: 32 * 1024,
+            chain_read_window_bytes: 1024,
             timestamp_config: TimestampConfig::default(),
             list_page_size: 100,
             list_max_concurrent: 16,
@@ -4019,6 +4079,7 @@ mod tests {
             }),
             previous_tip_hash: GENESIS_HASH,
             datablock_position: 0,
+            previous_aggregate_metablock_pos: 0,
         };
         shard.shard_mem_cache.borrow_mut().add_pending_trim_to_queue(
             agg, keep_from, idx.aggregate_version, idx.event_seq,
@@ -9829,6 +9890,137 @@ mod tests {
                 "recent-aggregate read should not have opened the oldest segment (active={active})");
             eprintln!("[scan-cost] recent aggregate read over {active} segments => oldest segment untouched (O(1) vs O(segments))");
 
+            shard.close().await;
+        });
+    }
+
+    // ── Per-aggregate backlink chain (reverse-scan foreign skip) ──
+
+    /// One-event write whose payload byte encodes the version, so a cold read can
+    /// verify each batch came back with the right content and order.
+    fn mark_event(version: u64) -> DatablockAggregateEvent {
+        DatablockAggregateEvent {
+            client_seq: version,
+            event_type_major: 1,
+            event_value: Arc::new(vec![version as u8; 8]),
+            ..Default::default()
+        }
+    }
+
+    async fn cold_open(dir: &std::path::Path, chain_window: u64) -> ShardWal<StubReplicationClient, StubS3Downloader> {
+        let cfg = InternalShardConfig { chain_read_window_bytes: chain_window, ..cold_scan_config(dir) };
+        ShardWal::open(cfg, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader)
+            .await
+            .unwrap()
+    }
+
+    /// Cold-open and read every version of `target` as (version, content) pairs.
+    async fn read_target_versions(dir: &std::path::Path, target: &AggregateKey, chain_window: u64) -> Vec<(u64, u8)> {
+        let shard = cold_open(dir, chain_window).await;
+        let read = unwrap_read(process(&shard, read_req(target.clone())).await);
+        let out = read.event_batches.iter().map(|b| (b.aggregate_version, b.events[0].event_value[0])).collect();
+        shard.close().await;
+        out
+    }
+
+    /// The chain must thread an aggregate's versions across many segment rotations:
+    /// each big foreign write rotates the 1.5MB segment, so the target's chain spans
+    /// a dozen segments and every hop crosses a boundary (backlink 0 -> older segment).
+    #[test]
+    fn chain_read_returns_all_versions_across_segment_rotation() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let target = key(1, 1, 42);
+            let n = 12u64;
+            {
+                let shard = cold_open(&dir, 1024).await;
+                for v in 1..=n {
+                    write_ok(&shard, write_req(target.clone(), vec![mark_event(v)])).await;
+                    write_ok(&shard, client_write_req(key(1, 1, 9000 + v as u128), vec![big_event(1, v)])).await;
+                }
+                shard.close().await;
+            }
+            // Cold reopen: recent-write cache empty, so the read walks the on-disk chain.
+            let got = read_target_versions(&dir, &target, 1024).await;
+            assert_eq!(got, (1..=n).map(|v| (v, v as u8)).collect::<Vec<_>>(),
+                "all target versions, in order with correct content, across rotations");
+        });
+    }
+
+    /// The follow-window is a pure performance knob: per-block (1024) and a large
+    /// window must return identical results for the same interleaved data.
+    #[test]
+    fn chain_window_size_does_not_affect_results() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let target = key(1, 1, 7);
+            let n = 40u64;
+            {
+                let shard = cold_open(&dir, 1024).await;
+                let mut foreign = 5000u128;
+                for v in 1..=n {
+                    write_ok(&shard, write_req(target.clone(), vec![mark_event(v)])).await;
+                    for _ in 0..3 {
+                        write_ok(&shard, write_req(key(1, 1, foreign), vec![mark_event(1)])).await;
+                        foreign += 1;
+                    }
+                }
+                shard.close().await;
+            }
+            let per_block = read_target_versions(&dir, &target, 1024).await;
+            let windowed = read_target_versions(&dir, &target, 64 * 1024).await;
+            assert_eq!(per_block, windowed, "follow-window size must not change results");
+            assert_eq!(per_block, (1..=n).map(|v| (v, v as u8)).collect::<Vec<_>>());
+        });
+    }
+
+    /// Boot rebuild: a restart in the middle of a segment must repopulate the chain
+    /// tips, or the first post-restart append back-links to 0 and a later read drops
+    /// the pre-restart versions sitting earlier in the same segment.
+    #[test]
+    fn chain_survives_restart_midsegment() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let target = key(1, 1, 3);
+            {
+                let shard = cold_open(&dir, 1024).await;
+                for v in 1..=4 { write_ok(&shard, write_req(target.clone(), vec![mark_event(v)])).await; }
+                shard.close().await;
+            }
+            {
+                let shard = cold_open(&dir, 1024).await;
+                for v in 5..=8 { write_ok(&shard, write_req(target.clone(), vec![mark_event(v)])).await; }
+                shard.close().await;
+            }
+            let got = read_target_versions(&dir, &target, 1024).await;
+            assert_eq!(got, (1..=8).map(|v| (v, v as u8)).collect::<Vec<_>>(),
+                "restart must not break the in-segment backlink chain");
+        });
+    }
+
+    /// A SoftTrim is a chain member: a cold read from the floor must walk the chain
+    /// straight through the trim metablock and return the kept versions, while a
+    /// below-floor read still errors after the disk-rebuilt snapshot recovers the floor.
+    #[test]
+    fn chain_read_through_trim_metablock_returns_kept_versions() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let target = key(1, 1, 5);
+            {
+                let shard = cold_open(&dir, 1024).await;
+                for v in 1..=6 { write_ok(&shard, write_req(target.clone(), vec![mark_event(v)])).await; }
+                assert!(matches!(process(&shard, trim_req(target.clone(), 4)).await, Ok(ClientResponse::TrimStart(_))));
+                for v in 7..=8 { write_ok(&shard, write_req(target.clone(), vec![mark_event(v)])).await; }
+                shard.close().await;
+            }
+            let shard = cold_open(&dir, 1024).await;
+            let read = unwrap_read(process(&shard, read_req_from(target.clone(), 4)).await);
+            let versions: Vec<u64> = read.event_batches.iter().map(|b| b.aggregate_version).collect();
+            assert_eq!(versions, vec![4, 5, 6, 7, 8], "kept versions returned via the chain past the trim metablock");
+
+            let below = process(&shard, read_req_from(target, 1)).await;
+            assert!(matches!(below, Err(ShardError::Read(ShardReadError::UnavailableBatchIndex { .. }))),
+                "below-floor read must still error after disk rebuild");
             shard.close().await;
         });
     }

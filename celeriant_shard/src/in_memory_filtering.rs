@@ -281,6 +281,7 @@ mod tests {
                 crc32c: 0,
             }),
             datablock_position: 0,
+            previous_aggregate_metablock_pos: 0,
             wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
                 aggregate_key: AggregateKey::new(1, 1, 1),
                 event_types_data: EventTypesKind::Direct(*event_types),
@@ -331,6 +332,7 @@ mod tests {
                 crc32c: 0,
             }),
             datablock_position: 0,
+            previous_aggregate_metablock_pos: 0,
             wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
                 aggregate_key: AggregateKey::new(1, 1, 1),
                 event_types_data: EventTypesKind::Bloom(bloom_bytes),

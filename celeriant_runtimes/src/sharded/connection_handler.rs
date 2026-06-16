@@ -1535,6 +1535,7 @@ mod tests {
             replication_port: 8081,
             max_open_files: 100,
             read_max_chunk_size: 1024,
+            chain_read_window_bytes: 1024,
             write_max_chunk_size: 1024,
             max_request_size: 1024,
             internode_max_request_size: 64 * 1024 * 1024,

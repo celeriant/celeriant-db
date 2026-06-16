@@ -734,6 +734,20 @@ pub fn all_tests() -> &'static [TestEntry] {
             distributed: true,
         },
         TestEntry {
+            name: "idempotency_cold_reconstruction",
+            description: "After restart, cold client-seq reverse-WAL reconstruction dedupes a replay across interleaved foreign aggregates",
+            estimated_secs: 20,
+            categories: &[Correctness, Invariant],
+            distributed: false,
+        },
+        TestEntry {
+            name: "idempotency_negative_scan_load",
+            description: "Reproduces the negative client-idempotency lookup cost: fresh-producer first-writes to a deep aggregate vs a shallow one",
+            estimated_secs: 30,
+            categories: &[Performance, Debug],
+            distributed: false,
+        },
+        TestEntry {
             name: "p2_2_dual_restart",
             description: "Both nodes restart simultaneously, S3 lease race resolves cleanly",
             estimated_secs: 14,

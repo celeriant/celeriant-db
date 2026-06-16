@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -20,6 +21,7 @@ use celeriant_wal::constants::{self, EntryHashBytes, FIRST_AGGREGATE_VERSION, FI
 use celeriant_wire::codec::compression::DictCodec;
 use celeriant_wal::segment_summary::{SegmentSummaryBlock, SegmentSummaryPayload};
 
+use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::metablocks::metablock::Metablock;
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
@@ -198,6 +200,12 @@ fn commit_sync(
     let mut event_collector = WatchEventCollector::new();
 
     for queue_item in pending_append_queue {
+        // Commit this metablock as its aggregate's latest in-segment position so the
+        // next append back-links to it. Matches what sync() wrote into the bytes.
+        if let Some(key) = chain_aggregate_key(&queue_item.metablock) {
+            log_segment_file.aggregate_chain_tips.borrow_mut().insert(key.clone(), queue_item.metablock_absolute_pos);
+        }
+
         if !node_status.is_leader() {
             shard_mem_cache.update_segment_summary(&queue_item.metablock);
         }
@@ -410,6 +418,10 @@ pub(crate) async fn sync(
     let buffer_metablocks_slice = buffer_metablocks.as_bytes_mut();
     let mut position = 0usize;
     let mut index = 0;
+    // Within-batch view of each aggregate's latest metablock position, layered over
+    // the segment's committed tips, so multiple metablocks for one aggregate in this
+    // batch chain to each other. Applied to the live tips only on commit.
+    let mut chain_overlay: HashMap<AggregateKey, u64> = HashMap::new();
     for item in &mut sync_positions_snapshot.pending_append_queue {
         if item.datablock_bytes.is_some() && item.datablock.is_some() {
             item.metablock.datablock_position = datablocks_absolute_write_positions[index];
@@ -438,6 +450,18 @@ pub(crate) async fn sync(
                 aggregate_positions.metablock_absolute_pos = metablock_absolute_pos;
                 aggregate_positions.wal_seq = item.metablock.wal_seq;
             }
+        }
+
+        // Per-aggregate backlink to this aggregate's previous metablock in this segment
+        // (0 = none). Excluded from the hash chain, recomputed locally on every node.
+        if let Some(key) = chain_aggregate_key(&item.metablock).cloned() {
+            let prev = chain_overlay
+                .get(&key)
+                .copied()
+                .or_else(|| log_segment_file.aggregate_chain_tips.borrow().get(&key).copied())
+                .unwrap_or(0);
+            item.metablock.previous_aggregate_metablock_pos = prev;
+            chain_overlay.insert(key, metablock_absolute_pos);
         }
 
         // Keep the chain - store the previous hash in the next metablock. Done before serialisation!
@@ -531,12 +555,25 @@ pub(crate) async fn sync_header_only(
     Ok(())
 }
 
-/// Hash chain: blake3(previous_hash || metablock_bytes), skipping the CRC (which covers
-/// datablock_position) and the datablock_position field itself — both are node-local.
+/// Aggregate key of any metablock in the per-aggregate backlink chain (event
+/// batch, soft delete, soft trim). None for schema registrations.
+fn chain_aggregate_key(metablock: &Metablock) -> Option<&AggregateKey> {
+    match &metablock.wal_metablock_type {
+        MetablockKind::EventBatchMetadata(eb) => Some(&eb.aggregate_key),
+        MetablockKind::SoftDelete(sd) => Some(&sd.aggregate_key),
+        MetablockKind::SoftTrim(st) => Some(&st.aggregate_key),
+        _ => None,
+    }
+}
+
+/// Hash chain: blake3(previous_hash || metablock_bytes), skipping the CRC and the
+/// contiguous node-local fields datablock_position + previous_aggregate_metablock_pos.
 pub(crate) fn compute_entry_hash(previous_hash: &EntryHashBytes, content: &[u8]) -> EntryHashBytes {
     const CRC_END: usize = versioned_block::CRC_SIZE;
     const SKIP_START: usize = versioned_block::HEADER_SIZE + Metablock::OFFSET_DATABLOCK_POSITION;
-    const SKIP_END: usize = SKIP_START + Metablock::WIRE_SIZE_DATABLOCK_POSITION;
+    const SKIP_END: usize = SKIP_START
+        + Metablock::WIRE_SIZE_DATABLOCK_POSITION
+        + Metablock::WIRE_SIZE_PREVIOUS_AGGREGATE_METABLOCK_POS;
 
     let mut hasher = blake3::Hasher::new();
     hasher.update(previous_hash);
@@ -634,6 +671,7 @@ mod tests {
             datablock_compression_type: 0,
             previous_tip_hash: GENESIS_HASH,
             datablock_position: 0,
+            previous_aggregate_metablock_pos: 0,
             wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
                 aggregate_key,
                 aggregate_version,
@@ -666,6 +704,7 @@ mod tests {
             datablock_compression_type: 0,
             previous_tip_hash: GENESIS_HASH,
             datablock_position: 0,
+            previous_aggregate_metablock_pos: 0,
             wal_metablock_type: MetablockKind::SoftDelete(MetablockSoftDelete {
                 aggregate_key,
                 allow_recreate: false,
@@ -693,6 +732,7 @@ mod tests {
             datablock_compression_type: 0,
             previous_tip_hash: GENESIS_HASH,
             datablock_position: 0,
+            previous_aggregate_metablock_pos: 0,
             wal_metablock_type: MetablockKind::SoftTrim(MetablockSoftTrim {
                 aggregate_key,
                 keep_from_aggregate_version: keep_from,

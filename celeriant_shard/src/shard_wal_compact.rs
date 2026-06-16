@@ -426,14 +426,15 @@ struct DatablockRef {
 /// The temp file is written to `{temp_dir}/log_{target_log_id}.compacting`. The caller
 /// (Phase 3) is responsible for atomically renaming it over the original.
 ///
-/// Returns `(temp_path, compacted_size_bytes)`.
+/// Returns `(temp_path, compacted_size_bytes, new_tips)`, where `new_tips` maps each
+/// surviving aggregate to its rewritten tip offset so the caller can remap cached positions.
 async fn build_compacted_file(
     target_log_id: u64,
     log_segments_cache: &Rc<LogSegmentsCache>,
     state_map: &HashMap<AggregateKey, AggregateCompactionState>,
     estimate: &ReclaimableSpaceEstimate,
     temp_dir: &Path,
-) -> Result<(PathBuf, u64), CompactionError> {
+) -> Result<(PathBuf, u64, HashMap<AggregateKey, u64>), CompactionError> {
     // -------------------------------------------------------------------------
     // 1. Open the source segment for reading.
     //    We acquire the lock once and hold it across both the metablock scan
@@ -534,6 +535,9 @@ async fn build_compacted_file(
     // -------------------------------------------------------------------------
     let mut datablock_refs: Vec<DatablockRef> = Vec::with_capacity(estimate.kept_metablock_count as usize);
     let mut bloom = AggregateKeyBloom::new();
+    // Per-aggregate backlink tips for the COMPACTED layout; dropped metablocks shift
+    // positions, so recompute the chain against the new offsets.
+    let mut compact_tips: HashMap<AggregateKey, u64> = HashMap::new();
 
     // Cursor walking backward through the datablock region (absolute file offsets).
     let mut new_datablocks_cursor: u64 = datablocks_region_end;
@@ -566,6 +570,19 @@ async fn build_compacted_file(
                         size: db_bytes,
                         new_pos: new_datablocks_cursor,
                     });
+                }
+
+                // Recompute the per-aggregate backlink for the new compacted offset.
+                let new_metablock_pos = HEADER_BLOCK_SIZE_BYTES as u64 + mb_offset as u64;
+                let chain_key = match &metablock.wal_metablock_type {
+                    MetablockKind::EventBatchMetadata(eb) => Some(eb.aggregate_key.clone()),
+                    MetablockKind::SoftDelete(sd) => Some(sd.aggregate_key.clone()),
+                    MetablockKind::SoftTrim(st) => Some(st.aggregate_key.clone()),
+                    MetablockKind::SchemaRegistration(_) => None,
+                };
+                if let Some(key) = chain_key {
+                    metablock.previous_aggregate_metablock_pos = compact_tips.get(&key).copied().unwrap_or(0);
+                    compact_tips.insert(key, new_metablock_pos);
                 }
 
                 // Serialize directly into the metablock DMA buffer at the current offset.
@@ -710,7 +727,7 @@ async fn build_compacted_file(
             source: e.to_string(),
         })?;
 
-    Ok((temp_path, new_file_size))
+    Ok((temp_path, new_file_size, compact_tips))
 }
 
 /// Result of a completed compaction: sizes before and after the atomic swap.
@@ -788,7 +805,7 @@ pub async fn compact_segment(
         segment.metadata.borrow().file_len
     };
 
-    let (temp_path, compacted_size) = build_compacted_file(
+    let (temp_path, compacted_size, compact_tips) = build_compacted_file(
         target_log_id,
         log_segments_cache,
         &state_map,
@@ -798,6 +815,14 @@ pub async fn compact_segment(
     .await?;
 
     atomic_swap_segment(target_log_id, &temp_path, log_segments_cache)?;
+
+    // Repoint cached positions to the rewritten offsets. Synchronous and immediately
+    // after the swap (no await between): a concurrent write that moves an aggregate's
+    // tip to the active segment bumps its cached log_id past target_log_id, so the
+    // log_id guard inside skips it; the two orderings can't interleave.
+    shard_mem_cache
+        .borrow_mut()
+        .remap_compacted_positions(target_log_id, &compact_tips);
 
     Ok(Some(CompactionResult {
         log_id: target_log_id,

@@ -31,6 +31,10 @@ pub struct Metablock {
     /// Absolute position where the datablock payload is located in the shard log.
     /// Excluded from hash chain computation as it varies between nodes.
     pub datablock_position: u64,
+    /// Back-link to the previous metablock for the same aggregate within this
+    /// segment file (0 = none). Node-local like datablock_position, excluded from
+    /// the hash chain; lets the reverse scan skip foreign metablocks.
+    pub previous_aggregate_metablock_pos: u64,
     /// Different types of fixed 512 byte metablocks
     pub wal_metablock_type: MetablockKind,
     /// Type of datablock linked to this metablock, if any
@@ -51,6 +55,7 @@ impl Metablock {
     const WIRE_SIZE_DATABLOCK_COMPRESSION_TYPE: usize = 1;
     const WIRE_SIZE_PREVIOUS_TIP_HASH: usize = 32;
     pub const WIRE_SIZE_DATABLOCK_POSITION: usize = 8;
+    pub const WIRE_SIZE_PREVIOUS_AGGREGATE_METABLOCK_POS: usize = 8;
 
     pub const OFFSET_WAL_SEQ: usize = 0;
 
@@ -81,8 +86,11 @@ impl Metablock {
     pub const OFFSET_DATABLOCK_POSITION: usize =
         Self::OFFSET_PREVIOUS_TIP_HASH + Self::WIRE_SIZE_PREVIOUS_TIP_HASH;
 
-    pub const OFFSET_WAL_METABLOCK_TYPE: usize =
+    pub const OFFSET_PREVIOUS_AGGREGATE_METABLOCK_POS: usize =
         Self::OFFSET_DATABLOCK_POSITION + Self::WIRE_SIZE_DATABLOCK_POSITION;
+
+    pub const OFFSET_WAL_METABLOCK_TYPE: usize =
+        Self::OFFSET_PREVIOUS_AGGREGATE_METABLOCK_POS + Self::WIRE_SIZE_PREVIOUS_AGGREGATE_METABLOCK_POS;
 
     pub fn default_inline_event_batch_metadata(aggregate_key: AggregateKey) -> Self {
         Self {
@@ -96,6 +104,7 @@ impl Metablock {
             datablock_compression_type: 0,
             previous_tip_hash: [0u8; 32],
             datablock_position: 0,
+            previous_aggregate_metablock_pos: 0,
             wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
                 aggregate_key,
                 aggregate_version: 0,

@@ -1,4 +1,7 @@
-use celeriant_wal::{constants::EntryHashBytes, shard_log_header::{HeaderCursor, ShardLogHeader}};
+use celeriant_wal::{
+    constants::EntryHashBytes,
+    shard_log_header::{HeaderCursor, ShardLogHeader},
+};
 
 use crate::log_segment_file::aggregate_key_bloom::AggregateKeyBloom;
 

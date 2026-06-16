@@ -8,9 +8,9 @@ pub const FIXED_BLOCK_SIZE_BYTES: usize = 512;
 pub const HEADER_BLOCK_SIZE_BYTES: usize = 512 * 1024;
 
 #[cfg(not(feature = "small-metablock"))]
-pub const MINIBATCH_SIZE_BYTES: usize = 726;
+pub const MINIBATCH_SIZE_BYTES: usize = 718;
 #[cfg(feature = "small-metablock")]
-pub const MINIBATCH_SIZE_BYTES: usize = 214;
+pub const MINIBATCH_SIZE_BYTES: usize = 206;
 pub const WIRE_VERSION_WAL_METABLOCK: u32 = 1;
 pub const WIRE_VERSION_WAL_DATABLOCK: u32 = 1;
 pub const WIRE_VERSION_WAL_SHARD_LOG_HEADER: u32 = 1;

@@ -77,3 +77,11 @@ harness = false
 [[bench]]
 name = "warmup_benchmark"
 harness = false
+
+[[bench]]
+name = "reverse_metablock_scan_benchmark"
+harness = false
+
+[[bench]]
+name = "client_seq_scan_benchmark"
+harness = false

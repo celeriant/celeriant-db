@@ -1,6 +1,6 @@
-use celeriant_wal::{constants::HEADER_BLOCK_SIZE_BYTES, shard_log_header::ShardLogHeader};
 #[cfg(test)]
 use celeriant_wal::shard_log_header::HeaderCursor;
+use celeriant_wal::{constants::HEADER_BLOCK_SIZE_BYTES, shard_log_header::ShardLogHeader};
 
 use crate::log_segment_file::log_segment_cursor::LogSegmentCursor;
 
@@ -51,11 +51,8 @@ impl LogSegmentFileMetadata {
 
     #[must_use]
     pub fn to_shard_log_header(&self) -> ShardLogHeader {
-        self.write.to_shard_log_header(
-            self.read.as_ref(),
-            self.last_received_replication_wal_seq,
-            self.last_self_acked_wal_seq,
-        )
+        self.write
+            .to_shard_log_header(self.read.as_ref(), self.last_received_replication_wal_seq, self.last_self_acked_wal_seq)
     }
 
     /// Advance visible position after successful replication (write -> read)
@@ -178,10 +175,7 @@ mod tests {
 
     #[test]
     fn advance_visible_position_copies_write() {
-        let header = make_header_with_read(
-            HEADER_BLOCK_SIZE_BYTES as u64, 900, 5,
-            HEADER_BLOCK_SIZE_BYTES as u64, 900, 5,
-        );
+        let header = make_header_with_read(HEADER_BLOCK_SIZE_BYTES as u64, 900, 5, HEADER_BLOCK_SIZE_BYTES as u64, 900, 5);
         let mut meta = LogSegmentFileMetadata::new(1, 1000, None, &header, true);
         meta.write.wal_seq = 15;
         meta.advance_visible_position();
@@ -196,10 +190,7 @@ mod tests {
 
     #[test]
     fn is_pending_when_write_ahead() {
-        let header = make_header_with_read(
-            HEADER_BLOCK_SIZE_BYTES as u64, 900, 10,
-            HEADER_BLOCK_SIZE_BYTES as u64, 900, 5,
-        );
+        let header = make_header_with_read(HEADER_BLOCK_SIZE_BYTES as u64, 900, 10, HEADER_BLOCK_SIZE_BYTES as u64, 900, 5);
         let mut meta = LogSegmentFileMetadata::new(1, 1000, None, &header, true);
         meta.write.wal_seq = 10;
         assert!(meta.is_pending_advance());
@@ -207,10 +198,7 @@ mod tests {
 
     #[test]
     fn not_pending_when_synced() {
-        let header = make_header_with_read(
-            HEADER_BLOCK_SIZE_BYTES as u64, 900, 5,
-            HEADER_BLOCK_SIZE_BYTES as u64, 900, 5,
-        );
+        let header = make_header_with_read(HEADER_BLOCK_SIZE_BYTES as u64, 900, 5, HEADER_BLOCK_SIZE_BYTES as u64, 900, 5);
         let meta = LogSegmentFileMetadata::new(1, 1000, None, &header, true);
         assert!(!meta.is_pending_advance());
     }

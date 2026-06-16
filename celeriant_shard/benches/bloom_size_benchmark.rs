@@ -72,6 +72,7 @@ fn create_config(shard_dir: PathBuf) -> InternalShardConfig {
         aggregate_snapshots_cache_bytes: 64 * 1024 * 1024,
         aggregate_client_snapshots_cache_bytes: 32 * 1024 * 1024,
         read_max_chunk_size: 32 * 1024,
+        chain_read_window_bytes: 1024,
         timestamp_config: TimestampConfig::default(),
         list_max_duration: Duration::from_millis(2000),
         list_page_size: 20000,

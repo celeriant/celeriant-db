@@ -448,6 +448,7 @@ mod tests {
             datablock_compression_type: 1,
             previous_tip_hash: [1u8; 32],
             datablock_position: 0,
+            previous_aggregate_metablock_pos: 0,
             wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
                 aggregate_key,
                 aggregate_version: 10,

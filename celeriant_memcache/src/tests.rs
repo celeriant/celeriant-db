@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::cache_path::CachePath;
 use crate::cached_schema::{CachedSchema, CachedValidator, UniqueSchemaKeys};
 use crate::mem_snapshot_aggregate::{AggregateStatus, MemSnapshotAggregate};
@@ -67,6 +69,7 @@ fn test_metablock(aggregate_key: AggregateKey, aggregate_version: u64, max_event
         datablock_compression_type: 0,
         previous_tip_hash: GENESIS_HASH,
         datablock_position: 0,
+        previous_aggregate_metablock_pos: 0,
         wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
             aggregate_key,
             aggregate_version,
@@ -1911,6 +1914,7 @@ fn eb_metablock(key: AggregateKey, batch_idx: u64, server_ts: u64) -> Metablock 
         datablock_compression_type: 0,
         previous_tip_hash: GENESIS_HASH,
         datablock_position: 0,
+        previous_aggregate_metablock_pos: 0,
         wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
             aggregate_key: key,
             aggregate_version: batch_idx,
@@ -1943,6 +1947,7 @@ fn sd_metablock(key: AggregateKey) -> Metablock {
         datablock_compression_type: 0,
         previous_tip_hash: GENESIS_HASH,
         datablock_position: 0,
+        previous_aggregate_metablock_pos: 0,
         wal_metablock_type: MetablockKind::SoftDelete(MetablockSoftDelete {
             aggregate_key: key,
             allow_recreate: false,
@@ -1968,6 +1973,7 @@ fn st_metablock(key: AggregateKey, keep_from: u64) -> Metablock {
         datablock_compression_type: 0,
         previous_tip_hash: GENESIS_HASH,
         datablock_position: 0,
+        previous_aggregate_metablock_pos: 0,
         wal_metablock_type: MetablockKind::SoftTrim(MetablockSoftTrim {
             aggregate_key: key,
             keep_from_aggregate_version: keep_from,
@@ -2109,5 +2115,43 @@ fn fsync_rollback_preserves_segment_summary() {
     assert_eq!(c.peek_segment_summary_orgs().len(), 2);
     assert_eq!(c.peek_segment_summary_types().len(), 2);
     assert_eq!(c.peek_segment_summary().len(), 2);
+}
+
+// ── Compaction position remap ──
+
+/// After a segment is compacted, cached tips in it are remapped to the new offset,
+/// evicted if the block was dropped, and tips in other segments are left untouched.
+#[test]
+fn remap_compacted_positions_remaps_evicts_and_guards_log_id() {
+    let mut c = cache();
+    let kept = agg(1, 1, 1); // tip in compacted segment, survives → remap
+    let dropped = agg(1, 1, 2); // tip in compacted segment, gone → evict
+    let newer = agg(1, 1, 3); // tip in a newer segment → must be left alone
+
+    let eb_kept = test_event_batch(kept.clone(), 1, 1);
+    let eb_dropped = test_event_batch(dropped.clone(), 1, 1);
+    let eb_newer = test_event_batch(newer.clone(), 1, 1);
+
+    for path in [CachePath::Read, CachePath::Write] {
+        c.commit_position_snapshot(&eb_kept, 5, 1000, path);
+        c.commit_position_snapshot(&eb_dropped, 5, 2000, path);
+        c.commit_position_snapshot(&eb_newer, 6, 3000, path);
+    }
+
+    let mut new_tips = HashMap::new();
+    new_tips.insert(kept.clone(), 1500);
+    new_tips.insert(newer.clone(), 9999); // present in tips but lives in log 6: must be ignored
+
+    c.remap_compacted_positions(5, &new_tips);
+
+    for path in [CachePath::Read, CachePath::Write] {
+        let k = c.get_aggregate_snapshot(&kept, path).expect("kept tip remapped, not evicted");
+        assert_eq!((k.log_id, k.metablock_absolute_pos), (5, 1500));
+
+        assert!(c.get_aggregate_snapshot(&dropped, path).is_none(), "dropped tip must be evicted");
+
+        let n = c.get_aggregate_snapshot(&newer, path).expect("newer-segment tip untouched");
+        assert_eq!((n.log_id, n.metablock_absolute_pos), (6, 3000), "only target_log_id is remapped");
+    }
 }
 

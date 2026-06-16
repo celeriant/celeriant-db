@@ -145,6 +145,9 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 32 * 1024, env = "CELERIANT_READ_MAX_CHUNK_SIZE", help = "Max chunk size for disk reads (32kb)")]
     pub read_max_chunk_size: u64,
 
+    #[arg(long, default_value_t = 1024, env = "CELERIANT_CHAIN_READ_WINDOW_BYTES", help = "Per-hop read window when walking an aggregate's backlink chain for old-version reads. 1024 (one block) reads only the target's metablocks; best when many aggregates are interleaved (e.g. queues); raise toward read_max_chunk_size for low-cardinality shards with long single-aggregate chains")]
+    pub chain_read_window_bytes: u64,
+
     #[arg(long, default_value_t = 32 * 1024, env = "CELERIANT_WRITE_MAX_CHUNK_SIZE", help = "Max chunk size for disk writes (32kb)")]
     pub write_max_chunk_size: u64,
 
@@ -772,6 +775,7 @@ impl ServerConfig {
             replication_port: self.replication_port,
             max_open_files: self.max_open_files,
             read_max_chunk_size: self.read_max_chunk_size,
+            chain_read_window_bytes: self.chain_read_window_bytes,
             write_max_chunk_size: self.write_max_chunk_size,
             max_request_size: self.max_request_size,
             internode_max_request_size: self.internode_max_request_size,
@@ -889,6 +893,7 @@ impl ServerConfig {
         check_field!(reserve_coordinator_shard);
         check_field!(max_open_files);
         check_field!(read_max_chunk_size);
+        check_field!(chain_read_window_bytes);
         check_field!(write_max_chunk_size);
         check_field!(routing_rule);
         check_field!(max_request_size);
@@ -978,6 +983,7 @@ impl Default for ServerConfig {
             num_shards: None,
             reserve_coordinator_shard: false,
             read_max_chunk_size: 32 * 1024,
+            chain_read_window_bytes: 1024,
             write_max_chunk_size: 32 * 1024,
             max_open_files: 1000,
             max_request_size: 16 * 1024 * 1024,

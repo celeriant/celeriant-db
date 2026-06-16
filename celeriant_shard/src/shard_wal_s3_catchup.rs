@@ -1018,12 +1018,16 @@ async fn refine_divergence_by_byte_match(
     let mut advanced = 0u64;
 
     // Compare body bytes only. Skip the versioned header, previous_tip_hash
-    // (chain-derived), and datablock_position (node-local).
+    // (chain-derived), and the contiguous node-local fields datablock_position +
+    // previous_aggregate_metablock_pos.
     use celeriant_wal::metablocks::metablock::Metablock as Mb;
     const HEADER_SIZE: usize = celeriant_wire::disk::versioned_block::HEADER_SIZE;
     const CONTENT_START: usize = HEADER_SIZE;
     const PREV_HASH_START: usize = HEADER_SIZE + Mb::OFFSET_PREVIOUS_TIP_HASH;
-    const DATABLOCK_POS_END: usize = HEADER_SIZE + Mb::OFFSET_DATABLOCK_POSITION + Mb::WIRE_SIZE_DATABLOCK_POSITION;
+    const NODE_LOCAL_END: usize = HEADER_SIZE
+        + Mb::OFFSET_DATABLOCK_POSITION
+        + Mb::WIRE_SIZE_DATABLOCK_POSITION
+        + Mb::WIRE_SIZE_PREVIOUS_AGGREGATE_METABLOCK_POS;
 
     for batch_metablock in &matched_batch_metablocks[start_idx..] {
         let batch_metablock = *batch_metablock;
@@ -1058,7 +1062,7 @@ async fn refine_divergence_by_byte_match(
 
         let content_match = local_block[CONTENT_START..PREV_HASH_START]
             == batch_block[CONTENT_START..PREV_HASH_START]
-            && local_block[DATABLOCK_POS_END..] == batch_block[DATABLOCK_POS_END..];
+            && local_block[NODE_LOCAL_END..] == batch_block[NODE_LOCAL_END..];
         if !content_match {
             break;
         }
@@ -1223,6 +1227,11 @@ async fn truncate_wal(
             .await
             .map_err(|e| ShardFsyncError::MetablockSerialisationError(format!("carry-over read failed: {:?}", e)))?;
     }
+
+    // Rewound cursor invalidated the active segment's backlink tips; rebuild from disk.
+    crate::shard_wal::rebuild_active_segment_chain_tips(log_segments_cache, 64 * 1024)
+        .await
+        .map_err(|e| ShardFsyncError::MetablockSerialisationError(format!("chain-tips rebuild after truncate failed: {e:?}")))?;
 
     tracing::warn!(divergent_count, new_wal_seq, "WAL truncated due to divergent entries");
 
@@ -2376,6 +2385,7 @@ mod tests {
             }),
             datablock: DatablockStorageKind::Block(celeriant_wal::metablocks::datablock_block_ref::DatablockBlockRef { crc32c: 0 }),
             datablock_position: 1000,
+            previous_aggregate_metablock_pos: 0,
         };
 
         let metablock2 = Metablock {
@@ -2404,6 +2414,7 @@ mod tests {
             }),
             datablock: DatablockStorageKind::None,
             datablock_position: 0,
+            previous_aggregate_metablock_pos: 0,
         };
 
         let datablock1 = Some(Datablock {
@@ -2484,6 +2495,7 @@ mod tests {
             }),
             datablock: DatablockStorageKind::None,
             datablock_position: 0,
+            previous_aggregate_metablock_pos: 0,
         };
 
         let metablock_second = Metablock {

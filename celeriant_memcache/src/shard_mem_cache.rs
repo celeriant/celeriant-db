@@ -853,6 +853,46 @@ impl<V: Validate> ShardMemCache<V> {
         }
     }
 
+    /// Repoint cached metablock positions after `target_log_id` was compacted in place.
+    /// Remaps each tip to its new offset, or evicts the entry if the block was dropped.
+    /// Call synchronously right after the atomic swap (no await in between).
+    pub fn remap_compacted_positions(&mut self, target_log_id: u64, new_tips: &HashMap<AggregateKey, u64>) {
+        Self::remap_snapshot_lru(&mut self.aggregate_read_snapshots, target_log_id, new_tips);
+        Self::remap_snapshot_lru(&mut self.aggregate_write_snapshots, target_log_id, new_tips);
+
+        let mut dropped = Vec::new();
+        for (key, pos) in self.aggregate_queue_positions.iter_mut() {
+            if pos.log_id == target_log_id {
+                match new_tips.get(key) {
+                    Some(&new_pos) => pos.metablock_absolute_pos = new_pos,
+                    None => dropped.push(key.clone()),
+                }
+            }
+        }
+        for key in dropped {
+            self.aggregate_queue_positions.remove(&key);
+        }
+    }
+
+    fn remap_snapshot_lru(
+        cache: &mut LruCache<AggregateKey, MemSnapshotAggregate>,
+        target_log_id: u64,
+        new_tips: &HashMap<AggregateKey, u64>,
+    ) {
+        let mut dropped = Vec::new();
+        for (key, snapshot) in cache.iter_mut() {
+            if snapshot.log_id == target_log_id {
+                match new_tips.get(key) {
+                    Some(&new_pos) => snapshot.metablock_absolute_pos = new_pos,
+                    None => dropped.push(key.clone()),
+                }
+            }
+        }
+        for key in dropped {
+            cache.pop(&key);
+        }
+    }
+
     /// Get the latest batch and event index for an aggregate
     /// Preference the queue first, then fallback to file if no queued items for aggregate
     pub fn get_write_event_seqes(&mut self, aggregate_key: &AggregateKey) -> EventIndexes {

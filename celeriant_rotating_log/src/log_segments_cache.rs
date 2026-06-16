@@ -1,8 +1,19 @@
 use celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES;
 use lru::LruCache;
-use std::{cell::RefCell, num::NonZeroUsize, path::{Path, PathBuf}, rc::Rc};
+use std::{
+    cell::RefCell,
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+    rc::Rc,
+};
 
-use crate::{errors::{open_or_create_error::OpenOrCreateError, ready_up_error::ReadyUpError}, log_segment_file::{log_segment_cursor::LogSegmentCursor, log_segment_file::{is_zero_dual_header_orphan, log_file_name, LogSegmentFile}}};
+use crate::{
+    errors::{open_or_create_error::OpenOrCreateError, ready_up_error::ReadyUpError},
+    log_segment_file::{
+        log_segment_cursor::LogSegmentCursor,
+        log_segment_file::{LogSegmentFile, is_zero_dual_header_orphan, log_file_name},
+    },
+};
 
 /// Manages DmaFile handles for a shard with LRU caching.
 /// "Active File" file is the current log being written to
@@ -24,7 +35,6 @@ pub struct LogSegmentsCache {
 }
 
 impl LogSegmentsCache {
-
     /// Rollback write position after failed replication (read -> write)
     /// This is done here because it's possible the write is on a new rotated log file
     /// and read is still at the previous log file.
@@ -48,19 +58,17 @@ impl LogSegmentsCache {
         // Read position is still on a previous log file
         // Get cursor from previous file: prefer read, fallback to write
         let prev_cursor = {
-            self.lru_cache.borrow_mut()
-                .get(&prev_log_id)
-                .map(|prev_file| {
-                    let metadata = prev_file.metadata.borrow();
-                    metadata.read.clone().unwrap_or_else(|| metadata.write.clone())
-                })
+            self.lru_cache.borrow_mut().get(&prev_log_id).map(|prev_file| {
+                let metadata = prev_file.metadata.borrow();
+                metadata.read.clone().unwrap_or_else(|| metadata.write.clone())
+            })
         };
 
         // Reset active file - use previous cursor state if available, otherwise fresh
         {
             let active_file = self.active_file.borrow();
             let mut metadata = active_file.metadata.borrow_mut();
-            
+
             metadata.write = LogSegmentCursor {
                 log_id: metadata.log_id,
                 metablocks_position: HEADER_BLOCK_SIZE_BYTES as u64,
@@ -93,7 +101,8 @@ impl LogSegmentsCache {
         }
 
         // Read is still on previous log file, fallback to write if not found
-        self.lru_cache.borrow_mut()
+        self.lru_cache
+            .borrow_mut()
             .get(&prev_log_id)
             .map(|prev_file| {
                 let metadata = prev_file.metadata.borrow();
@@ -119,7 +128,8 @@ impl LogSegmentsCache {
             return read_wal_seq;
         }
 
-        self.lru_cache.borrow_mut()
+        self.lru_cache
+            .borrow_mut()
             .get(&prev_log_id)
             .map(|prev_file| {
                 let metadata = prev_file.metadata.borrow();
@@ -143,6 +153,8 @@ impl LogSegmentsCache {
         let mut current_log_segment_cache = self.active_file.borrow_mut();
         let old = std::mem::replace(&mut *current_log_segment_cache, new_log_segment_file);
 
+        // Sealed: it never takes writes again, so its chain tips are dead weight in the LRU.
+        old.seal_aggregate_chain_tips();
         self.lru_cache.borrow_mut().put(current_log_id, old);
 
         metrics::counter!("celeriant_log_rotations_total", &self.shard_label).increment(1);
@@ -159,8 +171,7 @@ impl LogSegmentsCache {
     pub fn publish_cursor_gauges(&self) {
         let active = self.active();
         let meta = active.metadata.borrow();
-        metrics::gauge!("celeriant_read_wal_seq", &self.shard_label)
-            .set(meta.read.as_ref().map_or(0, |r| r.wal_seq) as f64);
+        metrics::gauge!("celeriant_read_wal_seq", &self.shard_label).set(meta.read.as_ref().map_or(0, |r| r.wal_seq) as f64);
         metrics::gauge!("celeriant_wal_seq", &self.shard_label).set(meta.write.wal_seq as f64);
     }
 
@@ -169,11 +180,10 @@ impl LogSegmentsCache {
             return Err(ReadyUpError::InvalidPreallocatedBytes(preallocate_bytes));
         }
 
-        std::fs::create_dir_all(&shard_dir)
-            .map_err(|source| ReadyUpError::UnableToCreateDirectory {
-                directory: shard_dir.to_string_lossy().to_string(),
-                source,
-            })?;
+        std::fs::create_dir_all(&shard_dir).map_err(|source| ReadyUpError::UnableToCreateDirectory {
+            directory: shard_dir.to_string_lossy().to_string(),
+            source,
+        })?;
 
         let mut active_log_id = find_latest_log_file(&shard_dir)
             .map_err(|source| ReadyUpError::UnableToAccessDirectory {
@@ -209,11 +219,10 @@ impl LogSegmentsCache {
                         "Detected zero-dual-header orphan from crashed rotation; deleting and falling back to log_id-1"
                     );
 
-                    std::fs::remove_file(&orphan_path)
-                        .map_err(|source| ReadyUpError::UnableToDeleteOrphanSegment {
-                            path: orphan_path.to_string_lossy().to_string(),
-                            source,
-                        })?;
+                    std::fs::remove_file(&orphan_path).map_err(|source| ReadyUpError::UnableToDeleteOrphanSegment {
+                        path: orphan_path.to_string_lossy().to_string(),
+                        source,
+                    })?;
 
                     metrics::counter!("celeriant_orphan_segment_recovered_total", &[("shard_id", shard_id.to_string())]).increment(1);
 
@@ -343,10 +352,7 @@ impl LogSegmentsCache {
     ///
     /// The caller is responsible for rewriting `target_log_id`'s dual headers
     /// to reflect the new write cursor.
-    pub async fn unwind_active_to_sealed(
-        &self,
-        target_log_id: u64,
-    ) -> Result<(), UnwindActiveError> {
+    pub async fn unwind_active_to_sealed(&self, target_log_id: u64) -> Result<(), UnwindActiveError> {
         let current_active_id = self.active_log_id();
         if target_log_id >= current_active_id {
             return Err(UnwindActiveError::NotOlderThanActive {
@@ -357,10 +363,7 @@ impl LogSegmentsCache {
 
         // Open the target (may already be in the LRU) and remove it from the
         // LRU so we can move it into the active slot without aliasing.
-        let target = self
-            .get(target_log_id)
-            .await
-            .map_err(UnwindActiveError::OpenTarget)?;
+        let target = self.get(target_log_id).await.map_err(UnwindActiveError::OpenTarget)?;
         self.lru_cache.borrow_mut().pop(&target_log_id);
 
         // Collect every log_id that must be discarded (target+1..=current_active).
@@ -395,8 +398,7 @@ impl LogSegmentsCache {
             }
         }
 
-        metrics::gauge!("celeriant_log_segments_total", &self.shard_label)
-            .set((1 + self.lru_cache.borrow().len()) as f64);
+        metrics::gauge!("celeriant_log_segments_total", &self.shard_label).set((1 + self.lru_cache.borrow().len()) as f64);
         tracing::warn!(
             shard_id = %self.shard_label[0].1,
             target_log_id,
@@ -468,7 +470,6 @@ fn find_latest_log_file(dir: &PathBuf) -> Result<Option<u64>, std::io::Error> {
     Ok(best)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,7 +527,11 @@ mod tests {
 
             use crate::log_segment_file::log_segment_file::LogSegmentFile;
             for id in [1, 3, 7] {
-                LogSegmentFile::open_or_create_first_file_for_shard(&dir, FILE_SIZE, id, true).await.unwrap().close().await;
+                LogSegmentFile::open_or_create_first_file_for_shard(&dir, FILE_SIZE, id, true)
+                    .await
+                    .unwrap()
+                    .close()
+                    .await;
             }
 
             let cache = LogSegmentsCache::ready_up(dir.clone(), FILE_SIZE, 2, 0).await.unwrap();
@@ -604,7 +609,14 @@ mod tests {
             {
                 let active = cache.active();
                 let mut md = active.metadata.borrow_mut();
-                if let Some(r) = md.read.as_mut() { r.wal_seq = 4242; } else { md.read = Some(LogSegmentCursor { wal_seq: 4242, ..Default::default() }); }
+                if let Some(r) = md.read.as_mut() {
+                    r.wal_seq = 4242;
+                } else {
+                    md.read = Some(LogSegmentCursor {
+                        wal_seq: 4242,
+                        ..Default::default()
+                    });
+                }
                 md.write.wal_seq = 9999;
             }
             assert_eq!(cache.get_latest_read_cursor_wal_seq(), 4242);
@@ -627,7 +639,11 @@ mod tests {
                 cache.active().metadata.borrow_mut().read = None;
                 let prev = cache.get_if_cached(1).expect("prev segment cached");
                 let mut pmd = prev.metadata.borrow_mut();
-                if let Some(r) = pmd.read.as_mut() { r.wal_seq = 5151; } else { pmd.write.wal_seq = 5151; }
+                if let Some(r) = pmd.read.as_mut() {
+                    r.wal_seq = 5151;
+                } else {
+                    pmd.write.wal_seq = 5151;
+                }
             }
             equiv(&cache);
 
@@ -759,7 +775,11 @@ mod tests {
             {
                 let (_tmp, dir) = test_dir();
                 std::fs::create_dir_all(&dir).unwrap();
-                LogSegmentFile::open_or_create_first_file_for_shard(&dir, FILE_SIZE, 1, true).await.unwrap().close().await;
+                LogSegmentFile::open_or_create_first_file_for_shard(&dir, FILE_SIZE, 1, true)
+                    .await
+                    .unwrap()
+                    .close()
+                    .await;
                 make_zero_file(&dir.join("log_2.wal"), FILE_SIZE);
 
                 let cache = LogSegmentsCache::ready_up(dir.clone(), FILE_SIZE, 2, 0).await.unwrap();
@@ -773,7 +793,11 @@ mod tests {
             {
                 let (_tmp, dir) = test_dir();
                 std::fs::create_dir_all(&dir).unwrap();
-                LogSegmentFile::open_or_create_first_file_for_shard(&dir, FILE_SIZE, 1, true).await.unwrap().close().await;
+                LogSegmentFile::open_or_create_first_file_for_shard(&dir, FILE_SIZE, 1, true)
+                    .await
+                    .unwrap()
+                    .close()
+                    .await;
                 make_zero_file(&dir.join("log_2.wal"), FILE_SIZE);
                 make_zero_file(&dir.join("log_3.wal"), FILE_SIZE);
 
