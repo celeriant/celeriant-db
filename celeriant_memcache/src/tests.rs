@@ -128,6 +128,7 @@ fn test_pending_commit_data() -> PendingCommitData {
     let header = ShardLogHeader {
         write: cursor.clone(),
         aggregate_bloom: celeriant_rotating_log::log_segment_file::aggregate_key_bloom::AggregateKeyBloom::new().to_bytes(),
+        client_bloom: celeriant_rotating_log::log_segment_file::aggregate_key_bloom::AggregateKeyBloom::with_capacity_bytes(celeriant_wal::constants::CLIENT_BLOOM_BYTES).to_bytes(),
         last_received_replication_wal_seq: 0,
         last_self_acked_wal_seq: 0,
         read: cursor,

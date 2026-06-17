@@ -32,7 +32,7 @@ use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
 use celeriant_msg::response::responses::{AggregateListItem, AggregateTypeListItem, AggregateDetailsResponse, DeleteResponse, FollowerRejection, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, OrgListItem, ReadResponse, RegisterSchemaResponse, ReplicationBatchResponse, ReplicationResult, TrimStartResponse, WriteResponse};
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
-use celeriant_wal::aggregate_client_key::AggregateClientKey;
+use celeriant_wal::aggregate_client_key::{client_id_bloom_hash, AggregateClientKey};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::aggregate_type_key::AggregateTypeKey;
 use celeriant_wal::schema_key::SchemaKey;
@@ -1728,6 +1728,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             self.config.read_max_chunk_size,
         )
         .with_aggregate_chain(aggregate_key.clone(), self.config.chain_read_window_bytes)
+        .with_client_bloom_filter_hash(client_id_bloom_hash(aggregate_client_key.client_id))
         .with_write_cursor_upper_bound();
 
         let find_result = scanner
@@ -5225,7 +5226,7 @@ mod tests {
             std::fs::create_dir_all(&temp_dir).unwrap();
 
             let config = InternalShardConfig {
-                shard_log_preallocate_bytes: 3 * 512 * 1024, // 1.5MB — smallest valid segment
+                shard_log_preallocate_bytes: 2 * celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES as u64 + 512 * 1024, // 2 headers + 512KB usable
                 compaction_temp_dir: temp_dir,
                 ..test_config(&dir)
             };
@@ -7785,13 +7786,14 @@ mod tests {
 
     /// Config for compaction tests: small segment size to trigger rotation quickly.
     ///
-    /// Minimum valid preallocate_bytes is 3 * HEADER_BLOCK_SIZE_BYTES (3 * 512KB = 1.5MB).
-    /// This leaves 512KB usable per segment. Each fat write (~9KB) fills it in ~57 writes.
+    /// 2 header blocks + 512KB usable per segment (header-size-independent, so the byte-ratio
+    /// tuning below holds whatever HEADER_BLOCK_SIZE_BYTES is). Each fat write (~9KB) fills the
+    /// 512KB usable region in ~57 writes.
     fn compact_config(dir: &std::path::Path) -> InternalShardConfig {
         let temp_dir = dir.join("compaction_temp");
         std::fs::create_dir_all(&temp_dir).unwrap();
         InternalShardConfig {
-            shard_log_preallocate_bytes: 3 * 512 * 1024, // 1.5MB — smallest valid segment size
+            shard_log_preallocate_bytes: 2 * celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES as u64 + 512 * 1024, // 2 headers + 512KB usable
             compaction_min_reclaimable_ratio: 0.20,
             compaction_temp_dir: temp_dir,
             ..test_config(dir)
@@ -8382,7 +8384,7 @@ mod tests {
             let seg = shard.log_segments_cache.get(cr.log_id).await.unwrap();
             let bloom_has_b = seg.metadata.borrow()
                 .read.as_ref().unwrap()
-                .aggregate_key_bloom.may_contain(&agg_b);
+                .aggregate_key_bloom.borrow().may_contain(&agg_b);
             assert!(bloom_has_b, "compacted bloom must include the SoftTrim aggregate key");
 
             shard.close().await;
@@ -9784,7 +9786,7 @@ mod tests {
 
     fn cold_scan_config(dir: &std::path::Path) -> InternalShardConfig {
         InternalShardConfig {
-            shard_log_preallocate_bytes: 1536 * 1024, // 3 × 512KB header blocks
+            shard_log_preallocate_bytes: 2 * celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES as u64 + 512 * 1024, // 2 headers + 512KB usable
             max_open_files: 4096,
             cache_warmup_max_duration: Duration::ZERO,
             ..test_config(dir)

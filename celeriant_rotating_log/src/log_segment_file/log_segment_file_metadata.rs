@@ -33,15 +33,18 @@ impl LogSegmentFileMetadata {
     /// `advance_read=true` restores read from the header (None if zero sentinel).
     /// `advance_read=false` forces read=None; used during rotation for a fresh segment.
     pub fn new(log_id: u64, file_len: u64, datablocks_carry_over: Option<Vec<u8>>, shard_log_header: &ShardLogHeader, advance_read: bool) -> Self {
+        let write = LogSegmentCursor::from_shard_log_header_write(log_id, shard_log_header);
+        // Read shares the write bloom (same persisted bytes; superset is valid for reads) so a
+        // segment load allocates ONE bloom pair, not two.
         let read = if advance_read && shard_log_header.read.metablocks_position >= HEADER_BLOCK_SIZE_BYTES as u64 {
-            Some(LogSegmentCursor::from_shard_log_header_read(log_id, shard_log_header))
+            Some(write.read_snapshot_sharing_bloom(&shard_log_header.read))
         } else {
             None
         };
         LogSegmentFileMetadata {
             log_id,
             file_len,
-            write: LogSegmentCursor::from_shard_log_header_write(log_id, shard_log_header),
+            write,
             read,
             datablocks_carry_over,
             last_received_replication_wal_seq: shard_log_header.last_received_replication_wal_seq,
@@ -92,6 +95,7 @@ mod tests {
                 tip_hash: [0u8; 32],
             },
             aggregate_bloom: AggregateKeyBloom::new().to_bytes(),
+            client_bloom: AggregateKeyBloom::new().to_bytes(),
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
             // read defaults to zero sentinel (not advanced)
@@ -108,6 +112,7 @@ mod tests {
                 tip_hash: [0u8; 32],
             },
             aggregate_bloom: AggregateKeyBloom::new().to_bytes(),
+            client_bloom: AggregateKeyBloom::new().to_bytes(),
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
             read: HeaderCursor {
@@ -162,13 +167,13 @@ mod tests {
         // Simulates restart after leader crash with write=10, read=5
         let header = make_header_with_read(
             HEADER_BLOCK_SIZE_BYTES as u64 + 10 * 512,
-            1_000_000 - HEADER_BLOCK_SIZE_BYTES as u64,
+            4_000_000 - HEADER_BLOCK_SIZE_BYTES as u64,
             10,
             HEADER_BLOCK_SIZE_BYTES as u64 + 5 * 512,
-            1_000_000 - HEADER_BLOCK_SIZE_BYTES as u64,
+            4_000_000 - HEADER_BLOCK_SIZE_BYTES as u64,
             5,
         );
-        let meta = LogSegmentFileMetadata::new(1, 1_000_000, None, &header, true);
+        let meta = LogSegmentFileMetadata::new(1, 4_000_000, None, &header, true);
         assert_eq!(meta.write.wal_seq, 10);
         assert_eq!(meta.read.as_ref().unwrap().wal_seq, 5);
     }
@@ -214,9 +219,9 @@ mod tests {
             900_000,
             5,
         );
-        let meta = LogSegmentFileMetadata::new(1, 1_000_000, None, &header, true);
+        let meta = LogSegmentFileMetadata::new(1, 4_000_000, None, &header, true);
         let serialized = meta.to_shard_log_header();
-        let restored = LogSegmentFileMetadata::new(1, 1_000_000, None, &serialized, true);
+        let restored = LogSegmentFileMetadata::new(1, 4_000_000, None, &serialized, true);
         assert_eq!(restored.write.wal_seq, 10);
         assert_eq!(restored.read.as_ref().unwrap().wal_seq, 5);
     }

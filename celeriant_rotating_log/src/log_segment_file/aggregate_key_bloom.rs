@@ -17,16 +17,25 @@ impl Default for AggregateKeyBloom {
 }
 
 impl AggregateKeyBloom {
-    /// Create a new, empty aggregate key bloom.
+    /// Create a new, empty aggregate key bloom (256KB).
     #[must_use]
     pub fn new() -> Self {
         Self { words: vec![0u64; WORDS] }
     }
 
-    /// Create from existing bloom bytes (e.g., loaded from disk).
+    /// Create a new, empty bloom of a given byte size. Used for the smaller (128KB) client_id bloom
+    #[must_use]
+    pub fn with_capacity_bytes(bytes: usize) -> Self {
+        debug_assert_eq!(bytes % 32, 0, "SBBF byte size must be a multiple of the 32-byte block");
+        Self { words: vec![0u64; bytes / 8] }
+    }
+
+    /// Create from existing bloom bytes (e.g., loaded from disk). Length is whatever was
+    /// persisted (256KB aggregate or 128KB client), only required to be a whole number of
+    /// 32-byte SBBF blocks.
     #[must_use]
     pub fn from_bytes(bytes: &[u64]) -> Self {
-        debug_assert_eq!(bytes.len(), WORDS, "persisted aggregate bloom is the wrong size");
+        debug_assert_eq!(bytes.len() % 4, 0, "persisted bloom is not a whole number of SBBF blocks");
         Self { words: bytes.to_vec() }
     }
 

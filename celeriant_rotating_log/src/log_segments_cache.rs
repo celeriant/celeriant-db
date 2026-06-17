@@ -1,4 +1,4 @@
-use celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES;
+use celeriant_wal::constants::{CLIENT_BLOOM_BYTES, HEADER_BLOCK_SIZE_BYTES, MIN_WRITE_ALIGNMENT};
 use lru::LruCache;
 use std::{
     cell::RefCell,
@@ -10,7 +10,8 @@ use std::{
 use crate::{
     errors::{open_or_create_error::OpenOrCreateError, ready_up_error::ReadyUpError},
     log_segment_file::{
-        log_segment_cursor::LogSegmentCursor,
+        aggregate_key_bloom::AggregateKeyBloom,
+        log_segment_cursor::{LogSegmentCursor, fork_bloom, shared_bloom},
         log_segment_file::{LogSegmentFile, is_zero_dual_header_orphan, log_file_name},
     },
 };
@@ -69,12 +70,24 @@ impl LogSegmentsCache {
             let active_file = self.active_file.borrow();
             let mut metadata = active_file.metadata.borrow_mut();
 
+            // FORK, don't share: this new active cursor must own an INDEPENDENT bloom. `prev_cursor`
+            // is the PREVIOUS segment's cursor (and line below keeps it as that file's write
+            // cursor), so a plain Rc-share would let this segment's future writes dirty the
+            // previous segment's bloom. `fork_bloom` deep-copies. (None branch: fresh, right-sized.)
+            let (aggregate_key_bloom, client_id_bloom) = match prev_cursor.as_ref() {
+                Some(c) => (fork_bloom(&c.aggregate_key_bloom), fork_bloom(&c.client_id_bloom)),
+                None => (
+                    shared_bloom(AggregateKeyBloom::new()),
+                    shared_bloom(AggregateKeyBloom::with_capacity_bytes(CLIENT_BLOOM_BYTES)),
+                ),
+            };
             metadata.write = LogSegmentCursor {
                 log_id: metadata.log_id,
                 metablocks_position: HEADER_BLOCK_SIZE_BYTES as u64,
                 datablocks_position: metadata.file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64),
                 wal_seq: prev_cursor.as_ref().map_or(0, |c| c.wal_seq),
-                aggregate_key_bloom: prev_cursor.as_ref().map_or_else(Default::default, |c| c.aggregate_key_bloom.clone()),
+                aggregate_key_bloom,
+                client_id_bloom,
                 tip_hash: prev_cursor.as_ref().map_or(Default::default(), |c| c.tip_hash),
             };
         }
@@ -176,7 +189,12 @@ impl LogSegmentsCache {
     }
 
     pub async fn ready_up(shard_dir: PathBuf, preallocate_bytes: u64, max_cached_files: usize, shard_id: u32) -> Result<Self, ReadyUpError> {
-        if preallocate_bytes <= HEADER_BLOCK_SIZE_BYTES as u64 * 2 || preallocate_bytes % HEADER_BLOCK_SIZE_BYTES as u64 != 0 {
+        // Segment needs room for the two header copies plus a metablock+datablock region, and
+        // must be DMA-aligned. It does NOT need to be a multiple of the header block: the tail
+        // header sits at `file_len - HEADER_BLOCK_SIZE_BYTES`, datablocks align to
+        // MIN_WRITE_ALIGNMENT independently, so 4096-alignment of both is sufficient. (Relaxed
+        // from `% HEADER_BLOCK_SIZE_BYTES == 0` so the header can be right-sized below 512KB.)
+        if preallocate_bytes <= HEADER_BLOCK_SIZE_BYTES as u64 * 2 || preallocate_bytes % MIN_WRITE_ALIGNMENT != 0 {
             return Err(ReadyUpError::InvalidPreallocatedBytes(preallocate_bytes));
         }
 
@@ -516,6 +534,20 @@ mod tests {
                 let result = LogSegmentsCache::ready_up(dir.clone(), bad_size, 2, 0).await;
                 assert!(matches!(result, Err(ReadyUpError::InvalidPreallocatedBytes(_))));
             }
+        });
+    }
+
+    #[test]
+    fn ready_up_accepts_4096_aligned_non_header_multiple() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            // 4096-aligned but NOT a multiple of the (non-power-of-two) header block — the
+            // relaxed invariant must accept it. Mirrors the 1GB prod segment / 388KB header.
+            let size = HEADER_BLOCK_SIZE_BYTES as u64 * 3 + MIN_WRITE_ALIGNMENT;
+            assert_ne!(size % HEADER_BLOCK_SIZE_BYTES as u64, 0);
+            assert_eq!(size % MIN_WRITE_ALIGNMENT, 0);
+            let cache = LogSegmentsCache::ready_up(dir, size, 2, 0).await.unwrap();
+            cache.close().await;
         });
     }
 

@@ -21,6 +21,7 @@ use celeriant_wal::constants::{self, EntryHashBytes, FIRST_AGGREGATE_VERSION, FI
 use celeriant_wire::codec::compression::DictCodec;
 use celeriant_wal::segment_summary::{SegmentSummaryBlock, SegmentSummaryPayload};
 
+use celeriant_wal::aggregate_client_key::client_id_bloom_hash;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::metablocks::metablock::Metablock;
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
@@ -490,16 +491,17 @@ pub(crate) async fn sync(
     for item in &sync_positions_snapshot.pending_append_queue {
         match &item.metablock.wal_metablock_type {
             MetablockKind::EventBatchMetadata(event_batch) => {
-                log_segment_file_metadata.write.aggregate_key_bloom.insert(&event_batch.aggregate_key);
+                log_segment_file_metadata.write.aggregate_key_bloom.borrow_mut().insert(&event_batch.aggregate_key);
+                log_segment_file_metadata.write.client_id_bloom.borrow_mut().insert_hash(client_id_bloom_hash(event_batch.client_id));
             }
             MetablockKind::SchemaRegistration(schema_reg) => {
-                log_segment_file_metadata.write.aggregate_key_bloom.insert_hash(schema_reg.schema_key.bloom_hash());
+                log_segment_file_metadata.write.aggregate_key_bloom.borrow_mut().insert_hash(schema_reg.schema_key.bloom_hash());
             }
             MetablockKind::SoftDelete(soft_delete) => {
-                log_segment_file_metadata.write.aggregate_key_bloom.insert(&soft_delete.aggregate_key);
+                log_segment_file_metadata.write.aggregate_key_bloom.borrow_mut().insert(&soft_delete.aggregate_key);
             }
             MetablockKind::SoftTrim(soft_trim) => {
-                log_segment_file_metadata.write.aggregate_key_bloom.insert(&soft_trim.aggregate_key);
+                log_segment_file_metadata.write.aggregate_key_bloom.borrow_mut().insert(&soft_trim.aggregate_key);
             }
         }
     }

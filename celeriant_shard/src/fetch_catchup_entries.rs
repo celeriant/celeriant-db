@@ -171,6 +171,7 @@ mod tests {
             datablocks_position: FILE_SIZE.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64),
             wal_seq: metablocks[..count].last().map(|m| m.wal_seq).unwrap_or(0),
             aggregate_key_bloom: Default::default(),
+            client_id_bloom: celeriant_rotating_log::log_segment_file::log_segment_cursor::shared_bloom(celeriant_rotating_log::log_segment_file::aggregate_key_bloom::AggregateKeyBloom::with_capacity_bytes(celeriant_wal::constants::CLIENT_BLOOM_BYTES)),
             tip_hash: [0u8; 32],
         };
         let mut metadata = active.metadata.borrow_mut();

@@ -5,7 +5,9 @@ pub const FIXED_BLOCK_SIZE_BYTES: usize = 1024;
 #[cfg(feature = "small-metablock")]
 pub const FIXED_BLOCK_SIZE_BYTES: usize = 512;
 
-pub const HEADER_BLOCK_SIZE_BYTES: usize = 512 * 1024;
+// Right-sized to the smallest 4096-multiple that holds the serialized header: 256KB aggregate
+// bloom + 128KB client bloom + 2 cursors + scalars + framing = 393,368 B -> 97*4096 = 388KB
+pub const HEADER_BLOCK_SIZE_BYTES: usize = 388 * 1024;
 
 #[cfg(not(feature = "small-metablock"))]
 pub const MINIBATCH_SIZE_BYTES: usize = 718;
@@ -21,6 +23,9 @@ pub const FIRST_AGGREGATE_VERSION: u64 = 1;
 /// Per-segment aggregate-key bloom size (256KB split-block; see `celeriant_wal::sbbf`).
 /// ~10.5 bits/key at the 200k design capacity <1% false-positive rate.
 pub const AGGREGATE_BLOOM_BYTES: usize = 256 * 1024;
+/// Per-segment global client_id bloom size. 128KB (half the aggregate bloom): keeps <1% FP
+/// up to ~100k distinct clients/segment, and a false positive only costs a fall-back scan
+pub const CLIENT_BLOOM_BYTES: usize = 128 * 1024;
 pub type EntryHashBytes = [u8; 32];
 pub const GENESIS_HASH: EntryHashBytes = [0u8; 32];
 pub const STRUCT_TO_MEMORY_REAL_SIZE: usize = 3;

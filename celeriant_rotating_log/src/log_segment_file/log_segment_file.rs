@@ -11,7 +11,7 @@ use celeriant_disk::files::{
 };
 use celeriant_wal::{
     aggregate_key::AggregateKey,
-    constants::{AGGREGATE_BLOOM_BYTES, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_SHARD_LOG_HEADER},
+    constants::{AGGREGATE_BLOOM_BYTES, CLIENT_BLOOM_BYTES, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_SHARD_LOG_HEADER},
     shard_log_header::{HeaderCursor, ShardLogHeader},
 };
 use celeriant_wire::disk::versioned_block::{deserialise_shard_log_header, serialize_versioned_message};
@@ -446,6 +446,7 @@ async fn setup_new_file(
     let header = ShardLogHeader {
         write,
         aggregate_bloom: vec![0u64; AGGREGATE_BLOOM_BYTES / 8],
+        client_bloom: vec![0u64; CLIENT_BLOOM_BYTES / 8],
         last_received_replication_wal_seq,
         last_self_acked_wal_seq,
         read,

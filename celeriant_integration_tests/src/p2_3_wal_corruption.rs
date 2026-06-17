@@ -74,11 +74,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // WAL file structure:
-    // - Bytes 0-524288: Primary header
-    // - Bytes 524288+: Metablocks (1024 bytes each, with CRC32C)
-    // - Bytes (end-524288) to end: Backup header
-    // Corrupt the first metablock area (after header)
-    let corruption_offset = 524288u64 + 512; // First metablock, midway through payload
+    // - Bytes 0..HEADER_BLOCK_SIZE_BYTES: Primary header
+    // - HEADER_BLOCK_SIZE_BYTES..: Metablocks (1024 bytes each, with CRC32C)
+    // - (end - HEADER_BLOCK_SIZE_BYTES)..end: Backup header
+    // Corrupt the first metablock area (just after the header) — offset is header-relative so it
+    // tracks HEADER_BLOCK_SIZE_BYTES rather than assuming a fixed 512KB header.
+    let corruption_offset = celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES as u64 + 512; // first metablock, midway through payload
     let corruption_bytes = [0xFF, 0xFF, 0xFF, 0xFF];
 
     println!("  Corrupting {} bytes at offset {}...", corruption_bytes.len(), corruption_offset);

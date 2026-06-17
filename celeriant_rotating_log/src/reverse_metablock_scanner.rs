@@ -16,6 +16,9 @@ pub struct ReverseMetablockScanner<'a> {
     /// Optional hash for bloom filter optimization.
     /// When set, log segments where the bloom filter says "definitely not present" are skipped.
     bloom_filter_hash: Option<u64>,
+    /// Optional client_id bloom hash for a NEGATIVE client-seq lookup. When set, a segment
+    /// whose client bloom says "client definitely absent" is skipped
+    client_bloom_filter_hash: Option<u64>,
     /// When true, scan up to the write cursor (uncommitted region included)
     use_write_cursor: bool,
     /// When set, follow per-aggregate backlinks to skip foreign metablocks instead
@@ -35,6 +38,7 @@ impl<'a> ReverseMetablockScanner<'a> {
             chunk_size,
             start_from_position,
             bloom_filter_hash: None,
+            client_bloom_filter_hash: None,
             use_write_cursor: false,
             chain_aggregate_key: None,
             chain_follow_window: FIXED_BLOCK_SIZE_BYTES as u64,
@@ -63,6 +67,14 @@ impl<'a> ReverseMetablockScanner<'a> {
     #[must_use]
     pub fn with_bloom_filter_hash(mut self, hash: u64) -> Self {
         self.bloom_filter_hash = Some(hash);
+        self
+    }
+
+    /// Enable the client_id negative short-circuit: segments whose client bloom says the
+    /// client is absent are skipped without reading their metablocks
+    #[must_use]
+    pub fn with_client_bloom_filter_hash(mut self, hash: u64) -> Self {
+        self.client_bloom_filter_hash = Some(hash);
         self
     }
 
@@ -116,21 +128,29 @@ impl<'a> ReverseMetablockScanner<'a> {
 
         let metablock_position = {
             let metadata = log_segment_file.metadata.borrow();
-            let (position, bloom) = if self.use_write_cursor {
-                (metadata.write.metablocks_position, &metadata.write.aggregate_key_bloom)
+            let (position, bloom, client_bloom) = if self.use_write_cursor {
+                (metadata.write.metablocks_position, &metadata.write.aggregate_key_bloom, &metadata.write.client_id_bloom)
             } else {
                 let read = match &metadata.read {
                     Some(r) => r,
                     None => return Ok(None),
                 };
-                (read.metablocks_position, &read.aggregate_key_bloom)
+                (read.metablocks_position, &read.aggregate_key_bloom, &read.client_id_bloom)
             };
 
             // Check bloom filter - skip entire log segment if key definitely not present
             if let Some(hash) = self.bloom_filter_hash {
-                if !bloom.may_contain_hash(hash) {
+                if !bloom.borrow().may_contain_hash(hash) {
                     metrics::counter!("celeriant_read_bloom_short_circuit_total").increment(1);
                     tracing::trace!(log_id, "Bloom filter skip");
+                    return Ok(None);
+                }
+            }
+
+            // Negative client short-circuit: client absent here
+            if let Some(hash) = self.client_bloom_filter_hash {
+                if !client_bloom.borrow().may_contain_hash(hash) {
+                    metrics::counter!("celeriant_read_client_bloom_short_circuit_total").increment(1);
                     return Ok(None);
                 }
             }
@@ -193,19 +213,27 @@ impl<'a> ReverseMetablockScanner<'a> {
 
         let metablock_position = {
             let metadata = log_segment_file.metadata.borrow();
-            let (position, bloom) = if self.use_write_cursor {
-                (metadata.write.metablocks_position, &metadata.write.aggregate_key_bloom)
+            let (position, bloom, client_bloom) = if self.use_write_cursor {
+                (metadata.write.metablocks_position, &metadata.write.aggregate_key_bloom, &metadata.write.client_id_bloom)
             } else {
                 let read = match &metadata.read {
                     Some(r) => r,
                     None => return Ok(None),
                 };
-                (read.metablocks_position, &read.aggregate_key_bloom)
+                (read.metablocks_position, &read.aggregate_key_bloom, &read.client_id_bloom)
             };
 
             if let Some(hash) = self.bloom_filter_hash {
-                if !bloom.may_contain_hash(hash) {
+                if !bloom.borrow().may_contain_hash(hash) {
                     metrics::counter!("celeriant_read_bloom_short_circuit_total").increment(1);
+                    return Ok(None);
+                }
+            }
+
+            // Negative client short-circuit (see scan_single_log).
+            if let Some(hash) = self.client_bloom_filter_hash {
+                if !client_bloom.borrow().may_contain_hash(hash) {
+                    metrics::counter!("celeriant_read_client_bloom_short_circuit_total").increment(1);
                     return Ok(None);
                 }
             }
@@ -412,14 +440,14 @@ mod tests {
 
             let mut meta = active.metadata.borrow_mut();
             meta.write.metablocks_position = pos + FIXED_BLOCK_SIZE_BYTES as u64;
-            meta.write.aggregate_key_bloom.insert(key);
+            meta.write.aggregate_key_bloom.borrow_mut().insert(key);
             meta.write.wal_seq = self.wal_seq;
             pos
         }
 
         /// Force a hash into the active segment's write bloom.
         fn bloom_insert_hash(&self, hash: u64) {
-            self.cache.active().metadata.borrow_mut().write.aggregate_key_bloom.insert_hash(hash);
+            self.cache.active().metadata.borrow_mut().write.aggregate_key_bloom.borrow_mut().insert_hash(hash);
         }
 
         /// Start a new, higher segment. Chain links are per-segment, so tracking resets.

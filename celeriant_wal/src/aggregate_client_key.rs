@@ -64,6 +64,12 @@ impl AggregateClientKey {
     }
 }
 
+#[inline]
+#[must_use]
+pub fn client_id_bloom_hash(client_id: u128) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(&client_id.to_le_bytes())
+}
+
 
 impl Encode for AggregateClientKey {
     fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {

@@ -14,6 +14,7 @@ use celeriant_rotating_log::errors::scan_error::ScanError;
 use celeriant_rotating_log::log_segment_file::aggregate_key_bloom::AggregateKeyBloom;
 use celeriant_rotating_log::log_segment_file::log_segment_file::write_dual_shard_log_header;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
+use celeriant_wal::aggregate_client_key::client_id_bloom_hash;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::constants::{self, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, MIN_WRITE_ALIGNMENT, WIRE_VERSION_WAL_METABLOCK};
 use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
@@ -171,7 +172,7 @@ async fn resolve_aggregate_states(
         let Some((metablocks_end, bloom_hit)) = (|| {
             let metadata = log_segment.metadata.borrow();
             let read = metadata.read.as_ref()?;
-            let bloom_hit = unresolved.iter().any(|k| read.aggregate_key_bloom.may_contain(k));
+            let bloom_hit = unresolved.iter().any(|k| read.aggregate_key_bloom.borrow().may_contain(k));
             Some((read.metablocks_position, bloom_hit))
         })() else {
             // No committed read cursor for this segment — skip it.
@@ -535,6 +536,7 @@ async fn build_compacted_file(
     // -------------------------------------------------------------------------
     let mut datablock_refs: Vec<DatablockRef> = Vec::with_capacity(estimate.kept_metablock_count as usize);
     let mut bloom = AggregateKeyBloom::new();
+    let mut client_bloom = AggregateKeyBloom::with_capacity_bytes(constants::CLIENT_BLOOM_BYTES);
     // Per-aggregate backlink tips for the COMPACTED layout; dropped metablocks shift
     // positions, so recompute the chain against the new offsets.
     let mut compact_tips: HashMap<AggregateKey, u64> = HashMap::new();
@@ -595,7 +597,10 @@ async fn build_compacted_file(
                     .map_err(|e| CompactionError::MetablockSerialise(e.to_string()))?;
 
                 match &metablock.wal_metablock_type {
-                    MetablockKind::EventBatchMetadata(eb) => bloom.insert(&eb.aggregate_key),
+                    MetablockKind::EventBatchMetadata(eb) => {
+                        bloom.insert(&eb.aggregate_key);
+                        client_bloom.insert_hash(client_id_bloom_hash(eb.client_id));
+                    }
                     MetablockKind::SoftDelete(sd) => bloom.insert(&sd.aggregate_key),
                     MetablockKind::SoftTrim(st) => bloom.insert(&st.aggregate_key),
                     MetablockKind::SchemaRegistration(sr) => {
@@ -700,6 +705,7 @@ async fn build_compacted_file(
     let header = ShardLogHeader {
         write: cursor.clone(),
         aggregate_bloom: bloom.to_bytes(),
+        client_bloom: client_bloom.to_bytes(),
         last_received_replication_wal_seq: original_last_received_replication_wal_seq,
         last_self_acked_wal_seq: original_last_self_acked_wal_seq,
         read: cursor,
