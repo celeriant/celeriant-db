@@ -85,3 +85,31 @@ harness = false
 [[bench]]
 name = "client_seq_scan_benchmark"
 harness = false
+
+[[bench]]
+name = "negative_scan_present_client_benchmark"
+harness = false
+
+[[bench]]
+name = "read_stream_benchmark"
+harness = false
+
+[[bench]]
+name = "compression_benchmark"
+harness = false
+
+[[bench]]
+name = "list_aggregates_benchmark"
+harness = false
+
+[[bench]]
+name = "replication_batch_benchmark"
+harness = false
+
+[[bench]]
+name = "schema_validation_benchmark"
+harness = false
+
+[[bench]]
+name = "list_paged_benchmark"
+harness = false

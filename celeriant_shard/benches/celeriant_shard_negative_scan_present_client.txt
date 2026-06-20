@@ -1,0 +1,8 @@
+group                                                  negative_scan_present_client_baseline
+-----                                                  -------------------------------------
+negative_scan_present_client/existing_client/long      1.00    152.5±1.11ms        ? ?/sec
+negative_scan_present_client/existing_client/medium    1.00     60.5±5.28ms        ? ?/sec
+negative_scan_present_client/existing_client/short     1.00     14.7±0.11ms        ? ?/sec
+negative_scan_present_client/new_client/long           1.00      2.3±0.11ms        ? ?/sec
+negative_scan_present_client/new_client/medium         1.00      2.8±0.45ms        ? ?/sec
+negative_scan_present_client/new_client/short          1.00      2.8±0.03ms        ? ?/sec

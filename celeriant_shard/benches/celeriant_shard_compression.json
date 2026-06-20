@@ -1,0 +1,1949 @@
+{
+  "name": "compression_baseline",
+  "benchmarks": {
+    "write_compression/seq/sz24/compressible/dict/L1": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz24/compressible/dict/L1",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz24/compressible/dict/L1",
+        "throughput": {
+          "Bytes": 48000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz24/compressible/dict/L1",
+        "directory_name": "write_compression/seq/sz24_compressible_dict_L1"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1401483.1,
+            "upper_bound": 1427938.4325
+          },
+          "point_estimate": 1414791.8,
+          "standard_error": 6837.763552973538
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1392752.0,
+            "upper_bound": 1433991.0
+          },
+          "point_estimate": 1414641.5,
+          "standard_error": 14131.886855603932
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4567.890518903732,
+            "upper_bound": 35034.578678011894
+          },
+          "point_estimate": 29831.394070386887,
+          "standard_error": 8932.030753071362
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 15495.309030656845,
+            "upper_bound": 25799.751471671196
+          },
+          "point_estimate": 22839.796592789527,
+          "standard_error": 2650.772999834354
+        }
+      }
+    },
+    "write_compression/seq/sz24/compressible/dict/L3": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz24/compressible/dict/L3",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz24/compressible/dict/L3",
+        "throughput": {
+          "Bytes": 48000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz24/compressible/dict/L3",
+        "directory_name": "write_compression/seq/sz24_compressible_dict_L3"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1394887.0,
+            "upper_bound": 1423957.3
+          },
+          "point_estimate": 1407809.1,
+          "standard_error": 7466.569395867363
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1390716.0,
+            "upper_bound": 1422222.0
+          },
+          "point_estimate": 1395871.5,
+          "standard_error": 8096.842008904934
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1470.7391738891602,
+            "upper_bound": 34941.17487967014
+          },
+          "point_estimate": 9584.267529845238,
+          "standard_error": 9316.54213141482
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 7241.185799914879,
+            "upper_bound": 33600.85718874286
+          },
+          "point_estimate": 24731.2346389473,
+          "standard_error": 7119.045685435286
+        }
+      }
+    },
+    "write_compression/seq/sz24/compressible/dict/L9": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz24/compressible/dict/L9",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz24/compressible/dict/L9",
+        "throughput": {
+          "Bytes": 48000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz24/compressible/dict/L9",
+        "directory_name": "write_compression/seq/sz24_compressible_dict_L9"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1410387.9,
+            "upper_bound": 1432568.64
+          },
+          "point_estimate": 1421495.0,
+          "standard_error": 5635.872152925376
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1404536.0,
+            "upper_bound": 1433796.5
+          },
+          "point_estimate": 1425928.0,
+          "standard_error": 6921.69706289601
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 532.2533905506134,
+            "upper_bound": 36444.53125298023
+          },
+          "point_estimate": 16276.723811030388,
+          "standard_error": 9817.626998747795
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 10524.424634049015,
+            "upper_bound": 23839.407078057404
+          },
+          "point_estimate": 18681.965290383963,
+          "standard_error": 3473.818957788287
+        }
+      }
+    },
+    "write_compression/seq/sz24/compressible/nodict/L1": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz24/compressible/nodict/L1",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz24/compressible/nodict/L1",
+        "throughput": {
+          "Bytes": 48000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz24/compressible/nodict/L1",
+        "directory_name": "write_compression/seq/sz24_compressible_nodict_L1"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1402017.2,
+            "upper_bound": 1426503.255
+          },
+          "point_estimate": 1414023.7,
+          "standard_error": 6325.977490473587
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1393552.0,
+            "upper_bound": 1434207.0
+          },
+          "point_estimate": 1412599.0,
+          "standard_error": 9412.217479922954
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 6128.326991200447,
+            "upper_bound": 34162.068593502045
+          },
+          "point_estimate": 28319.14209723473,
+          "standard_error": 7985.046777469853
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 12194.80580866752,
+            "upper_bound": 26155.889945017498
+          },
+          "point_estimate": 21136.689933488746,
+          "standard_error": 3556.1629968495477
+        }
+      }
+    },
+    "write_compression/seq/sz24/compressible/nodict/L3": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz24/compressible/nodict/L3",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz24/compressible/nodict/L3",
+        "throughput": {
+          "Bytes": 48000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz24/compressible/nodict/L3",
+        "directory_name": "write_compression/seq/sz24_compressible_nodict_L3"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1395529.6,
+            "upper_bound": 1412385.3
+          },
+          "point_estimate": 1403183.1,
+          "standard_error": 4318.320070627808
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1393113.0,
+            "upper_bound": 1409841.0
+          },
+          "point_estimate": 1399961.0,
+          "standard_error": 4983.431485942956
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1145.30847966671,
+            "upper_bound": 22332.403403520584
+          },
+          "point_estimate": 14033.550050854685,
+          "standard_error": 5085.713159293703
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 6265.730001807894,
+            "upper_bound": 19965.463621670748
+          },
+          "point_estimate": 14393.078772258716,
+          "standard_error": 3990.6852142755342
+        }
+      }
+    },
+    "write_compression/seq/sz24/compressible/nodict/L9": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz24/compressible/nodict/L9",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz24/compressible/nodict/L9",
+        "throughput": {
+          "Bytes": 48000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz24/compressible/nodict/L9",
+        "directory_name": "write_compression/seq/sz24_compressible_nodict_L9"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1391098.6,
+            "upper_bound": 1412964.8
+          },
+          "point_estimate": 1400992.6,
+          "standard_error": 5665.4609518605275
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1387696.0,
+            "upper_bound": 1413790.0
+          },
+          "point_estimate": 1393142.5,
+          "standard_error": 6520.268561653317
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1351.3898760080338,
+            "upper_bound": 29382.907578349113
+          },
+          "point_estimate": 8722.135645151138,
+          "standard_error": 6993.594558838364
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4855.579448199543,
+            "upper_bound": 25912.32025177412
+          },
+          "point_estimate": 18971.12196178415,
+          "standard_error": 5293.900200874698
+        }
+      }
+    },
+    "write_compression/seq/sz24/json/dict/L1": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz24/json/dict/L1",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz24/json/dict/L1",
+        "throughput": {
+          "Bytes": 48000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz24/json/dict/L1",
+        "directory_name": "write_compression/seq/sz24_json_dict_L1"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1391071.88,
+            "upper_bound": 1406673.7
+          },
+          "point_estimate": 1398213.7,
+          "standard_error": 4012.873593383848
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1388382.0,
+            "upper_bound": 1408355.0
+          },
+          "point_estimate": 1392454.5,
+          "standard_error": 5222.152681060627
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 917.7293837070464,
+            "upper_bound": 21483.614918589592
+          },
+          "point_estimate": 7428.5671681165695,
+          "standard_error": 5234.763283865552
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4262.533788624448,
+            "upper_bound": 17287.547578788868
+          },
+          "point_estimate": 13378.146625083096,
+          "standard_error": 3107.1963017719336
+        }
+      }
+    },
+    "write_compression/seq/sz24/json/dict/L3": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz24/json/dict/L3",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz24/json/dict/L3",
+        "throughput": {
+          "Bytes": 48000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz24/json/dict/L3",
+        "directory_name": "write_compression/seq/sz24_json_dict_L3"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1391322.89,
+            "upper_bound": 1412560.1
+          },
+          "point_estimate": 1400581.3,
+          "standard_error": 5488.9611528272035
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1390247.0,
+            "upper_bound": 1412683.5
+          },
+          "point_estimate": 1391405.0,
+          "standard_error": 4840.835904851631
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 395.11289298534393,
+            "upper_bound": 23090.011990070343
+          },
+          "point_estimate": 3298.78494143486,
+          "standard_error": 5231.934703364521
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2564.4736713624316,
+            "upper_bound": 23846.692884974094
+          },
+          "point_estimate": 18347.563259644772,
+          "standard_error": 5732.007239152374
+        }
+      }
+    },
+    "write_compression/seq/sz24/json/dict/L9": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz24/json/dict/L9",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz24/json/dict/L9",
+        "throughput": {
+          "Bytes": 48000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz24/json/dict/L9",
+        "directory_name": "write_compression/seq/sz24_json_dict_L9"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1422479.1,
+            "upper_bound": 1433975.04
+          },
+          "point_estimate": 1428418.0,
+          "standard_error": 2915.7067778831815
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1423862.0,
+            "upper_bound": 1433346.0
+          },
+          "point_estimate": 1428042.0,
+          "standard_error": 2169.7553831561463
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 770.2106863260269,
+            "upper_bound": 15463.517725467682
+          },
+          "point_estimate": 5947.449794411659,
+          "standard_error": 3798.967721177554
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3380.045522607987,
+            "upper_bound": 13420.890243058706
+          },
+          "point_estimate": 9719.193176390723,
+          "standard_error": 2578.4000411391107
+        }
+      }
+    },
+    "write_compression/seq/sz24/json/nodict/L1": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz24/json/nodict/L1",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz24/json/nodict/L1",
+        "throughput": {
+          "Bytes": 48000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz24/json/nodict/L1",
+        "directory_name": "write_compression/seq/sz24_json_nodict_L1"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1428002.4,
+            "upper_bound": 1439729.2175
+          },
+          "point_estimate": 1433410.4,
+          "standard_error": 3006.5745222764876
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1426746.5,
+            "upper_bound": 1439210.0
+          },
+          "point_estimate": 1429391.0,
+          "standard_error": 3360.7099791856995
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1242.4187779426577,
+            "upper_bound": 15546.543323993685
+          },
+          "point_estimate": 4318.813723325729,
+          "standard_error": 3724.981573203444
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2831.1921119632007,
+            "upper_bound": 12889.93901947732
+          },
+          "point_estimate": 10082.670977694574,
+          "standard_error": 2427.8872815739705
+        }
+      }
+    },
+    "write_compression/seq/sz24/json/nodict/L3": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz24/json/nodict/L3",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz24/json/nodict/L3",
+        "throughput": {
+          "Bytes": 48000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz24/json/nodict/L3",
+        "directory_name": "write_compression/seq/sz24_json_nodict_L3"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1431446.2975,
+            "upper_bound": 1450909.5275
+          },
+          "point_estimate": 1439761.5,
+          "standard_error": 5084.349836934538
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1430559.5,
+            "upper_bound": 1448138.5
+          },
+          "point_estimate": 1432474.0,
+          "standard_error": 3790.698532585497
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 704.976287484169,
+            "upper_bound": 21359.07652080059
+          },
+          "point_estimate": 4132.006126642227,
+          "standard_error": 4302.432313554209
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2397.309624002151,
+            "upper_bound": 23465.761830093365
+          },
+          "point_estimate": 16969.505245521384,
+          "standard_error": 5768.835597938005
+        }
+      }
+    },
+    "write_compression/seq/sz24/json/nodict/L9": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz24/json/nodict/L9",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz24/json/nodict/L9",
+        "throughput": {
+          "Bytes": 48000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz24/json/nodict/L9",
+        "directory_name": "write_compression/seq/sz24_json_nodict_L9"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1383907.5725,
+            "upper_bound": 1417445.6
+          },
+          "point_estimate": 1397677.7,
+          "standard_error": 8856.061265287823
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1381264.0,
+            "upper_bound": 1403739.0
+          },
+          "point_estimate": 1389156.0,
+          "standard_error": 5342.9508458466835
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2729.466551542282,
+            "upper_bound": 29282.83208012581
+          },
+          "point_estimate": 11903.79518866539,
+          "standard_error": 7073.401349593059
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 6016.349369288101,
+            "upper_bound": 43462.64453336144
+          },
+          "point_estimate": 29434.94671701196,
+          "standard_error": 11376.390016161507
+        }
+      }
+    },
+    "write_compression/seq/sz24/random/dict/L1": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz24/random/dict/L1",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz24/random/dict/L1",
+        "throughput": {
+          "Bytes": 48000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz24/random/dict/L1",
+        "directory_name": "write_compression/seq/sz24_random_dict_L1"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1398518.6025,
+            "upper_bound": 1420456.1525
+          },
+          "point_estimate": 1408850.7,
+          "standard_error": 5630.8468726093815
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1395418.5,
+            "upper_bound": 1426880.0
+          },
+          "point_estimate": 1402318.0,
+          "standard_error": 7565.798275201413
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1295.792376995087,
+            "upper_bound": 28570.442792773247
+          },
+          "point_estimate": 13096.546867489817,
+          "standard_error": 7623.638800955905
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 8683.560550450105,
+            "upper_bound": 23770.43043152563
+          },
+          "point_estimate": 18662.54388429759,
+          "standard_error": 3801.628075966556
+        }
+      }
+    },
+    "write_compression/seq/sz24/random/dict/L3": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz24/random/dict/L3",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz24/random/dict/L3",
+        "throughput": {
+          "Bytes": 48000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz24/random/dict/L3",
+        "directory_name": "write_compression/seq/sz24_random_dict_L3"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1395182.7975,
+            "upper_bound": 1412402.6
+          },
+          "point_estimate": 1403246.6,
+          "standard_error": 4417.755564334685
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1390181.0,
+            "upper_bound": 1413234.0
+          },
+          "point_estimate": 1398635.0,
+          "standard_error": 5353.936823091357
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 996.3071823120116,
+            "upper_bound": 24727.543660998344
+          },
+          "point_estimate": 13205.517965555193,
+          "standard_error": 6126.435141374935
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 5443.245687189869,
+            "upper_bound": 18542.78660707596
+          },
+          "point_estimate": 14735.72736356551,
+          "standard_error": 3123.330720348481
+        }
+      }
+    },
+    "write_compression/seq/sz24/random/dict/L9": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz24/random/dict/L9",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz24/random/dict/L9",
+        "throughput": {
+          "Bytes": 48000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz24/random/dict/L9",
+        "directory_name": "write_compression/seq/sz24_random_dict_L9"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1398741.1,
+            "upper_bound": 1427706.0
+          },
+          "point_estimate": 1412002.8,
+          "standard_error": 7448.082828338868
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1391629.0,
+            "upper_bound": 1430247.0
+          },
+          "point_estimate": 1408109.5,
+          "standard_error": 9957.167904477652
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1477.4108737707138,
+            "upper_bound": 42903.478038311005
+          },
+          "point_estimate": 24932.88375735283,
+          "standard_error": 10198.355379391209
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 10914.738201675344,
+            "upper_bound": 33348.76882210858
+          },
+          "point_estimate": 24761.209608758796,
+          "standard_error": 6094.506942909666
+        }
+      }
+    },
+    "write_compression/seq/sz24/random/nodict/L1": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz24/random/nodict/L1",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz24/random/nodict/L1",
+        "throughput": {
+          "Bytes": 48000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz24/random/nodict/L1",
+        "directory_name": "write_compression/seq/sz24_random_nodict_L1"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1424317.0975,
+            "upper_bound": 1446675.8
+          },
+          "point_estimate": 1434703.0,
+          "standard_error": 5738.347672522764
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1422106.0,
+            "upper_bound": 1446827.5
+          },
+          "point_estimate": 1428831.5,
+          "standard_error": 6437.920795514239
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 537.4424904584885,
+            "upper_bound": 30305.084761977196
+          },
+          "point_estimate": 12484.233078360558,
+          "standard_error": 8337.652023210372
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 6949.791594797006,
+            "upper_bound": 23853.54603128572
+          },
+          "point_estimate": 19142.466664460982,
+          "standard_error": 4092.875885907268
+        }
+      }
+    },
+    "write_compression/seq/sz24/random/nodict/L3": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz24/random/nodict/L3",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz24/random/nodict/L3",
+        "throughput": {
+          "Bytes": 48000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz24/random/nodict/L3",
+        "directory_name": "write_compression/seq/sz24_random_nodict_L3"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1430931.4775,
+            "upper_bound": 1441317.6875
+          },
+          "point_estimate": 1435553.2,
+          "standard_error": 2671.4266866335424
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1429555.5,
+            "upper_bound": 1440412.0
+          },
+          "point_estimate": 1433425.0,
+          "standard_error": 2721.595342235726
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 770.9519863128662,
+            "upper_bound": 13284.837064146996
+          },
+          "point_estimate": 5951.897594332695,
+          "standard_error": 2992.223636099179
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3230.6898293603535,
+            "upper_bound": 12095.725002385483
+          },
+          "point_estimate": 8830.593937493044,
+          "standard_error": 2451.336084194962
+        }
+      }
+    },
+    "write_compression/seq/sz24/random/nodict/L9": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz24/random/nodict/L9",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz24/random/nodict/L9",
+        "throughput": {
+          "Bytes": 48000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz24/random/nodict/L9",
+        "directory_name": "write_compression/seq/sz24_random_nodict_L9"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1432518.2,
+            "upper_bound": 1446707.91
+          },
+          "point_estimate": 1439464.1,
+          "standard_error": 3653.412878170058
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1428370.0,
+            "upper_bound": 1450724.5
+          },
+          "point_estimate": 1439989.5,
+          "standard_error": 6040.783069294405
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1314.324876666069,
+            "upper_bound": 20466.55133664608
+          },
+          "point_estimate": 15183.306330442429,
+          "standard_error": 5251.5392163062925
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 7356.430214040439,
+            "upper_bound": 14701.305914781857
+          },
+          "point_estimate": 12181.488035813469,
+          "standard_error": 1887.4878460750351
+        }
+      }
+    },
+    "write_compression/seq/sz512/compressible/dict/L1": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz512/compressible/dict/L1",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz512/compressible/dict/L1",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz512/compressible/dict/L1",
+        "directory_name": "write_compression/seq/sz512_compressible_dict_L1"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1392428.0825,
+            "upper_bound": 1404119.7
+          },
+          "point_estimate": 1397985.7,
+          "standard_error": 2999.5932897242456
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1390779.0,
+            "upper_bound": 1405368.0
+          },
+          "point_estimate": 1391741.5,
+          "standard_error": 5150.010877239782
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 30.393299460411072,
+            "upper_bound": 19806.794348359108
+          },
+          "point_estimate": 2380.3142577409744,
+          "standard_error": 5534.472646543714
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4689.2985687271685,
+            "upper_bound": 13031.320894931054
+          },
+          "point_estimate": 10002.953686564562,
+          "standard_error": 2190.778458973677
+        }
+      }
+    },
+    "write_compression/seq/sz512/compressible/dict/L3": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz512/compressible/dict/L3",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz512/compressible/dict/L3",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz512/compressible/dict/L3",
+        "directory_name": "write_compression/seq/sz512_compressible_dict_L3"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1395057.435,
+            "upper_bound": 1406761.4
+          },
+          "point_estimate": 1401109.6,
+          "standard_error": 3015.9518338420876
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1392519.0,
+            "upper_bound": 1410231.0
+          },
+          "point_estimate": 1402146.0,
+          "standard_error": 4917.751150015033
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2209.0739607810974,
+            "upper_bound": 17069.173496961594
+          },
+          "point_estimate": 12602.099776268004,
+          "standard_error": 3942.201110061367
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 5836.675923274594,
+            "upper_bound": 11949.13716317812
+          },
+          "point_estimate": 10026.174170085462,
+          "standard_error": 1527.6312224380033
+        }
+      }
+    },
+    "write_compression/seq/sz512/compressible/dict/L9": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz512/compressible/dict/L9",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz512/compressible/dict/L9",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz512/compressible/dict/L9",
+        "directory_name": "write_compression/seq/sz512_compressible_dict_L9"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1411383.775,
+            "upper_bound": 1434264.8
+          },
+          "point_estimate": 1421172.7,
+          "standard_error": 5974.312293446478
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1410858.0,
+            "upper_bound": 1429202.5
+          },
+          "point_estimate": 1414071.5,
+          "standard_error": 4041.830103042893
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 975.5507826805116,
+            "upper_bound": 22758.65089595318
+          },
+          "point_estimate": 5137.20890879631,
+          "standard_error": 5775.836735332752
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3673.789459261133,
+            "upper_bound": 27817.870697953673
+          },
+          "point_estimate": 19872.16571572745,
+          "standard_error": 6657.491472706782
+        }
+      }
+    },
+    "write_compression/seq/sz512/compressible/nodict/L1": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz512/compressible/nodict/L1",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz512/compressible/nodict/L1",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz512/compressible/nodict/L1",
+        "directory_name": "write_compression/seq/sz512_compressible_nodict_L1"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1392193.435,
+            "upper_bound": 1405033.815
+          },
+          "point_estimate": 1398239.8,
+          "standard_error": 3295.0343820153644
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1389474.0,
+            "upper_bound": 1407778.0
+          },
+          "point_estimate": 1394179.0,
+          "standard_error": 5224.402902341769
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 746.4890867471695,
+            "upper_bound": 17598.46168756485
+          },
+          "point_estimate": 8613.164547085762,
+          "standard_error": 4596.9700408247745
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 5495.119165037672,
+            "upper_bound": 13320.278100617035
+          },
+          "point_estimate": 11002.717147242414,
+          "standard_error": 1952.5391947021335
+        }
+      }
+    },
+    "write_compression/seq/sz512/compressible/nodict/L3": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz512/compressible/nodict/L3",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz512/compressible/nodict/L3",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz512/compressible/nodict/L3",
+        "directory_name": "write_compression/seq/sz512_compressible_nodict_L3"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1393362.9,
+            "upper_bound": 1403490.9
+          },
+          "point_estimate": 1398226.1,
+          "standard_error": 2599.488204850678
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1390988.0,
+            "upper_bound": 1407100.0
+          },
+          "point_estimate": 1394913.0,
+          "standard_error": 4692.6276576086
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 619.7267889976501,
+            "upper_bound": 13151.403066515924
+          },
+          "point_estimate": 6911.139777302742,
+          "standard_error": 4175.569905832665
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4406.146378647806,
+            "upper_bound": 10048.388373610696
+          },
+          "point_estimate": 8658.060489124186,
+          "standard_error": 1346.4716765992882
+        }
+      }
+    },
+    "write_compression/seq/sz512/compressible/nodict/L9": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz512/compressible/nodict/L9",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz512/compressible/nodict/L9",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz512/compressible/nodict/L9",
+        "directory_name": "write_compression/seq/sz512_compressible_nodict_L9"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1424421.4,
+            "upper_bound": 1463118.6
+          },
+          "point_estimate": 1440820.3,
+          "standard_error": 10071.92238373929
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1425507.5,
+            "upper_bound": 1445544.5
+          },
+          "point_estimate": 1433824.0,
+          "standard_error": 5736.310301824531
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3670.917534828186,
+            "upper_bound": 34153.91429364681
+          },
+          "point_estimate": 13337.469363212584,
+          "standard_error": 7470.038848566518
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 7667.306472578518,
+            "upper_bound": 49751.46772195659
+          },
+          "point_estimate": 33671.8116334387,
+          "standard_error": 12776.311802655036
+        }
+      }
+    },
+    "write_compression/seq/sz512/json/dict/L1": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz512/json/dict/L1",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz512/json/dict/L1",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz512/json/dict/L1",
+        "directory_name": "write_compression/seq/sz512_json_dict_L1"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1392526.7,
+            "upper_bound": 1403687.6
+          },
+          "point_estimate": 1397734.0,
+          "standard_error": 2874.757250799909
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1390858.0,
+            "upper_bound": 1406886.0
+          },
+          "point_estimate": 1392317.0,
+          "standard_error": 4272.823287682519
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 391.40639305114746,
+            "upper_bound": 16109.190014004707
+          },
+          "point_estimate": 3803.61023247242,
+          "standard_error": 4499.265413899419
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3880.528118649757,
+            "upper_bound": 11638.325615062598
+          },
+          "point_estimate": 9584.261242034025,
+          "standard_error": 1986.7821073965324
+        }
+      }
+    },
+    "write_compression/seq/sz512/json/dict/L3": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz512/json/dict/L3",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz512/json/dict/L3",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz512/json/dict/L3",
+        "directory_name": "write_compression/seq/sz512_json_dict_L3"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1407105.7925,
+            "upper_bound": 1433645.1
+          },
+          "point_estimate": 1419404.3,
+          "standard_error": 6781.751304721096
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1401672.0,
+            "upper_bound": 1431232.5
+          },
+          "point_estimate": 1417788.0,
+          "standard_error": 8739.210230271288
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2281.7213594913483,
+            "upper_bound": 37627.646031975746
+          },
+          "point_estimate": 19055.116161704063,
+          "standard_error": 8233.102750350545
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 11043.499444804334,
+            "upper_bound": 30599.74719866526
+          },
+          "point_estimate": 22526.092229284295,
+          "standard_error": 5579.487991111374
+        }
+      }
+    },
+    "write_compression/seq/sz512/json/dict/L9": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz512/json/dict/L9",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz512/json/dict/L9",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz512/json/dict/L9",
+        "directory_name": "write_compression/seq/sz512_json_dict_L9"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1413285.58,
+            "upper_bound": 1425359.5775
+          },
+          "point_estimate": 1418972.2,
+          "standard_error": 3107.736105813607
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1410986.5,
+            "upper_bound": 1426827.0
+          },
+          "point_estimate": 1416012.5,
+          "standard_error": 4143.7824980043215
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1233.523178100586,
+            "upper_bound": 17801.577883958817
+          },
+          "point_estimate": 9064.616239070892,
+          "standard_error": 4011.6684011514826
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4329.247675212558,
+            "upper_bound": 12610.672380082584
+          },
+          "point_estimate": 10328.904876876131,
+          "standard_error": 1996.3229627309836
+        }
+      }
+    },
+    "write_compression/seq/sz512/json/nodict/L1": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz512/json/nodict/L1",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz512/json/nodict/L1",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz512/json/nodict/L1",
+        "directory_name": "write_compression/seq/sz512_json_nodict_L1"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1431699.9,
+            "upper_bound": 1444294.81
+          },
+          "point_estimate": 1437390.2,
+          "standard_error": 3264.441140251765
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1430247.0,
+            "upper_bound": 1443624.0
+          },
+          "point_estimate": 1432319.5,
+          "standard_error": 3319.7210383768956
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 149.00129735469818,
+            "upper_bound": 15454.62212562561
+          },
+          "point_estimate": 5489.326402544975,
+          "standard_error": 3948.060811212376
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3013.245581318146,
+            "upper_bound": 14392.37602999897
+          },
+          "point_estimate": 10890.20396503206,
+          "standard_error": 2931.7899573363693
+        }
+      }
+    },
+    "write_compression/seq/sz512/json/nodict/L3": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz512/json/nodict/L3",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz512/json/nodict/L3",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz512/json/nodict/L3",
+        "directory_name": "write_compression/seq/sz512_json_nodict_L3"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1431027.0,
+            "upper_bound": 1448187.2
+          },
+          "point_estimate": 1438608.7,
+          "standard_error": 4417.438943050045
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1429666.0,
+            "upper_bound": 1447355.5
+          },
+          "point_estimate": 1431525.5,
+          "standard_error": 4154.972193036932
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 766.5041863918304,
+            "upper_bound": 19502.861353754997
+          },
+          "point_estimate": 4245.425024628639,
+          "standard_error": 4599.911016621818
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2381.305281656353,
+            "upper_bound": 19323.353973021003
+          },
+          "point_estimate": 14767.53566329422,
+          "standard_error": 4324.19126904105
+        }
+      }
+    },
+    "write_compression/seq/sz512/json/nodict/L9": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz512/json/nodict/L9",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz512/json/nodict/L9",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz512/json/nodict/L9",
+        "directory_name": "write_compression/seq/sz512_json_nodict_L9"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1436792.4,
+            "upper_bound": 1447954.6
+          },
+          "point_estimate": 1442178.3,
+          "standard_error": 2863.8099721525396
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1434491.0,
+            "upper_bound": 1453546.0
+          },
+          "point_estimate": 1438809.0,
+          "standard_error": 5383.4313799083975
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1177.1843791007996,
+            "upper_bound": 15180.341130495071
+          },
+          "point_estimate": 9321.106034517288,
+          "standard_error": 4123.012025875165
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 5921.894775604624,
+            "upper_bound": 11041.24697265264
+          },
+          "point_estimate": 9553.532133893375,
+          "standard_error": 1323.7249992773236
+        }
+      }
+    },
+    "write_compression/seq/sz512/random/dict/L1": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz512/random/dict/L1",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz512/random/dict/L1",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz512/random/dict/L1",
+        "directory_name": "write_compression/seq/sz512_random_dict_L1"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2532030.7,
+            "upper_bound": 3771508.8
+          },
+          "point_estimate": 3151902.4,
+          "standard_error": 311245.5763190735
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2257386.5,
+            "upper_bound": 4353636.0
+          },
+          "point_estimate": 2560699.5,
+          "standard_error": 742798.421638328
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 5737.661898136139,
+            "upper_bound": 1476108.4096938372
+          },
+          "point_estimate": 458177.5067657232,
+          "standard_error": 513707.0979419489
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 668529.4695170637,
+            "upper_bound": 1110437.9220979842
+          },
+          "point_estimate": 1042942.0701316488,
+          "standard_error": 119143.59195519597
+        }
+      }
+    },
+    "write_compression/seq/sz512/random/dict/L3": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz512/random/dict/L3",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz512/random/dict/L3",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz512/random/dict/L3",
+        "directory_name": "write_compression/seq/sz512_random_dict_L3"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2236968.6,
+            "upper_bound": 2252480.6
+          },
+          "point_estimate": 2244838.4,
+          "standard_error": 3968.478427917114
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2233220.0,
+            "upper_bound": 2255502.5
+          },
+          "point_estimate": 2246854.0,
+          "standard_error": 5682.984691432616
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3062.3102456331253,
+            "upper_bound": 22857.243794202805
+          },
+          "point_estimate": 15741.505220532415,
+          "standard_error": 4993.977194100711
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 7687.750707592578,
+            "upper_bound": 16040.984109333036
+          },
+          "point_estimate": 13179.629300131655,
+          "standard_error": 2112.42763118615
+        }
+      }
+    },
+    "write_compression/seq/sz512/random/dict/L9": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz512/random/dict/L9",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz512/random/dict/L9",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz512/random/dict/L9",
+        "directory_name": "write_compression/seq/sz512_random_dict_L9"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2298391.345,
+            "upper_bound": 3657654.9
+          },
+          "point_estimate": 2971143.5,
+          "standard_error": 329572.785148031
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2278387.0,
+            "upper_bound": 4443491.0
+          },
+          "point_estimate": 2298884.5,
+          "standard_error": 549543.107938055
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 7794.028061628342,
+            "upper_bound": 1646817.1945631504
+          },
+          "point_estimate": 38183.62102210522,
+          "standard_error": 485882.3898109876
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 23640.17172079951,
+            "upper_bound": 1213931.1777064716
+          },
+          "point_estimate": 1094611.034268465,
+          "standard_error": 229019.6630850887
+        }
+      }
+    },
+    "write_compression/seq/sz512/random/nodict/L1": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz512/random/nodict/L1",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz512/random/nodict/L1",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz512/random/nodict/L1",
+        "directory_name": "write_compression/seq/sz512_random_nodict_L1"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2914205.2,
+            "upper_bound": 4068500.49
+          },
+          "point_estimate": 3506192.5,
+          "standard_error": 296703.54551733664
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2238664.0,
+            "upper_bound": 4326842.0
+          },
+          "point_estimate": 3877975.5,
+          "standard_error": 593909.2054692245
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 21512.525618076324,
+            "upper_bound": 1558738.8953268528
+          },
+          "point_estimate": 942852.781561017,
+          "standard_error": 459474.03558181017
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 622634.7746076967,
+            "upper_bound": 1123118.6182967715
+          },
+          "point_estimate": 989844.3707400842,
+          "standard_error": 131286.7169220932
+        }
+      }
+    },
+    "write_compression/seq/sz512/random/nodict/L3": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz512/random/nodict/L3",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz512/random/nodict/L3",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz512/random/nodict/L3",
+        "directory_name": "write_compression/seq/sz512_random_nodict_L3"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2230547.6700000004,
+            "upper_bound": 2254891.9749999996
+          },
+          "point_estimate": 2241883.3,
+          "standard_error": 6256.363238311808
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2225354.0,
+            "upper_bound": 2254743.5
+          },
+          "point_estimate": 2239275.5,
+          "standard_error": 7239.312911033501
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 5172.791308164597,
+            "upper_bound": 33414.0969067812
+          },
+          "point_estimate": 18132.197678089145,
+          "standard_error": 7237.227061719202
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 9926.83105135885,
+            "upper_bound": 27766.37500627132
+          },
+          "point_estimate": 20851.734236695465,
+          "standard_error": 4900.442759999506
+        }
+      }
+    },
+    "write_compression/seq/sz512/random/nodict/L9": {
+      "baseline": "compression_baseline",
+      "fullname": "compression_baseline/write_compression/seq/sz512/random/nodict/L9",
+      "criterion_benchmark_v1": {
+        "group_id": "write_compression",
+        "function_id": "seq",
+        "value_str": "sz512/random/nodict/L9",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "write_compression/seq/sz512/random/nodict/L9",
+        "directory_name": "write_compression/seq/sz512_random_nodict_L9"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2240478.9,
+            "upper_bound": 2255119.2
+          },
+          "point_estimate": 2247979.7,
+          "standard_error": 3759.285285309628
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2239586.0,
+            "upper_bound": 2260489.0
+          },
+          "point_estimate": 2246871.0,
+          "standard_error": 6541.65969107101
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 673.1003880500793,
+            "upper_bound": 22858.726394176483
+          },
+          "point_estimate": 12926.789170503616,
+          "standard_error": 5713.824304169315
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 7697.220282093635,
+            "upper_bound": 15750.987062191794
+          },
+          "point_estimate": 12556.108916468598,
+          "standard_error": 2160.106764294549
+        }
+      }
+    }
+  }
+}

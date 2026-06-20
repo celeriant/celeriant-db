@@ -22,6 +22,13 @@ mod sidecar;
 
 pub use {sharded::shard_config::{ApiKeyHashes, ShardConfig, TlsCertPaths}, sidecar::sidecar_config::SidecarConfig, sharded::routing_rule::RoutingRule, sharded::tls_config::{TlsConfig, TlsMode}};
 
+// Reloaders + client-auth mode, re-exported so a `PerShardExtension` (e.g. the
+// queue) can run the SAME mtime-poll hot-reload the engine's own ports do
+// against the cert/key paths handed on `ShardExtensionContext`.
+pub use sharded::api_key_reloader::ApiKeyReloader;
+pub use sharded::tls_reloader::TlsReloader;
+pub use celeriant_crypto::pki::ClientAuthMode;
+
 pub use sidecar::sidecar_s3_uploader::SidecarS3Uploader;
 pub use sidecar::sidecar_s3_downloader::SidecarS3Downloader;
 
@@ -46,6 +53,15 @@ pub struct ShardExtensionContext {
     pub tls_config: Option<Arc<TlsConfig>>,
     pub api_key_hashes: Option<Arc<ApiKeyHashes>>,
     pub data_root: std::path::PathBuf,
+    /// Cert/key paths + client-auth mode + poll interval, so an extension's own
+    /// listener can hot-reload TLS certs and `api_keys.toml` exactly as the
+    /// engine's client/replication ports do (`TlsReloader`/`ApiKeyReloader`).
+    /// `tls_cert_paths` is `Some` and the interval non-zero only when cert
+    /// reload is enabled (`--tls-cert-reload-interval-secs > 0`); api-key
+    /// reload keys off the interval + `data_root/api_keys.toml`.
+    pub tls_cert_paths: Option<TlsCertPaths>,
+    pub tls_client_auth: ClientAuthMode,
+    pub tls_cert_reload_interval: Duration,
 }
 
 pub trait PerShardExtension: Send + Sync + 'static {
@@ -237,6 +253,9 @@ pub fn run_executors_and_sidecar_with_extension<S: SidecarStoreTrait>(
                 let ext_tls_config = shard_config.tls_config.clone();
                 let ext_api_key_hashes = shard_config.api_key_hashes.borrow().clone();
                 let ext_data_root = shard_config.data_root.clone();
+                let ext_tls_cert_paths = shard_config.tls_cert_paths.clone();
+                let ext_tls_client_auth = shard_config.tls_client_auth;
+                let ext_tls_cert_reload_interval = shard_config.tls_cert_reload_interval;
                 let mut shard = Shard::new(shard_config, current_shard_id, sender, receivers, client_tcp_listener, replication_tcp_listener, filesystem, lease_manager, shard_failed);
                 if let Some(ext) = extension.as_ref() {
                     let ext_ctx = ShardExtensionContext {
@@ -250,6 +269,9 @@ pub fn run_executors_and_sidecar_with_extension<S: SidecarStoreTrait>(
                         tls_config: ext_tls_config,
                         api_key_hashes: ext_api_key_hashes,
                         data_root: ext_data_root,
+                        tls_cert_paths: ext_tls_cert_paths,
+                        tls_client_auth: ext_tls_client_auth,
+                        tls_cert_reload_interval: ext_tls_cert_reload_interval,
                     };
                     ext.spawn_for_shard(ext_ctx);
                 }

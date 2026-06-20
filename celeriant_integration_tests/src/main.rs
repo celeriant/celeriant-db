@@ -288,6 +288,7 @@ async fn dispatch_test(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         "p2_5_blackout_acked_writes_survive" => p2_5_blackout_acked_writes_survive::run().await,
         "idempotency_cold_reconstruction" => idempotency_cold_reconstruction::run().await,
         "idempotency_negative_scan_load" => idempotency_negative_scan_load::run().await,
+        "idempotency_negative_scan_present_client" => idempotency_negative_scan_present_client::run().await,
         "p2_2_dual_restart" => p2_2_dual_restart::run().await,
         "p2_3_wal_corruption" => p2_3_wal_corruption::run().await,
         "p2_4_s3_capacity" => p2_4_s3_capacity::run().await,

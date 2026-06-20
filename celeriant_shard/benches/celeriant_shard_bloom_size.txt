@@ -1,0 +1,14 @@
+group                                             bloom_size_baseline
+-----                                             -------------------
+bloom_effectiveness/exists_known/100_aggs         1.00     57.4±0.47µs 85.0 KElem/sec
+bloom_effectiveness/exists_known/131700_aggs      1.00    149.9±4.91ms    33 Elem/sec
+bloom_effectiveness/exists_known/14400_aggs       1.00  193.5±131.51µs 25.2 KElem/sec
+bloom_effectiveness/exists_known/3400_aggs        1.00     58.3±2.06µs 83.8 KElem/sec
+bloom_effectiveness/exists_known/500_aggs         1.00     57.4±1.34µs 85.0 KElem/sec
+bloom_effectiveness/exists_known/61000_aggs       1.00      5.6±0.11ms   896 Elem/sec
+bloom_effectiveness/exists_unknown/100_aggs       1.00  1341.5±36.39ns  3.6 MElem/sec
+bloom_effectiveness/exists_unknown/131700_aggs    1.00     20.3±1.58µs 240.1 KElem/sec
+bloom_effectiveness/exists_unknown/14400_aggs     1.00      7.1±2.10µs 691.5 KElem/sec
+bloom_effectiveness/exists_unknown/3400_aggs      1.00  1340.8±66.83ns  3.6 MElem/sec
+bloom_effectiveness/exists_unknown/500_aggs       1.00  1329.1±43.30ns  3.6 MElem/sec
+bloom_effectiveness/exists_unknown/61000_aggs     1.00     14.2±1.23µs 344.7 KElem/sec

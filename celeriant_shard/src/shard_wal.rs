@@ -93,6 +93,26 @@ pub(crate) fn compile_and_cache_schema(cache: &mut MemCache, schema_key: &Schema
     }
 }
 
+/// Listing cursor. The wire carries one opaque u64; clients never inspect it. High 32 bits pick the
+/// sealed segment to resume (`log_id`), low 32 the offset into that segment's immutable summary
+/// `Vec`. Resuming by offset keeps no in-memory index, so cardinality stays unbounded.
+#[derive(Clone, Copy)]
+struct ListCursor {
+    log_id: u64,
+    offset: u32,
+}
+
+impl ListCursor {
+    fn decode(raw: u64) -> Self {
+        Self { log_id: raw >> 32, offset: raw as u32 }
+    }
+
+    fn encode(self) -> u64 {
+        debug_assert!(self.log_id <= u32::MAX as u64, "log_id {} overflows 32-bit cursor field", self.log_id);
+        (self.log_id << 32) | self.offset as u64
+    }
+}
+
 /// Write-ahead log for a single shard.
 ///
 /// Handles the complete lifecycle of reads and writes:
@@ -965,8 +985,13 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             }
         }
 
-        // cursor: None = first page, Some(log_id) = resume from this closed segment downward
-        let start_log_id = match request.cursor {
+        // Cardinality is unbounded, so pagination keeps no in-memory index. Page 1 (cursor None)
+        // drains the active segment's summary whole: it's a live unordered map, can't be
+        // offset-resumed, but it's bounded by one segment, not by total cardinality. The unbounded
+        // dimension is the count of SEALED segments. Those we page: each one's on-disk summary is an
+        // immutable Vec, so an offset into it is a stable resume point (see ListCursor). Page 1 can
+        // return up to the active segment's size; every later page is capped at page_size.
+        let (mut log_id, mut offset) = match request.cursor {
             None => {
                 let summary = { self.shard_mem_cache.borrow().peek_segment_summary().clone() };
                 for (key, entry) in &summary {
@@ -975,32 +1000,40 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                         entry.min_aggregate_version, entry.last_aggregate_version,
                         entry.last_server_timestamp, entry.compressed_size, entry.uncompressed_size);
                 }
-                active_log_id.saturating_sub(1)
+                (active_log_id.saturating_sub(1), 0u32)
             }
-            Some(log_id) => log_id,
+            Some(raw) => { let c = ListCursor::decode(raw); (c.log_id, c.offset) }
         };
 
-        if start_log_id == 0 {
-            return Ok(build_response(request.correlation_id, result_order, &seen, None));
-        }
-
-        for log_id in (1..=start_log_id).rev() {
-            // Check page limit between segments (not within)
+        // Walk sealed segments newest-first, resuming the first at `offset`. Cap the page WITHIN a
+        // segment, not just between them, or one large segment blows past page_size.
+        while log_id >= 1 {
             if unique_count >= page_size || start_time.elapsed() >= max_duration {
-                return Ok(build_response(request.correlation_id, result_order, &seen, Some(log_id)));
+                let next = ListCursor { log_id, offset }.encode();
+                return Ok(build_response(request.correlation_id, result_order, &seen, Some(next)));
             }
 
             match read_segment_summary(self.log_segments_cache.shard_dir(), log_id).await {
                 Some(payload) => {
-                    for entry in &payload.aggregates {
+                    let mut i = offset as usize;
+                    while i < payload.aggregates.len() {
+                        if unique_count >= page_size || start_time.elapsed() >= max_duration {
+                            // Resume this same segment at entry `i` (not yet processed).
+                            let next = ListCursor { log_id, offset: i as u32 }.encode();
+                            return Ok(build_response(request.correlation_id, result_order, &seen, Some(next)));
+                        }
+                        let entry = &payload.aggregates[i];
                         process!(entry.org_id, entry.aggregate_type_id, entry.aggregate_id,
                             entry.is_deleted, entry.event_batch_count,
                             entry.min_aggregate_version, entry.last_aggregate_version,
                             entry.last_server_timestamp, entry.compressed_size, entry.uncompressed_size);
+                        i += 1;
                     }
                 }
                 None => {
-                    // Legacy fallback: scan this single segment's metablocks
+                    // Legacy segment, no on-disk summary. No stable Vec to offset into, so scan its
+                    // metablocks whole (bounded by one segment) and ignore `offset`. The
+                    // between-segment check above bounds how often this runs.
                     let mut scanner = ReverseMetablockScanner::new(
                         &self.log_segments_cache, log_id, None, self.config.read_max_chunk_size,
                     );
@@ -1029,6 +1062,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     }).await.map_err(ShardListingError::ReadFromDiskError)?;
                 }
             }
+
+            log_id -= 1;
+            offset = 0;
         }
 
         Ok(build_response(request.correlation_id, result_order, &seen, None))
@@ -3507,6 +3543,21 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         Ok(RegisterSchemaResponse {
             correlation_id: request.correlation_id,
         })
+    }
+
+    /// Read-only inner-payload validation against a registered schema, reusing
+    /// the hot compiled-schema cache
+    pub fn schema_validate(&self, schema_key: &SchemaKey, value: &[u8]) -> Option<Result<(), String>> {
+        let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
+        match shard_mem_cache.schema_cache_get(schema_key) {
+            Some(celeriant_memcache::cached_schema::CachedSchema::Validated(validator)) => {
+                Some(validator.validate(value))
+            }
+            Some(celeriant_memcache::cached_schema::CachedSchema::CompilationFailed(err)) => {
+                Some(Err(err.clone()))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -10023,6 +10074,66 @@ mod tests {
             let below = process(&shard, read_req_from(target, 1)).await;
             assert!(matches!(below, Err(ShardError::Read(ShardReadError::UnavailableBatchIndex { .. }))),
                 "below-floor read must still error after disk rebuild");
+            shard.close().await;
+        });
+    }
+
+    /// Index-free listing pagination across SEALED segments: the active summary returns whole on
+    /// page 1, then each sealed segment is paged by the (log_id, offset) packed cursor. Walking
+    /// the cursor to exhaustion must surface every aggregate (best-effort listing may duplicate
+    /// across pages but must never drop) and must terminate. Guards the cursor packing/offset
+    /// resume added for unbounded-cardinality listing.
+    #[test]
+    fn list_aggregates_paginates_sealed_segments_without_loss() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let mut cfg = test_config(&dir);
+            cfg.shard_log_preallocate_bytes = 2 * 1024 * 1024; // small segment -> rotates quickly
+            cfg.list_page_size = 4; // tiny pages so sealed segments span many pages
+            let shard = ShardWal::open(cfg, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap();
+
+            // Incompressible ~200KB payload so a 2MB segment seals in a handful of writes.
+            let big_events = || {
+                let mut buf = vec![0u8; 200 * 1024];
+                let mut s: u64 = 0x2545F4914F6CDD1D;
+                for b in buf.iter_mut() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; *b = s as u8; }
+                vec![DatablockAggregateEvent { client_seq: 1, event_type_major: 1, event_value: Arc::new(buf), ..Default::default() }]
+            };
+
+            // Write distinct aggregates until at least two segments have sealed, so listing must
+            // page sealed segments; then a few land in the still-open active segment.
+            let mut expected: std::collections::HashSet<u128> = std::collections::HashSet::new();
+            let mut id = 0u128;
+            while shard.log_segments_cache.active_log_id() < 3 && id < 1000 {
+                id += 1;
+                write_ok(&shard, write_req(key(1, 1, id), big_events())).await;
+                expected.insert(id);
+            }
+            assert!(shard.log_segments_cache.active_log_id() >= 3, "expected segment rotations to set up sealed segments");
+            for _ in 0..3 { id += 1; write_ok(&shard, write_req(key(1, 1, id), big_events())).await; expected.insert(id); }
+
+            // Page through the opaque cursor to exhaustion.
+            let mut got: std::collections::HashSet<u128> = std::collections::HashSet::new();
+            let mut cursor: Option<u64> = None;
+            let mut pages = 0;
+            loop {
+                let resp = unwrap_list_aggs(process(&shard, ClientRequest::ListAggregates(ListAggregatesRequest {
+                    correlation_id: None, shard_id: 1, org_id: Some(1), aggregate_type_id: Some(1), cursor,
+                })).await);
+                for a in &resp.aggregates { got.insert(a.aggregate_id); }
+                pages += 1;
+                assert!(pages < 10_000, "pagination did not terminate");
+                match resp.next_cursor {
+                    Some(c) => cursor = Some(c),
+                    None => break,
+                }
+            }
+
+            assert!(pages >= 2, "expected multiple pages across sealed segments, got {pages}");
+            for e in &expected {
+                assert!(got.contains(e), "aggregate {e} dropped by paginated listing");
+            }
+
             shard.close().await;
         });
     }

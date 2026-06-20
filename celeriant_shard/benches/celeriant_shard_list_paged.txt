@@ -1,0 +1,5 @@
+group                         list_paged_baseline
+-----                         -------------------
+list_paged/page2/page_10      1.00     31.3±0.07µs        ? ?/sec
+list_paged/page2/page_100     1.00     36.8±0.13µs        ? ?/sec
+list_paged/page2/page_1000    1.00     92.9±0.53µs        ? ?/sec

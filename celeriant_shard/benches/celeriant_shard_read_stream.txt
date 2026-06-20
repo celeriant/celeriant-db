@@ -1,0 +1,8 @@
+group                   read_stream_baseline
+-----                   --------------------
+read_stream/16B/100     1.00    113.1±0.54µs 863.7 KElem/sec
+read_stream/16B/1000    1.00    931.5±6.35µs 1048.4 KElem/sec
+read_stream/16B/5000    1.00     11.3±0.11ms 432.4 KElem/sec
+read_stream/1KB/100     1.00    151.7±0.67µs 643.9 KElem/sec
+read_stream/1KB/1000    1.00   1241.0±4.14µs 786.9 KElem/sec
+read_stream/1KB/5000    1.00     11.9±0.04ms 411.9 KElem/sec

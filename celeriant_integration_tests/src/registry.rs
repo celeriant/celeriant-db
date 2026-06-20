@@ -748,6 +748,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             distributed: false,
         },
         TestEntry {
+            name: "idempotency_negative_scan_present_client",
+            description: "a segment-present client (bloom can't short-circuit) first-writing to a deep aggregate vs a shallow one",
+            estimated_secs: 30,
+            categories: &[Performance, Debug],
+            distributed: false,
+        },
+        TestEntry {
             name: "p2_2_dual_restart",
             description: "Both nodes restart simultaneously, S3 lease race resolves cleanly",
             estimated_secs: 14,

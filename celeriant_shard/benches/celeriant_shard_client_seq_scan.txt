@@ -1,0 +1,11 @@
+group                                 client_seq_scan_baseline
+-----                                 ------------------------
+client_seq_scan/new_client/256x       1.00    124.9±0.25ms        ? ?/sec
+client_seq_scan/new_client/64x        1.00     17.1±0.14ms        ? ?/sec
+client_seq_scan/new_client/8x         1.00      5.1±0.06ms        ? ?/sec
+client_seq_scan/newest_client/256x    1.00    123.1±1.00ms        ? ?/sec
+client_seq_scan/newest_client/64x     1.00     15.3±0.14ms        ? ?/sec
+client_seq_scan/newest_client/8x      1.00      5.2±0.06ms        ? ?/sec
+client_seq_scan/oldest_client/256x    1.00    125.2±0.65ms        ? ?/sec
+client_seq_scan/oldest_client/64x     1.00     16.2±0.11ms        ? ?/sec
+client_seq_scan/oldest_client/8x      1.00      8.9±0.04ms        ? ?/sec

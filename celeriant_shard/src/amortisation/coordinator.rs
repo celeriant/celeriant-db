@@ -14,6 +14,8 @@ pub enum CaptureResult<T, E: Clone> {
     Captured(T),
     /// Capture failed (e.g., rollback occurred, queue was emptied).
     Failed(E),
+    /// Nothing to capture: a concurrent batch already drained the pending
+    /// work, so the caller is already covered. Resolves Ok without any I/O.
     NoCaptureRaceButOk,
 }
 
@@ -28,12 +30,13 @@ pub enum CaptureResult<T, E: Clone> {
 ///
 /// # Example
 /// ```ignore
-/// let coordinator = SyncCoordinator::new();
+/// let coordinator: Coordinator<FsyncError> = Coordinator::new();
 ///
 /// // Called from multiple concurrent writers
 /// coordinator.request_sync(
 ///     Some(Duration::from_millis(5)),
-///     || async { do_fsync().await }
+///     FsyncError::GateTimeout,
+///     || async { do_fsync().await },
 /// ).await?;
 /// ```
 pub struct Coordinator<E: Clone> {
@@ -62,7 +65,6 @@ impl<E: Clone> Coordinator<E> {
 
     /// Acquire rollback lock. Waits for any in-flight fsync to complete,
     /// then blocks new fsyncs until the guard is dropped.
-    /// Budget is a bit larger here to handle when server is under extreme load
     pub async fn acquire_rollback_lock(&self) -> Option<glommio::sync::RwLockWriteGuard<'_, ()>> {
         match with_budget(GATE_BUDGET, self.sync_gate.write()).await {
             Some(Ok(g)) => Some(g),
@@ -109,7 +111,7 @@ impl<E: Clone> Coordinator<E> {
                         Err(_) => Acquired::Retry,
                     },
                 }
-            }; // Guards dropped here automatically
+            };
 
             match acquired {
                 Acquired::Leader(event) => {
@@ -262,29 +264,29 @@ impl<E: Clone> Coordinator<E> {
 
             match acquired {
                 Acquired::Leader(event) => {
-                    // Fast path: server idle (sync_gate free) AND no followers yet — sync immediately.
-                    // Rc count == 1 means only the leader holds the event; no followers have joined.
-                    // This avoids wasting an fdatasync on a tiny batch when the gate happens to be
-                    // momentarily free between busy syncs.
-                    // Slow path: sleep for delay, then acquire the gate. The gate wait itself
-                    // also provides implicit batching under high load.
-                    let acquire_with_budget = || async {
-                        match with_budget(GATE_BUDGET, self.sync_gate.write()).await {
-                            Some(Ok(g)) => Some(g),
-                            _ => None,
-                        }
-                    };
-                    let sync_guard_opt = if Rc::strong_count(&event) == 1 {
-                        match self.sync_gate.try_write() {
-                            Ok(guard) => Some(guard),
-                            Err(_) => {
-                                glommio::timer::sleep(delay).await;
-                                acquire_with_budget().await
+                    // Fast path: the server is idle, so sync now and skip the amortisation delay.
+                    // The idle signal is `sync_gate.try_write()` succeeding: nobody else holds the
+                    // gate, so there is no in-flight sync to batch with and nothing to wait for.
+                    // Slow path: a sync holds the gate (we are under load). Sleep `delay` so more
+                    // writers accumulate behind us, then queue for the gate; the gate wait itself
+                    // also batches. (A momentarily-free gate between busy syncs may fast-path a small
+                    // batch, acceptable; under sustained load the gate is held and we batch.)
+                    //
+                    // NOTE: do NOT gate this on `Rc::strong_count(&event)`. The orchestrator holds a
+                    // clone of `event` (stored above) and followers attach via `event.listen()`,
+                    // which clones the inner listeners Rc, not this outer one, so the count is a
+                    // constant 2 here and tells you nothing. A past `== 1` check made the fast path
+                    // dead (idle writes paid the full delay); `two_phase_fast_path_fires_when_idle`
+                    // guards against that regressing again.
+                    let sync_guard_opt = match self.sync_gate.try_write() {
+                        Ok(guard) => Some(guard),
+                        Err(_) => {
+                            glommio::timer::sleep(delay).await;
+                            match with_budget(GATE_BUDGET, self.sync_gate.write()).await {
+                                Some(Ok(g)) => Some(g),
+                                _ => None,
                             }
                         }
-                    } else {
-                        glommio::timer::sleep(delay).await;
-                        acquire_with_budget().await
                     };
                     let _sync_guard = match sync_guard_opt {
                         Some(g) => g,
@@ -302,7 +304,7 @@ impl<E: Clone> Coordinator<E> {
 
                     // Phase 1: capture + clear the orchestrator atomically under the
                     // write lock. capture_fn is sync, so no writer can attach to our
-                    // event after its item missed the snapshot — the false-ack window
+                    // event after its item missed the snapshot. The false-ack window
                     // (writer attaches between capture and clear, then receives this
                     // batch's Ok for an item the batch never carried) is closed.
                     let captured = match write_with_timeout(&self.lock_orchestrator, "two_phase_capture_and_clear").await {
@@ -1379,6 +1381,227 @@ mod tests {
 
             sync_handle.await.unwrap();
             drain_handle.await;
+        });
+    }
+
+    // ==================== Two-Phase Fast Path ====================
+
+    /// Regression guard for the idle fast path. An idle two-phase sync (gate free) must
+    /// skip the amortisation delay entirely. A broken predicate (the historical
+    /// `Rc::strong_count(&event) == 1`, which never matched because the orchestrator holds
+    /// a clone) makes every idle sync pay the full delay. This asserts it does not.
+    #[test]
+    fn two_phase_fast_path_fires_when_idle() {
+        run_with_glommio(|| async {
+            let coordinator: Coordinator<String> = Coordinator::new();
+            let committed = Rc::new(Cell::new(false));
+            // Deliberately large: if the fast path fires we never sleep it; if it regresses
+            // we block for ~1s and the elapsed assert fails.
+            let delay = Duration::from_secs(1);
+
+            let c = committed.clone();
+            let start = std::time::Instant::now();
+            let result = coordinator
+                .request_sync_two_phase(
+                    Some(delay),
+                    "gate-timeout".to_string(),
+                    || CaptureResult::Captured(()),
+                    move |_| async move {
+                        c.set(true);
+                        Ok(())
+                    },
+                )
+                .await;
+            let elapsed = start.elapsed();
+
+            assert!(result.is_ok());
+            assert!(committed.get(), "fast path must still capture and commit");
+            assert!(
+                elapsed < Duration::from_millis(300),
+                "idle two-phase sync took {elapsed:?}: the fast path is not firing; it must \
+                 skip the {delay:?} amortisation delay when the gate is free"
+            );
+        });
+    }
+
+    /// When the gate is held (a sync in flight / rollback), the fast path's `try_write` must
+    /// fail and the caller takes the slow path: it waits for the gate, then still captures.
+    #[test]
+    fn two_phase_takes_slow_path_when_gate_busy() {
+        run_with_glommio(|| async {
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let committed = Rc::new(Cell::new(false));
+
+            // Hold the gate so try_write() cannot succeed.
+            let gate = coordinator.acquire_rollback_lock().await;
+
+            let coord = coordinator.clone();
+            let c = committed.clone();
+            let writer = spawn_local(async move {
+                coord
+                    .request_sync_two_phase(
+                        Some(Duration::from_millis(5)),
+                        "gate-timeout".to_string(),
+                        || CaptureResult::Captured(()),
+                        move |_| async move {
+                            c.set(true);
+                            Ok(())
+                        },
+                    )
+                    .await
+            });
+
+            glommio::timer::sleep(Duration::from_millis(20)).await;
+            assert!(!committed.get(), "must not sync while the gate is held");
+
+            drop(gate);
+            let result = writer.await;
+            assert!(result.is_ok());
+            assert!(committed.get(), "slow path must capture once the gate frees");
+        });
+    }
+
+    /// The fast path takes the gate via `try_write`, so it must still serialize: even under
+    /// concurrent idle writers, no two sync_fn bodies run at once.
+    #[test]
+    fn two_phase_fast_path_still_serializes_through_gate() {
+        run_with_glommio(|| async {
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let concurrent = Rc::new(Cell::new(0i32));
+            let max_concurrent = Rc::new(Cell::new(0i32));
+            let completed = Rc::new(Cell::new(0));
+
+            let mut handles = vec![];
+            for _ in 0..20 {
+                let coord = coordinator.clone();
+                let cur = concurrent.clone();
+                let mx = max_concurrent.clone();
+                let done = completed.clone();
+                handles.push(spawn_local(async move {
+                    let cur2 = cur.clone();
+                    let mx2 = mx.clone();
+                    let r = coord
+                        .request_sync_two_phase(
+                            Some(Duration::from_millis(1)),
+                            "gate-timeout".to_string(),
+                            || CaptureResult::Captured(()),
+                            move |_| async move {
+                                let n = cur2.get() + 1;
+                                cur2.set(n);
+                                if n > mx2.get() {
+                                    mx2.set(n);
+                                }
+                                yield_now().await; // hold the in-sync window open
+                                cur2.set(cur2.get() - 1);
+                                Ok(())
+                            },
+                        )
+                        .await;
+                    assert!(r.is_ok());
+                    done.set(done.get() + 1);
+                }));
+            }
+            for h in handles {
+                h.await;
+            }
+
+            assert_eq!(completed.get(), 20);
+            assert_eq!(max_concurrent.get(), 1, "gate must serialize syncs even on the fast path");
+        });
+    }
+
+    /// A failed capture returns the error without running sync_fn, and must release both the
+    /// orchestrator and the gate so the coordinator is immediately reusable.
+    #[test]
+    fn two_phase_capture_failed_propagates_and_recovers() {
+        run_with_glommio(|| async {
+            let coordinator: Coordinator<String> = Coordinator::new();
+
+            let sync_ran = Rc::new(Cell::new(false));
+            let sr = sync_ran.clone();
+            let result = coordinator
+                .request_sync_two_phase(
+                    Some(Duration::from_millis(1)),
+                    "gate-timeout".to_string(),
+                    || CaptureResult::<(), String>::Failed("capture failed".to_string()),
+                    move |_| async move {
+                        sr.set(true);
+                        Ok(())
+                    },
+                )
+                .await;
+            assert_eq!(result.unwrap_err(), "capture failed");
+            assert!(!sync_ran.get(), "sync_fn must not run when capture fails");
+
+            // Reusable: a clean cycle must work right after the Failed cycle.
+            let committed = Rc::new(Cell::new(false));
+            let c = committed.clone();
+            let result = coordinator
+                .request_sync_two_phase(
+                    Some(Duration::from_millis(1)),
+                    "gate-timeout".to_string(),
+                    || CaptureResult::Captured(()),
+                    move |_| async move {
+                        c.set(true);
+                        Ok(())
+                    },
+                )
+                .await;
+            assert!(result.is_ok());
+            assert!(committed.get(), "coordinator must recover after a failed capture");
+        });
+    }
+
+    /// Single-phase (barrier) and two-phase (data) cycles use separate orchestrators but share
+    /// the one `sync_gate`. The invariant (coordinator.rs comment on `sync_gate`) is that their
+    /// sync bodies never overlap. Interleave both kinds under concurrency and assert it holds.
+    #[test]
+    fn single_and_two_phase_never_overlap_on_gate() {
+        run_with_glommio(|| async {
+            async fn hold_and_track(cur: Rc<Cell<i32>>, mx: Rc<Cell<i32>>) -> SyncResult<String> {
+                let n = cur.get() + 1;
+                cur.set(n);
+                if n > mx.get() {
+                    mx.set(n);
+                }
+                yield_now().await;
+                glommio::timer::sleep(Duration::from_millis(2)).await;
+                cur.set(cur.get() - 1);
+                Ok(())
+            }
+
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let concurrent = Rc::new(Cell::new(0i32));
+            let max_concurrent = Rc::new(Cell::new(0i32));
+
+            let mut handles = vec![];
+            for i in 0..20 {
+                let coord = coordinator.clone();
+                let cur = concurrent.clone();
+                let mx = max_concurrent.clone();
+                handles.push(spawn_local(async move {
+                    if i % 2 == 0 {
+                        coord
+                            .request_sync(Some(Duration::from_millis(1)), "gt".to_string(), move || hold_and_track(cur, mx))
+                            .await
+                    } else {
+                        coord
+                            .request_sync_two_phase(
+                                Some(Duration::from_millis(1)),
+                                "gt".to_string(),
+                                || CaptureResult::Captured(()),
+                                move |_| hold_and_track(cur, mx),
+                            )
+                            .await
+                    }
+                }));
+                yield_now().await;
+            }
+            for h in handles {
+                h.await.unwrap();
+            }
+
+            assert_eq!(max_concurrent.get(), 1, "single- and two-phase syncs must never run at once (shared gate)");
         });
     }
 }

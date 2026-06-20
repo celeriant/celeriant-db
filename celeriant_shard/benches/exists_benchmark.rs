@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use celeriant_distributed::validated_node_status::ValidatedNodeStatus;
+use celeriant_shard::error::shard_exists_error::ShardAggregateDetailsError;
 use celeriant_shard::internal_shard_config::InternalShardConfig;
 use celeriant_shard::replication_client::StubReplicationClient;
 use celeriant_shard::s3_downloader::StubS3Downloader;
@@ -276,12 +277,18 @@ fn bench_exists_wal_sizes(c: &mut Criterion) {
                                 };
 
                                 let start = std::time::Instant::now();
-                                let result = shard_wal.exists(&exists_request).await.unwrap();
+                                let result = shard_wal.exists(&exists_request).await;
                                 total_duration += start.elapsed();
 
-                                // Verify it's actually not found
-                                debug_assert_eq!(result.min_aggregate_version, 0);
-                                black_box(result);
+                                // Negative lookup: a missing aggregate now returns
+                                // Err(AggregateNotExists) (was Ok with min_aggregate_version == 0).
+                                // Either way the WAL lookup ran, which is what this measures.
+                                debug_assert!(
+                                    matches!(&result, Err(ShardAggregateDetailsError::AggregateNotExists))
+                                        || matches!(&result, Ok(r) if r.min_aggregate_version == 0),
+                                    "unknown aggregate should be absent"
+                                );
+                                black_box(result.ok());
                             }
 
                             total_duration

@@ -1,0 +1,11 @@
+group                                     reverse_metablock_scan_baseline
+-----                                     -------------------------------
+old_version_read/newest/256x              1.00     93.4±0.62µs        ? ?/sec
+old_version_read/newest/64x               1.00     37.3±0.98µs        ? ?/sec
+old_version_read/newest/8x                1.00     37.4±0.21µs        ? ?/sec
+old_version_read/oldest_perblock/256x     1.00      9.5±0.03ms        ? ?/sec
+old_version_read/oldest_perblock/64x      1.00  1261.5±19.46µs        ? ?/sec
+old_version_read/oldest_perblock/8x       1.00  1143.7±58.66µs        ? ?/sec
+old_version_read/oldest_window32k/256x    1.00     11.4±0.21ms        ? ?/sec
+old_version_read/oldest_window32k/64x     1.00      6.6±0.02ms        ? ?/sec
+old_version_read/oldest_window32k/8x      1.00    367.7±8.61µs        ? ?/sec

@@ -1,0 +1,8 @@
+group                           warmup_baseline
+-----                           ---------------
+boot_warmup/bounded_50ms/20k    1.00     65.1±1.77ms        ? ?/sec
+boot_warmup/bounded_50ms/5k     1.00     22.0±1.38ms        ? ?/sec
+boot_warmup/bounded_50ms/80k    1.00    235.7±0.36ms        ? ?/sec
+boot_warmup/unbounded/20k       1.00     76.4±0.32ms        ? ?/sec
+boot_warmup/unbounded/5k        1.00     19.2±0.11ms        ? ?/sec
+boot_warmup/unbounded/80k       1.00    636.7±5.75ms        ? ?/sec

@@ -1,0 +1,8 @@
+group                                       replication_batch_baseline
+-----                                       --------------------------
+replication_batch/leader_batch/1agg_50ev    1.00     64.4±0.20ms   151.5 MB/sec
+replication_batch/leader_batch/1agg_5ev     1.00     64.5±0.10ms    15.1 MB/sec
+replication_batch/leader_batch/32agg_5ev    1.00     68.2±0.26ms   457.9 MB/sec
+replication_batch/leader_batch/8agg_5ev     1.00     66.6±0.23ms   117.3 MB/sec
+replication_batch/role/leader               1.00     64.5±0.19ms    15.1 MB/sec
+replication_batch/role/standalone           1.00     12.4±0.02ms    78.9 MB/sec

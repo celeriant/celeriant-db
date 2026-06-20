@@ -1,0 +1,14 @@
+group                                            schema_validation_baseline
+-----                                            --------------------------
+schema_validation/fields32_payload1024b/100ev    1.00    265.6±0.86µs 367.7 KElem/sec
+schema_validation/fields32_payload1024b/10ev     1.00     26.7±0.10µs 365.3 KElem/sec
+schema_validation/fields32_payload1024b/1ev      1.00      2.6±0.00µs 371.2 KElem/sec
+schema_validation/fields32_payload64b/100ev      1.00    259.0±1.24µs 377.0 KElem/sec
+schema_validation/fields32_payload64b/10ev       1.00     25.5±0.10µs 382.6 KElem/sec
+schema_validation/fields32_payload64b/1ev        1.00      2.6±0.01µs 382.7 KElem/sec
+schema_validation/fields4_payload1024b/100ev     1.00     33.6±0.19µs  2.8 MElem/sec
+schema_validation/fields4_payload1024b/10ev      1.00      3.3±0.01µs  2.9 MElem/sec
+schema_validation/fields4_payload1024b/1ev       1.00    331.0±2.54ns  2.9 MElem/sec
+schema_validation/fields4_payload64b/100ev       1.00     29.1±0.21µs  3.3 MElem/sec
+schema_validation/fields4_payload64b/10ev        1.00      2.9±0.01µs  3.3 MElem/sec
+schema_validation/fields4_payload64b/1ev         1.00    257.1±0.67ns  3.7 MElem/sec

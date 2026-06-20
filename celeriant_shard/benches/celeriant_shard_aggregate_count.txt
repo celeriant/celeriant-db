@@ -1,13 +1,13 @@
 group                                            aggregate_count_baseline
 -----                                            ------------------------
-aggregate_count_impact/multi_write/agg_1         1.00     14.6±2.78ms     8.2 GB/sec
-aggregate_count_impact/multi_write/agg_10        1.00     15.1±4.38ms     7.9 GB/sec
-aggregate_count_impact/multi_write/agg_100       1.00     15.7±3.73ms     7.6 GB/sec
-aggregate_count_impact/multi_write/agg_1000      1.00      7.0±0.65ms    17.1 GB/sec
-aggregate_count_impact/multi_write/agg_15000     1.00      7.3±0.88ms    16.3 GB/sec
-aggregate_count_impact/multi_write/agg_180000    1.00      9.0±2.65ms    13.2 GB/sec
-aggregate_count_impact/multi_write/agg_30000     1.00      7.5±0.75ms    15.9 GB/sec
-aggregate_count_impact/multi_write/agg_360000    1.00      8.2±0.87ms    14.6 GB/sec
-aggregate_count_impact/multi_write/agg_500       1.00     14.0±2.59ms     8.5 GB/sec
-aggregate_count_impact/multi_write/agg_5000      1.00      7.1±0.83ms    16.8 GB/sec
-aggregate_count_impact/multi_write/agg_90000     1.00      7.9±0.84ms    15.1 GB/sec
+aggregate_count_impact/multi_write/agg_1         1.00     10.2±0.26ms    11.7 GB/sec
+aggregate_count_impact/multi_write/agg_10        1.00     10.5±0.55ms    11.3 GB/sec
+aggregate_count_impact/multi_write/agg_100       1.00     12.2±2.83ms     9.8 GB/sec
+aggregate_count_impact/multi_write/agg_1000      1.00      6.7±0.17ms    17.8 GB/sec
+aggregate_count_impact/multi_write/agg_15000     1.00      7.1±0.13ms    16.8 GB/sec
+aggregate_count_impact/multi_write/agg_180000    1.00      7.4±0.31ms    16.2 GB/sec
+aggregate_count_impact/multi_write/agg_30000     1.00      7.2±0.06ms    16.6 GB/sec
+aggregate_count_impact/multi_write/agg_360000    1.00      7.2±0.08ms    16.5 GB/sec
+aggregate_count_impact/multi_write/agg_500       1.00      7.7±0.28ms    15.4 GB/sec
+aggregate_count_impact/multi_write/agg_5000      1.00      7.5±0.58ms    15.9 GB/sec
+aggregate_count_impact/multi_write/agg_90000     1.00      7.2±0.12ms    16.5 GB/sec

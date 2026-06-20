@@ -1,0 +1,8 @@
+group                                         cold_read_baseline
+-----                                         ------------------
+cold_negative_lookup/cold_file_cache/32seg    1.00    107.5±0.54ms        ? ?/sec
+cold_negative_lookup/cold_file_cache/8seg     1.00     24.3±0.15ms        ? ?/sec
+cold_negative_lookup/cold_file_cache/96seg    1.00    328.3±2.86ms        ? ?/sec
+cold_negative_lookup/warm_file_cache/32seg    1.00     17.6±0.33µs        ? ?/sec
+cold_negative_lookup/warm_file_cache/8seg     1.00      6.1±0.45µs        ? ?/sec
+cold_negative_lookup/warm_file_cache/96seg    1.00     53.8±2.60µs        ? ?/sec

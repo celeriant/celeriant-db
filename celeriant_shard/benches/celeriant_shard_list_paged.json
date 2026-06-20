@@ -1,0 +1,182 @@
+{
+  "name": "list_paged_baseline",
+  "benchmarks": {
+    "list_paged/page2/page_10": {
+      "baseline": "list_paged_baseline",
+      "fullname": "list_paged_baseline/list_paged/page2/page_10",
+      "criterion_benchmark_v1": {
+        "group_id": "list_paged",
+        "function_id": "page2",
+        "value_str": "page_10",
+        "throughput": null,
+        "full_id": "list_paged/page2/page_10",
+        "directory_name": "list_paged/page2/page_10"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 31251.492394540255,
+            "upper_bound": 31338.032198082732
+          },
+          "point_estimate": 31293.2975388721,
+          "standard_error": 21.949152718204544
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 31249.889297002537,
+            "upper_bound": 31329.53526015074
+          },
+          "point_estimate": 31283.62361501858,
+          "standard_error": 18.360646094653216
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1.043036451212767,
+            "upper_bound": 120.8876500541556
+          },
+          "point_estimate": 51.8883153175568,
+          "standard_error": 29.596547829271916
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 31269.772143146583,
+            "upper_bound": 31384.20091480682
+          },
+          "point_estimate": 31323.657621542086,
+          "standard_error": 30.659307838937405
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 28.965005931512746,
+            "upper_bound": 101.6685367139192
+          },
+          "point_estimate": 73.24509533395877,
+          "standard_error": 18.520861372394094
+        }
+      }
+    },
+    "list_paged/page2/page_100": {
+      "baseline": "list_paged_baseline",
+      "fullname": "list_paged_baseline/list_paged/page2/page_100",
+      "criterion_benchmark_v1": {
+        "group_id": "list_paged",
+        "function_id": "page2",
+        "value_str": "page_100",
+        "throughput": null,
+        "full_id": "list_paged/page2/page_100",
+        "directory_name": "list_paged/page2/page_100"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 36680.05833531542,
+            "upper_bound": 36835.17059902578
+          },
+          "point_estimate": 36754.00339714036,
+          "standard_error": 39.83318984060138
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 36661.35519063367,
+            "upper_bound": 36834.29113924051
+          },
+          "point_estimate": 36729.510919147,
+          "standard_error": 47.90895139030786
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 35.91070506208088,
+            "upper_bound": 228.01818423445184
+          },
+          "point_estimate": 119.6055193579288,
+          "standard_error": 46.95230801316135
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 36639.60850290537,
+            "upper_bound": 36781.460847802125
+          },
+          "point_estimate": 36707.0196293614,
+          "standard_error": 36.88941023030141
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 66.13413117027073,
+            "upper_bound": 177.2095706895392
+          },
+          "point_estimate": 133.01776571025516,
+          "standard_error": 29.54030074070995
+        }
+      }
+    },
+    "list_paged/page2/page_1000": {
+      "baseline": "list_paged_baseline",
+      "fullname": "list_paged_baseline/list_paged/page2/page_1000",
+      "criterion_benchmark_v1": {
+        "group_id": "list_paged",
+        "function_id": "page2",
+        "value_str": "page_1000",
+        "throughput": null,
+        "full_id": "list_paged/page2/page_1000",
+        "directory_name": "list_paged/page2/page_1000"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 92601.22457413112,
+            "upper_bound": 93217.20292439224
+          },
+          "point_estimate": 92890.52380432656,
+          "standard_error": 158.40390386321312
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 92491.36851566512,
+            "upper_bound": 93486.11741140216
+          },
+          "point_estimate": 92712.38390564236,
+          "standard_error": 230.25866302412788
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 68.74588078388258,
+            "upper_bound": 809.5676491763595
+          },
+          "point_estimate": 333.4359549239348,
+          "standard_error": 194.1730886889165
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 92561.5947905689,
+            "upper_bound": 93286.81134892842
+          },
+          "point_estimate": 92904.65132771696,
+          "standard_error": 194.47649531449673
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 186.08170595585747,
+            "upper_bound": 640.111090086749
+          },
+          "point_estimate": 527.0500911248429,
+          "standard_error": 100.28279029494692
+        }
+      }
+    }
+  }
+}

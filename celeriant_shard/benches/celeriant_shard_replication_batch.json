@@ -1,0 +1,329 @@
+{
+  "name": "replication_batch_baseline",
+  "benchmarks": {
+    "replication_batch/leader_batch/1agg_50ev": {
+      "baseline": "replication_batch_baseline",
+      "fullname": "replication_batch_baseline/replication_batch/leader_batch/1agg_50ev",
+      "criterion_benchmark_v1": {
+        "group_id": "replication_batch",
+        "function_id": "leader_batch",
+        "value_str": "1agg_50ev",
+        "throughput": {
+          "Bytes": 10240000,
+          "Elements": null
+        },
+        "full_id": "replication_batch/leader_batch/1agg_50ev",
+        "directory_name": "replication_batch/leader_batch/1agg_50ev"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 64325106.0,
+            "upper_bound": 64565250.0
+          },
+          "point_estimate": 64440933.2,
+          "standard_error": 61341.38542261808
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 64255703.0,
+            "upper_bound": 64651433.0
+          },
+          "point_estimate": 64401243.5,
+          "standard_error": 98821.60588083566
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 44664.80680704117,
+            "upper_bound": 334099.45626854897
+          },
+          "point_estimate": 228365.61524569988,
+          "standard_error": 82457.30481101714
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 106860.18655230952,
+            "upper_bound": 241608.57011723443
+          },
+          "point_estimate": 204901.77094175312,
+          "standard_error": 31992.936397819445
+        }
+      }
+    },
+    "replication_batch/leader_batch/1agg_5ev": {
+      "baseline": "replication_batch_baseline",
+      "fullname": "replication_batch_baseline/replication_batch/leader_batch/1agg_5ev",
+      "criterion_benchmark_v1": {
+        "group_id": "replication_batch",
+        "function_id": "leader_batch",
+        "value_str": "1agg_5ev",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "replication_batch/leader_batch/1agg_5ev",
+        "directory_name": "replication_batch/leader_batch/1agg_5ev"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 64483270.3025,
+            "upper_bound": 64601333.2
+          },
+          "point_estimate": 64548950.3,
+          "standard_error": 30343.247768196587
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 64518268.0,
+            "upper_bound": 64599359.0
+          },
+          "point_estimate": 64563908.0,
+          "standard_error": 16461.46506589011
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3702.793434262276,
+            "upper_bound": 131970.67145705223
+          },
+          "point_estimate": 24048.51287305355,
+          "standard_error": 36029.38283914277
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 28576.09619186404,
+            "upper_bound": 143625.30001425874
+          },
+          "point_estimate": 100406.7779374923,
+          "standard_error": 32457.041024711223
+        }
+      }
+    },
+    "replication_batch/leader_batch/32agg_5ev": {
+      "baseline": "replication_batch_baseline",
+      "fullname": "replication_batch_baseline/replication_batch/leader_batch/32agg_5ev",
+      "criterion_benchmark_v1": {
+        "group_id": "replication_batch",
+        "function_id": "leader_batch",
+        "value_str": "32agg_5ev",
+        "throughput": {
+          "Bytes": 32768000,
+          "Elements": null
+        },
+        "full_id": "replication_batch/leader_batch/32agg_5ev",
+        "directory_name": "replication_batch/leader_batch/32agg_5ev"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 68076781.6,
+            "upper_bound": 68380808.24
+          },
+          "point_estimate": 68242559.3,
+          "standard_error": 78268.4301343414
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 68092909.0,
+            "upper_bound": 68378351.0
+          },
+          "point_estimate": 68356420.5,
+          "standard_error": 77724.86767490364
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 7701.36556327343,
+            "upper_bound": 372064.3937945366
+          },
+          "point_estimate": 68994.27237510681,
+          "standard_error": 113050.92896907484
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 79942.7329113303,
+            "upper_bound": 342941.83146611514
+          },
+          "point_estimate": 261130.9387265962,
+          "standard_error": 66705.4889415928
+        }
+      }
+    },
+    "replication_batch/leader_batch/8agg_5ev": {
+      "baseline": "replication_batch_baseline",
+      "fullname": "replication_batch_baseline/replication_batch/leader_batch/8agg_5ev",
+      "criterion_benchmark_v1": {
+        "group_id": "replication_batch",
+        "function_id": "leader_batch",
+        "value_str": "8agg_5ev",
+        "throughput": {
+          "Bytes": 8192000,
+          "Elements": null
+        },
+        "full_id": "replication_batch/leader_batch/8agg_5ev",
+        "directory_name": "replication_batch/leader_batch/8agg_5ev"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 66451710.3,
+            "upper_bound": 66723148.5425
+          },
+          "point_estimate": 66597263.0,
+          "standard_error": 69578.25817402994
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 66404217.0,
+            "upper_bound": 66767330.0
+          },
+          "point_estimate": 66684187.0,
+          "standard_error": 98553.20950511927
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 10652.48081088066,
+            "upper_bound": 366102.859300375
+          },
+          "point_estimate": 124693.32948625088,
+          "standard_error": 91324.41796961462
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 75263.4242041467,
+            "upper_bound": 278399.6371318676
+          },
+          "point_estimate": 230553.6475178343,
+          "standard_error": 46133.54857852757
+        }
+      }
+    },
+    "replication_batch/role/leader": {
+      "baseline": "replication_batch_baseline",
+      "fullname": "replication_batch_baseline/replication_batch/role/leader",
+      "criterion_benchmark_v1": {
+        "group_id": "replication_batch",
+        "function_id": "role",
+        "value_str": "leader",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "replication_batch/role/leader",
+        "directory_name": "replication_batch/role/leader"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 64401212.1,
+            "upper_bound": 64623246.2
+          },
+          "point_estimate": 64528073.0,
+          "standard_error": 57647.588725240654
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 64453546.5,
+            "upper_bound": 64643810.5
+          },
+          "point_estimate": 64620171.0,
+          "standard_error": 52776.205914140766
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 10418.230015039444,
+            "upper_bound": 242737.93939054012
+          },
+          "point_estimate": 46340.14477729797,
+          "standard_error": 63350.08746904626
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 47899.81308059099,
+            "upper_bound": 267517.75864734163
+          },
+          "point_estimate": 192262.18749636883,
+          "standard_error": 61415.23861993783
+        }
+      }
+    },
+    "replication_batch/role/standalone": {
+      "baseline": "replication_batch_baseline",
+      "fullname": "replication_batch_baseline/replication_batch/role/standalone",
+      "criterion_benchmark_v1": {
+        "group_id": "replication_batch",
+        "function_id": "role",
+        "value_str": "standalone",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "replication_batch/role/standalone",
+        "directory_name": "replication_batch/role/standalone"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 12364281.9,
+            "upper_bound": 12390722.2
+          },
+          "point_estimate": 12377081.3,
+          "standard_error": 6794.642301430412
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 12354258.0,
+            "upper_bound": 12394999.0
+          },
+          "point_estimate": 12377978.0,
+          "standard_error": 10333.821692371084
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3991.900429129601,
+            "upper_bound": 39251.0930031538
+          },
+          "point_estimate": 28584.527492523193,
+          "standard_error": 9639.21584722216
+        },
+        "slope": null,
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 13125.93491950616,
+            "upper_bound": 27734.56081738691
+          },
+          "point_estimate": 22535.783303941804,
+          "standard_error": 3752.124796865986
+        }
+      }
+    }
+  }
+}

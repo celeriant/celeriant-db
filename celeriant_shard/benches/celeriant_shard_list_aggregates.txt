@@ -1,0 +1,10 @@
+group                                                  list_aggregates_baseline
+-----                                                  ------------------------
+list_aggregates/list_aggregate_types/m_100000          1.00   267.9±23.90ns 347.6 GElem/sec
+list_aggregates/list_aggregates/m_1000/page_100        1.00     66.7±0.34µs 14.3 MElem/sec
+list_aggregates/list_aggregates/m_1000/page_20000      1.00     51.9±1.70µs 18.4 MElem/sec
+list_aggregates/list_aggregates/m_10000/page_100       1.00   1220.4±4.44µs  7.8 MElem/sec
+list_aggregates/list_aggregates/m_10000/page_20000     1.00   1138.9±4.92µs  8.4 MElem/sec
+list_aggregates/list_aggregates/m_100000/page_100      1.00     13.0±0.27ms  7.3 MElem/sec
+list_aggregates/list_aggregates/m_100000/page_20000    1.00     13.6±0.28ms  7.0 MElem/sec
+list_aggregates/list_orgs/m_100000                     1.00   259.4±23.16ns 359.0 GElem/sec
