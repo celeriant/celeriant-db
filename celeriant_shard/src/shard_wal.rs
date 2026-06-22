@@ -81,6 +81,11 @@ use crate::shard_wal_replicate::{capture_replication_snapshot, commit_replicatio
 use crate::shard_wal_s3_catchup::{self, S3CatchupResult, catchup_from_s3};
 use crate::shard_wal_sync::{capture_fsync_snapshot, commit_fsync_with_rollback, compute_entry_hash, sync_header_only};
 
+/// Upper bound on how long a leader write waits for the read cursor to confirm
+/// its events before giving up with `LeaderFenced`. Matches the replication spin
+/// hard timeout; exceeding it means replication is wedged, not merely lagging.
+const REPLICATION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Compile a schema datablock and insert into the cache.
 /// Shared by pre_warm_cache, ensure_schema_cached, and follower replication.
 pub(crate) fn compile_and_cache_schema(cache: &mut MemCache, schema_key: &SchemaKey, datablock: &Datablock) {
@@ -970,6 +975,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             }
         }
 
+        // `seen` dedups within one page only. Segment summaries are per-segment, so an
+        // aggregate spanning a rotation lives in several and can recur across pages.
+        // Listing is best-effort: callers paginating to completion dedup by key.
         let mut seen: HashMap<AggregateKey, AccumulatedStats> = HashMap::with_capacity(page_size);
         let mut result_order: Vec<AggregateKey> = Vec::with_capacity(page_size);
         let mut deleted_barrier: HashSet<AggregateKey> = HashSet::new();
@@ -2476,7 +2484,40 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         } else {
             self.config.s3_replication_delay
         };
-        self.run_replication_through_coordinator(ReplicationTrigger::Write, Some(delay)).await
+
+        // Confirmation gate. A single coordinator cycle can return Ok via
+        // NoCaptureRaceButOk for a writer whose events were captured by a
+        // concurrent in-flight cycle that has not yet committed — read cursor
+        // still below them. Acking there is a false ack: a later fence/cull
+        // rewinds to the lagging barrier and the acked writes are lost (or never
+        // reach the follower). Replicate up to the write tip as of entry, then
+        // re-enter until the read cursor confirms it. Re-entry blocks on the
+        // in-flight cycle (its gate), so this waits, it does not spin.
+        let write_target = wal_positions(&self.log_segments_cache).0;
+        let confirm_deadline = Instant::now() + REPLICATION_CONFIRM_TIMEOUT;
+        let mut cycle_delay = Some(delay);
+        loop {
+            self.run_replication_through_coordinator(ReplicationTrigger::Write, cycle_delay).await?;
+            if wal_positions(&self.log_segments_cache).1 >= write_target {
+                return Ok(());
+            }
+            if !self.node_status.get().is_leader() {
+                return Err(ReplicationError::LeaderFenced);
+            }
+            if Instant::now() > confirm_deadline {
+                warn!(
+                    shard_id = self.config.shard_id,
+                    write_target,
+                    read_wal = wal_positions(&self.log_segments_cache).1,
+                    "replicate_durable: read cursor did not confirm write tip before timeout"
+                );
+                return Err(ReplicationError::LeaderFenced);
+            }
+            // Re-enter immediately (no amortisation delay) to attach to the
+            // in-flight cycle holding our events; yield so it can commit.
+            cycle_delay = None;
+            glommio::yield_if_needed().await;
+        }
     }
 
     /// Drift-detection probe routed through the replication coordinator.

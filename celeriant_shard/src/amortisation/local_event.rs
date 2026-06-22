@@ -89,6 +89,12 @@ impl<T> LocalEvent<T> {
         }
     }
 
+    /// Number of listeners currently attached. For a per-cycle orchestrator event
+    /// this is the batch size: how many followers coalesced behind the leader.
+    pub fn listener_count(&self) -> usize {
+        self.listeners.borrow().len()
+    }
+
     pub fn notify(&self, result: T)
     where
         T: Clone,

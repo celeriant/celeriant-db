@@ -50,6 +50,9 @@ pub struct ListAggregateTypesResponse {
     pub next_cursor: Option<u64>,
 }
 
+/// Best-effort listing. An aggregate whose writes span a segment rotation can
+/// appear on more than one page; callers paginating to completion must dedup by
+/// aggregate key.
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct ListAggregatesResponse {
     pub correlation_id: Option<u128>,

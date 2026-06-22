@@ -225,6 +225,9 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
 
     loop {
         result.rounds += 1;
+        // Count at execution, not at clean exit: a round that truncates then returns
+        // early via `?` (replacement chain not yet in S3, handed to TCP) still ran.
+        metrics::counter!("celeriant_s3_catchup_rounds_total").increment(1);
 
         let inner_applied = result.batches_applied;
         let mut truncated = false;
@@ -542,9 +545,6 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
         first_iteration = truncated;
     }
 
-    if result.rounds > 0 {
-        metrics::counter!("celeriant_s3_catchup_rounds_total").increment(result.rounds as u64);
-    }
     Ok(result)
 }
 

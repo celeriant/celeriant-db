@@ -48,6 +48,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut leader_config = s3_cluster_config(num_shards, &region, &bucket, &access_key, &secret_key, &endpoint, allow_http);
     leader_config.heartbeat_lease_duration_ms = 5_000;
     leader_config.s3_lease_duration_ms = 5_000;
+    // Disable the recent-write cache so the audit reads disk truth, not volatile
+    // cache: a culled-but-cached acked event must not mask as present on the leader.
+    leader_config.recent_write_cache_ratio = 0.0;
 
     let mut follower_config = leader_config.clone();
     follower_config.client_port = follower_port;

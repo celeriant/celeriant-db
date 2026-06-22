@@ -1,6 +1,7 @@
 use crate::amortisation::local_event::{LocalEvent, LocalEventListener};
 use celeriant_disk::files::rwlock_timeout::{read_with_timeout, with_budget, write_with_timeout};
 use glommio::sync::RwLock;
+use std::cell::Cell;
 use std::{rc::Rc, time::Duration};
 
 const GATE_BUDGET: Duration = Duration::from_secs(60);
@@ -52,6 +53,13 @@ pub struct Coordinator<E: Clone> {
     /// Fsync and rollback both acquire write lock - ensures one-at-a-time execution.
     /// Shared by both orchestrators: single- and two-phase cycles never overlap.
     sync_gate: RwLock<()>,
+
+    /// Did the previous two-phase cycle coalesce followers? It is the load signal
+    /// for the fast path: a free gate alone is not idle (under load the gate frees
+    /// in brief windows between syncs, and fast-pathing a lone writer there
+    /// fragments the batch). If the last cycle had followers we are under load, so
+    /// the next leader sleeps `delay` to coalesce instead of fast-pathing.
+    last_two_phase_batched: Cell<bool>,
 }
 
 impl<E: Clone> Coordinator<E> {
@@ -60,6 +68,7 @@ impl<E: Clone> Coordinator<E> {
             lock_orchestrator: RwLock::new(None),
             lock_orchestrator_single: RwLock::new(None),
             sync_gate: RwLock::new(()),
+            last_two_phase_batched: Cell::new(false),
         }
     }
 
@@ -278,9 +287,20 @@ impl<E: Clone> Coordinator<E> {
                     // constant 2 here and tells you nothing. A past `== 1` check made the fast path
                     // dead (idle writes paid the full delay); `two_phase_fast_path_fires_when_idle`
                     // guards against that regressing again.
-                    let sync_guard_opt = match self.sync_gate.try_write() {
-                        Ok(guard) => Some(guard),
-                        Err(_) => {
+                    // Fast path requires a free gate AND that the previous cycle did NOT
+                    // coalesce followers (we are not under load). A free gate alone is not
+                    // idle: under sustained load it frees in brief windows between syncs, and
+                    // fast-pathing a lone writer there fragments the batch — de-amortisation
+                    // that raises latency under load. `two_phase_amortises_under_sustained_staggered_load`
+                    // guards this; `two_phase_fast_path_fires_when_idle` guards the idle win.
+                    let fast_guard = if self.last_two_phase_batched.get() {
+                        None
+                    } else {
+                        self.sync_gate.try_write().ok()
+                    };
+                    let sync_guard_opt = match fast_guard {
+                        Some(guard) => Some(guard),
+                        None => {
                             glommio::timer::sleep(delay).await;
                             match with_budget(GATE_BUDGET, self.sync_gate.write()).await {
                                 Some(Ok(g)) => Some(g),
@@ -330,6 +350,8 @@ impl<E: Clone> Coordinator<E> {
                     };
 
                     drop(_sync_guard);
+                    // Load signal for the next leader: did this cycle coalesce followers?
+                    self.last_two_phase_batched.set(event.listener_count() > 0);
                     event.notify(result.clone());
                     return result;
                 }
@@ -1507,6 +1529,81 @@ mod tests {
 
             assert_eq!(completed.get(), 20);
             assert_eq!(max_concurrent.get(), 1, "gate must serialize syncs even on the fast path");
+        });
+    }
+
+    /// Amortisation regression guard. Under SUSTAINED, STAGGERED concurrent load the
+    /// coordinator must coalesce writers into shared syncs. The risk is the opposite:
+    /// a fast path that fires whenever the gate is momentarily free de-amortises —
+    /// it issues tiny batches per arrival, pushing the sync count toward one-per-request.
+    /// That is the low-concurrency latency regression in disguise (a sync-count regime,
+    /// observable without wall-clock timing). Lockstep arrival hides it (every version
+    /// batches cleanly), so writers arrive with independent jitter. Ideal coalescing is
+    /// one sync per round (`REQUESTS` total); we assert the count stays well under that,
+    /// which the de-amortising fast path cannot satisfy.
+    #[test]
+    fn two_phase_amortises_under_sustained_staggered_load() {
+        run_with_glommio(|| async {
+            const WRITERS: usize = 32;
+            const REQUESTS: usize = 20; // per writer
+            const JITTER_MAX_US: u64 = 1000;
+            // Coalescing window wide vs likely preemption: this test runs in parallel
+            // with the rest of the suite, so a few-hundred-µs steal must not collapse the
+            // batch. Ideal stays one sync per round (REQUESTS); the de-amortising fast
+            // path roughly doubles it (~1.6x), which the threshold below catches.
+            let delay = Duration::from_micros(3000);
+            let fsync_sim = Duration::from_micros(200);
+
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let syncs = Rc::new(Cell::new(0u64));
+
+            let mut handles = vec![];
+            for w in 0..WRITERS {
+                let coord = coordinator.clone();
+                let syncs = syncs.clone();
+                handles.push(spawn_local(async move {
+                    // Deterministic per-writer LCG: reproducible jitter so the guard does
+                    // not move because the randomness moved.
+                    let mut rng = (w as u64).wrapping_add(1);
+                    for _ in 0..REQUESTS {
+                        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        let jitter = (rng >> 33) % JITTER_MAX_US;
+                        if jitter > 0 {
+                            glommio::timer::sleep(Duration::from_micros(jitter)).await;
+                        }
+                        let syncs = syncs.clone();
+                        let r = coord
+                            .request_sync_two_phase(
+                                Some(delay),
+                                "gate-timeout".to_string(),
+                                || CaptureResult::Captured(()),
+                                move |_| async move {
+                                    syncs.set(syncs.get() + 1);
+                                    glommio::timer::sleep(fsync_sim).await;
+                                    Ok(())
+                                },
+                            )
+                            .await;
+                        assert!(r.is_ok());
+                    }
+                }));
+            }
+            for h in handles {
+                h.await;
+            }
+
+            let total = (WRITERS * REQUESTS) as u64;
+            let n_syncs = syncs.get();
+            // Ideal is one sync per round = REQUESTS (+1 for the initial idle fast path).
+            // Allow 40% slack for parallel-test preemption; a de-amortising fast path
+            // roughly doubles the count and clears this comfortably.
+            let max_syncs = (REQUESTS as u64 * 14) / 10;
+            assert!(
+                n_syncs <= max_syncs,
+                "de-amortisation: {n_syncs} syncs for {total} requests across {WRITERS} writers \
+                 (ideal ~{REQUESTS}, allowed ≤{max_syncs}); the fast path is firing tiny batches \
+                 under load instead of coalescing"
+            );
         });
     }
 
