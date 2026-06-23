@@ -22,6 +22,7 @@ pub mod api_key_test;
 pub mod batch;
 pub mod bug_kick_after_restart;
 pub mod batch_standalone_cleartext;
+pub mod batch_standalone_compressed;
 pub mod chaos;
 pub mod chaos_delete;
 pub mod chaos_watch;

@@ -7,6 +7,7 @@ use celeriant_msg::process_identify::{
 use celeriant_msg::process_client_requests::ClientRequest;
 use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_msg::request::requests::IdentifyRequest;
+use celeriant_client_wire::{build_frame, decompress_body, write_frame};
 use celeriant_wal::compression_type::CompressionType;
 use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V2, WireHeader};
 use rustls_pki_types::ServerName;
@@ -259,25 +260,32 @@ impl CeleriantClient {
         &mut self,
         request: &ClientRequest,
     ) -> Result<ClientResponse, ClientError> {
-        let compression_type = self.choose_compression(request);
-        let dict_bytes = self.current_dict.as_ref().map(|d| d.bytes.clone());
+        // Compress variable-size bodies up front with celeriant_client_wire's stateless dict
+        // helper (raw `&[u8]` dict, not a `!Sync` DictCodec), so this request future stays `Send`.
+        // Fixed-size requests are never compressed.
+        if request.is_variable_size() {
+            let body = request.serialize_body(PROTOCOL_VERSION_V2)?;
+            let type_id = request.request_type() as u32;
+            let compress = self.choose_compression(request) == CompressionType::ZstdDict;
+            let dict = self.current_dict.as_ref().map(|d| d.bytes.as_ref());
+            let frame = build_frame(type_id, body, dict, compress)?;
+            write_frame(&mut self.stream, &frame, self.max_request_size, PROTOCOL_VERSION_V2).await?;
+        } else {
+            ClientRequest::write_request(&mut self.stream, request, self.max_request_size, PROTOCOL_VERSION_V2)
+                .await?;
+        }
 
-        crate::tokio_wire::send_request(
-            &mut self.stream,
-            request,
-            compression_type,
-            self.max_request_size,
-            PROTOCOL_VERSION_V2,
-            dict_bytes.as_deref(),
-        )
-        .await?;
-
-        let response = crate::tokio_wire::read_response(
-            &mut self.stream,
-            self.max_response_size,
-            dict_bytes.as_deref(),
-        )
-        .await?;
+        // Fixed-size responses read straight from the header; variable-size bodies are decompressed
+        // with the same stateless dict helper once the body is in hand.
+        let header = WireHeader::from_reader(&mut self.stream, self.max_response_size).await?;
+        let response = if ClientResponse::is_fixed_size_variant(header.message_type) {
+            ClientResponse::read_from_header(header, &mut self.stream).await?
+        } else {
+            let raw = header.read_variable_body_raw(&mut self.stream).await?;
+            let dict = self.current_dict.as_ref().map(|d| d.bytes.as_ref());
+            let plain = decompress_body(header.compression_type, header.uncompressed_length, &raw, dict)?;
+            ClientResponse::deserialize_body(header.message_type, &plain, header.version)?
+        };
 
         match response {
             ClientResponse::ProtocolError(_) => Err(ClientError::ProtocolError),

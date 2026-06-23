@@ -214,6 +214,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             distributed: false,
         },
         TestEntry {
+            name: "batch_standalone_compressed",
+            description: "Plaintext standalone write throughput with ~3 KiB compressed (ZstdDict) payloads",
+            estimated_secs: 40,
+            categories: &[Core, Performance],
+            distributed: false,
+        },
+        TestEntry {
             name: "read_list_benchmark",
             description: "Read and list performance benchmark with large WAL and concurrent ops",
             estimated_secs: 150,

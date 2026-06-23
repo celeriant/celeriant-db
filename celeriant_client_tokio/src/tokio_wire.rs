@@ -1,71 +1,10 @@
-//! Tokio-side wire helpers.
-//!
-//! The wire layer (celeriant_wire) is thread-per-core / glommio-flavoured: its
-//! compression-aware helpers take `&DictCodec`, which is `!Send` and so can't sit on a
-//! tokio task that may move between worker threads at any await point. Tokio composes
-//! its own send/receive path here using the wire layer's raw escape hatches plus the
-//! stateless `compress_with_dict` / `decompress_with_dict` utilities.
-//!
-//! "Stateless" means the zstd dict is digested on every call — slower than the per-shard
-//! compiled `DictCodec` the server uses, but tokio's client path is not the server hot
-//! path. The simplicity is worth the throughput.
-use celeriant_msg::process_client_requests::ClientRequest;
+
 use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_msg::read_wire_data_error::ReadWireDataError;
 use celeriant_wal::compression_type::CompressionType;
-use celeriant_wire::codec::compression::{compress_with_dict, decompress_with_dict};
-use celeriant_wire::network::{
-    wire_error::WireError,
-    wire_header::{WireHeader, wire_header_write_variable_size_raw},
-};
-use futures_lite::{AsyncReadExt, AsyncWriteExt};
-
-/// Compression level used for client-side outbound writes. Mirrors the level the server
-/// defaults to; the level affects compressed size only, not decompressibility.
-const COMPRESSION_LEVEL: i32 = 3;
-
-/// Sends a request. Fixed-size variants are always uncompressed (no dict path). Variable-
-/// size variants may compress when `dict_bytes` is present and the caller asks for it.
-///
-/// Pre-Identify (no `dict_bytes`), variable-size variants are sent uncompressed.
-pub(crate) async fn send_request<W>(
-    writer: &mut W,
-    request: &ClientRequest,
-    compression: CompressionType,
-    max_message_size: u64,
-    version: u32,
-    dict_bytes: Option<&[u8]>,
-) -> Result<(), WireError>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    if !request.is_variable_size() {
-        return ClientRequest::write_request(writer, request, max_message_size, version).await;
-    }
-
-    let body = request.serialize_body(version)?;
-    let uncompressed_size = body.len() as u32;
-    let request_type_id = request.request_type() as u32;
-
-    let (effective_compression, frame_body) = match (compression, dict_bytes) {
-        (CompressionType::ZstdDict, Some(dict)) => (
-            CompressionType::ZstdDict,
-            compress_with_dict(&body, COMPRESSION_LEVEL, dict)?,
-        ),
-        _ => (CompressionType::None, body),
-    };
-
-    wire_header_write_variable_size_raw(
-        writer,
-        &frame_body,
-        request_type_id,
-        effective_compression,
-        uncompressed_size,
-        max_message_size,
-        version,
-    )
-    .await
-}
+use celeriant_wire::codec::compression::decompress_with_dict;
+use celeriant_wire::network::{wire_error::WireError, wire_header::WireHeader};
+use futures_lite::AsyncReadExt;
 
 /// Reads a response. Variable-size frames may arrive `ZstdDict`-compressed when
 /// `dict_bytes` is present; the wire layer hands back raw bytes and we decompress
@@ -122,17 +61,13 @@ where
 mod tests {
     use super::*;
     use celeriant_msg::process_client_responses::ClientResponse;
-    use celeriant_msg::request::requests::{WatchRequest, WriteRequest, SingleAggregateWrite};
     use celeriant_msg::response::responses::{AggregateDetailsResponse, WatchResponse};
     use celeriant_msg::response::watch_event::WatchResponseEvent;
-    use celeriant_wal::aggregate_key::AggregateKey;
     use celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES;
-    use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
     use celeriant_wire::codec::compression::DictCodec;
-    use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V2, WIRE_HEADER_SIZE};
+    use celeriant_wire::network::wire_header::PROTOCOL_VERSION_V2;
     use futures_lite::future::block_on;
     use futures_lite::io::Cursor;
-    use std::collections::HashMap;
 
     const MAX_SIZE: u64 = 64 * 1024 * 1024;
 
@@ -252,105 +187,6 @@ mod tests {
                 ReadWireDataError::ReadBodyFailure(WireError::MalformedFrame(_)) => {}
                 other => panic!("expected MalformedFrame, got {:?}", other),
             }
-        });
-    }
-
-    /// `send_request` on a fixed-size variant produces a frame readable by the server-
-    /// side `ClientRequest::read_from_header` — no dict, no compression.
-    #[test]
-    fn send_request_fixed_size_writes_uncompressed_frame() {
-        block_on(async {
-            let request = ClientRequest::Watch(WatchRequest {
-                correlation_id: Some(0x1234),
-                requested_latency_ms: Some(100),
-                shard_id: None,
-                orgs: None,
-                aggregate_types: None,
-                aggregates: None,
-                operation_types: None,
-            });
-
-            let mut buf = Vec::new();
-            send_request(&mut buf, &request, CompressionType::ZstdDict, MAX_SIZE, PROTOCOL_VERSION_V2, Some(BUILTIN_DICT_BYTES))
-                .await.expect("send_request");
-
-            // Even with ZstdDict + dict requested, fixed-size must still be uncompressed.
-            assert_eq!(buf[16], CompressionType::None.to_byte());
-
-            let codec = test_codec();
-            let header = WireHeader::from_reader(&mut Cursor::new(buf.clone()), MAX_SIZE)
-                .await.expect("from_reader");
-            let parsed = ClientRequest::read_from_header(
-                header,
-                &mut Cursor::new(buf[WIRE_HEADER_SIZE..].to_vec()),
-                &codec,
-            ).await.expect("read_from_header");
-            assert!(matches!(parsed, ClientRequest::Watch(_)));
-        });
-    }
-
-    /// `send_request` on a variable-size variant compresses with `ZstdDict` when the
-    /// caller supplies dict bytes; the server-side codec decodes it.
-    #[test]
-    fn send_request_variable_size_zstd_dict_roundtrip() {
-        block_on(async {
-            // Build a Write with enough payload that the codec path is exercised.
-            let key = AggregateKey::new(1, 2, 3);
-            let event = DatablockAggregateEvent {
-                client_seq: 0,
-                event_seq: 0,
-                event_id: Some(0xAA),
-                event_timestamp: 100,
-                event_type_major: 1,
-                event_type_minor: 0,
-                event_value: std::sync::Arc::new(vec![42u8; 4096]),
-                iv: None,
-            };
-            let request = ClientRequest::Write(WriteRequest {
-                correlation_id: Some(0xBEEF),
-                client_id: 1,
-                user_id: None,
-                writes: HashMap::from([(key, SingleAggregateWrite {
-                    events: vec![event],
-                    allow_create: true,
-                    expected_version: None,
-                    enforce_client_idempotency: false,
-                })]),
-            });
-
-            let mut buf = Vec::new();
-            send_request(&mut buf, &request, CompressionType::ZstdDict, MAX_SIZE, PROTOCOL_VERSION_V2, Some(BUILTIN_DICT_BYTES))
-                .await.expect("send_request");
-            assert_eq!(buf[16], CompressionType::ZstdDict.to_byte());
-
-            let codec = test_codec();
-            let header = WireHeader::from_reader(&mut Cursor::new(buf.clone()), MAX_SIZE)
-                .await.expect("from_reader");
-            let parsed = ClientRequest::read_from_header(
-                header,
-                &mut Cursor::new(buf[WIRE_HEADER_SIZE..].to_vec()),
-                &codec,
-            ).await.expect("read_from_header");
-            assert!(matches!(parsed, ClientRequest::Write(_)));
-        });
-    }
-
-    /// Pre-Identify: tokio has no cached dict, so variable-size variants must go out
-    /// uncompressed even if `ZstdDict` is requested.
-    #[test]
-    fn send_request_variable_size_no_dict_falls_back_to_none() {
-        block_on(async {
-            let request = ClientRequest::Write(WriteRequest {
-                correlation_id: Some(0x1),
-                client_id: 1,
-                user_id: None,
-                writes: HashMap::new(),
-            });
-
-            let mut buf = Vec::new();
-            send_request(&mut buf, &request, CompressionType::ZstdDict, MAX_SIZE, PROTOCOL_VERSION_V2, None)
-                .await.expect("send_request");
-            assert_eq!(buf[16], CompressionType::None.to_byte());
         });
     }
 

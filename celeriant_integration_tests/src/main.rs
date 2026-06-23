@@ -230,6 +230,7 @@ async fn dispatch_test(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         "api_key_test" => api_key_test::run().await,
         "batch" => batch::run().await,
         "batch_standalone_cleartext" => batch_standalone_cleartext::run().await,
+        "batch_standalone_compressed" => batch_standalone_compressed::run().await,
         "chaos" => chaos::run().await,
         "chaos_delete" => chaos_delete::run().await,
         "chaos_watch" => chaos_watch::run().await,

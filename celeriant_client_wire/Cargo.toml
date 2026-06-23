@@ -1,0 +1,13 @@
+[package]
+name = "celeriant_client_wire"
+description = "Internal: Send-safe, throughput-first client frame I/O over celeriant_wire"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+celeriant_wire = { path = "../celeriant_wire", version = "0.1.0" }
+celeriant_wal = { path = "../celeriant_wal", version = "0.1.0" }
+futures-lite.workspace = true

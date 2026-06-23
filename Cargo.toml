@@ -4,6 +4,7 @@ members = [
     "celeriant_msg",
     "celeriant_wal",
     "celeriant_wire",
+    "celeriant_client_wire",
     "celeriant_crypto",
     "celeriant_watch",
     "celeriant_memcache",
@@ -50,7 +51,7 @@ criterion = "0.8.0"
 tokio = { version = "1.48.0", features = ["full"] }
 tokio-util = { version = "0.7.17", features = ["compat"]}
 futures-util = { version = "0.3.31", features = ["io"] }
-glommio = { git = "https://github.com/utilitydelta/glommio", branch = "tcp-into-raw-fd-accepted-stream" }
+glommio = { git = "https://github.com/glommio/glommio" }
 tempfile = "3.23.0"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 uuid = { version = "1.18.1", features = ["v4"] }
@@ -67,7 +68,7 @@ thiserror = "2.0.2"
 rsa = { version = "0.9.9", features = ["sha2", "pem"] }
 sha2 = "0.10.9"
 rand = "0.8.5"
-flume = "0.11.1"
+flume = "0.12"
 bytes = "1.11.0"
 signal-hook = "0.3.18"
 async-trait = "0.1.89"
