@@ -10,11 +10,16 @@
 //!
 //! Key assertion: For every aggregate, `leader_count == follower_count` (strict equality)
 //!
+//! Follower visibility trails the leader's commit by design, so every follower
+//! count polls to the leader's count within `FOLLOWER_CONVERGENCE_TIMEOUT`.
+//! Equality after the poll stays strict.
+//!
 //! Run with: cargo run --bin invariant_replication_convergence_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{
-    count_events, s3_cluster_config, write_event, MinioContainer, TestServer,
+    count_events, poll_converged_count, s3_cluster_config, write_event, MinioContainer,
+    TestServer, FOLLOWER_CONVERGENCE_TIMEOUT,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::collections::HashMap;
@@ -77,7 +82,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Verifying counts on leader and follower...");
     for (shard_id, key) in keys.iter().enumerate() {
         let leader_count = count_events(&mut leader_client, key).await?;
-        let follower_count = count_events(&mut follower_client, key).await?;
+        let follower_count =
+            poll_converged_count(&mut follower_client, key, leader_count, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
         println!("    Shard {}: leader={}, follower={}", shard_id, leader_count, follower_count);
         assert_eq!(
             leader_count, follower_count,
@@ -157,7 +163,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut mismatches = 0;
     for (key, expected) in &expected_counts {
         let leader_count = count_events(&mut leader_client, key).await?;
-        let follower_count = count_events(&mut follower_client, key).await?;
+        let follower_count =
+            poll_converged_count(&mut follower_client, key, leader_count, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
 
         if leader_count != follower_count {
             println!(
@@ -187,7 +194,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Verifying {} sampled aggregates...", sample_size);
     for key in &sample_keys {
         let leader_count = count_events(&mut leader_client, key).await?;
-        let follower_count = count_events(&mut follower_client, key).await?;
+        let follower_count =
+            poll_converged_count(&mut follower_client, key, leader_count, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
         let expected = expected_counts.get(key).unwrap();
 
         println!(

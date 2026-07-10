@@ -52,12 +52,30 @@ impl Scraper {
                 .expect("reqwest client");
             let start = Instant::now();
             let interval = scrape_interval();
+            // NeverAhead needs the current FOLLOWER sampled strictly before the
+            // current leader within a tick: sampled follower-first, any state
+            // change between the two scrapes only advances the leader's read
+            // cursor, so cross-node skew can bias the comparison toward pass
+            // but never fake a violation. Order follows the previous tick's
+            // node_role and so swaps one tick late after a promotion — that
+            // tick falls inside the invariant's stability guard.
+            let mut config_leader_leads = true;
             loop {
                 let t_ms = elapsed_ms(start, Instant::now());
-                let (leader_sample, follower_sample) = tokio::join!(
-                    scrape_one(&client, &leader_host, &leader_url, t_ms),
-                    scrape_one(&client, &follower_host, &follower_url, t_ms),
-                );
+                let (leader_sample, follower_sample) = if config_leader_leads {
+                    let f = scrape_one(&client, &follower_host, &follower_url, t_ms).await;
+                    let l = scrape_one(&client, &leader_host, &leader_url, t_ms).await;
+                    (l, f)
+                } else {
+                    let l = scrape_one(&client, &leader_host, &leader_url, t_ms).await;
+                    let f = scrape_one(&client, &follower_host, &follower_url, t_ms).await;
+                    (l, f)
+                };
+                if leader_sample.ok && leader_sample.node_role >= 0.5 {
+                    config_leader_leads = true;
+                } else if follower_sample.ok && follower_sample.node_role >= 0.5 {
+                    config_leader_leads = false;
+                }
                 store_clone.push(leader_sample).await;
                 store_clone.push(follower_sample).await;
 

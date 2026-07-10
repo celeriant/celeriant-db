@@ -17,7 +17,7 @@
 //! Run with: cargo run --bin s3_stale_lease_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use crate::{count_events, poll_event_count, write_event, MinioContainer, ServerConfig, TestServer};
+use crate::{poll_converged_count, poll_event_count, write_event, MinioContainer, ServerConfig, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT};
 use celeriant_runtimes::RoutingRule;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::disk::versioned_block::deserialise_lease;
@@ -93,7 +93,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
-    let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
+    let follower_count =
+        poll_converged_count(&mut follower_client, &aggregate_key, 3, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     assert_eq!(follower_count, 3, "Follower should have 3 events");
     println!("  ✓ Cluster healthy: follower has {} events\n", follower_count);
 

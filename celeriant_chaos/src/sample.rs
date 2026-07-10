@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// One snapshot of metrics from one node, scraped at one instant.
-#[derive(Debug, Clone, Serialize)]
+/// Deserialize + container default: the replay bin loads stored run JSONs
+/// back through the checks, including runs recorded before newer fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NodeSample {
     pub host: String,
     /// Milliseconds since the scraper started. Monotonic, not wall-clock.
@@ -23,6 +26,22 @@ pub struct NodeSample {
     /// can self-heal before quiesce — only visible here.
     #[serde(default)]
     pub read_wal_seq_by_shard: BTreeMap<u32, u64>,
+    /// Per-shard follower parked-commit queue depth from
+    /// `celeriant_parked_commit_queue_depth{shard_id="N"}`. A plateau above
+    /// zero across ticks is a drain leak.
+    #[serde(default)]
+    pub parked_commit_depth_by_shard: BTreeMap<u32, u64>,
+    /// Per-shard ack barrier from `celeriant_last_self_acked_wal_seq{shard_id="N"}`:
+    /// the highest wal_seq this node acked as leader. Survives demotion and
+    /// restart — NeverAhead accepts a follower read covered by it.
+    #[serde(default)]
+    pub last_self_acked_by_shard: BTreeMap<u32, u64>,
+    /// Per-shard status from `celeriant_node_status_code{shard_id="N"}`
+    /// (1 = steady Follower). NeverAhead audits a shard only while its
+    /// follower is steady: catchup full-commits by design, so a catching-up
+    /// shard's read legitimately outruns the leader's scraped view.
+    #[serde(default)]
+    pub node_status_code_by_shard: BTreeMap<u32, u64>,
     pub writes_total: u64,
     pub write_errors_total: u64,
     pub leader_elections_total: u64,
@@ -115,6 +134,11 @@ pub struct NodeSample {
     pub tombstone_snapshot_regression_total: u64,
     /// A committed batch carried a version at/below the cached one on the write path.
     pub position_snapshot_stale_commit_total: u64,
+    /// Post-burst commit-notify sends (leader side). sent(leader) ==
+    /// received(follower) across a run means no notify was lost.
+    pub commit_notify_sent_total: u64,
+    /// Guard-passing empty-batch commit-notifies accepted (follower side).
+    pub commit_notify_received_total: u64,
 }
 
 impl NodeSample {
@@ -128,6 +152,9 @@ impl NodeSample {
             wal_seq_max: 0,
             wal_seq_by_shard: BTreeMap::new(),
             read_wal_seq_by_shard: BTreeMap::new(),
+            parked_commit_depth_by_shard: BTreeMap::new(),
+            last_self_acked_by_shard: BTreeMap::new(),
+            node_status_code_by_shard: BTreeMap::new(),
             writes_total: 0,
             write_errors_total: 0,
             leader_elections_total: 0,
@@ -170,6 +197,8 @@ impl NodeSample {
             catchup_fetch_error_total: 0,
             tombstone_snapshot_regression_total: 0,
             position_snapshot_stale_commit_total: 0,
+            commit_notify_sent_total: 0,
+            commit_notify_received_total: 0,
         }
     }
 }
@@ -185,6 +214,9 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
     let mut wal_seq_max: u64 = 0;
     let mut wal_seq_by_shard: BTreeMap<u32, u64> = BTreeMap::new();
     let mut read_wal_seq_by_shard: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut parked_commit_depth_by_shard: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut last_self_acked_by_shard: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut node_status_code_by_shard: BTreeMap<u32, u64> = BTreeMap::new();
     let mut client_connections_active: u64 = 0;
     let mut watch_subscribers_active: u64 = 0;
 
@@ -229,6 +261,8 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         "celeriant_catchup_fetch_error_total",
         "celeriant_tombstone_snapshot_regression_total",
         "celeriant_position_snapshot_stale_commit_total",
+        "celeriant_commit_notify_sent_total",
+        "celeriant_commit_notify_received_total",
     ];
 
     for line in body.lines() {
@@ -274,6 +308,33 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
             }
             continue;
         }
+        if name == "celeriant_parked_commit_queue_depth" {
+            if let Ok(v) = value_str.parse::<f64>()
+                && let Some(shard_id) = extract_label(name_part, "shard_id")
+                && let Ok(id) = shard_id.parse::<u32>()
+            {
+                parked_commit_depth_by_shard.insert(id, v as u64);
+            }
+            continue;
+        }
+        if name == "celeriant_last_self_acked_wal_seq" {
+            if let Ok(v) = value_str.parse::<f64>()
+                && let Some(shard_id) = extract_label(name_part, "shard_id")
+                && let Ok(id) = shard_id.parse::<u32>()
+            {
+                last_self_acked_by_shard.insert(id, v as u64);
+            }
+            continue;
+        }
+        if name == "celeriant_node_status_code" {
+            if let Ok(v) = value_str.parse::<f64>()
+                && let Some(shard_id) = extract_label(name_part, "shard_id")
+                && let Ok(id) = shard_id.parse::<u32>()
+            {
+                node_status_code_by_shard.insert(id, v as u64);
+            }
+            continue;
+        }
         if name == "celeriant_client_connections_active" {
             if let Ok(v) = value_str.parse::<f64>() {
                 client_connections_active = client_connections_active.saturating_add(v as u64);
@@ -304,6 +365,9 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         wal_seq_max,
         wal_seq_by_shard,
         read_wal_seq_by_shard,
+        parked_commit_depth_by_shard,
+        last_self_acked_by_shard,
+        node_status_code_by_shard,
         writes_total: get("celeriant_writes_total"),
         write_errors_total: get("celeriant_write_errors_total"),
         leader_elections_total: get("celeriant_leader_elections_total"),
@@ -344,6 +408,8 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         catchup_fetch_error_total: get("celeriant_catchup_fetch_error_total"),
         tombstone_snapshot_regression_total: get("celeriant_tombstone_snapshot_regression_total"),
         position_snapshot_stale_commit_total: get("celeriant_position_snapshot_stale_commit_total"),
+        commit_notify_sent_total: get("celeriant_commit_notify_sent_total"),
+        commit_notify_received_total: get("celeriant_commit_notify_received_total"),
         barrier_sync_fsync_total: get("celeriant_barrier_sync_fsync_total"),
         barrier_sync_fsync_failed_total: get("celeriant_barrier_sync_fsync_failed_total"),
     }

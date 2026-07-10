@@ -5,6 +5,12 @@ pub enum NodeStatus {
     /// Runtime kick: follower is catching up from S3, rejects TCP replication.
     /// Transitions directly back to Follower when catchup completes.
     FollowerCatchingUp { leader_lease_epoch: u64 },
+    /// Won the lease CAS, running the promotion pipeline (reconcile, catchup,
+    /// upload) before the Leader flip. Rejects all TCP replication (not a
+    /// follower state) and refuses heartbeat adoption at epoch <= its own, so a
+    /// deposed leader cannot re-open the replication gate mid-window. Carries
+    /// the won lease's TTL: an overrunning promotion decays to Fenced.
+    Promoting { lease_epoch: u64 },
     /// Boot-time S3 catchup, before election. TTL-exempt.
     BootCatchup,
     Fenced,
@@ -45,9 +51,13 @@ impl NodeStatus {
         matches!(self, NodeStatus::Follower { .. } | NodeStatus::FollowerCatchingUp { .. })
     }
 
+    pub fn is_promoting(&self) -> bool {
+        matches!(self, NodeStatus::Promoting { .. })
+    }
+
     pub fn lease_epoch(&self) -> Option<u64> {
         match self {
-            NodeStatus::Leader { lease_epoch } => Some(*lease_epoch),
+            NodeStatus::Leader { lease_epoch } | NodeStatus::Promoting { lease_epoch } => Some(*lease_epoch),
             NodeStatus::Standalone => Some(0),
             _ => None,
         }
@@ -55,7 +65,7 @@ impl NodeStatus {
 
     pub fn lease_epoch_for_logging(&self) -> u64 {
         match self {
-            NodeStatus::Leader { lease_epoch } => *lease_epoch,
+            NodeStatus::Leader { lease_epoch } | NodeStatus::Promoting { lease_epoch } => *lease_epoch,
             NodeStatus::Follower { leader_lease_epoch }
             | NodeStatus::FollowerCatchingUp { leader_lease_epoch } => *leader_lease_epoch,
             NodeStatus::Standalone | NodeStatus::Fenced | NodeStatus::BootCatchup => 0,
@@ -87,6 +97,13 @@ impl NodeStatus {
             // Leader -> Leader: TTL refresh after S3 renewal (lease_epoch unchanged).
             // Leader -> Follower: lost S3 CAS during election.
             (Leader { .. }, Leader { .. }) | (Leader { .. }, Follower { .. }) => true,
+
+            // A CAS win enters Promoting from any non-leader elective state; a
+            // re-election retry re-publishes it.
+            (Follower { .. } | FollowerCatchingUp { .. } | Fenced | BootCatchup | Promoting { .. }, Promoting { .. }) => true,
+
+            // Promotion completes into Leader, or steps down on a lost race.
+            (Promoting { .. }, Leader { .. }) | (Promoting { .. }, Follower { .. }) => true,
 
             // Everything else is invalid
             _ => false,
@@ -216,6 +233,41 @@ mod tests {
         assert!(boot.is_valid_transition_to(&NodeStatus::Fenced));
         assert!(!boot.is_valid_transition_to(&NodeStatus::FollowerCatchingUp { leader_lease_epoch: 1 }));
         assert!(!boot.is_valid_transition_to(&NodeStatus::Standalone));
+    }
+
+    #[test]
+    fn promoting_helpers() {
+        let status = NodeStatus::Promoting { lease_epoch: 9 };
+        assert!(!status.is_leader());
+        assert!(!status.is_follower());
+        assert!(!status.is_any_follower_state(), "Promoting must not accept TCP replication");
+        assert!(!status.is_fenced());
+        assert!(!status.is_catching_up());
+        assert!(status.is_promoting());
+        assert_eq!(status.lease_epoch(), Some(9));
+        assert_eq!(status.lease_epoch_for_logging(), 9);
+    }
+
+    #[test]
+    fn valid_transitions_around_promoting() {
+        let promoting = NodeStatus::Promoting { lease_epoch: 2 };
+        // CAS win enters Promoting from every non-leader elective state.
+        for from in [
+            NodeStatus::Follower { leader_lease_epoch: 1 },
+            NodeStatus::FollowerCatchingUp { leader_lease_epoch: 1 },
+            NodeStatus::Fenced,
+            NodeStatus::BootCatchup,
+            NodeStatus::Promoting { lease_epoch: 1 },
+        ] {
+            assert!(from.is_valid_transition_to(&promoting), "{from:?} -> Promoting");
+        }
+        assert!(!NodeStatus::Leader { lease_epoch: 1 }.is_valid_transition_to(&promoting), "a sitting leader renews, never promotes");
+        assert!(!NodeStatus::Standalone.is_valid_transition_to(&promoting));
+        // Promotion completes into Leader, steps down on a lost race, or fences.
+        assert!(promoting.is_valid_transition_to(&NodeStatus::Leader { lease_epoch: 2 }));
+        assert!(promoting.is_valid_transition_to(&NodeStatus::Follower { leader_lease_epoch: 3 }));
+        assert!(promoting.is_valid_transition_to(&NodeStatus::Fenced));
+        assert!(!promoting.is_valid_transition_to(&NodeStatus::Standalone));
     }
 
     #[test]

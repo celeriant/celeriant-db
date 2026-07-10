@@ -258,6 +258,7 @@ async fn dispatch_test(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         "edge_split_brain_s3_unavailable" => edge_split_brain_s3_unavailable::run().await,
         "edge_stale_cache_rotation" => edge_stale_cache_rotation::run().await,
         "edge_wal_tip_hash_divergence" => edge_wal_tip_hash_divergence::run().await,
+        "follower_notify_liveness" => follower_notify_liveness::run().await,
         "follower_read_snapshot" => follower_read_snapshot::run().await,
         "identity_test" => identity_test::run().await,
         "invariant_clock_drift_rejection" => invariant_clock_drift_rejection::run().await,
@@ -331,6 +332,7 @@ async fn dispatch_test(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         "s3_to_tcp_failback" => s3_to_tcp_failback::run().await,
         "typed_operations" => typed_operations::run().await,
         "watch_failover" => watch_failover::run().await,
+        "watch_follower_promotion" => watch_follower_promotion::run().await,
         "watch_test" => watch_test::run().await,
         _ => {
             eprintln!("unknown test: {name}");

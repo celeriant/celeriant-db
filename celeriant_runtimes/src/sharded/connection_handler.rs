@@ -1215,6 +1215,28 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
     let raw_status = if current_status.is_any_follower_state() {
         // Normal path: already a follower, accept heartbeat.
         current_status.raw()
+    } else if let NodeStatus::Promoting { lease_epoch } = current_status.raw() {
+        // Raw, not effective: even a decayed (expired) promotion must refuse a
+        // zombie's adoption — a heartbeat at epoch <= our won epoch is from a
+        // deposed leader and must not re-open the replication gate mid-window.
+        match promoting_heartbeat_adoption(lease_epoch, req.lease_epoch) {
+            Some(adopted) => {
+                tracing::warn!(
+                    shard_id = req.shard_id,
+                    promoting_lease_epoch = lease_epoch,
+                    remote_lease_epoch = req.lease_epoch,
+                    "Promotion lost the race to a higher-epoch leader, stepping down to follower"
+                );
+                adopted
+            }
+            None => {
+                metrics::counter!("celeriant_heartbeat_received_outcomes_total", &[("shard_id", shard_label.clone()), ("outcome", "rejected_promoting".to_string())]).increment(1);
+                return ClusterResponse::Heartbeat(HeartbeatResponse {
+                    correlation_id: req.correlation_id,
+                    result: HeartbeatResult::Rejected(HeartbeatRejection::NotAFollower),
+                });
+            }
+        }
     } else if current_status.is_fenced() {
         // Fenced node (e.g. old leader whose TTL expired): adopt follower role
         // with the remote leader's lease_epoch.
@@ -1259,7 +1281,10 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
             max_allowed_ms = ctx.config.max_clock_drift_ms,
             "Clock drift too high, fencing all shards"
         );
-        let fenced = ValidatedNodeStatus::create_fenced();
+        // Remember whether leadership was held at fence time: a later demotion may
+        // rewind an ex-leader's tail to its ack barrier, but a fenced ex-follower's
+        // tail is peer data that must survive.
+        let fenced = ValidatedNodeStatus::create_fenced(ctx.shard_wal.node_status.get().held_leadership());
         set_node_status_and_metric(&ctx.shard_wal.node_status, fenced, ctx.current_shard_id as u32);
         broadcast_status(ctx, fenced).await;
         metrics::counter!("celeriant_heartbeat_received_outcomes_total", &[("shard_id", shard_label.clone()), ("outcome", "rejected_clock_drift".to_string())]).increment(1);
@@ -1275,14 +1300,19 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
     }
 
     // A heartbeat from a higher-epoch peer (req.lease_epoch > local) demotes a non-follower
-    // (Fenced/Leader) to follower. Cull our un-acked speculative tail first, mirroring the
-    // election-path CullSpeculativeTail, or it strands (write>read) and S3 catchup wedges on
-    // no-common-ancestor. A self-reclaim never accepts a peer heartbeat and a steady follower
-    // has no tail, so neither is affected. Cull first so a following EnterS3Catchup lands after.
+    // (Fenced/Leader) to follower. Reconcile the durable tail first, mirroring the
+    // election-path CullSpeculativeTail, or an own-speculation tail strands (write>read)
+    // and S3 catchup wedges on no-common-ancestor. A self-reclaim never accepts a peer
+    // heartbeat, so it is unaffected. Reconcile first so a following EnterS3Catchup lands
+    // after. The mode follows the same rule as promotion_cull_flags: rewinding to the ack
+    // barrier is only sound when leadership was actually held (last_self_acked is a real
+    // floor and the tail is own speculation); a fenced ex-follower or a booting node may
+    // hold a peer tail, which provenance-checked reconciliation keeps parked.
     let demoting_to_higher_epoch_peer = !current_status.is_any_follower_state()
         && raw_status.is_follower()
         && req.lease_epoch > local_lease_epoch;
     if demoting_to_higher_epoch_peer {
+        let mode = crate::sharded::shard::demotion_mode(current_status.held_leadership());
         let shard_count = ctx.intrashard_sender.nr_consumers();
         for peer in 0..shard_count {
             if peer == ctx.current_shard_id {
@@ -1290,12 +1320,12 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
             }
             let _ = try_send_with_retry(
                 ctx.intrashard_sender.as_ref(), peer,
-                IntrashardMessages::CullSpeculativeTail { rewind_to_ack_barrier: true }, 10,
+                IntrashardMessages::CullSpeculativeTail { mode }, 10,
             ).await;
         }
-        if let Err(e) = ctx.shard_wal.cull_speculative_tail_for_promotion(true).await {
+        if let Err(e) = ctx.shard_wal.reconcile_durable_tail(mode).await {
             tracing::warn!(shard_id = ctx.current_shard_id, error = ?e,
-                "heartbeat-demotion cull failed, catchup may wedge on no-common-ancestor");
+                "heartbeat-demotion reconcile failed, catchup may wedge on no-common-ancestor");
         }
     }
 
@@ -1502,9 +1532,18 @@ fn create_watch_session<R: ReplicationClient + 'static, D: S3Downloader + 'stati
     Ok(WatchSession::new(watcher_id, subscribed_client, shard_wal.clone()))
 }
 
+/// A promoting node's reaction to a heartbeat: refuse adoption at epoch <= its
+/// own (only a deposed leader heartbeats at those epochs — adopting would
+/// re-open the replication gate mid-promotion); a higher epoch is a lost race
+/// and steps down to follow the winner.
+fn promoting_heartbeat_adoption(promoting_lease_epoch: u64, req_lease_epoch: u64) -> Option<NodeStatus> {
+    (req_lease_epoch > promoting_lease_epoch).then_some(NodeStatus::Follower { leader_lease_epoch: req_lease_epoch })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use celeriant_shard::shard_wal::TailReconciliation;
     use celeriant_msg::request::{
         read_filters::ReadFilters,
         requests::{
@@ -1516,6 +1555,67 @@ mod tests {
     use celeriant_shard::timestamp_config::TimestampPrecision;
     use celeriant_wal::aggregate_key::AggregateKey;
     use std::collections::HashMap;
+
+    /// A promoting node refuses heartbeat adoption at epoch <= its own (zombie
+    /// leader must not re-open the replication gate mid-window) and steps down
+    /// only for a genuinely newer election win.
+    #[test]
+    fn promoting_heartbeat_adoption_by_epoch() {
+        // (promoting epoch, heartbeat epoch, expected adoption)
+        let cases: &[(u64, u64, Option<NodeStatus>)] = &[
+            (5, 4, None),
+            (5, 5, None),
+            (5, 6, Some(NodeStatus::Follower { leader_lease_epoch: 6 })),
+        ];
+        for &(own, req, expected) in cases {
+            assert_eq!(promoting_heartbeat_adoption(own, req), expected, "own={own} req={req}");
+        }
+    }
+
+    /// A heartbeat demotion may rewind to the ack barrier ONLY when the demoted
+    /// node actually held leadership — the same rule promotion_cull_flags encodes
+    /// via the shared derivation. Every other pre-demotion state maps to
+    /// provenance-checked reconciliation (a peer tail must survive).
+    #[test]
+    fn heartbeat_demotion_mode_by_pre_demotion_state() {
+        use celeriant_distributed::validated_node_status::{unix_epoch_now_ms, ValidatedNodeStatus};
+        let expired = unix_epoch_now_ms().saturating_sub(10_000);
+        // (name, pre-demotion status, expected mode)
+        let cases: &[(&str, ValidatedNodeStatus, TailReconciliation)] = &[
+            (
+                "ttl_expired_leader",
+                ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 1 }, 500, expired),
+                TailReconciliation::RewindToAckBarrier,
+            ),
+            (
+                "explicitly_fenced_ex_leader",
+                ValidatedNodeStatus::create_fenced(true),
+                TailReconciliation::RewindToAckBarrier,
+            ),
+            (
+                "explicitly_fenced_ex_follower",
+                ValidatedNodeStatus::create_fenced(false),
+                TailReconciliation::ReconcileAsFollower,
+            ),
+            (
+                "ttl_expired_follower",
+                ValidatedNodeStatus::create_custom_status(NodeStatus::Follower { leader_lease_epoch: 1 }, 500, expired),
+                TailReconciliation::ReconcileAsFollower,
+            ),
+            (
+                "booting_node",
+                ValidatedNodeStatus::create_boot_catchup(),
+                TailReconciliation::ReconcileAsFollower,
+            ),
+        ];
+        for (name, status, expected) in cases {
+            assert_eq!(
+                crate::sharded::shard::demotion_mode(status.held_leadership()),
+                *expected,
+                "{name}",
+            );
+        }
+    }
 
     fn test_config(num_shards: u32, routing_rule: crate::RoutingRule) -> ShardConfig {
         ShardConfig {

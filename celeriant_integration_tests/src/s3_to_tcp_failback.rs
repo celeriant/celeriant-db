@@ -20,7 +20,7 @@
 //! 4. Still S3-dead: events 9-10 over live TCP replication.
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use crate::{count_events, poll_event_count, s3_cluster_config, write_event, MinioContainer, TestServer, TcpProxy};
+use crate::{poll_converged_count, poll_event_count, s3_cluster_config, write_event, MinioContainer, TestServer, TcpProxy, FOLLOWER_CONVERGENCE_TIMEOUT};
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -69,7 +69,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         write_retry(&mut leader_client, &leader, &key, i, i == 1).await?;
     }
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
-    let n = count_events(&mut follower_client, &key).await?;
+    let n =
+        poll_converged_count(&mut follower_client, &key, 3, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     assert_eq!(n, 3, "follower should have 3 events after TCP replication");
     drop(follower_client);
 

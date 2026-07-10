@@ -2,7 +2,7 @@
 //!
 //! Successor to the deleted `metamorphic_rollback_parity` (`fe90ecc`):
 //! replication rollback was replaced by an in-place spin retry plus
-//! `cull_speculative_tail_for_promotion` (`shard_wal.rs`). Covers
+//! `reconcile_durable_tail` (`shard_wal.rs`). Covers
 //! `docs/pending-testing/remaining-tests.md` item 1.
 //!
 //! Empirical note (first run of this test): the two recovery mechanisms map
@@ -44,11 +44,10 @@
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{
-    count_events,
     metamorphic_common::{diff_aggregate, format_key, wait_for_promotion, DiffMode},
-    poll_event_count, read_all_batches, s3_cluster_config, scrape_counter,
+    poll_converged_count, poll_event_count, read_all_batches, s3_cluster_config, scrape_counter,
     wait_for_election_and_replication, write_event, write_large_event, MinioContainer,
-    TcpProxy, TestServer,
+    TcpProxy, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES;
@@ -115,7 +114,7 @@ fn workload_keys() -> Vec<AggregateKey> {
 /// S3 (A-only proxy to MinIO) holds the spin retry open; A self-fences at
 /// lease expiry (~10s), B promotes via direct S3, and B's higher-epoch
 /// heartbeat demotes A in-process — the only path where
-/// `cull_speculative_tail_for_promotion` meets the tail.
+/// `reconcile_durable_tail` meets the tail.
 async fn phase_fence_demotion_cull(port_base: u16) -> Result<(), Box<dyn std::error::Error>> {
     let ports = PhasePorts::new(port_base);
     let (node_a_port, node_b_port, minio_port) = (ports.node_a, ports.node_b, ports.minio);
@@ -160,7 +159,7 @@ async fn phase_fence_demotion_cull(port_base: u16) -> Result<(), Box<dyn std::er
     }
     let mut b_client = CeleriantClient::connect(node_b.address()).await?;
     for key in &keys {
-        let n = count_events(&mut b_client, key).await?;
+        let n = poll_converged_count(&mut b_client, key, BASELINE_EVENTS as usize, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
         if n as u64 != BASELINE_EVENTS {
             return Err(format!(
                 "baseline not replicated to B: aggregate {} has {} events, expected {}",
@@ -264,7 +263,7 @@ async fn phase_fence_demotion_cull(port_base: u16) -> Result<(), Box<dyn std::er
     println!("  A counters: {}", m.report());
     if m.reframed != 0 || m.divergence_advanced != 0 {
         return Err(format!(
-            "tail removed by truncation/reframe ({}) — cull_speculative_tail_for_promotion \
+            "tail removed by truncation/reframe ({}) — reconcile_durable_tail \
              did not fire before catchup on the in-process demotion", m.report()
         ).into());
     }
@@ -323,7 +322,7 @@ async fn phase_kill_boot_truncation(port_base: u16, force_reframe: bool) -> Resu
     }
     let mut b_client = CeleriantClient::connect(node_b.address()).await?;
     for key in &keys {
-        let n = count_events(&mut b_client, key).await?;
+        let n = poll_converged_count(&mut b_client, key, BASELINE_EVENTS as usize, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
         if n as u64 != BASELINE_EVENTS {
             return Err(format!(
                 "baseline not replicated to B: aggregate {} has {} events, expected {}",
@@ -421,6 +420,13 @@ async fn phase_kill_boot_truncation(port_base: u16, force_reframe: bool) -> Resu
         // Simulated S3 GC: remove every batch at/below the tail base so the
         // divergence scan cannot match an ancestor by download. Coverage from
         // read+1 upward stays intact, so the reframe's contiguity gate holds.
+        //
+        // Zero deletions is legitimate: commit-notify drives the confirmed
+        // index to B's tip between bursts, so the promotion floor sits above
+        // B's durable write and upload_s3_promotion_batch has no unconfirmed
+        // tail to upload — the ancestor-free state this GC simulates is then
+        // already the natural one. The gate proves the state, not the
+        // deletion count.
         let mut deleted = 0;
         for shard_id in 0..NUM_SHARDS {
             let prefix = format!("cluster/fallback/shard_{:03}/", shard_id);
@@ -433,12 +439,23 @@ async fn phase_kill_boot_truncation(port_base: u16, force_reframe: bool) -> Resu
                 }
             }
         }
-        if deleted == 0 {
-            return Err("forced-reframe setup found no S3 batches at/below the tail base to GC — \
-                        the reframe precondition was not created"
-                .into());
+        for shard_id in 0..NUM_SHARDS {
+            let prefix = format!("cluster/fallback/shard_{:03}/", shard_id);
+            for key in minio.list_objects(&prefix).await? {
+                if let Some((_, last_wal)) = parse_batch_range(&key) {
+                    if last_wal <= BASELINE_EVENTS {
+                        return Err(format!(
+                            "S3 GC left a batch at/below the tail base (wal_seq {}): {}",
+                            BASELINE_EVENTS, key
+                        ).into());
+                    }
+                }
+            }
         }
-        println!("\nSimulated S3 GC: deleted {} batch(es) at/below wal_seq {}.", deleted, BASELINE_EVENTS);
+        println!(
+            "\nSimulated S3 GC: deleted {} batch(es); no S3 coverage at/below wal_seq {} remains.",
+            deleted, BASELINE_EVENTS
+        );
     }
 
     println!("\nRestarting node A — boot catchup must drop the tail, then converge...");

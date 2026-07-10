@@ -24,8 +24,8 @@
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{
-    count_events, is_leader, s3_cluster_config, write_event, write_large_event, MinioContainer,
-    TcpProxy, TestServer,
+    count_events, is_leader, poll_converged_count, s3_cluster_config, write_event,
+    write_large_event, MinioContainer, TcpProxy, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
@@ -117,8 +117,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Confirm baseline replication works before stressing.
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
-    let fc0 = count_events(&mut follower_client, &key_shard0).await?;
-    let fc1 = count_events(&mut follower_client, &key_shard1).await?;
+    let fc0 =
+        poll_converged_count(&mut follower_client, &key_shard0, 1, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
+    let fc1 =
+        poll_converged_count(&mut follower_client, &key_shard1, 1, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     assert_eq!(fc0, 1, "Shard 0 baseline event must replicate");
     assert_eq!(fc1, 1, "Shard 1 baseline event must replicate");
     println!("  Cluster healthy, baseline replication confirmed\n");
@@ -296,7 +298,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
 
     let final_lc0 = count_events(&mut leader_client, &key_shard0).await?;
-    let final_fc0 = count_events(&mut follower_client, &key_shard0).await?;
+    let final_fc0 =
+        poll_converged_count(&mut follower_client, &key_shard0, final_lc0, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     println!("  Shard 0: leader={}, follower={}", final_lc0, final_fc0);
     assert_eq!(
         final_lc0, final_fc0,
@@ -304,7 +307,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let final_lc1 = count_events(&mut leader_client, &key_shard1).await?;
-    let final_fc1 = count_events(&mut follower_client, &key_shard1).await?;
+    let final_fc1 =
+        poll_converged_count(&mut follower_client, &key_shard1, final_lc1, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     println!("  Shard 1: leader={}, follower={}", final_lc1, final_fc1);
     assert_eq!(
         final_lc1, final_fc1,

@@ -33,6 +33,20 @@ use crate::amortisation::coordinator::CaptureResult;
 use crate::error::shard_fsync_error::ShardFsyncError;
 use crate::watch_event_collector::WatchEventCollector;
 
+/// Who commits the read-side (visibility) half of a durable batch, and when.
+/// Provenance decides this, not `is_leader()`: the four write sources in the
+/// system map onto three commit rules.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CommitTarget {
+    /// Leader write: read untouched at fsync; commit_pcd advances it on replication ACK.
+    DeferToReplicationAck,
+    /// Follower live-TCP apply: park the read-side commit; drained when a carrier's
+    /// `leader_confirmed_wal_seq` covers the batch tip.
+    DeferToLeaderConfirmed,
+    /// S3 catchup + standalone: read = write at fsync.
+    FullCommit,
+}
+
 pub(crate) struct FsyncCapturedData {
     pub required_disk_space: u64,
     pub sync_positions_snapshot: SyncPositionsSnapshot,
@@ -64,6 +78,7 @@ pub(crate) fn capture_fsync_snapshot(shard_mem_cache: &Rc<RefCell<MemCache>>) ->
 
 pub(crate) async fn commit_fsync_with_rollback(
     node_status: NodeStatus,
+    commit_target: CommitTarget,
     log_segments_cache: Rc<LogSegmentsCache>,
     shard_mem_cache: Rc<RefCell<MemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
@@ -98,18 +113,19 @@ pub(crate) async fn commit_fsync_with_rollback(
             });
         }
 
-        if node_status.is_leader() {
-            // Leader: defer sidecar write until replication confirms.
-            // Snapshot current accumulator for the sealed segment.
-            let old_log_id = log_segments_cache.active_log_id();
-            shard_mem_cache.borrow_mut().store_sealed_segment_summary(old_log_id);
-        } else {
-            // Non-leader: summary is complete, write sidecar now.
+        if commit_target == CommitTarget::FullCommit {
+            // Full commit: summary is complete, write sidecar now.
             write_segment_summary_sidecar(
                 log_segments_cache.shard_dir(),
                 log_segments_cache.active_log_id(),
                 &shard_mem_cache,
             ).await?;
+        } else {
+            // Deferred commit: the summary is incomplete until the deferred
+            // read-side commit drains. Snapshot the accumulator for the sealed
+            // segment; the post-commit sweep writes the sidecar.
+            let old_log_id = log_segments_cache.active_log_id();
+            shard_mem_cache.borrow_mut().store_sealed_segment_summary(old_log_id);
         }
 
         log_segments_cache
@@ -120,12 +136,13 @@ pub(crate) async fn commit_fsync_with_rollback(
 
     let active_log_segment = log_segments_cache.active();
 
-    match sync(active_log_segment.clone(), &mut captured.sync_positions_snapshot, node_status).await {
+    match sync(active_log_segment.clone(), &mut captured.sync_positions_snapshot, commit_target).await {
         Ok(updated_log_segment_file_metadata) => {
             let wal_seq = updated_log_segment_file_metadata.write.wal_seq;
             commit_sync(
                 node_status,
-                shard_mem_cache,
+                commit_target,
+                shard_mem_cache.clone(),
                 watched_aggregates,
                 captured.sync_positions_snapshot,
                 active_log_segment.clone(),
@@ -139,8 +156,15 @@ pub(crate) async fn commit_fsync_with_rollback(
             // read ≤ write holds in every interleaving. Rewind sites
             // (truncate, demotion cull) set read first for the same reason.
             metrics::gauge!("celeriant_wal_seq", &shard_label).set(wal_seq as f64);
-            let read_wal_seq = active_log_segment.metadata.borrow().read.as_ref().map_or(0, |r| r.wal_seq);
+            // Shard-level committed cursor: the active segment's read is None
+            // right after rotation while the cursor sits in the predecessor.
+            let read_wal_seq = log_segments_cache.committed_read_wal_seq();
             metrics::gauge!("celeriant_read_wal_seq", &shard_label).set(read_wal_seq as f64);
+            if commit_target == CommitTarget::DeferToLeaderConfirmed {
+                metrics::gauge!("celeriant_follower_read_lag", &shard_label).set(wal_seq.saturating_sub(read_wal_seq) as f64);
+                metrics::gauge!("celeriant_parked_commit_queue_depth", &shard_label)
+                    .set(shard_mem_cache.borrow().parked_commit_count() as f64);
+            }
             Ok(())
         }
         Err(e) => {
@@ -154,6 +178,7 @@ pub(crate) async fn commit_fsync_with_rollback(
 /// Commits a successful sync by updating caches and broadcasting watch events.
 fn commit_sync(
     node_status: NodeStatus,
+    commit_target: CommitTarget,
     shard_mem_cache: Rc<RefCell<MemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
     mut sync_positions_snapshot: SyncPositionsSnapshot,
@@ -161,8 +186,9 @@ fn commit_sync(
     mut new_metadata: LogSegmentFileMetadata,
     dict_codec: &DictCodec,
 ) {
-    // Non-leader: advance read = write here. Leader: read stays behind until commit_pcd.
-    if !node_status.is_leader() {
+    // Full commit: advance read = write here. Deferred targets: read stays
+    // behind until commit_pcd (replication ACK or leader-confirmed drain).
+    if commit_target == CommitTarget::FullCommit {
         new_metadata.advance_visible_position();
     }
 
@@ -207,39 +233,52 @@ fn commit_sync(
             log_segment_file.aggregate_chain_tips.borrow_mut().insert(key.clone(), queue_item.metablock_absolute_pos);
         }
 
-        if !node_status.is_leader() {
+        if commit_target == CommitTarget::FullCommit {
             shard_mem_cache.update_segment_summary(&queue_item.metablock);
         }
 
         match &queue_item.metablock.wal_metablock_type {
             MetablockKind::EventBatchMetadata(event_batch_metadata) => {
-                if !node_status.is_leader() {
-                    event_collector.add_write_event(event_batch_metadata);
+                match commit_target {
+                    CommitTarget::FullCommit => {
+                        event_collector.add_write_event(event_batch_metadata);
 
-                    if event_batch_metadata.aggregate_version == FIRST_AGGREGATE_VERSION {
-                        event_collector.add_create_event(event_batch_metadata.aggregate_key.clone());
+                        if event_batch_metadata.aggregate_version == FIRST_AGGREGATE_VERSION {
+                            event_collector.add_create_event(event_batch_metadata.aggregate_key.clone());
+                        }
+
+                        // Update read and write snapshots so the aggregate is visible.
+                        // On the replication path, aggregate_queue_positions is empty
+                        // so commit_sync_positions_snapshot won't update these.
+                        shard_mem_cache.commit_position_snapshot(
+                            event_batch_metadata, log_id, queue_item.metablock_absolute_pos, CachePath::Read,
+                        );
+                        shard_mem_cache.commit_position_snapshot(
+                            event_batch_metadata, log_id, queue_item.metablock_absolute_pos, CachePath::Write,
+                        );
+
+                        let size_bytes = queue_item.size_bytes();
+                        shard_mem_cache.cache_recent_write(
+                            event_batch_metadata.aggregate_key.clone(),
+                            event_batch_metadata.aggregate_version,
+                            queue_item.metablock,
+                            queue_item.datablock,
+                            size_bytes,
+                        );
                     }
-
-                    // Update read and write snapshots so the aggregate is visible.
-                    // On the follower replication path, aggregate_queue_positions is empty
-                    // so commit_sync_positions_snapshot won't update these.
-                    shard_mem_cache.commit_position_snapshot(
-                        event_batch_metadata, log_id, queue_item.metablock_absolute_pos, CachePath::Read,
-                    );
-                    shard_mem_cache.commit_position_snapshot(
-                        event_batch_metadata, log_id, queue_item.metablock_absolute_pos, CachePath::Write,
-                    );
-
-                    let size_bytes = queue_item.size_bytes();
-                    shard_mem_cache.cache_recent_write(
-                        event_batch_metadata.aggregate_key.clone(),
-                        event_batch_metadata.aggregate_version,
-                        queue_item.metablock,
-                        queue_item.datablock,
-                        size_bytes,
-                    );
-                } else {
-                    pending_commit_data.pending_queue.push(PendingCacheItem::new(queue_item));
+                    CommitTarget::DeferToLeaderConfirmed => {
+                        // Write-side (OCC) state commits at fsync like the leader's,
+                        // but the leader gets it via commit_sync_positions_snapshot —
+                        // empty on the replication path — so update it explicitly.
+                        // Read side stays parked until the carrier confirms.
+                        shard_mem_cache.commit_position_snapshot(
+                            event_batch_metadata, log_id, queue_item.metablock_absolute_pos, CachePath::Write,
+                        );
+                        pending_commit_data.pending_queue.push(PendingCacheItem::new(queue_item));
+                    }
+                    CommitTarget::DeferToReplicationAck => {
+                        pending_commit_data.pending_queue.push(PendingCacheItem::new(queue_item));
+                    }
                 }
             }
             MetablockKind::SoftTrim(soft_trim) => {
@@ -253,7 +292,7 @@ fn commit_sync(
                     CachePath::Write,
                 );
 
-                if !node_status.is_leader() {
+                if commit_target == CommitTarget::FullCommit {
                     shard_mem_cache.commit_trim_snapshot(
                         &soft_trim.aggregate_key,
                         soft_trim.keep_from_aggregate_version,
@@ -285,7 +324,7 @@ fn commit_sync(
                     CachePath::Write,
                 );
 
-                if !node_status.is_leader() {
+                if commit_target == CommitTarget::FullCommit {
                     shard_mem_cache.put_aggregate_into_cache_as_deleted(
                         soft_delete.aggregate_key.clone(),
                         del_log_id, del_pos,
@@ -301,8 +340,8 @@ fn commit_sync(
                 }
             }
             MetablockKind::SchemaRegistration(schema_reg) => {
-                if !node_status.is_leader() {
-                    // Follower: compile and cache schema now that it's durable
+                if commit_target == CommitTarget::FullCommit {
+                    // Compile and cache schema now that it's durable
                     if let Some(ref datablock) = queue_item.datablock {
                         crate::shard_wal::compile_and_cache_schema(&mut shard_mem_cache, &schema_reg.schema_key, datablock);
                     } else if let Ok(datablock) = celeriant_wire::disk::serialised_datablock::deserialise_datablock(
@@ -317,17 +356,27 @@ fn commit_sync(
                         crate::shard_wal::compile_and_cache_schema(&mut shard_mem_cache, &schema_reg.schema_key, &datablock);
                     }
                 } else {
+                    // Both defer targets park it. The leader compiled at write time
+                    // (commit_pcd ignores it); the follower drain compiles on commit.
                     pending_commit_data.pending_queue.push(PendingCacheItem::new(queue_item));
                 }
             }
         }
     }
 
-    if !node_status.is_leader() {
-        event_collector.broadcast_all(&watched_aggregates);
-    } else {
-        // As leader, after fsync we can now allow replication to proceed
-        shard_mem_cache.push_pending_replication(pending_commit_data);
+    match commit_target {
+        CommitTarget::FullCommit => event_collector.broadcast_all(&watched_aggregates),
+        // After fsync the leader can let replication proceed
+        CommitTarget::DeferToReplicationAck => shard_mem_cache.push_pending_replication(pending_commit_data),
+        CommitTarget::DeferToLeaderConfirmed => {
+            if shard_mem_cache.push_parked_commit(pending_commit_data) {
+                tracing::warn!(
+                    log_id,
+                    parked_bytes = shard_mem_cache.parked_commit_bytes(),
+                    "parked commit queue exceeded the inflight cap — drain is lagging carriers"
+                );
+            }
+        }
     }
 }
 
@@ -348,7 +397,7 @@ fn rollback_sync(shard_mem_cache: Rc<RefCell<MemCache>>) {
 pub(crate) async fn sync(
     log_segment_file: Rc<LogSegmentFile>,
     sync_positions_snapshot: &mut SyncPositionsSnapshot,
-    node_status: NodeStatus,
+    commit_target: CommitTarget,
 ) -> Result<LogSegmentFileMetadata, ShardFsyncError> {
     let mut log_segment_file_metadata = log_segment_file.metadata.borrow().clone();
 
@@ -511,9 +560,10 @@ pub(crate) async fn sync(
     log_segment_file_metadata.datablocks_carry_over = datablocks_carry_over;
     log_segment_file_metadata.write.datablocks_position = new_datablocks_position;
 
-    // Non-leader: pre-advance read so the persisted header matches the final state
-    // rather than lagging by one fsync.
-    if !node_status.is_leader() {
+    // Full commit: pre-advance read so the persisted header matches the final state
+    // rather than lagging by one fsync. Deferred targets persist the current read
+    // as-is (a follower's drain may already have advanced it before this fsync).
+    if commit_target == CommitTarget::FullCommit {
         log_segment_file_metadata.advance_visible_position();
     }
     let header_end_start_pos = log_segment_file_metadata.file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64);
@@ -524,7 +574,10 @@ pub(crate) async fn sync(
     dma_file_writer.fdatasync().await
         .map_err(|e| ShardFsyncError::FDataSyncError(e.to_string()))?;
 
-    log_segment_file.note_header_synced(log_segment_file_metadata.last_self_acked_wal_seq);
+    log_segment_file.note_header_synced(
+        log_segment_file_metadata.last_self_acked_wal_seq,
+        log_segment_file_metadata.read.as_ref().map_or(0, |r| r.wal_seq),
+    );
 
     Ok(log_segment_file_metadata)
 }
@@ -552,7 +605,10 @@ pub(crate) async fn sync_header_only(
     dma_file_writer.fdatasync().await
         .map_err(|e| ShardFsyncError::FDataSyncError(e.to_string()))?;
 
-    log_segment_file.note_header_synced(metadata.last_self_acked_wal_seq);
+    log_segment_file.note_header_synced(
+        metadata.last_self_acked_wal_seq,
+        metadata.read.as_ref().map_or(0, |r| r.wal_seq),
+    );
 
     Ok(())
 }
@@ -753,151 +809,196 @@ mod tests {
         ShardLogQueueItem::new(None, None, metablock)
     }
 
-    /// Simulates the non-leader commit path: add_to_pending_queue → sync → commit_sync.
-    fn non_leader_commit_sync(
-        node_status: NodeStatus,
-        shard_mem_cache: &Rc<RefCell<MemCache>>,
-        watched_aggregates: &Rc<AggregateWatchers>,
-        log_segment_file: &Rc<LogSegmentFile>,
-    ) {
-        let sync_positions_snapshot = shard_mem_cache.borrow_mut().take_sync_positions_snapshot();
-        let new_metadata = log_segment_file.metadata.borrow().clone();
+    fn test_schema_key() -> celeriant_wal::schema_key::SchemaKey {
+        celeriant_wal::schema_key::SchemaKey::new(1, 1, 7, 0)
+    }
+
+    fn schema_queue_item() -> ShardLogQueueItem {
+        use celeriant_wal::datablocks::datablock::Datablock;
+        use celeriant_wal::datablocks::datablock_kind::DatablockKind;
+        use celeriant_wal::datablocks::datablock_schema_registration::DatablockSchemaRegistration;
+        use celeriant_wal::metablocks::metablock_schema_registration::MetablockSchemaRegistration;
+        use celeriant_wal::schema_type::SchemaType;
+
+        let datablock = Datablock {
+            datablock_kind: DatablockKind::SchemaRegistration(DatablockSchemaRegistration {
+                schema_type: SchemaType::Json,
+                schema: r#"{"type":"object"}"#.to_string(),
+            }),
+        };
+        let metablock = Metablock {
+            wal_seq: 0,
+            server_timestamp: 1000,
+            lease_epoch: 1,
+            node_id: 1,
+            uncompressed_size: 0,
+            compressed_size: 0,
+            datablock_version: 1,
+            datablock_compression_type: 0,
+            previous_tip_hash: GENESIS_HASH,
+            datablock_position: 0,
+            previous_aggregate_metablock_pos: 0,
+            wal_metablock_type: MetablockKind::SchemaRegistration(MetablockSchemaRegistration {
+                schema_key: test_schema_key(),
+                client_id: 1,
+                user_id: None,
+            }),
+            datablock: DatablockStorageKind::Inline(DatablockInlineData {
+                minibatch: [0u8; MINIBATCH_SIZE_BYTES],
+            }),
+        };
+        ShardLogQueueItem::new(Some(datablock), None, metablock)
+    }
+
+    fn watch_everything_request() -> celeriant_msg::request::requests::WatchRequest {
+        celeriant_msg::request::requests::WatchRequest {
+            correlation_id: None,
+            requested_latency_ms: None,
+            shard_id: None,
+            orgs: None,
+            aggregate_types: None,
+            aggregates: None,
+            operation_types: None,
+        }
+    }
+
+    /// Non-blocking watch poll after letting the executor settle: by then an
+    /// event is either in the channel or was never broadcast.
+    async fn poll_watch_event(
+        subscriber: &Rc<RefCell<celeriant_watch::subscribed_client::SubscribedClient>>,
+    ) -> Option<celeriant_watch::aggregate_watch_event::AggregateWatchEvent> {
+        glommio::timer::sleep(std::time::Duration::from_millis(10)).await;
+        futures_lite::future::poll_once(subscriber.borrow().receiver.recv()).await.flatten()
+    }
+
+    struct TestShard {
+        _tmp: tempfile::TempDir,
+        lsc: Rc<LogSegmentsCache>,
+        smc: Rc<RefCell<MemCache>>,
+        watched: Rc<AggregateWatchers>,
+        log_segment: Rc<LogSegmentFile>,
+    }
+
+    async fn test_shard() -> TestShard {
+        let (tmp, dir) = test_dir();
+        let lsc = Rc::new(LogSegmentsCache::ready_up(dir, 4 * 1024 * 1024, 4, 0).await.unwrap());
+        let smc = Rc::new(RefCell::new(
+            MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
+        ));
+        let watched = Rc::new(AggregateWatchers::new());
+        let log_segment = lsc.active();
+        TestShard { _tmp: tmp, lsc, smc, watched, log_segment }
+    }
+
+    /// Drives the post-fsync commit path: take snapshot → commit_sync.
+    fn run_commit_sync(t: &TestShard, node_status: NodeStatus, commit_target: CommitTarget) {
+        let sync_positions_snapshot = t.smc.borrow_mut().take_sync_positions_snapshot();
+        let new_metadata = t.log_segment.metadata.borrow().clone();
         commit_sync(
             node_status,
-            shard_mem_cache.clone(),
-            watched_aggregates.clone(),
+            commit_target,
+            t.smc.clone(),
+            t.watched.clone(),
             sync_positions_snapshot,
-            log_segment_file.clone(),
+            t.log_segment.clone(),
             new_metadata,
             &test_codec(),
         );
     }
 
-    fn non_leader_statuses() -> [NodeStatus; 2] {
-        [NodeStatus::Follower { leader_lease_epoch: 1 }, NodeStatus::Standalone]
+    fn full_commit_sync(t: &TestShard) {
+        run_commit_sync(t, NodeStatus::Standalone, CommitTarget::FullCommit);
     }
 
+    fn deferred_follower_commit_sync(t: &TestShard) {
+        run_commit_sync(t, NodeStatus::Follower { leader_lease_epoch: 1 }, CommitTarget::DeferToLeaderConfirmed);
+    }
+
+    /// FullCommit (standalone / catchup) commits the read side at fsync: the
+    /// aggregate is visible on both cache paths immediately.
     #[test]
-    fn non_leader_event_batch_via_pending_queue_populates_read_snapshot() {
+    fn full_commit_event_batch_populates_read_snapshot_at_fsync() {
         glommio_test!({
-            for node_status in non_leader_statuses() {
-                let (_tmp, dir) = test_dir();
-                let lsc = Rc::new(
-                    LogSegmentsCache::ready_up(dir, 4 * 1024 * 1024, 4, 0).await.unwrap()
-                );
-                let smc = Rc::new(RefCell::new(
-                    MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
-                ));
-                let watched = Rc::new(AggregateWatchers::new());
-                let log_segment = lsc.active();
+            let t = test_shard().await;
+            let k = AggregateKey::new(1, 1, 1);
 
-                let k = AggregateKey::new(1, 1, 1);
+            t.smc.borrow_mut().add_to_pending_queue(vec![
+                queue_item(event_batch_metablock(k.clone(), 1, 5)),
+                queue_item(event_batch_metablock(k.clone(), 2, 10)),
+            ]);
+            full_commit_sync(&t);
 
-                smc.borrow_mut().add_to_pending_queue(vec![
-                    queue_item(event_batch_metablock(k.clone(), 1, 5)),
-                    queue_item(event_batch_metablock(k.clone(), 2, 10)),
-                ]);
-
-                non_leader_commit_sync(node_status, &smc, &watched, &log_segment);
-
-                let (loaded, status) = smc.borrow_mut().aggregate_load_status(&k, CachePath::Read);
-                assert!(loaded, "{:?} read snapshot should be populated after commit_sync", node_status);
+            for path in [CachePath::Read, CachePath::Write] {
+                let (loaded, status) = t.smc.borrow_mut().aggregate_load_status(&k, path);
+                assert!(loaded, "{:?} snapshot should be populated after full commit", path);
                 assert_eq!(status, celeriant_memcache::mem_snapshot_aggregate::AggregateStatus::Found);
-
-                let pos = smc.borrow_mut().get_aggregate_last_metablock_pos(&k, CachePath::Read);
-                assert_eq!(pos.aggregate_version, 2, "should have latest aggregate_version");
-                assert_eq!(pos.event_seq, 10, "should have latest event_seq");
-
-                let (loaded, status) = smc.borrow_mut().aggregate_load_status(&k, CachePath::Write);
-                assert!(loaded, "{:?} write snapshot should be populated after commit_sync", node_status);
-                assert_eq!(status, celeriant_memcache::mem_snapshot_aggregate::AggregateStatus::Found);
-
-                lsc.close().await;
             }
+
+            let pos = t.smc.borrow_mut().get_aggregate_last_metablock_pos(&k, CachePath::Read);
+            assert_eq!(pos.aggregate_version, 2, "should have latest aggregate_version");
+            assert_eq!(pos.event_seq, 10, "should have latest event_seq");
+
+            t.lsc.close().await;
         });
     }
 
+    /// FullCommit soft delete is visible on both paths at fsync, carrying the
+    /// delete metablock's real disk position (not a manufactured 0,0).
     #[test]
-    fn non_leader_soft_delete_via_pending_queue_marks_deleted_with_position() {
+    fn full_commit_soft_delete_marks_deleted_with_position_at_fsync() {
         glommio_test!({
-            for node_status in non_leader_statuses() {
-                let (_tmp, dir) = test_dir();
-                let lsc = Rc::new(
-                    LogSegmentsCache::ready_up(dir, 4 * 1024 * 1024, 4, 0).await.unwrap()
-                );
-                let smc = Rc::new(RefCell::new(
-                    MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
-                ));
-                let watched = Rc::new(AggregateWatchers::new());
-                let log_segment = lsc.active();
+            let t = test_shard().await;
+            let k = AggregateKey::new(1, 1, 1);
 
-                let k = AggregateKey::new(1, 1, 1);
+            t.smc.borrow_mut().add_to_pending_queue(vec![
+                queue_item(event_batch_metablock(k.clone(), 1, 5)),
+            ]);
+            full_commit_sync(&t);
 
-                smc.borrow_mut().add_to_pending_queue(vec![
-                    queue_item(event_batch_metablock(k.clone(), 1, 5)),
-                ]);
-                non_leader_commit_sync(node_status, &smc, &watched, &log_segment);
+            let mut delete_item = queue_item(soft_delete_metablock(k.clone(), 1, 5));
+            delete_item.metablock_absolute_pos = 4096;
+            t.smc.borrow_mut().add_to_pending_queue(vec![delete_item]);
+            full_commit_sync(&t);
 
-                let mut delete_item = queue_item(soft_delete_metablock(k.clone(), 1, 5));
-                delete_item.metablock_absolute_pos = 4096;
-                smc.borrow_mut().add_to_pending_queue(vec![delete_item]);
-                non_leader_commit_sync(node_status, &smc, &watched, &log_segment);
-
-                for path in [CachePath::Read, CachePath::Write] {
-                    let (loaded, status) = smc.borrow_mut().aggregate_load_status(&k, path);
-                    assert!(loaded, "{:?} should be loaded on {:?}", node_status, path);
-                    assert_eq!(
-                        status,
-                        celeriant_memcache::mem_snapshot_aggregate::AggregateStatus::Deleted,
-                        "{:?} should be Deleted on {:?}", node_status, path
-                    );
-                }
-
-                let snap = smc.borrow_mut().get_aggregate_snapshot(&k, CachePath::Read).unwrap();
-                assert_ne!(snap.metablock_absolute_pos, 0,
-                    "{:?} deleted aggregate should have real disk position", node_status);
-
-                lsc.close().await;
+            for path in [CachePath::Read, CachePath::Write] {
+                let (loaded, status) = t.smc.borrow_mut().aggregate_load_status(&k, path);
+                assert!(loaded, "should be loaded on {:?}", path);
+                assert_eq!(status, celeriant_memcache::mem_snapshot_aggregate::AggregateStatus::Deleted,
+                    "should be Deleted on {:?}", path);
             }
+
+            let snap = t.smc.borrow_mut().get_aggregate_snapshot(&k, CachePath::Read).unwrap();
+            assert_ne!(snap.metablock_absolute_pos, 0, "deleted aggregate should have real disk position");
+
+            t.lsc.close().await;
         });
     }
 
+    /// FullCommit soft trim advances min_aggregate_version on both paths at fsync.
     #[test]
-    fn non_leader_soft_trim_via_pending_queue_updates_trimmed_below_version() {
+    fn full_commit_soft_trim_updates_trimmed_below_version_at_fsync() {
         glommio_test!({
-            for node_status in non_leader_statuses() {
-                let (_tmp, dir) = test_dir();
-                let lsc = Rc::new(
-                    LogSegmentsCache::ready_up(dir, 4 * 1024 * 1024, 4, 0).await.unwrap()
-                );
-                let smc = Rc::new(RefCell::new(
-                    MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
-                ));
-                let watched = Rc::new(AggregateWatchers::new());
-                let log_segment = lsc.active();
+            let t = test_shard().await;
+            let k = AggregateKey::new(1, 1, 1);
 
-                let k = AggregateKey::new(1, 1, 1);
+            t.smc.borrow_mut().add_to_pending_queue(vec![
+                queue_item(event_batch_metablock(k.clone(), 1, 5)),
+                queue_item(event_batch_metablock(k.clone(), 2, 10)),
+                queue_item(event_batch_metablock(k.clone(), 3, 15)),
+            ]);
+            full_commit_sync(&t);
 
-                smc.borrow_mut().add_to_pending_queue(vec![
-                    queue_item(event_batch_metablock(k.clone(), 1, 5)),
-                    queue_item(event_batch_metablock(k.clone(), 2, 10)),
-                    queue_item(event_batch_metablock(k.clone(), 3, 15)),
-                ]);
-                non_leader_commit_sync(node_status, &smc, &watched, &log_segment);
+            t.smc.borrow_mut().add_to_pending_queue(vec![
+                queue_item(soft_trim_metablock(k.clone(), 2)),
+            ]);
+            full_commit_sync(&t);
 
-                smc.borrow_mut().add_to_pending_queue(vec![
-                    queue_item(soft_trim_metablock(k.clone(), 2)),
-                ]);
-                non_leader_commit_sync(node_status, &smc, &watched, &log_segment);
-
-                for path in [CachePath::Read, CachePath::Write] {
-                    let pos = smc.borrow_mut().get_aggregate_last_metablock_pos(&k, path);
-                    assert_eq!(pos.min_aggregate_version, 2,
-                        "{:?} min_aggregate_version should be 2 on {:?}", node_status, path);
-                }
-
-                lsc.close().await;
+            for path in [CachePath::Read, CachePath::Write] {
+                let pos = t.smc.borrow_mut().get_aggregate_last_metablock_pos(&k, path);
+                assert_eq!(pos.min_aggregate_version, 2, "min_aggregate_version should be 2 on {:?}", path);
             }
+
+            t.lsc.close().await;
         });
     }
 
@@ -910,89 +1011,153 @@ mod tests {
     #[test]
     fn trim_only_window_cache_miss_commits_real_snapshot() {
         glommio_test!({
-            for node_status in non_leader_statuses() {
-                let (_tmp, dir) = test_dir();
-                let lsc = Rc::new(
-                    LogSegmentsCache::ready_up(dir, 4 * 1024 * 1024, 4, 0).await.unwrap()
-                );
-                let smc = Rc::new(RefCell::new(
-                    MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
-                ));
-                let watched = Rc::new(AggregateWatchers::new());
-                let log_segment = lsc.active();
+            let t = test_shard().await;
+            let k = AggregateKey::new(1, 1, 1);
 
-                let k = AggregateKey::new(1, 1, 1);
+            let mut trim_item = queue_item(soft_trim_metablock(k.clone(), 2));
+            trim_item.metablock_absolute_pos = 4096;
+            t.smc.borrow_mut().add_pending_trim_to_queue(&k, 2, 0, 0, trim_item);
+            full_commit_sync(&t);
 
-                let mut trim_item = queue_item(soft_trim_metablock(k.clone(), 2));
-                trim_item.metablock_absolute_pos = 4096;
-                smc.borrow_mut().add_pending_trim_to_queue(&k, 2, 0, 0, trim_item);
-                non_leader_commit_sync(node_status, &smc, &watched, &log_segment);
-
-                for path in [CachePath::Read, CachePath::Write] {
-                    let snap = smc.borrow_mut().get_aggregate_snapshot(&k, path)
-                        .unwrap_or_else(|| panic!("{:?} snapshot must exist on {:?}", node_status, path));
-                    assert_eq!(snap.metablock_absolute_pos, 4096,
-                        "{:?} trim-only commit must carry the trim metablock's position on {:?}", node_status, path);
-                    assert_eq!(snap.min_aggregate_version, 2,
-                        "{:?} trim floor must land on {:?}", node_status, path);
-                }
-
-                lsc.close().await;
+            for path in [CachePath::Read, CachePath::Write] {
+                let snap = t.smc.borrow_mut().get_aggregate_snapshot(&k, path)
+                    .unwrap_or_else(|| panic!("snapshot must exist on {:?}", path));
+                assert_eq!(snap.metablock_absolute_pos, 4096,
+                    "trim-only commit must carry the trim metablock's position on {:?}", path);
+                assert_eq!(snap.min_aggregate_version, 2, "trim floor must land on {:?}", path);
             }
-        });
-    }
 
-    fn leader_commit_sync(
-        shard_mem_cache: &Rc<RefCell<MemCache>>,
-        watched_aggregates: &Rc<AggregateWatchers>,
-        log_segment_file: &Rc<LogSegmentFile>,
-    ) {
-        let sync_positions_snapshot = shard_mem_cache.borrow_mut().take_sync_positions_snapshot();
-        let new_metadata = log_segment_file.metadata.borrow().clone();
-        commit_sync(
-            NodeStatus::Leader { lease_epoch: 1 },
-            shard_mem_cache.clone(),
-            watched_aggregates.clone(),
-            sync_positions_snapshot,
-            log_segment_file.clone(),
-            new_metadata,
-            &test_codec(),
-        );
+            t.lsc.close().await;
+        });
     }
 
     #[test]
     fn leader_event_batch_does_not_advance_read_snapshot() {
         glommio_test!({
-            let (_tmp, dir) = test_dir();
-            let lsc = Rc::new(
-                LogSegmentsCache::ready_up(dir, 4 * 1024 * 1024, 4, 0).await.unwrap()
-            );
-            let smc = Rc::new(RefCell::new(
-                MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
-            ));
-            let watched = Rc::new(AggregateWatchers::new());
-            let log_segment = lsc.active();
-
+            let t = test_shard().await;
             let k = AggregateKey::new(1, 1, 1);
 
-            // Leader writes via the normal write path (not add_to_pending_queue)
-            smc.borrow_mut().add_to_pending_queue(vec![
+            t.smc.borrow_mut().add_to_pending_queue(vec![
                 queue_item(event_batch_metablock(k.clone(), 1, 5)),
             ]);
-            leader_commit_sync(&smc, &watched, &log_segment);
+            run_commit_sync(&t, NodeStatus::Leader { lease_epoch: 1 }, CommitTarget::DeferToReplicationAck);
 
             // Read snapshot must NOT be populated — leader defers to replication
-            let (loaded, _) = smc.borrow_mut().aggregate_load_status(&k, CachePath::Read);
+            let (loaded, _) = t.smc.borrow_mut().aggregate_load_status(&k, CachePath::Read);
             assert!(!loaded, "leader must not advance read snapshot before replication");
 
             // Data should be in pending replication queue instead
-            let pending = smc.borrow_mut().take_pending_replication();
+            let pending = t.smc.borrow_mut().take_pending_replication();
             assert_eq!(pending.len(), 1, "leader should have queued data for replication");
             assert!(!pending[0].pending_queue.is_empty());
 
-            lsc.close().await;
+            t.lsc.close().await;
         });
     }
+
+    /// The deferred follower's fsync commits ONLY write-side (OCC) state; the
+    /// read side — snapshots, recent-write cache, watch events, schema compile,
+    /// read cursor — parks until a carrier confirms. One parked batch holds all
+    /// metablock kinds.
+    #[test]
+    fn deferred_follower_fsync_parks_read_side_and_commits_write_side() {
+        glommio_test!({
+            let t = test_shard().await;
+            let k_event = AggregateKey::new(1, 1, 1);
+            let k_trim = AggregateKey::new(1, 1, 2);
+            let k_del = AggregateKey::new(1, 1, 3);
+
+            let (_id, subscriber) = t.watched.add_subscriber(watch_everything_request());
+
+            t.smc.borrow_mut().add_to_pending_queue(vec![
+                queue_item(event_batch_metablock(k_event.clone(), 1, 5)),
+                queue_item(soft_trim_metablock(k_trim.clone(), 2)),
+                queue_item(soft_delete_metablock(k_del.clone(), 1, 5)),
+                schema_queue_item(),
+            ]);
+            deferred_follower_commit_sync(&t);
+
+            // Write side committed at fsync (OCC parity with the leader).
+            let (loaded, status) = t.smc.borrow_mut().aggregate_load_status(&k_event, CachePath::Write);
+            assert!(loaded, "event write snapshot must commit at fsync");
+            assert_eq!(status, celeriant_memcache::mem_snapshot_aggregate::AggregateStatus::Found);
+            let pos = t.smc.borrow_mut().get_aggregate_last_metablock_pos(&k_trim, CachePath::Write);
+            assert_eq!(pos.min_aggregate_version, 2, "trim floor must commit on the write path at fsync");
+            let (_, status) = t.smc.borrow_mut().aggregate_load_status(&k_del, CachePath::Write);
+            assert_eq!(status, celeriant_memcache::mem_snapshot_aggregate::AggregateStatus::Deleted,
+                "delete must commit on the write path at fsync");
+
+            // Read side parked: nothing visible, no events, no schema, cursor unmoved.
+            for k in [&k_event, &k_trim, &k_del] {
+                let (loaded, _) = t.smc.borrow_mut().aggregate_load_status(k, CachePath::Read);
+                assert!(!loaded, "read snapshot for {:?} must stay cold until confirmed", k);
+            }
+            assert!(!t.smc.borrow().schema_cache_has_schema(&test_schema_key()),
+                "schema must not compile at fsync on the deferred path");
+            assert!(t.log_segment.metadata.borrow().read.as_ref().map_or(0, |r| r.wal_seq) == 0,
+                "read cursor must not advance at fsync");
+            assert!(poll_watch_event(&subscriber).await.is_none(),
+                "no watch event may fire at fsync");
+
+            assert_eq!(t.smc.borrow().parked_commit_count(), 1, "the batch must be parked whole");
+            assert_eq!(t.smc.borrow_mut().drain_parked_commits_up_to(u64::MAX)[0].pending_queue.len(), 4,
+                "every kind parks into the same batch");
+
+            t.lsc.close().await;
+        });
+    }
+
+    /// Committing a parked batch (commit_pcd with a schema codec) applies the
+    /// full read-side set: snapshots, schema compile, watch events, read cursor.
+    #[test]
+    fn deferred_follower_drain_applies_full_read_side_set() {
+        glommio_test!({
+            let t = test_shard().await;
+            let k_event = AggregateKey::new(1, 1, 1);
+            let k_trim = AggregateKey::new(1, 1, 2);
+            let k_del = AggregateKey::new(1, 1, 3);
+
+            let (_id, subscriber) = t.watched.add_subscriber(watch_everything_request());
+
+            let mut items = vec![
+                queue_item(event_batch_metablock(k_event.clone(), 1, 5)),
+                queue_item(soft_trim_metablock(k_trim.clone(), 2)),
+                queue_item(soft_delete_metablock(k_del.clone(), 1, 5)),
+                schema_queue_item(),
+            ];
+            for (i, item) in items.iter_mut().enumerate() {
+                item.metablock.wal_seq = i as u64 + 1;
+                item.metablock_absolute_pos = 4096 * (i as u64 + 1);
+            }
+            t.smc.borrow_mut().add_to_pending_queue(items);
+            t.log_segment.metadata.borrow_mut().write.wal_seq = 4;
+            deferred_follower_commit_sync(&t);
+
+            let pcds = t.smc.borrow_mut().drain_parked_commits_up_to(4);
+            assert_eq!(pcds.len(), 1);
+            for pcd in pcds {
+                crate::shard_wal_replicate::commit_pcd(&t.lsc, &t.smc, &t.watched, pcd, Some(&test_codec()));
+            }
+
+            let (loaded, status) = t.smc.borrow_mut().aggregate_load_status(&k_event, CachePath::Read);
+            assert!(loaded, "event read snapshot must be populated on drain");
+            assert_eq!(status, celeriant_memcache::mem_snapshot_aggregate::AggregateStatus::Found);
+            let pos = t.smc.borrow_mut().get_aggregate_last_metablock_pos(&k_trim, CachePath::Read);
+            assert_eq!(pos.min_aggregate_version, 2, "trim floor must land on the read path on drain");
+            let (_, status) = t.smc.borrow_mut().aggregate_load_status(&k_del, CachePath::Read);
+            assert_eq!(status, celeriant_memcache::mem_snapshot_aggregate::AggregateStatus::Deleted,
+                "delete must land on the read path on drain");
+            assert!(t.smc.borrow().schema_cache_has_schema(&test_schema_key()),
+                "schema must compile on drain");
+            assert_eq!(t.log_segment.metadata.borrow().read.as_ref().map_or(0, |r| r.wal_seq), 4,
+                "read cursor must land on the parked batch tip");
+            assert!(poll_watch_event(&subscriber).await.is_some(),
+                "parked watch events must fire on drain");
+
+            t.lsc.close().await;
+        });
+    }
+
 
     #[test]
     fn empty_segment_no_summary_written() {

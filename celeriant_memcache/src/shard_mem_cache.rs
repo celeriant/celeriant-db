@@ -97,6 +97,17 @@ pub struct ShardMemCache<V: Validate> {
     /// Total bytes in pending replication queue
     pending_replication_bytes: u64,
 
+    /// Follower's deferred read-side commits (post-fsync, pre-leader-confirmation),
+    /// wal_seq-ordered by construction (pushed in fsync order). Drained when a
+    /// carrier's `leader_confirmed_wal_seq` covers a batch's tip. Bounded by
+    /// in-flight replication (the leader sends one snapshot at a time and its
+    /// confirmation rides the next carrier); `push_parked_commit` reports an
+    /// overflow of the inflight cap as a tripwire without dropping data.
+    parked_commits: VecDeque<PendingCommitData>,
+
+    /// Total bytes in the parked commit queue
+    parked_commit_bytes: u64,
+
     /// Total bytes in the pre-fsync queue (`pending_append_queue`). Updated on
     /// every push and reset to zero in `take_sync_positions_snapshot` when fsync
     /// drains the queue into a PCD.
@@ -125,8 +136,9 @@ pub struct ShardMemCache<V: Validate> {
     segment_summary_orgs: HashSet<u128>,
     segment_summary_types: HashSet<AggregateTypeKey>,
 
-    /// Sealed segment summaries waiting for replication to confirm before sidecar write.
-    /// Leader-only: stores summaries drained at rotation time, keyed by sealed log_id.
+    /// Sealed segment summaries waiting for the deferred read-side commit
+    /// (leader: replication ACK; follower: leader confirmation) before sidecar
+    /// write. Stored at rotation time, keyed by sealed log_id.
     sealed_segment_summaries: HashMap<u64, SealedSegmentSummary>,
 }
 
@@ -161,9 +173,12 @@ impl<V: Validate> ShardMemCache<V> {
     }
 
     /// Clear all caches including read snapshots and recent writes.
-    /// Used during WAL truncation where read cache is also invalidated.
+    /// Used during WAL truncation and the demotion cull, where the local chain
+    /// diverged from the authoritative one: parked deferred commits reference
+    /// entries that may be discarded, so their watch events must never fire.
     pub fn clear_all_caches(&mut self) {
         self.execute_replication_rollback();
+        self.clear_parked_commits();
         self.aggregate_read_snapshots.clear();
         self.aggregate_recent_writes.clear();
         self.cache_eviction_queue.clear();
@@ -1016,6 +1031,62 @@ impl<V: Validate> ShardMemCache<V> {
         self.pending_replication_batches.len()
     }
 
+    /// Park a follower's deferred read-side commit until a carrier confirms it.
+    /// Returns true when the queue exceeds the inflight cap (tripwire only; the
+    /// batch is parked regardless — dropping it would lose watch events).
+    pub fn push_parked_commit(&mut self, batch: PendingCommitData) -> bool {
+        debug_assert!(
+            self.parked_commits.back().map_or(true, |b| b.log_metadata.write.wal_seq < batch.log_metadata.write.wal_seq),
+            "parked commits must be pushed in ascending wal_seq order"
+        );
+        self.parked_commit_bytes = self.parked_commit_bytes.saturating_add(batch.size_bytes());
+        self.parked_commits.push_back(batch);
+        let over_cap = self.parked_commit_bytes > self.internode_max_request_size;
+        if over_cap {
+            metrics::counter!("celeriant_parked_commit_overflow_total").increment(1);
+        }
+        over_cap
+    }
+
+    /// Pop parked commits whose fsync-time write tip the carrier confirms.
+    /// The queue is wal_seq-ordered, so this is a prefix drain.
+    pub fn drain_parked_commits_up_to(&mut self, target_wal_seq: u64) -> Vec<PendingCommitData> {
+        let mut drained = Vec::new();
+        while self.parked_commits.front().map_or(false, |b| b.log_metadata.write.wal_seq <= target_wal_seq) {
+            let batch = self.parked_commits.pop_front().expect("front checked above");
+            self.parked_commit_bytes = self.parked_commit_bytes.saturating_sub(batch.size_bytes());
+            drained.push(batch);
+        }
+        if self.parked_commits.is_empty() {
+            debug_assert_eq!(self.parked_commit_bytes, 0, "parked byte accounting drifted from queue contents");
+            self.parked_commit_bytes = 0;
+        }
+        drained
+    }
+
+    /// Take every parked commit (promotion: the whole durable tail commits).
+    pub fn take_all_parked_commits(&mut self) -> Vec<PendingCommitData> {
+        self.parked_commit_bytes = 0;
+        self.parked_commits.drain(..).collect()
+    }
+
+    /// Discard parked commits (WAL truncation / demotion cull): the entries are
+    /// gone from the chain, their watch events must never fire.
+    pub fn clear_parked_commits(&mut self) -> usize {
+        let dropped = self.parked_commits.len();
+        self.parked_commits.clear();
+        self.parked_commit_bytes = 0;
+        dropped
+    }
+
+    pub fn parked_commit_bytes(&self) -> u64 {
+        self.parked_commit_bytes
+    }
+
+    pub fn parked_commit_count(&self) -> usize {
+        self.parked_commits.len()
+    }
+
     pub fn pending_append_bytes(&self) -> u64 {
         self.pending_append_bytes
     }
@@ -1138,6 +1209,8 @@ impl<V: Validate> ShardMemCache<V> {
             pending_schema_registrations: HashSet::new(),
             pending_replication_batches: Vec::new(),
             pending_replication_bytes: 0,
+            parked_commits: VecDeque::new(),
+            parked_commit_bytes: 0,
             pending_append_bytes: 0,
             internode_max_request_size,
             fsync_rollback_occurred: false,
@@ -1222,9 +1295,11 @@ impl<V: Validate> ShardMemCache<V> {
             orgs: std::mem::take(&mut self.segment_summary_orgs),
             aggregate_types: std::mem::take(&mut self.segment_summary_types),
         };
-        if !sealed.aggregates.is_empty() {
-            self.sealed_segment_summaries.insert(log_id, sealed);
-        }
+        // Store even when empty: deferred commits for this segment may still be
+        // in flight, and update_segment_summary_for_log must route them here,
+        // not into the next segment's active accumulator. An empty payload is
+        // dropped at sidecar-write time.
+        self.sealed_segment_summaries.insert(log_id, sealed);
     }
 
     /// Update the segment summary for a specific log segment.

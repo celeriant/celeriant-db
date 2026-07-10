@@ -481,6 +481,15 @@ pub async fn tear_down_and_evaluate_with_audit(
         }
     }
 
+    // Quiesce wait for ReadConvergedAtQuiesce: the read cursor's convergence
+    // is netted by the 5s reconciliation probe (the notify has by-design
+    // lost paths), so grant two probe periods + margin for the drain to
+    // reach the write tip before the final samples are taken. A timeout
+    // does not abort — the gated check judges whatever state was reached.
+    if expectations.assert_read_converged_at_quiesce {
+        wait_for_read_convergence(scenario_name, cfg, Duration::from_secs(12)).await;
+    }
+
     // Give the scraper one more tick before stopping it.
     sleep(Duration::from_millis(750)).await;
     let outcome = up.scraper.stop().await;
@@ -831,6 +840,14 @@ pub async fn run_baseline(
 
     let extra_checks = delete_trim_checks("baseline", cfg, &pool, run_dir, dt_handle).await;
 
+    // Strict-zero counters plus the follower-visibility oracles: with zero
+    // role flips the entire window is one stable-leadership run.
+    let expectations = ScenarioExpectations {
+        assert_never_ahead: true,
+        assert_read_converged_at_quiesce: true,
+        ..ScenarioExpectations::default()
+    };
+
     tear_down_and_evaluate_with_audit(
         "baseline",
         cfg,
@@ -838,7 +855,7 @@ pub async fn run_baseline(
         bench_result,
         bench_window_start_ms,
         bench_window_end_ms,
-        ScenarioExpectations::default(),
+        expectations,
         params,
         extra_checks,
         None,
@@ -1155,6 +1172,53 @@ async fn wait_for_wal_convergence(scen: &str, cfg: &ClusterConfig, max_wait: Dur
         }
         if start.elapsed() >= max_wait {
             println!("[{scen}] WARNING: wal not converged after {:.0}s — proceeding to audit reads", max_wait.as_secs());
+            return;
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Poll both nodes until every shard with a read-cursor gauge shows
+/// read_wal_seq == wal_seq, or `max_wait` expires. Same shape as
+/// `wait_for_wal_convergence` but per-node (read catching its own write
+/// tip), not cross-node. Timing out is not fatal: the still-running scraper
+/// records the final state and `ReadConvergedAtQuiesce` judges it.
+async fn wait_for_read_convergence(scen: &str, cfg: &ClusterConfig, max_wait: Duration) {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("reqwest client");
+    let start = Instant::now();
+    loop {
+        let fetch = |host: String, url: String| {
+            let client = client.clone();
+            async move {
+                let body = client.get(&url).send().await.ok()?.text().await.ok()?;
+                Some(crate::sample::parse_metrics(host, 0, &body))
+            }
+        };
+        let (l, f) = tokio::join!(
+            fetch(cfg.leader_host.clone(), cfg.metrics_url(&cfg.leader_host)),
+            fetch(cfg.follower_host.clone(), cfg.metrics_url(&cfg.follower_host)),
+        );
+        let converged = |s: &Option<NodeSample>| {
+            s.as_ref().is_some_and(|s| {
+                s.ok && !s.read_wal_seq_by_shard.is_empty()
+                    && s.read_wal_seq_by_shard.iter().all(|(shard, read)| {
+                        // A missing write gauge is NOT converged.
+                        s.wal_seq_by_shard.get(shard).is_some_and(|write| read == write)
+                    })
+            })
+        };
+        if converged(&l) && converged(&f) {
+            println!("[{scen}] read cursors converged after {:.1}s", start.elapsed().as_secs_f32());
+            return;
+        }
+        if start.elapsed() >= max_wait {
+            println!(
+                "[{scen}] WARNING: read cursors not converged after {:.0}s — final samples decide",
+                max_wait.as_secs()
+            );
             return;
         }
         sleep(Duration::from_secs(1)).await;
@@ -2318,6 +2382,11 @@ pub async fn run_leader_graceful_stop(
         // margin). Set by the S3-CAS path: TTL drain (~500ms) → must_fence →
         // challenge → S3 CAS. Measured at scraper resolution (±500ms).
         max_failover_ms: Some(1600),
+        // Follower-visibility oracles: the stability guard skips the
+        // promotion window; the 15s settle + probe-keyed quiesce wait give
+        // the restarted ex-leader time to converge read to write.
+        assert_never_ahead: true,
+        assert_read_converged_at_quiesce: true,
         ..ScenarioExpectations::default()
     };
 
@@ -2419,6 +2488,10 @@ pub async fn run_leader_sigkill(
         // a clean handoff signal but the lease TTL drives recovery in
         // the same timing envelope.
         max_failover_ms: Some(1600),
+        // Follower-visibility oracles — same reasoning as SCEN-4; the 60s
+        // settle covers the killed node's divergence truncation + catchup.
+        assert_never_ahead: true,
+        assert_read_converged_at_quiesce: true,
         ..ScenarioExpectations::default()
     };
 
@@ -2596,6 +2669,12 @@ pub async fn run_leader_restart_loop(
         // already proves the cluster handled the chaos. Relaxed from 2 → 1.
         require_distinct_leader_hosts: Some(1),
         assert_eventual_progress: true,
+        // Follower-visibility oracles: three flips leave short stable
+        // windows mid-run, but the 8s rejoins + 60s settle give NeverAhead
+        // real coverage between cycles and after the last one; quiesce
+        // convergence is well-defined since every killed node restarts.
+        assert_never_ahead: true,
+        assert_read_converged_at_quiesce: true,
         ..ScenarioExpectations::default()
     };
 
@@ -2749,6 +2828,12 @@ pub async fn run_partition_leader_follower_replication(
         // point during their tenure.
         require_final_leader_write_progress: true,
         assert_eventual_progress: true,
+        // Follower-visibility oracles. During the partition the follower
+        // receives no carriers, so its read cursor freezes while the
+        // leader's advances via S3-fallback commits — never-ahead must hold
+        // throughout, and any role churn is excluded by the guard.
+        assert_never_ahead: true,
+        assert_read_converged_at_quiesce: true,
         ..ScenarioExpectations::default()
     };
 
@@ -3985,6 +4070,12 @@ pub async fn run_rolling_restart(
         // leader post-phase-2.
         require_distinct_leader_hosts: Some(2),
         assert_eventual_progress: true,
+        // Follower-visibility oracles: the two restart phases are excluded
+        // by the stability guard; the 40s inter-phase drain and trailing
+        // steady-state writes are exactly the stable windows NeverAhead
+        // should police.
+        assert_never_ahead: true,
+        assert_read_converged_at_quiesce: true,
         ..ScenarioExpectations::default()
     };
 
@@ -4737,7 +4828,7 @@ async fn detect_leader(cfg: &ClusterConfig, scraper: &Scraper) -> Option<String>
     }
 }
 
-fn sample_window(samples: &[NodeSample], start_ms: u64, end_ms: u64) -> (usize, usize) {
+pub fn sample_window(samples: &[NodeSample], start_ms: u64, end_ms: u64) -> (usize, usize) {
     let start = samples
         .iter()
         .position(|s| s.t_ms >= start_ms)

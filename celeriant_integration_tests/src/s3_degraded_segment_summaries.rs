@@ -26,8 +26,8 @@
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{
-    count_events, s3_cluster_config, write_event, write_large_event, MinioContainer, ServerConfig,
-    TestServer,
+    poll_converged_count, s3_cluster_config, write_event, write_large_event, MinioContainer,
+    ServerConfig, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::path::Path;
@@ -122,7 +122,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         write_event(&mut leader_client, &aggregate_key, i, i == 1).await?;
     }
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
-    let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
+    let follower_count =
+        poll_converged_count(&mut follower_client, &aggregate_key, 5, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     assert_eq!(follower_count, 5, "Follower should have 5 events via TCP");
 
     let pre = minio.list_objects(&shard_prefix).await?;

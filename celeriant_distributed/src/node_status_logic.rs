@@ -59,6 +59,7 @@ pub fn kick_transition(current_status: NodeStatus) -> KickOutcome {
         }
         NodeStatus::FollowerCatchingUp { .. } => KickOutcome::AlreadyCatchingUp,
         NodeStatus::Leader { .. }
+        | NodeStatus::Promoting { .. }
         | NodeStatus::Standalone
         | NodeStatus::BootCatchup
         | NodeStatus::Fenced => KickOutcome::NotAFollower,

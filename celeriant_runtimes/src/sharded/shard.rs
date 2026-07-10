@@ -7,7 +7,7 @@ use std::{
 
 use celeriant_distributed::{lease_store::LeaseStore, node_status::NodeStatus, node_status_logic::{compute_new_ttl, decide_post_catchup_action, PostCatchupAction}, s3_lease_manager::{ElectionOutcome, S3LeaseManager}, validated_node_status::{self, ValidatedNodeStatus, set_node_status_and_metric}};
 use celeriant_msg::response::responses::HeartbeatResult;
-use celeriant_shard::{error::send_heartbeat_error::SendHeartbeatError, replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::{LeaseRenewalRequester, ShardWal}, shard_wal_s3_catchup::CatchupCompletion};
+use celeriant_shard::{error::send_heartbeat_error::SendHeartbeatError, replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::{LeaseRenewalRequester, ShardWal, TailReconciliation}, shard_wal_s3_catchup::CatchupCompletion};
 use glommio::{
     channels::{
         channel_mesh::{Receivers, Senders},
@@ -78,6 +78,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
 
         let shutdown_requested = Rc::new(Cell::new(false));
         let shard_wal = Rc::new(shard_wal);
+        // Wire the weak self-ref so the detached commit-notify timer can re-enter.
+        shard_wal.set_self_ref();
 
         let dict_codec = shard_wal.dict_codec.clone();
         let (extension_redirect_tx, extension_inbound) = local_channel::new_bounded::<RedirectedConnection>(EXTENSION_REDIRECT_CHANNEL_CAP);
@@ -708,7 +710,45 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
     // node held the lease in between and may have uploaded S3 fallback batches.
     let lease_changed_hands = new_lease_epoch > previous_lease_epoch;
     let became_leader = !is_currently_leader && outcome.status.is_leader();
-    let became_follower_from_leader_or_fenced = is_currently_leader && !outcome.status.is_leader();
+    // held_leadership (not raw is_leader): a drift-fenced ex-leader demoting via
+    // this path must reach the same ack-barrier rewind the heartbeat path gives it.
+    let became_follower_from_leader_or_fenced = previous_status.held_leadership() && !outcome.status.is_leader();
+
+    // Every CAS win enters the Promoting window before any promotion work: it
+    // rejects all TCP replication (nothing can park mid-window), refuses
+    // heartbeat adoption at epoch <= its own (a deposed leader cannot re-open
+    // the gate), is admitted by the promotion-upload status gate, and carries
+    // the won lease's TTL so an overrunning promotion decays to Fenced. The
+    // Leader flip at the end of this function proceeds only from this status.
+    if became_leader {
+        let promoting = ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Promoting { lease_epoch: new_lease_epoch },
+            ctx.config.max_clock_drift_ms,
+            outcome.status.lease_expires_at_ms(),
+        );
+        set_node_status_and_metric(&ctx.shard_wal.node_status, promoting, ctx.current_shard_id as u32);
+        broadcast_message_to_other_shards(
+            ctx.current_shard_id,
+            IntrashardMessages::StatusUpdate { status: promoting, cas_confirmed_at_ms: None, leader_changed_hands: false },
+            ctx.intrashard_sender.clone(),
+        ).await;
+    }
+
+    // Disk-truth resume check: a reacquired lease may be a crashed promotion,
+    // not a self-reclaim — a peer tail or an uncleared promotion floor means the
+    // previous incarnation still owed the commit and/or the S3 upload.
+    let resume_promotion = if became_leader && outcome.reacquired_own_lease {
+        match ctx.shard_wal.promotion_resume_owed().await {
+            Ok(owed) => owed,
+            Err(e) => {
+                return Err(celeriant_distributed::lease_store::LeaseStoreError::Unavailable {
+                    message: format!("promotion resume check failed: {e:?}"),
+                });
+            }
+        }
+    } else {
+        false
+    };
 
     // Use the restart-proof signal from S3 to decide whether leadership changed hands.
     // outcome.reacquired_own_lease is derived from the durable S3 lease holder (not from
@@ -719,15 +759,16 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
     // and may have authored a divergent tail) or on demotion.  Self-reclaim: keep the tail.
     // Also skip upload_s3_promotion_batch on self-reclaim: no incoming replication means
     // nothing to bridge, and its idempotent-cull prefix would re-cull the tail we kept.
-    let (needs_cull, leader_changed_hands, needs_catchup, rewind_to_ack_barrier) = promotion_cull_flags(
+    let (cull_mode, leader_changed_hands, needs_catchup) = promotion_cull_flags(
         became_leader,
         became_follower_from_leader_or_fenced,
         outcome.reacquired_own_lease,
         lease_changed_hands,
         outcome.status.raw().is_any_follower_state(),
+        resume_promotion,
     );
 
-    if needs_cull || needs_catchup {
+    if cull_mode.is_some() || needs_catchup {
         if outcome.status.is_leader() && leader_changed_hands {
             info!(previous_lease_epoch, new_lease_epoch, "Lease changed hands during partition — running S3 catchup");
         } else if outcome.status.is_leader() {
@@ -742,14 +783,15 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
 
         // Queues are FIFO; broadcasting cull first means any following EnterS3Catchup
         // arrives after the cull lands.
-        if needs_cull {
+        if let Some(mode) = cull_mode {
+            let mode = pre_catchup_mode(mode);
             let shard_count = ctx.config.num_shards as usize;
             for peer in 1..shard_count {
-                if let Err(e) = try_send_with_retry(ctx.intrashard_sender.as_ref(), peer, IntrashardMessages::CullSpeculativeTail { rewind_to_ack_barrier }, 10).await {
+                if let Err(e) = try_send_with_retry(ctx.intrashard_sender.as_ref(), peer, IntrashardMessages::CullSpeculativeTail { mode }, 10).await {
                     panic!("Failed to send CullSpeculativeTail to shard {peer} after retries: {e:?}");
                 }
             }
-            if let Err(e) = ctx.shard_wal.cull_speculative_tail_for_promotion(rewind_to_ack_barrier).await {
+            if let Err(e) = ctx.shard_wal.reconcile_durable_tail(mode).await {
                 return Err(celeriant_distributed::lease_store::LeaseStoreError::Unavailable {
                     message: format!("pre-catchup speculative tail cull failed: {e:?}"),
                 });
@@ -806,6 +848,33 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
         ctx.intrashard_sender.clone()
     ).await;
 
+    // The Leader flip proceeds only from the exact Promoting window it opened —
+    // flipping over a fresher truth would install a zombie leader. Nothing is
+    // logged or broadcast before this gate.
+    match promotion_flip_gate(became_leader, ctx.shard_wal.node_status.get().effective_node_status(), new_lease_epoch) {
+        PromotionFlipGate::Proceed => {}
+        PromotionFlipGate::LostRace => {
+            // A higher-epoch winner adopted this node mid-window (the heartbeat
+            // handler already set and propagated the follower status): a benign,
+            // chaos-common outcome, not a failure. Peer wiring settles via the
+            // winner's heartbeats and the next election pass.
+            let adopted = ctx.shard_wal.node_status.get();
+            warn!(
+                shard_id = ctx.current_shard_id,
+                won_lease_epoch = new_lease_epoch,
+                adopted = ?adopted.raw(),
+                "Promotion lost the race mid-window; continuing as the adopted follower"
+            );
+            return Ok(ElectionOutcome { status: adopted, peer_info: outcome.peer_info, reacquired_own_lease: false });
+        }
+        PromotionFlipGate::Abort => {
+            let observed = ctx.shard_wal.node_status.get().effective_node_status();
+            return Err(celeriant_distributed::lease_store::LeaseStoreError::Unavailable {
+                message: format!("promotion aborted: status moved to {observed:?} during the window"),
+            });
+        }
+    }
+
     // Finally open up writes if leader or accept replication if follower
     let previous = ctx.shard_wal.node_status.get();
     let role_changed = !previous.raw().same_role(&outcome.status.raw());
@@ -830,6 +899,19 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
     set_node_status_and_metric(&ctx.shard_wal.node_status, outcome.status, ctx.current_shard_id as u32);
     if role_changed && was_leader && !now_leader {
         ctx.shard_wal.drain_pending_replication_on_role_change().await;
+    }
+    if role_changed && !was_leader && now_leader {
+        // Same failure semantics as the pre-catchup reconcile: a failed drain
+        // must fail the election (before the Leader broadcast), not limp into
+        // leadership with an orphaned parked commit. Structurally dead under
+        // Promoting (nothing can park mid-window), so this is fail-loud only.
+        if let Err(e) = ctx.shard_wal.commit_parked_tail_on_promotion().await {
+            return Err(celeriant_distributed::lease_store::LeaseStoreError::Unavailable {
+                message: format!("promotion flip parked-commit drain failed: {e:?}"),
+            });
+        }
+        // Single floor-clear site: the promotion is complete on this shard.
+        ctx.shard_wal.clear_promotion_floor();
     }
     // CAS path: record the confirmation timestamp on this shard and broadcast to all
     // other shards. Data shards unblock their S3 fallback uploads on receipt.
@@ -1300,8 +1382,8 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
                 }
             }
         }
-        IntrashardMessages::CullSpeculativeTail { rewind_to_ack_barrier } => {
-            if let Err(e) = ctx.shard_wal.cull_speculative_tail_for_promotion(rewind_to_ack_barrier).await {
+        IntrashardMessages::CullSpeculativeTail { mode } => {
+            if let Err(e) = ctx.shard_wal.reconcile_durable_tail(mode).await {
                 tracing::warn!(shard_id = ctx.current_shard_id, error = ?e, "CullSpeculativeTail fsync failed — catchup may miss peer S3 batches");
             }
         }
@@ -1335,6 +1417,14 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
             if role_changed && was_leader && !now_leader {
                 ctx.shard_wal.drain_pending_replication_on_role_change().await;
             }
+            if role_changed && !was_leader && now_leader {
+                // Unlike shard 0, the flip is already broadcast — there is no
+                // election to fail here. Structurally dead under Promoting
+                // (nothing can park mid-window), so fail loud and continue.
+                if let Err(e) = ctx.shard_wal.commit_parked_tail_on_promotion().await {
+                    tracing::error!(shard_id = ctx.current_shard_id, error = ?e, "promotion flip parked-commit drain failed");
+                }
+            }
             // Mirror the lease-handler's promotion-batch upload (shard.rs:579) for
             // shards 1..N which inherit lease via this broadcast. Without this,
             // entries received over TCP from the previous leader (and never
@@ -1343,10 +1433,21 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
             // wedges with `Chain mismatch with no common ancestor`.
             //
             // Gated on leader_changed_hands to match shard 0's gate: on self-reclaim
-            // the node kept its speculative tail, and upload_s3_promotion_batch's
-            // idempotent re-cull (shard_wal.rs:2644) would rewind write→read and
-            // discard that tail, re-creating the same-seq fork the peer holds.
-            if should_upload_promotion_batch_on_status(role_changed, was_leader, now_leader, leader_changed_hands) {
+            // the node kept its speculative tail, and the upload's reconcile prefix
+            // would otherwise cull it, re-creating the same-seq fork the peer holds.
+            // The self-reclaim skip splits on THIS shard's disk truth, mirroring the
+            // election path: a crash between sibling flips can leave this shard
+            // still owing the upload (floor set) while shard 0 already completed —
+            // and the flip clear below would otherwise erase the only marker of it.
+            // An own speculative tail reads as not-owed, keeping the carve-out.
+            let mut do_upload = should_upload_promotion_batch_on_status(role_changed, was_leader, now_leader, leader_changed_hands);
+            if !do_upload && role_changed && !was_leader && now_leader {
+                match ctx.shard_wal.promotion_resume_owed().await {
+                    Ok(owed) => do_upload = owed,
+                    Err(e) => tracing::error!(shard_id = ctx.current_shard_id, error = ?e, "promotion resume check failed — floor kept for the next transition"),
+                }
+            }
+            if do_upload {
                 if let Err(e) = ctx.shard_wal.upload_s3_promotion_batch().await {
                     tracing::warn!(shard_id = ctx.current_shard_id, error = ?e, "Failed to upload promotion batch to S3 — old leader may not be able to catch up via S3");
                 }
@@ -1355,6 +1456,11 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
                 // would have discarded the speculative tail we kept. This line is the
                 // behavioral signal that the data-shard gate fired (anti-stale grep target).
                 info!(shard_id = ctx.current_shard_id, "self-reclaim: keeping speculative tail, skipping data-shard promotion-batch upload");
+            }
+            // Single floor-clear site (Leader flip), sequenced AFTER the upload
+            // above, which consumes the floor as its range start.
+            if role_changed && !was_leader && now_leader {
+                ctx.shard_wal.clear_promotion_floor();
             }
         }
         IntrashardMessages::UpdatePeerNodeId { peer_node_id } => {
@@ -1472,33 +1578,104 @@ const PERIODIC_PROBE_INTERVAL_MS: u64 = 5_000;
 /// Compute cull and catchup flags for a role transition.
 ///
 /// became_leader: transition from non-leader to leader.
-/// became_follower_from_leader_or_fenced: transition from leader to non-leader.
+/// became_follower_from_leader_or_fenced: demoting from leadership actually HELD
+/// (held_leadership, which survives interim fences), to non-leader.
 /// reacquired_own_lease: from ElectionOutcome, a restart-proof S3 signal.
 /// lease_changed_hands: epoch increased (a peer held the lease in between).
 /// now_following_peer: new status is Follower/FollowerCatchingUp (a confirmed leader
 /// exists), not Fenced.
+/// resume_promotion: disk-truth "promotion incomplete" marker for a reacquired
+/// lease (peer tail or uncleared promotion floor) — the previous incarnation
+/// crashed mid-promotion still owing the tail commit and/or the S3 upload.
 ///
-/// Returns (needs_cull, leader_changed_hands, needs_catchup, rewind_to_ack_barrier).
+/// Returns (tail reconciliation mode — None means keep the tail, leader_changed_hands,
+/// needs_catchup).
 fn promotion_cull_flags(
     became_leader: bool,
     became_follower_from_leader_or_fenced: bool,
     reacquired_own_lease: bool,
     lease_changed_hands: bool,
     now_following_peer: bool,
-) -> (bool, bool, bool, bool) {
-    let leader_changed_hands = became_leader && !reacquired_own_lease;
-    // Cull whenever we follow a peer while non-leader (peer took a higher epoch, OR we were
+    resume_promotion: bool,
+) -> (Option<TailReconciliation>, bool, bool) {
+    // A reacquired lease is a self-reclaim (keep the tail) ONLY when the disk
+    // says the previous promotion completed; otherwise the crashed promotion
+    // resumes through the full changed-hands pipeline (reconcile, catchup,
+    // commit, upload) — its peer tail may hold client-acked entries that exist
+    // in S3 nowhere.
+    let leader_changed_hands = became_leader && (!reacquired_own_lease || resume_promotion);
+    // Reconcile whenever we follow a peer while non-leader (peer took a higher epoch, OR we were
     // stopped-while-leader and rejoin as follower via boot). NOT gated on lease_changed_hands: a
     // Follower outcome carries no lease_epoch (reads 0), so gating left the stale un-acked tail
     // unculled. A bare self-fence (following no one) stays excluded so a self-reclaim keeps its tail.
     let demoted_to_peer = now_following_peer && !reacquired_own_lease;
-    let needs_cull = leader_changed_hands || became_follower_from_leader_or_fenced || demoted_to_peer;
+    // The demotion arms share one mode derivation with the heartbeat entry point:
+    // ack-barrier rewind only from leadership actually held (there last_self_acked
+    // is a real durable floor; a node that never led has last_self_acked=0, where
+    // rewinding wipes its S3-caught-up chain).
+    let cull_mode = if leader_changed_hands {
+        Some(TailReconciliation::CommitForPromotion)
+    } else if became_follower_from_leader_or_fenced {
+        Some(demotion_mode(true))
+    } else if demoted_to_peer {
+        Some(demotion_mode(false))
+    } else {
+        None
+    };
     let needs_catchup = became_leader || lease_changed_hands;
-    // Rewind read to last_self_acked only when demoting from leadership actually held; there it is
-    // a real durable floor. A node that never led has last_self_acked=0, where rewinding wipes its
-    // S3-caught-up chain. needs_cull still fires for it but only via the safe write->read arm.
-    let rewind_to_ack_barrier = became_follower_from_leader_or_fenced;
-    (needs_cull, leader_changed_hands, needs_catchup, rewind_to_ack_barrier)
+    (cull_mode, leader_changed_hands, needs_catchup)
+}
+
+/// Pre-flip gate for a won election: the flip proceeds only from the exact
+/// Promoting window it opened. An observed Follower means a lost race — a
+/// higher-epoch winner adopted this node mid-window and it is already a healthy
+/// follower (graceful outcome). Anything else (TTL decay to Fenced, unexpected
+/// states) aborts fail-loud and the election retries.
+#[derive(Debug, PartialEq, Eq)]
+enum PromotionFlipGate {
+    Proceed,
+    LostRace,
+    Abort,
+}
+
+fn promotion_flip_gate(became_leader: bool, observed: NodeStatus, won_lease_epoch: u64) -> PromotionFlipGate {
+    if !became_leader {
+        return PromotionFlipGate::Proceed;
+    }
+    if observed == (NodeStatus::Promoting { lease_epoch: won_lease_epoch }) {
+        return PromotionFlipGate::Proceed;
+    }
+    if observed.is_follower() {
+        return PromotionFlipGate::LostRace;
+    }
+    PromotionFlipGate::Abort
+}
+
+/// Tail-reconciliation mode for a demotion, shared by BOTH entry points (the
+/// election path and the heartbeat handler): the ack-barrier rewind is only
+/// sound when leadership was actually held (last_self_acked is a real floor and
+/// the tail is own speculation); every other demoted state (fenced ex-follower,
+/// booting node) gets provenance-checked reconciliation so a peer tail —
+/// possibly holding entries the old leader acked — survives.
+pub(crate) fn demotion_mode(held_leadership: bool) -> TailReconciliation {
+    if held_leadership {
+        TailReconciliation::RewindToAckBarrier
+    } else {
+        TailReconciliation::ReconcileAsFollower
+    }
+}
+
+/// Mode for the PRE-catchup tail reconciliation. Never commits: an own fork is
+/// culled (must precede catchup, which starts at write+1), a peer tail stays
+/// parked so its watch events cannot fire for a range the catchup's divergence
+/// check may still truncate — the old leader can roll back an entry we hold and
+/// land a competing one in S3. The commit leg of a promotion runs POST-catchup,
+/// via `upload_s3_promotion_batch`'s reconcile prefix and the status-flip drain.
+fn pre_catchup_mode(mode: TailReconciliation) -> TailReconciliation {
+    match mode {
+        TailReconciliation::CommitForPromotion => TailReconciliation::ReconcileAsFollower,
+        other => other,
+    }
 }
 
 /// Whether a data shard, on receiving a leader-promotion `StatusUpdate`, should
@@ -1567,66 +1744,110 @@ mod tests {
     ///
     /// Columns: became_leader, became_follower, reacquired_own_lease, lease_changed_hands,
     ///          now_following_peer
-    /// Expected: (needs_cull, leader_changed_hands, needs_catchup, rewind_to_ack_barrier).
-    /// rewind_to_ack_barrier == the became_follower column: rewind read to last_self_acked only
-    /// when demoting from held leadership (§7.5).
+    /// Expected: (cull mode, leader_changed_hands, needs_catchup).
+    /// RewindToAckBarrier tracks the became_follower column: rewind read to last_self_acked
+    /// only when demoting from held leadership (§7.5).
     #[test]
     fn promotion_cull_flags_truth_table() {
+        use celeriant_shard::shard_wal::TailReconciliation::*;
+
         // (became_leader, became_follower, reacquired_own_lease, lease_changed_hands,
-        //  now_following_peer, exp_needs_cull, exp_leader_changed_hands, exp_needs_catchup,
-        //  exp_rewind_to_ack_barrier)
-        let cases: &[(bool, bool, bool, bool, bool, bool, bool, bool, bool)] = &[
+        //  now_following_peer, resume_promotion, exp_mode, exp_leader_changed_hands,
+        //  exp_needs_catchup)
+        let cases: &[(bool, bool, bool, bool, bool, bool, Option<TailReconciliation>, bool, bool)] = &[
             // RESTART self-reclaim: previous_lease_epoch=0 (BootCatchup), S3 lease is ours
-            // (epoch 1). reacquired_own_lease=true, so no cull (keep the tail).
-            (true, false, true, true, false, false, false, true, false),
+            // (epoch 1), disk shows the previous promotion COMPLETED (no peer tail, floor
+            // cleared). Keep the tail.
+            (true, false, true, true, false, false, None, false, true),
+
+            // RESTART mid-promotion: reacquired our own lease but the disk still
+            // owes the promotion (peer tail, or uncleared floor after a catchup-commit
+            // crash). Resume the full changed-hands pipeline.
+            (true, false, true, true, false, true, Some(CommitForPromotion), true, true),
+            (true, false, true, false, false, true, Some(CommitForPromotion), true, true),
 
             // Warm self-reclaim (no restart): epoch stable, reacquired.
-            (true, false, true, false, false, false, false, true, false),
+            (true, false, true, false, false, false, None, false, true),
 
             // Promote-over-peer: took over an expired/fenced peer lease.
-            (true, false, false, true, false, true, true, true, false),
+            (true, false, false, true, false, false, Some(CommitForPromotion), true, true),
 
             // Promote-over-peer where epoch didn't change (shouldn't happen; verify).
-            (true, false, false, false, false, true, true, true, false),
+            (true, false, false, false, false, false, Some(CommitForPromotion), true, true),
 
             // Demotion: leader lost lease to peer (Leader to Follower edge observed).
-            (false, true, false, true, true, true, false, true, true),
+            (false, true, false, true, true, false, Some(RewindToAckBarrier), false, true),
 
             // Demotion: self-fenced (Leader to Fenced, lease not yet taken). Culls; no catchup.
-            (false, true, false, false, false, true, false, false, true),
+            (false, true, false, false, false, false, Some(RewindToAckBarrier), false, false),
 
             // No role change (already leader, renewals): no cull, no catchup.
-            (false, false, true, false, false, false, false, false, false),
+            (false, false, true, false, false, false, None, false, false),
 
             // Already non-leader, a higher-epoch peer took the lease and we now follow it
             // (self-fenced before challenging, so no Leader to Follower edge).
-            // !reacquired_own_lease confirms a peer, so cull the stranded tail.
-            (false, false, false, true, true, true, false, true, false),
+            // !reacquired_own_lease confirms a peer, so reconcile the stranded tail.
+            (false, false, false, true, true, false, Some(ReconcileAsFollower), false, true),
 
-            // Stop-while-leader rejoin as follower: cull the stale un-acked tail (write>read arm),
-            // no catchup, no rewind (lease_changed_hands false; last_self_acked not a valid floor).
-            (false, false, false, false, true, true, false, false, false),
+            // Stop-while-leader rejoin as follower: reconcile the stale un-acked tail, no catchup,
+            // no ack-barrier rewind (lease_changed_hands false; last_self_acked not a valid floor).
+            (false, false, false, false, true, false, Some(ReconcileAsFollower), false, false),
 
             // guard: boot->follower after a clean S3 catchup (read==write, last_self_acked=0).
-            // Same inputs; rewind MUST stay false or we wipe the caught-up chain (fork-from-genesis).
-            (false, false, false, false, true, true, false, false, false),
+            // Same inputs; the mode MUST NOT be RewindToAckBarrier or we wipe the caught-up
+            // chain (fork-from-genesis).
+            (false, false, false, false, true, false, Some(ReconcileAsFollower), false, false),
 
             // Already non-leader, epoch advanced but not following anyone (Fenced): may
             // self-reclaim, so no cull. Catchup only.
-            (false, false, false, true, false, false, false, true, false),
+            (false, false, false, true, false, false, None, false, true),
 
             // Non-leader, epoch advanced, but reacquired our own lease: never cull even if
             // momentarily following.
-            (false, false, true, true, true, false, false, true, false),
+            (false, false, true, true, true, false, None, false, true),
         ];
 
-        for &(became_leader, became_follower, reacquired, lease_changed, following, exp_cull, exp_lch, exp_catchup, exp_rewind) in cases {
-            let (cull, lch, catchup, rewind) = promotion_cull_flags(became_leader, became_follower, reacquired, lease_changed, following);
+        for &(became_leader, became_follower, reacquired, lease_changed, following, resume, exp_mode, exp_lch, exp_catchup) in cases {
+            let (mode, lch, catchup) = promotion_cull_flags(became_leader, became_follower, reacquired, lease_changed, following, resume);
             assert_eq!(
-                (cull, lch, catchup, rewind),
-                (exp_cull, exp_lch, exp_catchup, exp_rewind),
-                "became_leader={became_leader} became_follower={became_follower} reacquired={reacquired} lease_changed={lease_changed} following={following}",
+                (mode, lch, catchup),
+                (exp_mode, exp_lch, exp_catchup),
+                "became_leader={became_leader} became_follower={became_follower} reacquired={reacquired} lease_changed={lease_changed} following={following} resume={resume}",
             );
+        }
+    }
+
+    /// The Leader flip proceeds only from the exact Promoting window it opened;
+    /// a lost race (adopted Follower) continues gracefully, everything else
+    /// aborts fail-loud. Renewals (no promotion) always proceed.
+    #[test]
+    fn promotion_flip_gate_by_observed_status() {
+        // (name, became_leader, observed, won_epoch, expected)
+        let cases: &[(&str, bool, NodeStatus, u64, PromotionFlipGate)] = &[
+            ("renewal_no_promotion", false, NodeStatus::Leader { lease_epoch: 5 }, 5, PromotionFlipGate::Proceed),
+            ("window_intact", true, NodeStatus::Promoting { lease_epoch: 5 }, 5, PromotionFlipGate::Proceed),
+            ("lost_race_adopted_follower", true, NodeStatus::Follower { leader_lease_epoch: 6 }, 5, PromotionFlipGate::LostRace),
+            ("ttl_decayed_to_fenced", true, NodeStatus::Fenced, 5, PromotionFlipGate::Abort),
+            ("foreign_promoting_epoch", true, NodeStatus::Promoting { lease_epoch: 6 }, 5, PromotionFlipGate::Abort),
+        ];
+        for (name, became_leader, observed, won, expected) in cases {
+            assert_eq!(&promotion_flip_gate(*became_leader, *observed, *won), expected, "{name}");
+        }
+    }
+
+    /// The pre-catchup reconciliation must never commit: CommitForPromotion maps
+    /// to the keep-parked/cull-own mode so no watch event can fire for a range
+    /// the catchup's divergence check may truncate. Demotion modes pass through.
+    #[test]
+    fn pre_catchup_mode_never_commits() {
+        use celeriant_shard::shard_wal::TailReconciliation::*;
+        let cases: &[(TailReconciliation, TailReconciliation)] = &[
+            (CommitForPromotion, ReconcileAsFollower),
+            (RewindToAckBarrier, RewindToAckBarrier),
+            (ReconcileAsFollower, ReconcileAsFollower),
+        ];
+        for &(input, expected) in cases {
+            assert_eq!(pre_catchup_mode(input), expected, "input {input:?}");
         }
     }
 

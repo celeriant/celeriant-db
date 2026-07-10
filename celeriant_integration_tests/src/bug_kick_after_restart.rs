@@ -19,7 +19,8 @@
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{
-    count_events, poll_event_count, s3_cluster_config, write_event, MinioContainer, TestServer,
+    count_events, poll_converged_count, poll_event_count, s3_cluster_config, write_event,
+    MinioContainer, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
@@ -68,7 +69,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
-    let fc = count_events(&mut follower_client, &aggregate_key).await?;
+    let fc =
+        poll_converged_count(&mut follower_client, &aggregate_key, 3, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     assert_eq!(fc, 3, "Follower should have 3 events");
     println!("  Follower has {} events (TCP working)\n", fc);
 
@@ -117,7 +119,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_secs(10)).await;
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
-    let fc = count_events(&mut follower_client, &aggregate_key).await?;
+    let fc =
+        poll_converged_count(&mut follower_client, &aggregate_key, 6, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     println!("  Follower has {} events (expected: 5, bug = kick not sent)", fc);
 
     // After the fix: kick is sent regardless of follower_reachable flag.

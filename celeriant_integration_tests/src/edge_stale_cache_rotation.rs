@@ -20,7 +20,8 @@
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{
-    count_events, s3_cluster_config, write_event, write_large_event, MinioContainer, TestServer,
+    poll_converged_count, s3_cluster_config, write_event, write_large_event, MinioContainer,
+    TestServer, FOLLOWER_CONVERGENCE_TIMEOUT,
 };
 use celeriant_runtimes::RoutingRule;
 use celeriant_wal::aggregate_key::AggregateKey;
@@ -37,7 +38,9 @@ async fn verify_aggregate_counts(
     let mut failures = Vec::new();
     for i in range {
         let key = AggregateKey::new(agg_type_id, category_id, i);
-        let count = count_events(client, &key).await.unwrap_or(0);
+        let count = poll_converged_count(client, &key, expected_count, FOLLOWER_CONVERGENCE_TIMEOUT)
+            .await
+            .unwrap_or(0);
         if count != expected_count {
             failures.push(format!(
                 "{} aggregate {}: expected {} events, got {}",

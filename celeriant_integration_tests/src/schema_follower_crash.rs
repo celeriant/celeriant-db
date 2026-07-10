@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
-use crate::{count_events, poll_event_count, s3_cluster_config, write_event, MinioContainer, TestServer};
+use crate::{poll_converged_count, poll_event_count, s3_cluster_config, write_event, MinioContainer, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT};
 use celeriant_msg::{
     process_client_requests::ClientRequest,
     request::requests::{RegisterSchemaRequest, SingleAggregateWrite, WriteRequest},
@@ -152,7 +152,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Valid write: PASS");
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
-    let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
+    let follower_count =
+        poll_converged_count(&mut follower_client, &aggregate_key, 4, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     assert_eq!(follower_count, 4, "Follower should have 4 events");
     println!("  Follower has {} events (schema replicated via TCP)\n", follower_count);
 

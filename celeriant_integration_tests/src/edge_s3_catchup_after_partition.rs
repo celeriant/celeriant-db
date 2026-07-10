@@ -17,7 +17,7 @@
 //!   13 (WAL divergence recovery)
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use crate::{count_events, s3_cluster_config, write_event, MinioContainer, TestServer, TcpProxy};
+use crate::{count_events, poll_converged_count, s3_cluster_config, write_event, MinioContainer, TestServer, TcpProxy, FOLLOWER_CONVERGENCE_TIMEOUT};
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
 
@@ -76,7 +76,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         write_event(&mut client_a, &aggregate_key, i, i == 1).await?;
     }
 
-    let b_count = count_events(&mut client_b, &aggregate_key).await?;
+    let b_count =
+        poll_converged_count(&mut client_b, &aggregate_key, 10, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     assert_eq!(b_count, 10, "Node B should have 10 events via TCP replication");
     println!("  Node B has {} events via TCP replication\n", b_count);
 
@@ -141,7 +142,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Node A is alive (no WalSeqGap crash)");
 
     let mut client_a = CeleriantClient::connect(&format!("127.0.0.1:{}", node_a_port)).await?;
-    let a_count = count_events(&mut client_a, &aggregate_key).await?;
+    let a_count =
+        poll_converged_count(&mut client_a, &aggregate_key, 30, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     println!("  Node A has {} events after catchup", a_count);
     assert_eq!(a_count, 30, "Node A should have all 30 events after S3 catchup");
 
@@ -157,7 +159,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     drop(client_a);
     let mut client_a = CeleriantClient::connect(&format!("127.0.0.1:{}", node_a_port)).await?;
-    let a_final = count_events(&mut client_a, &aggregate_key).await?;
+    let a_final =
+        poll_converged_count(&mut client_a, &aggregate_key, 33, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     assert_eq!(a_final, 33, "Node A should have 33 events after replication");
     println!("  Replication B -> A working: node A has {} events", a_final);
 

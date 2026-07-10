@@ -270,6 +270,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             distributed: true,
         },
         TestEntry {
+            name: "watch_follower_promotion",
+            description: "Follower-side watch subscriber across a promotion: every acked event delivered exactly once, in order, parked tail events fire on the promotion commit",
+            estimated_secs: 60,
+            categories: &[Replication, Election, Edge],
+            distributed: true,
+        },
+        TestEntry {
             name: "connection_test",
             description: "Connection lifecycle, pipelining, and shard routing",
             estimated_secs: 1,
@@ -359,6 +366,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             description: "Standalone-to-distributed WAL migration and replication convergence",
             estimated_secs: 41,
             categories: &[Replication, Operations],
+            distributed: true,
+        },
+        TestEntry {
+            name: "follower_notify_liveness",
+            description: "Idle-tail commit-notify convergence bound (burst tail + lone write)",
+            estimated_secs: 40,
+            categories: &[Core],
             distributed: true,
         },
         TestEntry {

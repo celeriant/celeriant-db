@@ -19,7 +19,7 @@
 //! Invariants tested: 7 (WAL continuity), 10 (S3 catchup), 13 (divergence recovery)
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use crate::{count_events, s3_cluster_config, write_event, MinioContainer, TestServer};
+use crate::{count_events, poll_converged_count, s3_cluster_config, write_event, MinioContainer, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT};
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
 
@@ -61,7 +61,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1..=10 {
         write_event(&mut client_a, &aggregate_key, i, i == 1).await?;
     }
-    let b_count = count_events(&mut client_b, &aggregate_key).await?;
+    let b_count =
+        poll_converged_count(&mut client_b, &aggregate_key, 10, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     assert_eq!(b_count, 10, "B should have 10 events");
     println!("  Both nodes have 10 events via TCP\n");
 
@@ -158,7 +159,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Node A is alive (no WalSeqGap crash)");
 
     let mut client_a = CeleriantClient::connect(&format!("127.0.0.1:{}", node_a_port)).await?;
-    let a_count = count_events(&mut client_a, &aggregate_key).await?;
+    let a_count =
+        poll_converged_count(&mut client_a, &aggregate_key, b_final, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     println!("  Node A has {} events after catchup", a_count);
     assert_eq!(a_count, b_final,
         "A should match B's count after catchup. A={}, B={}", a_count, b_final);
@@ -176,8 +178,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     drop(client_a);
     let mut client_a = CeleriantClient::connect(&format!("127.0.0.1:{}", node_a_port)).await?;
-    let a_final = count_events(&mut client_a, &aggregate_key).await?;
     let b_count = count_events(&mut client_b, &aggregate_key).await?;
+    let a_final =
+        poll_converged_count(&mut client_a, &aggregate_key, b_count, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     assert_eq!(a_final, b_count, "Both should converge. A={}, B={}", a_final, b_count);
     println!("  Replication working: A={}, B={}", a_final, b_count);
 

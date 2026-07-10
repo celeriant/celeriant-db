@@ -45,6 +45,22 @@ sudo apt install -y -qq xfsprogs
 echo ">>> Creating data directory..."
 sudo mkdir -p /var/lib/celeriant
 
+# chrony instead of systemd-timesyncd: continuous clock discipline + frequent
+# polling keeps the two data nodes within a few ms of a common reference. The
+# clock-drift fence (max_clock_drift_ms, default 500ms) compares heartbeat
+# timestamps across nodes; timesyncd's step-only sync with a ~34min poll let the
+# RPi oscillators drift past the threshold under load (observed 5.5s at 12k),
+# fencing the leader and churning leadership. chrony holds relative drift ~1ms.
+echo ">>> Installing chrony (replacing systemd-timesyncd)..."
+sudo apt install -y -qq chrony
+# maxpoll/minpoll are options on the pool line, not standalone directives.
+printf "pool 0.debian.pool.ntp.org iburst maxpoll 6 minpoll 4\nmakestep 1.0 3\ndriftfile /var/lib/chrony/chrony.drift\nrtcsync\nlogdir /var/log/chrony\n" | sudo tee /etc/chrony/chrony.conf > /dev/null
+# chrony is timedated-managed; set-ntp true starts it (and survives the clock-skew
+# scenarios' set-ntp false/true cycle, which would otherwise leave a bad conf dead).
+sudo systemctl reset-failed chrony 2>/dev/null || true
+sudo timedatectl set-ntp true
+sudo chronyc makestep || true
+
 echo ">>> OS prep complete."
 REMOTE_SETUP
 

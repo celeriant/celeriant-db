@@ -105,6 +105,24 @@ pub struct ScenarioExpectations {
     /// EventualConvergence's number comparison silently passes.
     /// `false` (default) skips the check (it requires live SSH access).
     pub assert_no_divergent_tips: bool,
+
+    /// If true, run `NeverAhead`: at every sample tick inside a
+    /// stable-leadership window, the current follower's per-shard read
+    /// cursor must not exceed the current leader's. Falsifies the
+    /// follower-runs-ahead-of-leader-commit inversion continuously under
+    /// real timing. Roles come from `node_role` per tick, not config slots;
+    /// transition windows (where a promotion commit legitimately jumps the
+    /// follower's read cursor) are excluded by a stability guard.
+    /// `false` (default) skips the check.
+    pub assert_never_ahead: bool,
+
+    /// If true, run `ReadConvergedAtQuiesce`: the last ok sample of each
+    /// node must show read_wal_seq == wal_seq per shard. Falsifies a wedged
+    /// or slowly leaking drain that a single bounded test run never sees.
+    /// The teardown path grants a bounded quiesce wait (keyed to the 5s
+    /// reconciliation probe, which nets the by-design lost-notify paths)
+    /// before the final samples are taken. `false` (default) skips it.
+    pub assert_read_converged_at_quiesce: bool,
 }
 
 impl Default for ScenarioExpectations {
@@ -125,6 +143,8 @@ impl Default for ScenarioExpectations {
             require_distinct_leader_hosts: None,
             max_failover_ms: None,
             assert_no_divergent_tips: false,
+            assert_never_ahead: false,
+            assert_read_converged_at_quiesce: false,
         }
     }
 }
@@ -230,6 +250,18 @@ pub fn run_all(data: &RunData, expect: &ScenarioExpectations) -> Vec<CheckResult
     }
     if expect.assert_no_divergent_tips {
         out.push(tip_fork::check_no_divergent_shard_tips(data.leader_host, data.follower_host));
+    }
+    if expect.assert_never_ahead {
+        out.push(check_never_ahead(data));
+    }
+    if expect.assert_read_converged_at_quiesce {
+        // Full sample stream, not the bench window: the quiesce samples land
+        // after bench_end_idx, during the teardown wait.
+        out.push(check_read_converged_at_quiesce(
+            data.samples,
+            data.leader_host,
+            data.follower_host,
+        ));
     }
     out
 }
@@ -759,6 +791,265 @@ fn check_read_within_write(data: &RunData) -> CheckResult {
     }
 }
 
+/// A role assignment must have held this long before NeverAhead trusts a
+/// tick. Leadership flips are exactly when the follower's read cursor
+/// legitimately jumps (promotion commits the durable tail), and a restarted
+/// ex-leader can briefly export stale cursors until divergence truncation —
+/// the reconciliation probe (5s) plus 50% margin covers both settle paths.
+const STABILITY_GUARD_MS: u64 = 7_500;
+
+/// Per stable tick, per shard: current-follower read cursor ≤ current-leader
+/// read cursor. Roles are derived from `node_role` at each tick — leadership
+/// moves between config slots mid-scenario. The scraper samples the current
+/// follower BEFORE the leader (see `Scraper::start`), so skew between the
+/// two scrapes only advances the leader's cursor and cannot fake a
+/// violation; the ordering swaps one tick late after a flip, which the
+/// stability guard excludes. Lone violating ticks are tolerated the same way
+/// `ReadCursorWithinWrite` tolerates exporter render races — a genuine
+/// inversion persists across scrapes until the next carrier — so only two
+/// or more CONSECUTIVE violating stable ticks per shard fail.
+pub fn check_never_ahead(data: &RunData) -> CheckResult {
+    const NAME: &str = "NeverAhead";
+    let mut violations: Vec<String> = Vec::new();
+    let mut ticks_audited = 0u64;
+    let mut single_tick_blips = 0u64;
+    // (leader-is-config-leader-slot, t_ms the assignment was first seen).
+    let mut assignment: Option<(bool, u64)> = None;
+    // (follower-is-config-leader-slot, shard) → previous violating tick's message.
+    let mut pending: HashMap<(bool, u32), String> = HashMap::new();
+    // shard → max leader read across ALL tenures. The comparator, not the
+    // current leader's gauge: the logical confirmed index is monotone, but a
+    // restarted leader's gauge regresses to its persisted read (header fsync
+    // is amortised), and a rejoined old leader correctly keeps its own-acked
+    // read above the new leader's while S3 bridges the gap. A follower is
+    // only genuinely ahead if it shows more than EVERY tenure ever confirmed.
+    let mut high_water: HashMap<u32, u64> = HashMap::new();
+    // (follower-is-config-leader-slot, shard) → first tick that host's shard
+    // status has been steady Follower (code 1). Catchup full-commits by
+    // design, so a catching-up shard's read legitimately outruns the leader's
+    // scraped view; each host's shard re-arms on its OWN history after a
+    // flip. Samples without status codes (older binary) audit as before.
+    let mut follower_steady_since: HashMap<(bool, u32), u64> = HashMap::new();
+    // shard → (ticks audited, ticks excluded by the status guard, of which
+    // the shard's status series was absent while the family was present).
+    let mut shard_ticks: std::collections::BTreeMap<u32, (u64, u64, u64)> =
+        std::collections::BTreeMap::new();
+    for (a, b) in data.pairs() {
+        // Unreachable node or no single leader: can't attest the assignment.
+        // Reset — conservative in the pass direction, which is exactly the
+        // transition-window exclusion.
+        if !(a.ok && b.ok) || (a.node_role + b.node_role - 1.0).abs() > 0.5 {
+            assignment = None;
+            pending.clear();
+            continue;
+        }
+        let leader_is_a = a.node_role >= 0.5;
+        let (leader, follower) = if leader_is_a { (a, b) } else { (b, a) };
+        let follower_is_a = !leader_is_a;
+        // Accumulate whenever the leader is identifiable, including guard
+        // windows — tenure high-water is valid history regardless of
+        // stability. But only a shard the leader-side status attests as
+        // Leader (code 4) may raise the bound: in a role-split window the
+        // node-level gauge (set on shard-0 transitions) can flag a node
+        // whose data shard is still catching up — its full-committed read
+        // would poison hw for the rest of the run. Absent codes = older
+        // binary, accumulate as before (preserves the main red-proof).
+        for (&shard, &l_read) in &leader.read_wal_seq_by_shard {
+            if !leader.node_status_code_by_shard.is_empty()
+                && leader.node_status_code_by_shard.get(&shard) != Some(&4)
+            {
+                continue;
+            }
+            let hw = high_water.entry(shard).or_insert(0);
+            if l_read > *hw {
+                *hw = l_read;
+            }
+        }
+        // Track per-(host, shard) follower steadiness across every
+        // identifiable tick.
+        if !follower.node_status_code_by_shard.is_empty() {
+            for (&shard, &code) in &follower.node_status_code_by_shard {
+                if code == 1 {
+                    follower_steady_since.entry((follower_is_a, shard)).or_insert(a.t_ms);
+                } else {
+                    follower_steady_since.remove(&(follower_is_a, shard));
+                    pending.remove(&(follower_is_a, shard));
+                }
+            }
+        }
+        match assignment {
+            Some((was_a, since)) if was_a == leader_is_a => {
+                if a.t_ms.saturating_sub(since) < STABILITY_GUARD_MS {
+                    continue;
+                }
+            }
+            _ => {
+                assignment = Some((leader_is_a, a.t_ms));
+                pending.clear();
+                continue;
+            }
+        }
+        if follower.read_wal_seq_by_shard.is_empty() {
+            continue;
+        }
+        ticks_audited += 1;
+        for (&shard, &f_read) in &follower.read_wal_seq_by_shard {
+            let counts = shard_ticks.entry(shard).or_insert((0, 0, 0));
+            // No leader high-water yet: excluded but COUNTED — a shard whose
+            // leader never published a read would otherwise skip bookkeeping
+            // and dodge the [NEVER AUDITED] naming.
+            let Some(&hw) = high_water.get(&shard) else {
+                counts.1 += 1;
+                continue;
+            };
+            // Shard-level steadiness: skip while the follower is (or recently
+            // was) in a catchup/interim status. Absent codes = older binary,
+            // audit as before.
+            if !follower.node_status_code_by_shard.is_empty() {
+                if !follower.node_status_code_by_shard.contains_key(&shard) {
+                    counts.1 += 1;
+                    counts.2 += 1;
+                    continue;
+                }
+                match follower_steady_since.get(&(follower_is_a, shard)) {
+                    Some(&since) if a.t_ms.saturating_sub(since) >= STABILITY_GUARD_MS => {}
+                    _ => {
+                        counts.1 += 1;
+                        continue;
+                    }
+                }
+            }
+            counts.0 += 1;
+            // The follower's own ack barrier also covers its read: a demoted
+            // leader legitimately keeps everything it acked visible, and its
+            // final pre-stop confirms are invisible to scrape-derived
+            // high-water (up to a tick of writes land between the last scrape
+            // and the stop).
+            let self_acked = follower.last_self_acked_by_shard.get(&shard).copied().unwrap_or(0);
+            let bound = hw.max(self_acked);
+            if f_read > bound {
+                let l_read = leader.read_wal_seq_by_shard.get(&shard).copied().unwrap_or(0);
+                let msg = format!(
+                    "t={}ms shard_{shard}: follower {} read {f_read} > max(leader high-water {hw}, own self-acked {self_acked}) ({} current read {l_read})",
+                    a.t_ms, follower.host, leader.host
+                );
+                if let Some(prev) = pending.insert((follower_is_a, shard), msg.clone()) {
+                    if violations.len() < 10 {
+                        violations.push(format!("{prev}; then {msg}"));
+                    }
+                }
+            } else if pending.remove(&(follower_is_a, shard)).is_some() {
+                single_tick_blips += 1;
+            }
+        }
+    }
+    if violations.is_empty() {
+        // Per-shard counts make the exclusion magnitude visible in the
+        // artifact — a fully-excluded shard is named, not silently skipped.
+        let per_shard: Vec<String> = shard_ticks
+            .iter()
+            .map(|(shard, (aud, exc, absent))| {
+                let mut s = format!("shard_{shard} {aud}/{exc}");
+                if *absent > 0 {
+                    s.push_str(&format!(" (status series absent {absent} ticks)"));
+                }
+                if *aud == 0 {
+                    s.push_str(" [NEVER AUDITED]");
+                }
+                s
+            })
+            .collect();
+        let mut detail =
+            format!("{ticks_audited} stable ticks audited ({single_tick_blips} single-tick blips ignored)");
+        if !per_shard.is_empty() {
+            detail.push_str(&format!("; per-shard audited/excluded: {}", per_shard.join(", ")));
+        }
+        CheckResult::pass_with_detail(NAME, detail)
+    } else {
+        CheckResult::fail(NAME, violations.join("; "))
+    }
+}
+
+/// At end-of-run quiesce the read cursor must have reached the write cursor
+/// on BOTH nodes, per shard — judged on each host's LAST ok sample, which
+/// the teardown path takes after a bounded probe-keyed wait. No comparable
+/// shard is a fail, not a vacuous pass: this check is gated per scenario,
+/// so a missing read gauge means the oracle lost its instrument. The judged
+/// sample must also be FRESH (within ~3 scrape ticks of the run's end) — a
+/// dead exporter must not pass on a minutes-old idle sample. A final-tick
+/// `read < write` is accepted only when the write cursor moved since the
+/// host's previous ok sample AND `read == write` held there: in-flight
+/// brand-new writes at the final tick are not a wedged drain, which shows
+/// `read < write` on both ticks.
+pub fn check_read_converged_at_quiesce(
+    samples: &[NodeSample],
+    leader_host: &str,
+    follower_host: &str,
+) -> CheckResult {
+    const NAME: &str = "ReadConvergedAtQuiesce";
+    let run_end_ms = samples.iter().filter(|s| s.ok).map(|s| s.t_ms).max().unwrap_or(0);
+    // Scrape tick ≈ median inter-sample spacing across the judged hosts.
+    let mut gaps: Vec<u64> = Vec::new();
+    for host in [leader_host, follower_host] {
+        let mut prev: Option<u64> = None;
+        for s in samples.iter().filter(|s| s.host == host && s.ok) {
+            if let Some(p) = prev
+                && s.t_ms > p
+            {
+                gaps.push(s.t_ms - p);
+            }
+            prev = Some(s.t_ms);
+        }
+    }
+    gaps.sort_unstable();
+    let max_stale_ms = gaps.get(gaps.len() / 2).map(|tick| tick * 3);
+
+    let mut lagging: Vec<String> = Vec::new();
+    let mut shards_checked = 0usize;
+    for host in [leader_host, follower_host] {
+        let mut ok_samples = samples.iter().rev().filter(|s| s.host == host && s.ok);
+        let Some(last) = ok_samples.next() else {
+            return CheckResult::fail(NAME, format!("no ok sample for {host} at quiesce"));
+        };
+        if let Some(bound) = max_stale_ms {
+            let age = run_end_ms.saturating_sub(last.t_ms);
+            if age > bound {
+                return CheckResult::fail(
+                    NAME,
+                    format!("last ok sample for {host} is {age}ms before run end (freshness bound {bound}ms) — convergence unattestable"),
+                );
+            }
+        }
+        let prev = ok_samples.next();
+        for (&shard, &write) in &last.wal_seq_by_shard {
+            let Some(&read) = last.read_wal_seq_by_shard.get(&shard) else { continue };
+            shards_checked += 1;
+            if read == write {
+                continue;
+            }
+            let write_moved_from_converged = prev.is_some_and(|p| {
+                match (p.wal_seq_by_shard.get(&shard), p.read_wal_seq_by_shard.get(&shard)) {
+                    (Some(&pw), Some(&pr)) => write > pw && pr == pw,
+                    _ => false,
+                }
+            });
+            if !write_moved_from_converged {
+                lagging.push(format!(
+                    "{host} shard_{shard}: read {read} != write {write} (t={}ms)",
+                    last.t_ms
+                ));
+            }
+        }
+    }
+    if shards_checked == 0 {
+        CheckResult::fail(NAME, "no read-cursor gauges on either node — convergence unattestable")
+    } else if lagging.is_empty() {
+        CheckResult::pass_with_detail(NAME, format!("{shards_checked} host-shards converged"))
+    } else {
+        CheckResult::fail(NAME, lagging.join("; "))
+    }
+}
+
 fn check_wal_seq_advanced(data: &RunData) -> CheckResult {
     const NAME: &str = "WalSeqAdvanced";
     let Some((first, last)) = data.leader_first_last() else {
@@ -799,6 +1090,9 @@ mod tests {
             wal_seq_max,
             wal_seq_by_shard,
             read_wal_seq_by_shard: BTreeMap::new(),
+            parked_commit_depth_by_shard: BTreeMap::new(),
+            last_self_acked_by_shard: BTreeMap::new(),
+            node_status_code_by_shard: BTreeMap::new(),
             writes_total: 0,
             write_errors_total: 0,
             leader_elections_total: 0,
@@ -841,6 +1135,8 @@ mod tests {
             catchup_fetch_error_total: 0,
             tombstone_snapshot_regression_total: 0,
             position_snapshot_stale_commit_total: 0,
+            commit_notify_sent_total: 0,
+            commit_notify_received_total: 0,
         }
     }
 
@@ -986,5 +1282,441 @@ mod tests {
         let r = check_read_within_write(&data);
         assert!(r.passed);
         assert!(r.detail.contains("0 ticks"), "{}", r.detail);
+    }
+
+    /// Sample with explicit role and per-shard (write, read) cursor pairs.
+    fn rsample(host: &str, t_ms: u64, role: f64, shards: &[(u32, u64, u64)]) -> NodeSample {
+        let writes: Vec<(u32, u64)> = shards.iter().map(|&(id, w, _)| (id, w)).collect();
+        let mut s = sample(host, t_ms, &writes);
+        s.node_role = role;
+        s.read_wal_seq_by_shard = shards.iter().map(|&(id, _, r)| (id, r)).collect();
+        s
+    }
+
+    /// One paired tick: leader-slot and follower-slot samples at the same t_ms.
+    /// `l`/`f` are (write, read) for shard 1; `leader_is_config_leader` picks
+    /// which slot holds node_role=1.
+    fn tick(t_ms: u64, leader_is_config_leader: bool, l: (u64, u64), f: (u64, u64)) -> [NodeSample; 2] {
+        let (a_role, b_role) = if leader_is_config_leader { (1.0, 0.0) } else { (0.0, 1.0) };
+        [
+            rsample(LEADER, t_ms, a_role, &[(1, l.0, l.1)]),
+            rsample(FOLLOWER, t_ms, b_role, &[(1, f.0, f.1)]),
+        ]
+    }
+
+    // NeverAhead: follower read > leader read on two consecutive stable
+    // ticks (past the 7500ms guard) is a genuine inversion — FAIL.
+    #[test]
+    fn never_ahead_violation_on_consecutive_stable_ticks_fails() {
+        let mut samples = Vec::new();
+        for t in (0..=7_000).step_by(500) {
+            samples.extend(tick(t, true, (100, 100), (100, 90)));
+        }
+        // Past the guard: follower read jumps AHEAD of leader read, twice.
+        samples.extend(tick(7_500, true, (200, 150), (200, 180)));
+        samples.extend(tick(8_000, true, (200, 150), (200, 180)));
+        let data = run_data(&samples);
+        let r = check_never_ahead(&data);
+        assert!(!r.passed, "{}", r.detail);
+        assert!(r.detail.contains("shard_1"), "{}", r.detail);
+        assert!(r.detail.contains("read 180 > max(leader high-water"), "{}", r.detail);
+        assert!(r.detail.contains("then"), "{}", r.detail);
+    }
+
+    // A lone violating tick between clean ticks is scrape/render skew, not
+    // an inversion (an inversion persists until the next carrier) — PASS,
+    // counted as a blip.
+    #[test]
+    fn never_ahead_single_tick_blip_passes() {
+        let mut samples = Vec::new();
+        for t in (0..=7_000).step_by(500) {
+            samples.extend(tick(t, true, (100, 100), (100, 90)));
+        }
+        samples.extend(tick(7_500, true, (200, 150), (200, 180))); // blip
+        samples.extend(tick(8_000, true, (300, 300), (300, 250))); // clean again
+        let data = run_data(&samples);
+        let r = check_never_ahead(&data);
+        assert!(r.passed, "{}", r.detail);
+        assert!(r.detail.contains("1 single-tick blips ignored"), "{}", r.detail);
+    }
+
+    // Follower-ahead ticks right after a leadership flip sit inside the
+    // stability guard (promotion commit legitimately jumps the new state)
+    // and must be EXCLUDED — pass.
+    #[test]
+    fn never_ahead_transition_window_excluded() {
+        let mut samples = Vec::new();
+        // Stable window under the old assignment, clean throughout.
+        for t in (0..=9_500).step_by(500) {
+            samples.extend(tick(t, true, (100, 100), (100, 90)));
+        }
+        // Flip: config follower promotes. The restarted ex-leader (now
+        // follower) briefly exports a stale, higher read cursor.
+        for t in (10_000..=12_000).step_by(500) {
+            samples.extend(tick(t, false, (300, 500), (300, 300)));
+        }
+        let data = run_data(&samples);
+        let r = check_never_ahead(&data);
+        assert!(r.passed, "{}", r.detail);
+    }
+
+    // Same shape but the stale cursor PERSISTS past the guard after the
+    // flip — that is a real violation under the new assignment.
+    #[test]
+    fn never_ahead_violation_after_flip_settles_fails() {
+        let mut samples = Vec::new();
+        for t in (0..=9_500).step_by(500) {
+            samples.extend(tick(t, true, (100, 100), (100, 90)));
+        }
+        for t in (10_000..=18_500).step_by(500) {
+            samples.extend(tick(t, false, (300, 500), (300, 300)));
+        }
+        let data = run_data(&samples);
+        let r = check_never_ahead(&data);
+        assert!(!r.passed, "{}", r.detail);
+        // Comparison must follow roles, not config slots: the config-LEADER
+        // slot is the follower after the flip.
+        assert!(r.detail.contains(&format!("follower {LEADER}")), "{}", r.detail);
+    }
+
+    // An unreachable node resets the stability run: ticks right after it
+    // comes back can't be trusted yet.
+    #[test]
+    fn never_ahead_unreachable_tick_resets_guard() {
+        let mut samples = Vec::new();
+        for t in (0..=7_500).step_by(500) {
+            samples.extend(tick(t, true, (100, 100), (100, 90)));
+        }
+        samples.push(rsample(LEADER, 8_000, 1.0, &[(1, 100, 100)]));
+        samples.push(NodeSample::unreachable(FOLLOWER.into(), 8_000, "down".into()));
+        // Back up, follower ahead — inside the re-armed guard, excluded.
+        samples.extend(tick(8_500, true, (200, 150), (200, 180)));
+        samples.extend(tick(9_000, true, (200, 150), (200, 180)));
+        let data = run_data(&samples);
+        let r = check_never_ahead(&data);
+        assert!(r.passed, "{}", r.detail);
+    }
+
+    // Leader restart regresses its read GAUGE (persisted read lags the
+    // in-memory confirmed index; a rejoined old leader keeps its own-acked
+    // read). Follower at-or-below the all-tenure high-water is NOT ahead.
+    #[test]
+    fn never_ahead_leader_gauge_regression_within_high_water_tolerated() {
+        let mut samples = Vec::new();
+        // Tenure 1: leader confirms up to 100.
+        for t in (0..=8_000).step_by(500) {
+            samples.extend(tick(t, true, (100, 100), (100, 90)));
+        }
+        // Restart gap.
+        samples.push(NodeSample::unreachable(LEADER.into(), 8_500, "down".into()));
+        samples.push(rsample(FOLLOWER, 8_500, 0.0, &[(1, 100, 100)]));
+        // Tenure 2: leader back with regressed read 60; follower holds 100
+        // (= old tenure's confirmed tip) far past the re-armed guard.
+        for t in (9_000..=20_000).step_by(500) {
+            samples.extend(tick(t, true, (110, 60), (110, 100)));
+        }
+        let data = run_data(&samples);
+        let r = check_never_ahead(&data);
+        assert!(r.passed, "{}", r.detail);
+    }
+
+    // Demoted old leader whose final pre-stop confirms outran the last scrape:
+    // read exceeds the observed high-water but its own ack barrier covers it.
+    #[test]
+    fn never_ahead_own_self_acked_covers_post_scrape_confirms() {
+        let mut samples = Vec::new();
+        for t in (0..=8_000).step_by(500) {
+            samples.extend(tick(t, true, (100, 100), (100, 90)));
+        }
+        samples.push(NodeSample::unreachable(LEADER.into(), 8_500, "down".into()));
+        samples.push(rsample(FOLLOWER, 8_500, 0.0, &[(1, 100, 100)]));
+        // Old leader rejoins as follower holding read=120: never scraped as a
+        // leader read, but its persisted ack barrier attests it.
+        for t in (9_000..=20_000).step_by(500) {
+            let [a, mut b] = tick(t, false, (130, 110), (130, 120));
+            b.last_self_acked_by_shard.insert(1, 120);
+            samples.push(a);
+            samples.push(b);
+        }
+        let data = run_data(&samples);
+        let r = check_never_ahead(&data);
+        assert!(r.passed, "{}", r.detail);
+    }
+
+    // Follower in S3 catchup (status code 2) full-commits by design: its read
+    // outrunning every scraped bound is excluded from the audit.
+    #[test]
+    fn never_ahead_catchup_window_excluded() {
+        let mut samples = Vec::new();
+        for t in (0..=8_000).step_by(500) {
+            samples.extend(tick(t, true, (100, 100), (100, 90)));
+        }
+        // Catching up: read way past the high-water while code != 1.
+        for t in (8_500..=20_000).step_by(500) {
+            let [a, mut b] = tick(t, true, (150, 110), (300, 300));
+            b.node_status_code_by_shard.insert(1, 2);
+            samples.push(a);
+            samples.push(b);
+        }
+        let data = run_data(&samples);
+        let r = check_never_ahead(&data);
+        assert!(r.passed, "{}", r.detail);
+    }
+
+    // After the status settles back to Follower the shard guard re-arms and a
+    // sustained excursion past both bounds fails again — the exclusion is a
+    // window, not a blanket waiver.
+    #[test]
+    fn never_ahead_violation_after_catchup_settles_fails() {
+        let mut samples = Vec::new();
+        for t in (0..=2_000).step_by(500) {
+            let [a, mut b] = tick(t, true, (100, 100), (100, 90));
+            b.node_status_code_by_shard.insert(1, 2);
+            samples.push(a);
+            samples.push(b);
+        }
+        // Steady Follower again for well past both guards, then ahead.
+        for t in (2_500..=20_000).step_by(500) {
+            let ahead = if t >= 15_000 { 300 } else { 100 };
+            let [a, mut b] = tick(t, true, (150, 110), (300, ahead));
+            b.node_status_code_by_shard.insert(1, 1);
+            samples.push(a);
+            samples.push(b);
+        }
+        let data = run_data(&samples);
+        let r = check_never_ahead(&data);
+        assert!(!r.passed, "{}", r.detail);
+        assert!(r.detail.contains("read 300"), "{}", r.detail);
+    }
+
+    // Same restart shape, but the follower shows MORE than any tenure ever
+    // confirmed — genuinely ahead, must fail naming the high-water.
+    #[test]
+    fn never_ahead_above_all_tenure_high_water_fails() {
+        let mut samples = Vec::new();
+        for t in (0..=8_000).step_by(500) {
+            samples.extend(tick(t, true, (100, 100), (100, 90)));
+        }
+        samples.push(NodeSample::unreachable(LEADER.into(), 8_500, "down".into()));
+        samples.push(rsample(FOLLOWER, 8_500, 0.0, &[(1, 100, 100)]));
+        for t in (9_000..=20_000).step_by(500) {
+            samples.extend(tick(t, true, (130, 60), (130, 120)));
+        }
+        let data = run_data(&samples);
+        let r = check_never_ahead(&data);
+        assert!(!r.passed, "{}", r.detail);
+        assert!(r.detail.contains("high-water 100"), "{}", r.detail);
+    }
+
+    // No read gauges (pre-upgrade binary): vacuous pass, zero stable ticks.
+    #[test]
+    fn never_ahead_without_read_gauges_is_vacuous() {
+        let mut samples = Vec::new();
+        for t in (0..=9_000).step_by(500) {
+            samples.push(sample(LEADER, t, &[(1, 100)]));
+            samples.push(sample(FOLLOWER, t, &[(1, 100)]));
+        }
+        let data = run_data(&samples);
+        let r = check_never_ahead(&data);
+        assert!(r.passed, "{}", r.detail);
+        assert!(r.detail.contains("0 stable ticks"), "{}", r.detail);
+    }
+
+    // Role-split poisoning (F-P4-5): the node-level role gauge flags a node
+    // whose data shard is still catching up (shard code != 4). Its
+    // full-committed read must NOT raise the high-water — a later genuine
+    // follower-ahead below the poisoned level must still fail.
+    #[test]
+    fn never_ahead_role_split_tick_does_not_poison_high_water() {
+        let mut samples = Vec::new();
+        for t in (0..=8_000).step_by(500) {
+            let [mut a, mut b] = tick(t, true, (100, 100), (100, 90));
+            a.node_status_code_by_shard.insert(1, 4);
+            b.node_status_code_by_shard.insert(1, 1);
+            samples.push(a);
+            samples.push(b);
+        }
+        // Role-split tick: node_role still 1 but shard 1 is catching up
+        // (code 2) with a full-committed read of 500. Must not enter hw.
+        let [mut a, mut b] = tick(8_500, true, (500, 500), (100, 90));
+        a.node_status_code_by_shard.insert(1, 2);
+        b.node_status_code_by_shard.insert(1, 1);
+        samples.push(a);
+        samples.push(b);
+        // Back to a genuine leader; follower later shows read 300 > hw 110
+        // on consecutive stable ticks — below the poisoned 500.
+        for t in (9_000..=20_000).step_by(500) {
+            let f_read = if t >= 18_000 { 300 } else { 90 };
+            let [mut a, mut b] = tick(t, true, (110, 110), (310, f_read));
+            a.node_status_code_by_shard.insert(1, 4);
+            b.node_status_code_by_shard.insert(1, 1);
+            samples.push(a);
+            samples.push(b);
+        }
+        let data = run_data(&samples);
+        let r = check_never_ahead(&data);
+        assert!(!r.passed, "poisoned hw masked the violation: {}", r.detail);
+        assert!(r.detail.contains("read 300"), "{}", r.detail);
+    }
+
+    // Status family present but one shard's series absent: that shard is
+    // never audited and the pass detail must NAME it (F-P4-9a), not hide it
+    // inside a global tick count.
+    #[test]
+    fn never_ahead_fully_excluded_shard_named_in_detail() {
+        let mut samples = Vec::new();
+        for t in (0..=20_000).step_by(500) {
+            let mut a = rsample(LEADER, t, 1.0, &[(1, 100, 100), (2, 100, 100)]);
+            let mut b = rsample(FOLLOWER, t, 0.0, &[(1, 100, 90), (2, 100, 90)]);
+            a.node_status_code_by_shard.insert(1, 4);
+            a.node_status_code_by_shard.insert(2, 4);
+            b.node_status_code_by_shard.insert(1, 1); // shard 2 series absent
+            samples.push(a);
+            samples.push(b);
+        }
+        let data = run_data(&samples);
+        let r = check_never_ahead(&data);
+        assert!(r.passed, "{}", r.detail);
+        assert!(r.detail.contains("shard_2 0/"), "{}", r.detail);
+        assert!(r.detail.contains("status series absent"), "{}", r.detail);
+        assert!(r.detail.contains("NEVER AUDITED"), "{}", r.detail);
+    }
+
+    // Steadiness is keyed by (host, shard) (F-P4-9b): after a flip the new
+    // follower re-arms on its OWN status history. Its shard-1 series appears
+    // late; its ahead-looking read inside its own 7.5s re-arm is excluded —
+    // a shard-only key would inherit the old follower's clock and false-fail.
+    #[test]
+    fn never_ahead_post_flip_follower_rearms_on_own_history() {
+        let mut samples = Vec::new();
+        for t in (0..=9_500).step_by(500) {
+            let [mut a, mut b] = tick(t, true, (100, 100), (100, 90));
+            a.node_status_code_by_shard.insert(1, 4);
+            b.node_status_code_by_shard.insert(1, 1);
+            samples.push(a);
+            samples.push(b);
+        }
+        // Flip: the config-follower slot leads; the config-leader slot is now
+        // the follower and exports codes for shard 2 only — shard 1's series
+        // appears at t=16000. Its shard-1 read looks ahead the whole time
+        // (promotion-adjacent settle).
+        for t in (10_000..=21_000).step_by(500) {
+            let [mut new_follower, mut new_leader] = tick(t, false, (310, 300), (110, 110));
+            new_leader.node_status_code_by_shard.insert(1, 4);
+            if t >= 16_000 {
+                new_follower.node_status_code_by_shard.insert(1, 1);
+            }
+            new_follower.node_status_code_by_shard.insert(2, 1);
+            samples.push(new_follower);
+            samples.push(new_leader);
+        }
+        let data = run_data(&samples);
+        let r = check_never_ahead(&data);
+        assert!(r.passed, "inherited steadiness clock audited too early: {}", r.detail);
+    }
+
+    // ReadConvergedAtQuiesce: read == write per shard on both hosts' final
+    // samples — PASS, even if earlier samples were mid-drain.
+    #[test]
+    fn quiesce_converged_final_samples_pass() {
+        let samples = vec![
+            rsample(LEADER, 0, 1.0, &[(1, 100, 100), (2, 50, 50)]),
+            rsample(FOLLOWER, 0, 0.0, &[(1, 100, 40), (2, 50, 20)]), // mid-drain
+            rsample(LEADER, 5_000, 1.0, &[(1, 200, 200), (2, 80, 80)]),
+            rsample(FOLLOWER, 5_000, 0.0, &[(1, 200, 200), (2, 80, 80)]),
+        ];
+        let r = check_read_converged_at_quiesce(&samples, LEADER, FOLLOWER);
+        assert!(r.passed, "{}", r.detail);
+        assert!(r.detail.contains("4 host-shards"), "{}", r.detail);
+    }
+
+    // The quiesce wait timed out with the follower still lagging on one
+    // shard — FAIL naming host and shard. This is the wedged/leaking-drain
+    // signature the check exists for.
+    #[test]
+    fn quiesce_lagging_shard_fails() {
+        let samples = vec![
+            rsample(LEADER, 5_000, 1.0, &[(1, 200, 200), (2, 80, 80)]),
+            rsample(FOLLOWER, 5_000, 0.0, &[(1, 200, 200), (2, 80, 61)]),
+        ];
+        let r = check_read_converged_at_quiesce(&samples, LEADER, FOLLOWER);
+        assert!(!r.passed);
+        assert!(r.detail.contains(&format!("{FOLLOWER} shard_2")), "{}", r.detail);
+        assert!(r.detail.contains("read 61 != write 80"), "{}", r.detail);
+    }
+
+    // Gated on but no read gauges exported: unattestable is a FAIL, not a
+    // vacuous pass — the oracle lost its instrument.
+    #[test]
+    fn quiesce_without_read_gauges_fails() {
+        let samples = vec![
+            sample(LEADER, 5_000, &[(1, 200)]),
+            sample(FOLLOWER, 5_000, &[(1, 200)]),
+        ];
+        let r = check_read_converged_at_quiesce(&samples, LEADER, FOLLOWER);
+        assert!(!r.passed);
+        assert!(r.detail.contains("unattestable"), "{}", r.detail);
+    }
+
+    // A host that never produced an ok sample can't attest convergence.
+    #[test]
+    fn quiesce_missing_host_fails() {
+        let samples = vec![
+            rsample(LEADER, 5_000, 1.0, &[(1, 200, 200)]),
+            NodeSample::unreachable(FOLLOWER.into(), 5_000, "down".into()),
+        ];
+        let r = check_read_converged_at_quiesce(&samples, LEADER, FOLLOWER);
+        assert!(!r.passed);
+        assert!(r.detail.contains(&format!("no ok sample for {FOLLOWER}")), "{}", r.detail);
+    }
+
+    // The 1783294884 teardown-writer shape (F-P4-3): converged at the prior
+    // tick, then a teardown-phase writer lands brand-new writes and the final
+    // scrape catches the leader mid-commit-round (+64 write, read stale).
+    // In-flight new writes are not a wedged drain — PASS.
+    #[test]
+    fn quiesce_write_jump_on_final_tick_with_prior_convergence_passes() {
+        let samples = vec![
+            rsample(LEADER, 4_500, 1.0, &[(2, 217_198, 217_198)]),
+            rsample(FOLLOWER, 4_500, 0.0, &[(2, 217_198, 217_198)]),
+            rsample(LEADER, 5_000, 1.0, &[(2, 217_262, 217_198)]),
+            rsample(FOLLOWER, 5_000, 0.0, &[(2, 217_198, 217_198)]),
+        ];
+        let r = check_read_converged_at_quiesce(&samples, LEADER, FOLLOWER);
+        assert!(r.passed, "{}", r.detail);
+    }
+
+    // Wedged drain with traffic: read < write on BOTH final ticks. The write
+    // cursor moving does not excuse a drain that was already behind — FAIL.
+    #[test]
+    fn quiesce_wedged_drain_with_traffic_fails() {
+        let samples = vec![
+            rsample(LEADER, 4_500, 1.0, &[(1, 150, 100)]),
+            rsample(FOLLOWER, 4_500, 0.0, &[(1, 150, 150)]),
+            rsample(LEADER, 5_000, 1.0, &[(1, 200, 100)]),
+            rsample(FOLLOWER, 5_000, 0.0, &[(1, 200, 200)]),
+        ];
+        let r = check_read_converged_at_quiesce(&samples, LEADER, FOLLOWER);
+        assert!(!r.passed);
+        assert!(r.detail.contains(&format!("{LEADER} shard_1")), "{}", r.detail);
+    }
+
+    // A minutes-old "last ok" sample (dead exporter during teardown) cannot
+    // attest convergence, however converged it looked back then — FAIL loud.
+    #[test]
+    fn quiesce_stale_last_ok_sample_fails() {
+        let mut samples = Vec::new();
+        for t in (0..=20_000).step_by(500) {
+            samples.push(rsample(LEADER, t, 1.0, &[(1, 200, 200)]));
+            if t <= 5_000 {
+                samples.push(rsample(FOLLOWER, t, 0.0, &[(1, 200, 200)]));
+            } else {
+                samples.push(NodeSample::unreachable(FOLLOWER.into(), t, "down".into()));
+            }
+        }
+        let r = check_read_converged_at_quiesce(&samples, LEADER, FOLLOWER);
+        assert!(!r.passed);
+        assert!(r.detail.contains("freshness bound"), "{}", r.detail);
+        assert!(r.detail.contains(FOLLOWER), "{}", r.detail);
     }
 }

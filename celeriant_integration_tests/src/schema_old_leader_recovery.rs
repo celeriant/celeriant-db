@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
-use crate::{count_events, s3_cluster_config, write_event, MinioContainer, TestServer};
+use crate::{poll_converged_count, s3_cluster_config, write_event, MinioContainer, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT};
 use celeriant_msg::{
     process_client_requests::ClientRequest,
     request::requests::{RegisterSchemaRequest, SingleAggregateWrite, WriteRequest},
@@ -156,7 +156,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Invalid write rejected on A: PASS");
 
     let mut node_b_client = CeleriantClient::connect(node_b.address()).await?;
-    let b_count = count_events(&mut node_b_client, &aggregate_key).await?;
+    let b_count =
+        poll_converged_count(&mut node_b_client, &aggregate_key, 4, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     assert_eq!(b_count, 4, "Node B should have 4 events");
     println!("  Node B has {} events (schema replicated via TCP)\n", b_count);
 
@@ -213,7 +214,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     write_event(&mut node_b_client, &aggregate_key, 10, false).await?;
 
     let mut node_a_client = CeleriantClient::connect(node_a.address()).await?;
-    let a_count = count_events(&mut node_a_client, &aggregate_key).await?;
+    let a_count =
+        poll_converged_count(&mut node_a_client, &aggregate_key, 10, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     assert_eq!(a_count, 10, "Node A should have 10 events after catchup");
     println!("  Node A caught up: {} events\n", a_count);
 

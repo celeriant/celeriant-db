@@ -5,7 +5,7 @@
 //! that once led carries its old `last_self_acked_wal_seq` forever. If it
 //! later serves as follower, receives TCP-replicated entries beyond that
 //! barrier, then bounces Fenced→Follower (heartbeat gap > TTL, then heal),
-//! the demotion cull (`cull_speculative_tail_for_promotion(true)`,
+//! the demotion cull (`reconcile_durable_tail(RewindToAckBarrier)`,
 //! `BothToAckBarrier` arm) fires with `read == write > last_self_acked` and
 //! rewinds both cursors to the stale barrier — destroying entries the
 //! *current* leader already ACKed to clients. If the leader then dies before

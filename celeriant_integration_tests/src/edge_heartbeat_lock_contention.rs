@@ -21,7 +21,8 @@
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{
-    count_events, is_leader, s3_cluster_config, write_event, MinioContainer, TcpProxy, TestServer,
+    count_events, is_leader, poll_converged_count, s3_cluster_config, write_event,
+    MinioContainer, TcpProxy, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
@@ -109,7 +110,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Write a baseline event and verify it replicates.
     let probe_key = AggregateKey::new(1, 0, 12345);
     write_event(&mut leader_client, &probe_key, 1, true).await?;
-    let baseline = count_events(&mut follower_client, &probe_key).await?;
+    let baseline =
+        poll_converged_count(&mut follower_client, &probe_key, 1, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     assert_eq!(baseline, 1, "Baseline event should have replicated to follower");
     println!("  Cluster healthy, baseline replication confirmed\n");
 
@@ -209,7 +211,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Both shards must have converged event counts.
     let lc_shard0 = count_events(&mut leader_client, &key_shard0).await?;
-    let fc_shard0 = count_events(&mut follower_client, &key_shard0).await?;
+    let fc_shard0 =
+        poll_converged_count(&mut follower_client, &key_shard0, lc_shard0, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     println!("  Shard 0: leader={}, follower={}", lc_shard0, fc_shard0);
     assert_eq!(
         lc_shard0, fc_shard0,
@@ -217,7 +220,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let lc_shard1 = count_events(&mut leader_client, &key_shard1).await?;
-    let fc_shard1 = count_events(&mut follower_client, &key_shard1).await?;
+    let fc_shard1 =
+        poll_converged_count(&mut follower_client, &key_shard1, lc_shard1, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     println!("  Shard 1: leader={}, follower={}", lc_shard1, fc_shard1);
     assert_eq!(
         lc_shard1, fc_shard1,

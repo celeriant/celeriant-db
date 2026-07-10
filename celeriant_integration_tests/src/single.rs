@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use celeriant_runtimes::RoutingRule;
 
-use crate::{MinioContainer, ServerConfig, TestServer};
+use crate::{poll_converged_count, MinioContainer, ServerConfig, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT};
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_client_tokio::list_operations::{
@@ -230,6 +230,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => println!("Idempotent retry result: {:?}", e),
     }
 
+    // Follower commit-notify is paced; wait for both writes to be visible on read_client
+    // before the reads and listing assertions below.
+    poll_converged_count(&mut read_client, &aggregate_1, 2, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
+    poll_converged_count(&mut read_client, &aggregate_2, 2, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
+
     // Read back events from both aggregates (use read_client - follower in replicated mode)
     println!("\n=== Reading events from both aggregates ===");
     if REPLICATED_MODE {
@@ -342,6 +347,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Ok(response) => println!("Delete aggregate 1: {:?}", response),
         Err(e) => println!("Delete aggregate 1 failed: {:?}", e),
     }
+
+    // Wait for the delete to be applied on read_client before listing.
+    poll_converged_count(&mut read_client, &aggregate_1, 0, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
 
     // === List Aggregates again to verify delete ===
     println!("\n=== Listing Aggregates (after delete, excluding deleted) ===");

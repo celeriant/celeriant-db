@@ -77,6 +77,7 @@ criterion_group!(
     benches,
     bench_leader_vs_standalone,
     bench_leader_batch_size,
+    bench_follower_apply,
 );
 criterion_main!(benches);
 
@@ -392,6 +393,191 @@ fn bench_leader_batch_size(c: &mut Criterion) {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
                     total += run_write_workload(leader_status(), evs, aggs);
+                }
+                total
+            });
+        });
+    }
+
+    group.finish();
+}
+
+// =============================================================================
+// FOLLOWER APPLY
+// =============================================================================
+
+/// Real leader wire batches for the follower-apply bench: each element is one
+/// replication call's items plus the leader_confirmed_wal_seq it carried
+/// (steady-state carrier shape: batch N confirms batch N-1's tip).
+struct CapturedBatches {
+    calls: Vec<(Vec<celeriant_msg::request::requests::ReplicationBatchItem>, u64)>,
+}
+
+/// Records every replicate_to_follower call instead of sending it.
+#[derive(Default)]
+struct CaptureToFollowerClient {
+    calls: std::cell::RefCell<Vec<(Vec<celeriant_msg::request::requests::ReplicationBatchItem>, u64)>>,
+}
+
+impl celeriant_shard::replication_client::ReplicationClient for CaptureToFollowerClient {
+    fn set_follower_address(&self, _address: Option<String>) {}
+    fn set_follower_reachable(&self, _reachable: bool) {}
+    fn is_follower_reachable(&self) -> bool { true }
+    fn current_heartbeat_started_at_unix_ms(&self) -> Option<u64> { None }
+    fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
+    fn reset_heartbeat_state(&self) {}
+    async fn replicate_to_follower(
+        &self,
+        batches: Vec<celeriant_msg::request::requests::ReplicationBatchItem>,
+        leader_confirmed_wal_seq: u64,
+        _sender_lease_epoch: u64,
+    ) -> Result<(), celeriant_shard::error::replication_to_follower_error::ReplicateToFollowerError> {
+        // Post-burst commit-notifies (empty batches) are not apply work; keep
+        // the captured stream to the data batches the follower applies.
+        if !batches.is_empty() {
+            self.calls.borrow_mut().push((batches, leader_confirmed_wal_seq));
+        }
+        Ok(())
+    }
+    async fn replicate_to_s3(
+        &self,
+        _batches: Vec<celeriant_msg::request::requests::ReplicationBatchItem>,
+    ) -> Result<(), celeriant_shard::error::replication_to_s3_error::ReplicateToS3Error> {
+        Ok(())
+    }
+    async fn send_heartbeat(
+        &self,
+        unix_epoch_now_ms: u64,
+        _lease_epoch: u64,
+    ) -> Result<celeriant_msg::response::responses::HeartbeatResult, celeriant_shard::error::send_heartbeat_error::SendHeartbeatError> {
+        Ok(celeriant_msg::response::responses::HeartbeatResult::Ack {
+            follower_timestamp_ms: unix_epoch_now_ms + 10,
+            follower_can_accept_tcp_replication: true,
+        })
+    }
+    async fn send_kick(&self) -> Result<bool, celeriant_shard::error::send_heartbeat_error::SendHeartbeatError> {
+        Ok(true)
+    }
+}
+
+const FOLLOWER_APPLY_WRITES: usize = 100;
+
+/// Run a real leader over sequential awaited writes (replication_delay ZERO so
+/// calls map 1:1 to writes) and capture the wire batches it sends.
+fn capture_leader_batches(aggregates_per_write: usize, events_per_agg: usize) -> CapturedBatches {
+    let tempdir = tempdir().unwrap();
+    let shard_dir = tempdir.path().to_path_buf();
+
+    let calls = LocalExecutorBuilder::new(Placement::Fixed(0))
+        .spawn(move || async move {
+            let mut config = create_config(shard_dir, Duration::ZERO, 64 * 1024 * 1024);
+            config.replication_delay = Duration::ZERO;
+            let shard_wal = ShardWal::open(
+                config,
+                leader_status(),
+                CaptureToFollowerClient::default(),
+                StubS3Downloader,
+            )
+            .await
+            .unwrap();
+
+            for write_id in 0..FOLLOWER_APPLY_WRITES {
+                let req = create_write_request(
+                    (write_id * aggregates_per_write) as u128,
+                    aggregates_per_write,
+                    events_per_agg,
+                    (write_id * events_per_agg) as u64,
+                    write_id as u128,
+                );
+                shard_wal.write(req).await.unwrap();
+            }
+            shard_wal.close().await;
+            let calls = shard_wal.replication_client.calls.borrow().clone();
+            assert_eq!(calls.len(), FOLLOWER_APPLY_WRITES, "sequential awaited writes must replicate 1:1");
+            calls
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+
+    CapturedBatches { calls }
+}
+
+/// Apply every captured batch to a fresh follower shard, steady-state carrier
+/// shape, and return the wall time of the apply loop only (open/close excluded).
+fn run_follower_apply(captured: &CapturedBatches) -> Duration {
+    let tempdir = tempdir().unwrap();
+    let shard_dir = tempdir.path().to_path_buf();
+    let calls = captured.calls.clone();
+
+    LocalExecutorBuilder::new(Placement::Fixed(0))
+        .spawn(move || async move {
+            let config = create_config(shard_dir, Duration::ZERO, 64 * 1024 * 1024);
+            let follower_status = ValidatedNodeStatus::create_custom_status(
+                NodeStatus::Follower { leader_lease_epoch: 1 },
+                500,
+                now_ms() + 30_000,
+            );
+            let shard_wal = ShardWal::open(config, follower_status, StubReplicationClient, StubS3Downloader)
+                .await
+                .unwrap();
+
+            let start = Instant::now();
+            for (batches, leader_confirmed_wal_seq) in calls {
+                let req = celeriant_msg::request::requests::ReplicationBatchRequest {
+                    correlation_id: None,
+                    shard_id: 1,
+                    leader_timestamp_ms: now_ms(),
+                    leader_confirmed_wal_seq,
+                    sender_lease_epoch: 1,
+                    batches,
+                };
+                let resp = shard_wal.handle_replication_batch(req).await.unwrap();
+                match black_box(resp).result {
+                    celeriant_msg::response::responses::ReplicationResult::Success { .. } => {}
+                    other => panic!("follower rejected a captured batch: {other:?}"),
+                }
+            }
+            let elapsed = start.elapsed();
+
+            shard_wal.close().await;
+            elapsed
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+/// Follower live-TCP apply throughput: real captured leader batches, applied in
+/// order with the steady-state carrier (each batch confirms the previous tip).
+/// This is the path the deferred-commit change adds work to (park + drain);
+/// compare against the `main_pre_follower_commit` baseline, band ±5%.
+fn bench_follower_apply(c: &mut Criterion) {
+    let mut group = c.benchmark_group("replication_batch");
+    // 30 samples: n=10 left the 8agg CI wider than the ±5% band (phase-4 gate).
+    group.sample_size(30);
+    group.measurement_time(Duration::from_secs(10));
+    group.warm_up_time(Duration::from_secs(3));
+
+    // (label, aggregates_per_write, events_per_aggregate)
+    let configs: [(&str, usize, usize); 2] = [
+        ("1agg_5ev", 1, 5),
+        ("8agg_5ev", 8, 5),
+    ];
+
+    for (label, aggs, evs) in configs {
+        let captured = capture_leader_batches(aggs, evs);
+        let bytes_per_iter = EVENT_SIZE_BYTES * evs * aggs * FOLLOWER_APPLY_WRITES;
+        group.throughput(Throughput::Bytes(bytes_per_iter as u64));
+        eprintln!(
+            "\n=== follower_apply: {} ({} batches of {} items) ===",
+            label, FOLLOWER_APPLY_WRITES, aggs
+        );
+        group.bench_function(BenchmarkId::new("follower_apply", label), |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    total += run_follower_apply(&captured);
                 }
                 total
             });

@@ -34,8 +34,9 @@
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{
-    copy_shard_dirs, count_events, s3_cluster_config, write_event, write_large_event,
-    MinioContainer, RoutingRule, ServerConfig, TestServer,
+    copy_shard_dirs, count_events, poll_converged_count, s3_cluster_config, write_event,
+    write_large_event, MinioContainer, RoutingRule, ServerConfig, TestServer,
+    FOLLOWER_CONVERGENCE_TIMEOUT,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
@@ -294,7 +295,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  A is still alive (auto-heal succeeded).");
 
     let mut client_a = CeleriantClient::connect(node_a.address()).await?;
-    let a_count = count_events(&mut client_a, &aggregate_key).await?;
+    let a_count =
+        poll_converged_count(&mut client_a, &aggregate_key, 14, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     println!("  A has {} events after auto-heal", a_count);
     assert_eq!(
         a_count, 14,
@@ -326,7 +328,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     drop(client_a);
     let mut client_a = CeleriantClient::connect(node_a.address()).await?;
-    let a_final = count_events(&mut client_a, &aggregate_key).await?;
+    let a_final =
+        poll_converged_count(&mut client_a, &aggregate_key, 16, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     println!("  B: {} events, A: {} events", b_final, a_final);
     assert_eq!(
         a_final, 16,

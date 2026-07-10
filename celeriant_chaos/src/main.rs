@@ -1,29 +1,12 @@
-mod actions;
-mod checkers;
-mod config;
-mod disk_truth;
-pub mod epoch_oracle;
-mod final_read;
-mod invariants;
-pub mod journal_assert;
-mod logs;
-mod report;
-pub mod resource_baseline;
-mod sample;
-mod scenario;
-mod scrape;
-pub mod s3_lifecycle;
-mod tip_fork;
-
 use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
 
-use crate::actions::find_project_root;
-use crate::config::ClusterConfig;
-use crate::report::{RunDir, write_run_report, write_scenario};
-use crate::scenario::{
+use celeriant_chaos::actions::find_project_root;
+use celeriant_chaos::config::ClusterConfig;
+use celeriant_chaos::report::{RunDir, write_run_report, write_scenario};
+use celeriant_chaos::scenario::{
     ScenarioParams, ScenarioReport, run_baseline, run_bridge, run_cas_storm_scenario,
     run_clock_scrambler, run_duplicate_replay,
     run_follower_graceful_stop, run_follower_sigkill, run_single_node_isolation,

@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use celeriant_distributed::validated_node_status::ValidatedNodeStatus;
 use celeriant_msg::{process_client_requests::ClientRequest, process_cluster_requests::ClusterRequest, request::requests::RegisterSchemaRequest, response::responses::AccessLevel};
-use celeriant_shard::{error::{s3_catchup_error::S3CatchupError, shard_schema_error::ShardSchemaError}, shard_wal_s3_catchup::S3CatchupResult};
+use celeriant_shard::{error::{s3_catchup_error::S3CatchupError, shard_schema_error::ShardSchemaError}, shard_wal::TailReconciliation, shard_wal_s3_catchup::S3CatchupResult};
 use glommio::channels::channel_mesh::Senders;
 use glommio::channels::local_channel::LocalReceiver;
 use glommio::net::AcceptedTcpStream;
@@ -26,7 +26,7 @@ pub enum IntrashardMessages {
         accepted_tcp_stream: AcceptedTcpStream,
         payload: Vec<u8>,
     },
-    CullSpeculativeTail { rewind_to_ack_barrier: bool },
+    CullSpeculativeTail { mode: TailReconciliation },
     RenewS3LeaseNow { requesting_shard: usize },
     EnterS3Catchup,
     S3CatchupComplete {

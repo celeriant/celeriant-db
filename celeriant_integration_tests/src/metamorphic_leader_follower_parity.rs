@@ -1,14 +1,16 @@
 //! Metamorphic oracle: leader vs follower payload-level parity.
 //!
-//! Writes N events across M aggregates to the leader, then immediately reads
-//! every aggregate's full event list from BOTH leader and follower via the
-//! client API. Fails if any aggregate's batches differ in any field exposed by
-//! the read response (aggregate version, client/user id, server timestamp, or any
+//! Writes N events across M aggregates to the leader, then reads every
+//! aggregate's full event list from BOTH leader and follower via the client
+//! API. Fails if any aggregate's batches differ in any field exposed by the
+//! read response (aggregate version, client/user id, server timestamp, or any
 //! per-event field including the raw payload bytes).
 //!
-//! No quiesce wait is required: `invariants.md` guarantees that by the time a
-//! client sees `ok` for a write, fsync AND replication have both completed and
-//! both read cursors have advanced. If an immediate read flakes, that is a bug.
+//! The leader is read immediately: write `ok` means the leader's read cursor
+//! has advanced. The follower commits on the leader's confirmed index, so its
+//! visibility trails by design — its read polls until the payload digest
+//! matches the leader's (bounded by `FOLLOWER_CONVERGENCE_TIMEOUT`), then the
+//! full strict diff runs. Convergence is bounded, parity is exact.
 //!
 //! Post-run: asserts no S3 fallback objects were uploaded. In a healthy cluster
 //! all replication flows over TCP (`invariants.md`, "Replication Protocol").
@@ -20,7 +22,7 @@ use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{
     metamorphic_common::{diff_aggregate, format_key, response_digest, DiffMode},
     read_all_batches, s3_cluster_config, wait_for_election_and_replication, write_event,
-    MinioContainer, TestServer,
+    MinioContainer, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 
@@ -72,14 +74,21 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             write_event(&mut leader_client, key, event_num, event_num == 1).await?;
         }
     }
-    println!("  Writes complete. Reading immediately (no quiesce wait).");
+    println!("  Writes complete. Leader read immediately; follower polled to convergence.");
 
-    // Read each aggregate from both nodes and diff.
+    // Read each aggregate from both nodes and diff. The follower read polls
+    // until its digest matches the leader's; on timeout the strict diff below
+    // runs against whatever it last saw and reports the divergence.
     let mut mismatches = Vec::<String>::new();
     for key in &keys {
         let leader_batches = read_all_batches(&mut leader_client, key).await?;
-        let follower_batches = read_all_batches(&mut follower_client, key).await?;
         let lh = response_digest(&leader_batches);
+        let deadline = std::time::Instant::now() + FOLLOWER_CONVERGENCE_TIMEOUT;
+        let mut follower_batches = read_all_batches(&mut follower_client, key).await?;
+        while response_digest(&follower_batches) != lh && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            follower_batches = read_all_batches(&mut follower_client, key).await?;
+        }
         let fh = response_digest(&follower_batches);
         println!(
             "  aggregate {}: leader_batches={}, follower_batches={}, response_digest leader={:016x} follower={:016x}",

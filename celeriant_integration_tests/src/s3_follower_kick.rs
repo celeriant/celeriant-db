@@ -15,7 +15,8 @@
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{
-    count_events, s3_cluster_config, write_event, MinioContainer, TcpProxy, TestServer,
+    count_events, poll_converged_count, s3_cluster_config, write_event, MinioContainer, TcpProxy,
+    TestServer, FOLLOWER_CONVERGENCE_TIMEOUT,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
@@ -85,8 +86,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
-    let count1 = count_events(&mut follower_client, &key_shard1).await?;
-    let count2 = count_events(&mut follower_client, &key_shard2).await?;
+    let count1 =
+        poll_converged_count(&mut follower_client, &key_shard1, 3, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
+    let count2 =
+        poll_converged_count(&mut follower_client, &key_shard2, 3, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     println!("  Follower: shard1={} events, shard2={} events", count1, count2);
     assert_eq!(count1, 3, "Follower shard 1 should have 3 events");
     assert_eq!(count2, 3, "Follower shard 2 should have 3 events");
@@ -223,10 +226,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
-    let final1 = count_events(&mut follower_client, &key_shard1).await?;
-    let final2 = count_events(&mut follower_client, &key_shard2).await?;
     let expected1 = base1 + 3;
     let expected2 = base2 + 3;
+    let final1 =
+        poll_converged_count(&mut follower_client, &key_shard1, expected1, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
+    let final2 =
+        poll_converged_count(&mut follower_client, &key_shard2, expected2, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     println!("  Follower: shard1={}/{}, shard2={}/{}", final1, expected1, final2, expected2);
     assert_eq!(final1, expected1, "Follower shard 1 should have all events after re-join");
     assert_eq!(final2, expected2, "Follower shard 2 should have all events after re-join");

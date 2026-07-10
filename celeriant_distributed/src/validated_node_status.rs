@@ -15,6 +15,14 @@ pub struct ValidatedNodeStatus {
     lease_expires_at_ms: u64,
     max_clock_drift_ms: u64,
     leader_since_ms: u64,
+    /// Interim statuses (Fenced, Promoting, FollowerCatchingUp, BootCatchup)
+    /// erase the raw role, but demotion handling needs to know whether the node
+    /// held leadership when it entered the interim state: a demoted ex-leader
+    /// rewinds to its ack barrier, while an ex-follower may hold a peer tail
+    /// that must survive. Carried through interim rewrites by
+    /// `set_node_status_and_metric`; reset by steady Follower/Standalone, set
+    /// by Leader. In-memory only: after a restart, decisions derive from disk.
+    held_leadership: bool,
 }
 
 impl ValidatedNodeStatus {
@@ -27,8 +35,16 @@ impl ValidatedNodeStatus {
         unix_epoch_now_ms() > self.lease_expires_at_ms.saturating_sub(self.max_clock_drift_ms)
     }
 
-    pub fn create_fenced() -> Self {
-        Self { status: NodeStatus::Fenced, max_clock_drift_ms: 0, lease_expires_at_ms: 0, leader_since_ms: 0 }
+    pub fn create_fenced(held_leadership: bool) -> Self {
+        Self { status: NodeStatus::Fenced, max_clock_drift_ms: 0, lease_expires_at_ms: 0, leader_since_ms: 0, held_leadership }
+    }
+
+    /// True when this node held leadership at the point it left the follower
+    /// fold: it is (possibly TTL-expired) Leader, or entered an interim state
+    /// FROM a leader role. Decides whether a demotion may rewind to the ack
+    /// barrier.
+    pub fn held_leadership(&self) -> bool {
+        self.status.is_leader() || self.held_leadership
     }
 
     pub fn current_budget(&self) -> Option<std::time::Duration> {
@@ -41,15 +57,15 @@ impl ValidatedNodeStatus {
     }
 
     pub fn create_standalone() -> Self {
-        Self { status: NodeStatus::Standalone, max_clock_drift_ms: 0, lease_expires_at_ms: 0, leader_since_ms: 0 }
+        Self { status: NodeStatus::Standalone, max_clock_drift_ms: 0, lease_expires_at_ms: 0, leader_since_ms: 0, held_leadership: false }
     }
 
     pub fn create_boot_catchup() -> Self {
-        Self { status: NodeStatus::BootCatchup, max_clock_drift_ms: 0, lease_expires_at_ms: 0, leader_since_ms: 0 }
+        Self { status: NodeStatus::BootCatchup, max_clock_drift_ms: 0, lease_expires_at_ms: 0, leader_since_ms: 0, held_leadership: false }
     }
 
     pub fn create_custom_status(status: NodeStatus, max_clock_drift_ms: u64, lease_expires_at_ms: u64) -> Self {
-        Self { status, max_clock_drift_ms, lease_expires_at_ms, leader_since_ms: 0 }
+        Self { status, max_clock_drift_ms, lease_expires_at_ms, leader_since_ms: 0, held_leadership: false }
     }
 
     /// Unix-epoch ms when this node became leader; 0 if never. Stable across
@@ -117,7 +133,28 @@ pub fn set_node_status_and_metric(
     } else {
         prev.leader_since_ms
     };
+    // Held-leadership provenance: set by Leader, cleared by the steady roles,
+    // carried through interim states (a constructor may also assert it, e.g.
+    // create_fenced from a drift-fenced leader).
+    status.held_leadership = match status.raw() {
+        NodeStatus::Leader { .. } => true,
+        NodeStatus::Follower { .. } | NodeStatus::Standalone => false,
+        NodeStatus::Fenced
+        | NodeStatus::Promoting { .. }
+        | NodeStatus::FollowerCatchingUp { .. }
+        | NodeStatus::BootCatchup => status.held_leadership || prev.held_leadership(),
+    };
     cell.set(status);
+    let code = match status.raw() {
+        NodeStatus::BootCatchup => 0.0,
+        NodeStatus::Follower { .. } => 1.0,
+        NodeStatus::FollowerCatchingUp { .. } => 2.0,
+        NodeStatus::Promoting { .. } => 3.0,
+        NodeStatus::Leader { .. } => 4.0,
+        NodeStatus::Fenced => 5.0,
+        NodeStatus::Standalone => 6.0,
+    };
+    metrics::gauge!("celeriant_node_status_code", &[("shard_id", shard_id.to_string())]).set(code);
     if shard_id == 0 {
         let role = if status.is_leader() || status.is_standalone() { 1.0 } else { 0.0 };
         metrics::gauge!("celeriant_node_role").set(role);
@@ -244,6 +281,27 @@ mod tests {
         );
         assert!(!status.is_fenced());
         assert!(status.is_catching_up());
+    }
+
+    /// Held-leadership provenance survives the interim-status chain a demotion
+    /// can traverse (Leader -> drift-Fenced -> Promoting -> catchup rewrite) and
+    /// resets only when a steady role lands. The demotion mode derivation reads
+    /// it to decide ack-barrier rewind vs provenance-checked reconciliation.
+    #[test]
+    fn held_leadership_carried_through_interim_states_and_reset_by_steady_roles() {
+        let cell = std::cell::Cell::new(ValidatedNodeStatus::create_boot_catchup());
+        let set = |s: NodeStatus| {
+            set_node_status_and_metric(&cell, ValidatedNodeStatus::create_custom_status(s, DRIFT, FAR_FUTURE), 1);
+            cell.get().held_leadership()
+        };
+        assert!(!set(NodeStatus::Follower { leader_lease_epoch: 1 }), "never led yet");
+        assert!(!set(NodeStatus::Fenced), "fenced ex-follower: no leadership to remember");
+        assert!(set(NodeStatus::Leader { lease_epoch: 2 }), "leader holds leadership");
+        assert!(set(NodeStatus::Fenced), "drift-fenced ex-leader remembers");
+        assert!(set(NodeStatus::Promoting { lease_epoch: 3 }), "promoting ex-leader remembers");
+        assert!(set(NodeStatus::BootCatchup), "in-process catchup rewrite remembers");
+        assert!(!set(NodeStatus::Follower { leader_lease_epoch: 3 }), "steady follower resets");
+        assert!(!set(NodeStatus::Promoting { lease_epoch: 4 }), "promoting ex-follower has nothing to remember");
     }
 
     #[test]

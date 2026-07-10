@@ -24,7 +24,8 @@ use std::time::Duration;
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
 use crate::{
-    count_events, s3_cluster_config, scrape_counter, write_event, MinioContainer, TcpProxy, TestServer,
+    count_events, poll_converged_count, s3_cluster_config, scrape_counter, write_event,
+    MinioContainer, TcpProxy, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT,
 };
 use celeriant_msg::process_client_requests::ClientRequest;
 use celeriant_msg::request::requests::{SingleAggregateWrite, WriteRequest};
@@ -102,9 +103,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut follower_client = CeleriantClient::connect(_follower.address()).await?;
-    let fc = count_events(&mut follower_client, &probe_shard0).await?;
+    let fc = poll_converged_count(&mut follower_client, &probe_shard0, 3, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     println!("  Follower shard 0: {} events", fc);
-    assert_eq!(fc, 3, "Follower should have 3 events on shard 0");
+    assert_eq!(fc, 3, "Follower should converge to 3 events on shard 0");
 
     let backpressure_before = scrape_counter(
         "127.0.0.1",
@@ -273,12 +274,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut follower_client = CeleriantClient::connect(_follower.address()).await?;
     let verify_key = AggregateKey::new(1, 1, 0);
     let lc = count_events(&mut leader_client, &verify_key).await?;
-    let fc = count_events(&mut follower_client, &verify_key).await?;
+    let fc = poll_converged_count(&mut follower_client, &verify_key, lc, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     println!("  Verify key (agg 0): leader={}, follower={}", lc, fc);
     assert_eq!(fc, lc, "Follower should track leader on post-recovery writes");
 
     let lc0 = count_events(&mut leader_client, &probe_shard0).await?;
-    let fc0 = count_events(&mut follower_client, &probe_shard0).await?;
+    let fc0 = poll_converged_count(&mut follower_client, &probe_shard0, lc0, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     println!("  Shard 0 probe: leader={}, follower={}", lc0, fc0);
     assert_eq!(lc0, fc0, "Shard 0 counts must match");
 
@@ -286,7 +287,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     for agg_id in 0..NUM_AGGREGATES {
         let key = AggregateKey::new(1, 1, agg_id as u128);
         let lc = count_events(&mut leader_client, &key).await?;
-        let fc = count_events(&mut follower_client, &key).await?;
+        let fc = poll_converged_count(&mut follower_client, &key, lc, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
         if lc != fc {
             println!("  MISMATCH agg_id={}: leader={}, follower={}", agg_id, lc, fc);
             mismatches += 1;

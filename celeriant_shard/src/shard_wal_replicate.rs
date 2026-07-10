@@ -16,6 +16,7 @@ use crate::schema_validator::CompiledValidator;
 type MemCache = ShardMemCache<CompiledValidator>;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_wal::constants::FIRST_AGGREGATE_VERSION;
+use celeriant_wal::metablocks::metablock::Metablock;
 use celeriant_wal::segment_summary::SegmentSummaryPayload;
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
@@ -39,6 +40,11 @@ use crate::watch_event_collector::WatchEventCollector;
 pub(crate) enum ReplicationTrigger {
     Write,
     Probe,
+    /// Post-burst idle edge: carry the current confirmed index to the follower
+    /// without waiting for the probe. An empty capture sends a header-only
+    /// notify; a non-empty capture proceeds as a normal write cycle (the
+    /// notify is absorbed by the real batch, which carries the index anyway).
+    CommitNotify,
 }
 
 /// Captured data from the replication snapshot phase.
@@ -59,6 +65,7 @@ pub(crate) fn capture_replication_snapshot(
     let trigger_label = match trigger {
         ReplicationTrigger::Write => "write",
         ReplicationTrigger::Probe => "probe",
+        ReplicationTrigger::CommitNotify => "commit_notify",
     };
 
     // Check the rollback flag BEFORE popping. Items in pending stay queued.
@@ -74,6 +81,22 @@ pub(crate) fn capture_replication_snapshot(
             "capture: rollback flag set, preserving pending for next cycle"
         );
         return CaptureResult::Failed(ReplicationError::RollbackInProgress);
+    }
+
+    // Leg 2 (drop-at-capture): a CommitNotify that finds pending writes yields
+    // without draining — the write cycle immediately behind carries the index for
+    // free, so the notify has nothing to send. Only a provably-empty capture goes
+    // on to run_notify_send. Must peek before take: the capture is destructive, so
+    // draining a non-empty snapshot here and discarding it would lose those writes.
+    // NoCaptureRaceButOk maps to Ok and leaves the queue intact.
+    if matches!(trigger, ReplicationTrigger::CommitNotify)
+        && cache.pending_replication_count() != 0
+    {
+        metrics::counter!(
+            "celeriant_replication_capture_outcome_total",
+            "outcome" => "notify_yield_pending", "trigger" => trigger_label,
+        ).increment(1);
+        return CaptureResult::NoCaptureRaceButOk;
     }
 
     let replication_snapshot = cache.take_pending_replication();
@@ -135,6 +158,8 @@ pub(crate) async fn commit_replication<R: ReplicationClient + 'static>(
     s3_lease_duration_ms: u64,
     dict_codec: Rc<DictCodec>,
     lease_renewal_requester: Option<Rc<dyn LeaseRenewalRequester>>,
+    commit_notify_confirmed_floor: Rc<Cell<u64>>,
+    last_batch_sent_at: Rc<Cell<Instant>>,
 ) -> Result<(), ReplicationError> {
     let start = Instant::now();
     let shard_label = [("shard_id", shard_id.to_string())];
@@ -164,11 +189,13 @@ pub(crate) async fn commit_replication<R: ReplicationClient + 'static>(
 
         let outcome = replicate_loop(
             &replication_client, &log_segments_cache, &shard_mem_cache, &watched_aggregates, &node_status,
-            &mut replication_snapshot,
+            &mut replication_snapshot, trigger,
             max_catchup_gap_bytes, max_request_size, read_max_chunk_size, max_clock_drift_ms, shard_id,
             &s3_cas_confirmed_at_ms, s3_lease_duration_ms,
             &dict_codec,
             lease_renewal_requester.as_ref(),
+            &commit_notify_confirmed_floor,
+            &last_batch_sent_at,
         ).await;
 
         match outcome {
@@ -221,6 +248,7 @@ pub(crate) async fn commit_replication<R: ReplicationClient + 'static>(
         let mut meta = active.metadata.borrow_mut();
         if acked_wal > meta.last_self_acked_wal_seq {
             meta.last_self_acked_wal_seq = acked_wal;
+            metrics::gauge!("celeriant_last_self_acked_wal_seq", &shard_label).set(acked_wal as f64);
             true
         } else {
             false
@@ -287,6 +315,7 @@ async fn replicate_loop<R: ReplicationClient + 'static>(
     watched_aggregates: &Rc<AggregateWatchers>,
     node_status: &Rc<Cell<ValidatedNodeStatus>>,
     snapshot: &mut Vec<PendingCommitData>,
+    trigger: ReplicationTrigger,
     max_catchup_gap_bytes: Option<u64>,
     max_request_size: u64,
     read_max_chunk_size: u64,
@@ -296,6 +325,8 @@ async fn replicate_loop<R: ReplicationClient + 'static>(
     s3_lease_duration_ms: u64,
     dict_codec: &DictCodec,
     lease_renewal_requester: Option<&Rc<dyn LeaseRenewalRequester>>,
+    pushed_to_follower_seq: &Cell<u64>,
+    last_batch_sent_at: &Cell<Instant>,
 ) -> Result<ReplicationDetails, ReplicationError> {
     if !node_status.get().is_leader() {
         let snapshot_count = snapshot.len();
@@ -315,10 +346,18 @@ async fn replicate_loop<R: ReplicationClient + 'static>(
     let reachable_at_commit = replication_client.is_follower_reachable();
 
     if snapshot.is_empty() {
+        if matches!(trigger, ReplicationTrigger::CommitNotify) {
+            return run_notify_send(
+                replication_client, log_segments_cache, node_status,
+                reachable_at_commit, max_clock_drift_ms, shard_id,
+                pushed_to_follower_seq,
+            ).await;
+        }
         return run_probe_send(
             replication_client, log_segments_cache, node_status,
             reachable_at_commit, max_catchup_gap_bytes, max_request_size,
             read_max_chunk_size, max_clock_drift_ms, shard_id, dict_codec,
+            pushed_to_follower_seq,
         ).await;
     }
 
@@ -342,11 +381,12 @@ async fn replicate_loop<R: ReplicationClient + 'static>(
     match tcp_send_snapshot(
         replication_client, log_segments_cache, node_status, snapshot,
         max_request_size, max_catchup_gap_bytes, read_max_chunk_size, max_clock_drift_ms, shard_id, dict_codec,
+        pushed_to_follower_seq, last_batch_sent_at,
     ).await? {
         SnapshotSendOutcome::Sent => {
             let pcds = std::mem::take(snapshot);
             for pcd in pcds {
-                commit_pcd(log_segments_cache, shard_mem_cache, watched_aggregates, pcd);
+                commit_pcd(log_segments_cache, shard_mem_cache, watched_aggregates, pcd, None);
             }
             set_read_cursor_gauge(log_segments_cache, shard_id);
             Ok(ReplicationDetails::ReplicatedToFollower)
@@ -373,6 +413,7 @@ async fn run_probe_send<R: ReplicationClient + 'static>(
     max_clock_drift_ms: u64,
     shard_id: u32,
     dict_codec: &DictCodec,
+    pushed_to_follower_seq: &Cell<u64>,
 ) -> Result<ReplicationDetails, ReplicationError> {
     if !reachable {
         return Ok(ReplicationDetails::ReplicatedToFollower);
@@ -423,6 +464,7 @@ async fn run_probe_send<R: ReplicationClient + 'static>(
     let outcome = single_send(replication_client, node_status, probe_items, leader_confirmed_wal_seq, max_clock_drift_ms, shard_id).await?;
     match outcome {
         SingleSendOutcome::Ok => {
+            raise_pushed(pushed_to_follower_seq, leader_confirmed_wal_seq);
             metrics::counter!("celeriant_probe_outcome_current_total").increment(1);
             debug!(shard_id, leader_wal_seq, "Probe: follower already current");
         }
@@ -457,6 +499,38 @@ async fn run_probe_send<R: ReplicationClient + 'static>(
         }
     }
     metrics::histogram!("celeriant_probe_duration_seconds").record(probe_start.elapsed().as_secs_f64());
+    Ok(ReplicationDetails::ReplicatedToFollower)
+}
+
+/// Header-only commit-notify: empty batches carrying the current confirmed
+/// index, so an idle follower commits its parked tail within a bounded window
+/// instead of the probe interval. Best effort — every failure is swallowed
+/// (the probe is the safety net) so a notify never retries, spins, or fails
+/// the coordinator cycle that carries it.
+async fn run_notify_send<R: ReplicationClient + 'static>(
+    replication_client: &Rc<R>,
+    log_segments_cache: &Rc<LogSegmentsCache>,
+    node_status: &Rc<Cell<ValidatedNodeStatus>>,
+    reachable: bool,
+    max_clock_drift_ms: u64,
+    shard_id: u32,
+    confirmed_floor: &Cell<u64>,
+) -> Result<ReplicationDetails, ReplicationError> {
+    let leader_confirmed_wal_seq = current_leader_confirmed_wal_seq(log_segments_cache);
+    if !reachable || leader_confirmed_wal_seq == 0 {
+        return Ok(ReplicationDetails::ReplicatedToFollower);
+    }
+    metrics::counter!("celeriant_commit_notify_sent_total", &[("shard_id", shard_id.to_string())]).increment(1);
+    let outcome = single_send(
+        replication_client, node_status, vec![], leader_confirmed_wal_seq, max_clock_drift_ms, shard_id,
+    ).await;
+    // A delivered notify raises the trigger floor to the index it actually
+    // carried — a queued notify can send a newer index than its trigger
+    // observed, and re-notifying that index would be a duplicate. Failed or
+    // rejected sends leave the floor alone (the probe covers them).
+    if matches!(outcome, Ok(SingleSendOutcome::Ok)) && leader_confirmed_wal_seq > confirmed_floor.get() {
+        confirmed_floor.set(leader_confirmed_wal_seq);
+    }
     Ok(ReplicationDetails::ReplicatedToFollower)
 }
 
@@ -549,7 +623,7 @@ async fn run_s3_fallback<R: ReplicationClient + 'static>(
 
     let pcds = std::mem::take(snapshot);
     for pcd in pcds {
-        commit_pcd(log_segments_cache, shard_mem_cache, watched_aggregates, pcd);
+        commit_pcd(log_segments_cache, shard_mem_cache, watched_aggregates, pcd, None);
     }
     set_read_cursor_gauge(log_segments_cache, shard_id);
     Ok(())
@@ -568,6 +642,8 @@ async fn tcp_send_snapshot<R: ReplicationClient + 'static>(
     max_clock_drift_ms: u64,
     shard_id: u32,
     dict_codec: &DictCodec,
+    pushed_to_follower_seq: &Cell<u64>,
+    last_batch_sent_at: &Cell<Instant>,
 ) -> Result<SnapshotSendOutcome, ReplicationError> {
     debug_assert!(!snapshot.is_empty());
 
@@ -576,7 +652,11 @@ async fn tcp_send_snapshot<R: ReplicationClient + 'static>(
 
     let leader_confirmed_wal_seq = current_leader_confirmed_wal_seq(log_segments_cache);
     match single_send(replication_client, node_status, items.clone(), leader_confirmed_wal_seq, max_clock_drift_ms, shard_id).await? {
-        SingleSendOutcome::Ok => return Ok(SnapshotSendOutcome::Sent),
+        SingleSendOutcome::Ok => {
+            raise_pushed(pushed_to_follower_seq, leader_confirmed_wal_seq);
+            last_batch_sent_at.set(Instant::now());
+            return Ok(SnapshotSendOutcome::Sent);
+        }
         SingleSendOutcome::Failed => return Ok(SnapshotSendOutcome::FallbackToS3),
         SingleSendOutcome::WalSeqMismatch { max_follower_wal_seq } => {
             debug!(shard_id, max_follower_wal_seq, leader_first_wal, "Follower behind; running catchup");
@@ -598,7 +678,11 @@ async fn tcp_send_snapshot<R: ReplicationClient + 'static>(
     // Re-read confirmed index: catchup may have advanced read.wal_seq meanwhile.
     let leader_confirmed_wal_seq_retry = current_leader_confirmed_wal_seq(log_segments_cache);
     match single_send(replication_client, node_status, items, leader_confirmed_wal_seq_retry, max_clock_drift_ms, shard_id).await? {
-        SingleSendOutcome::Ok => Ok(SnapshotSendOutcome::Sent),
+        SingleSendOutcome::Ok => {
+            raise_pushed(pushed_to_follower_seq, leader_confirmed_wal_seq_retry);
+            last_batch_sent_at.set(Instant::now());
+            Ok(SnapshotSendOutcome::Sent)
+        }
         SingleSendOutcome::Failed | SingleSendOutcome::WalSeqMismatch { .. } => {
             Ok(SnapshotSendOutcome::FallbackToS3)
         }
@@ -689,6 +773,16 @@ async fn single_send<R: ReplicationClient + 'static>(
             Ok(SingleSendOutcome::Failed)
         }
         _ => Ok(SingleSendOutcome::Failed),
+    }
+}
+
+/// Monotone raise of the pushed-to-follower watermark to a seq a send actually
+/// delivered. Feeds the level-triggered notify obligation: a dedicated notify is
+/// redundant once `pushed_to_follower_seq` reaches `pending_notify_seq`.
+#[inline]
+fn raise_pushed(pushed_to_follower_seq: &Cell<u64>, delivered_seq: u64) {
+    if delivered_seq > pushed_to_follower_seq.get() {
+        pushed_to_follower_seq.set(delivered_seq);
     }
 }
 
@@ -813,25 +907,26 @@ fn log_replication_outcome(initial_batch_count: usize, details: &ReplicationDeta
     }
 }
 
-/// Publish the active segment's read cursor. Pairs with the write-cursor
+/// Publish the shard's committed read cursor. Pairs with the write-cursor
 /// gauge set at fsync; called after every batch of read-cursor advances.
-fn set_read_cursor_gauge(log_segments_cache: &Rc<LogSegmentsCache>, shard_id: u32) {
-    let read_wal_seq = log_segments_cache
-        .active()
-        .metadata
-        .borrow()
-        .read
-        .as_ref()
-        .map_or(0, |r| r.wal_seq);
+/// Shard-level, not active-segment: right after a rotation the active read is
+/// None while the cursor still sits in the sealed predecessor.
+pub(crate) fn set_read_cursor_gauge(log_segments_cache: &Rc<LogSegmentsCache>, shard_id: u32) {
+    let read_wal_seq = log_segments_cache.committed_read_wal_seq();
     metrics::gauge!("celeriant_read_wal_seq", &[("shard_id", shard_id.to_string())]).set(read_wal_seq as f64);
 }
 
-/// Advance the read cursor in-memory, update caches, broadcast watch events
-fn commit_pcd(
+/// Advance the read cursor in-memory, update caches, broadcast watch events.
+///
+/// `schema_codec`: Some on the follower's deferred-commit drain, which must
+/// compile parked schema registrations here — unlike the leader, which compiled
+/// at write time and passes None.
+pub(crate) fn commit_pcd(
     log_segments_cache: &Rc<LogSegmentsCache>,
     shard_mem_cache: &Rc<RefCell<MemCache>>,
     watched_aggregates: &Rc<AggregateWatchers>,
     commit_data: PendingCommitData,
+    schema_codec: Option<&DictCodec>,
 ) {
     let log_id = commit_data.log_id();
 
@@ -845,16 +940,11 @@ fn commit_pcd(
 
     for item in commit_data.pending_queue {
         shard_mem_cache.update_segment_summary_for_log(log_id, &item.metablock);
+        collect_watch_event(&mut event_collector, &item.metablock);
 
         match &item.metablock.wal_metablock_type {
             MetablockKind::EventBatchMetadata(event_batch) => {
                 shard_mem_cache.commit_position_snapshot(&event_batch, log_id, item.metablock_absolute_pos, CachePath::Read);
-
-                event_collector.add_write_event(event_batch);
-
-                if event_batch.aggregate_version == FIRST_AGGREGATE_VERSION {
-                    event_collector.add_create_event(event_batch.aggregate_key.clone());
-                }
 
                 let size_bytes = item.size_bytes();
                 shard_mem_cache.cache_recent_write(
@@ -884,7 +974,6 @@ fn commit_pcd(
                     item.metablock_absolute_pos,
                     CachePath::Read,
                 );
-                event_collector.add_trim_event(soft_trim.aggregate_key.clone(), soft_trim.keep_from_aggregate_version);
             }
             MetablockKind::SoftDelete(soft_delete) => {
                 shard_mem_cache.put_aggregate_into_cache_as_deleted(
@@ -896,9 +985,24 @@ fn commit_pcd(
                     soft_delete.allow_sequence_continuation,
                     CachePath::Read,
                 );
-                event_collector.add_delete_event(soft_delete.aggregate_key.clone());
             }
-            MetablockKind::SchemaRegistration(_) => {}
+            MetablockKind::SchemaRegistration(schema_reg) => {
+                if let Some(codec) = schema_codec {
+                    if let Some(ref datablock) = item.datablock {
+                        crate::shard_wal::compile_and_cache_schema(&mut shard_mem_cache, &schema_reg.schema_key, datablock);
+                    } else if let Ok(datablock) = celeriant_wire::disk::serialised_datablock::deserialise_datablock(
+                        item.metablock.uncompressed_size,
+                        item.metablock.compressed_size,
+                        item.metablock.datablock_version,
+                        item.metablock.datablock_compression_type,
+                        &item.metablock.datablock,
+                        None,
+                        codec,
+                    ) {
+                        crate::shard_wal::compile_and_cache_schema(&mut shard_mem_cache, &schema_reg.schema_key, &datablock);
+                    }
+                }
+            }
         }
     }
 
@@ -906,9 +1010,30 @@ fn commit_pcd(
     event_collector.broadcast_all(&watched_aggregates);
 }
 
-/// Sweep the leader's "rotated but sidecar not yet written" queue and return any whose
-/// read cursor has caught up (i.e., the segment is fully replicated)
-fn collect_eligible_sealed_summaries(
+/// Queue the watch event(s) one committed metablock owes its subscribers.
+/// Shared by commit_pcd and the truncate path's straddling-batch handling,
+/// which fires events for surviving items without the rest of the commit.
+pub(crate) fn collect_watch_event(event_collector: &mut WatchEventCollector, metablock: &Metablock) {
+    match &metablock.wal_metablock_type {
+        MetablockKind::EventBatchMetadata(event_batch) => {
+            event_collector.add_write_event(event_batch);
+            if event_batch.aggregate_version == FIRST_AGGREGATE_VERSION {
+                event_collector.add_create_event(event_batch.aggregate_key.clone());
+            }
+        }
+        MetablockKind::SoftTrim(soft_trim) => {
+            event_collector.add_trim_event(soft_trim.aggregate_key.clone(), soft_trim.keep_from_aggregate_version);
+        }
+        MetablockKind::SoftDelete(soft_delete) => {
+            event_collector.add_delete_event(soft_delete.aggregate_key.clone());
+        }
+        MetablockKind::SchemaRegistration(_) => {}
+    }
+}
+
+/// Sweep the "rotated but sidecar not yet written" queue and return any whose
+/// read cursor has caught up (i.e., the segment is fully committed)
+pub(crate) fn collect_eligible_sealed_summaries(
     log_segments_cache: &Rc<LogSegmentsCache>,
     shard_mem_cache: &Rc<RefCell<MemCache>>,
 ) -> Vec<(u64, SegmentSummaryPayload)> {
@@ -1134,6 +1259,8 @@ mod tests {
         tcp: RefCell<TcpResponder>,
         s3: RefCell<S3Responder>,
         tcp_calls: Rc<RefCell<Vec<usize>>>,
+        /// `leader_confirmed_wal_seq` carried by each TCP call, same order as `tcp_calls`.
+        tcp_confirmed: Rc<RefCell<Vec<u64>>>,
         s3_calls: Rc<RefCell<Vec<usize>>>,
         tcp_pre_delay: Cell<Option<Duration>>,
     }
@@ -1147,6 +1274,7 @@ mod tests {
                 tcp: RefCell::new(Box::new(|_| Ok(()))),
                 s3: RefCell::new(Box::new(|_| Ok(()))),
                 tcp_calls: tcp_calls.clone(),
+                tcp_confirmed: Rc::new(RefCell::new(Vec::new())),
                 s3_calls: s3_calls.clone(),
                 tcp_pre_delay: Cell::new(None),
             };
@@ -1178,12 +1306,13 @@ mod tests {
         fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
         fn reset_heartbeat_state(&self) {}
 
-        async fn replicate_to_follower(&self, b: Vec<ReplicationBatchItem>, _leader_confirmed_wal_seq: u64, _sender_lease_epoch: u64) -> Result<(), ReplicateToFollowerError> {
+        async fn replicate_to_follower(&self, b: Vec<ReplicationBatchItem>, leader_confirmed_wal_seq: u64, _sender_lease_epoch: u64) -> Result<(), ReplicateToFollowerError> {
             if let Some(d) = self.tcp_pre_delay.get() {
                 glommio::timer::sleep(d).await;
             }
             let n = b.len();
             self.tcp_calls.borrow_mut().push(n);
+            self.tcp_confirmed.borrow_mut().push(leader_confirmed_wal_seq);
             (self.tcp.borrow_mut())(n)
         }
 
@@ -1221,6 +1350,9 @@ mod tests {
         /// 0 = gate disabled (standalone / most unit tests). Non-zero enables the
         /// CAS-freshness gate in run_s3_fallback.
         s3_lease_duration_ms: u64,
+        /// Commit-notify trigger floor, raised to the sent index by a
+        /// delivered notify.
+        notify_floor: Rc<Cell<u64>>,
     }
 
     impl Harness {
@@ -1236,6 +1368,7 @@ mod tests {
                 watched: Rc::new(AggregateWatchers::new()),
                 s3_cas_confirmed_at_ms: Rc::new(Cell::new(0)),
                 s3_lease_duration_ms: 0,
+                notify_floor: Rc::new(Cell::new(0)),
             }
         }
 
@@ -1281,6 +1414,8 @@ mod tests {
                 self.s3_lease_duration_ms,
                 test_codec(),
                 None,
+                self.notify_floor.clone(),
+                Rc::new(Cell::new(Instant::now())),
             ).await
         }
 
@@ -1310,6 +1445,47 @@ mod tests {
             }
             CaptureResult::NoCaptureRaceButOk => panic!("Probe must NOT short-circuit on empty queue"),
             CaptureResult::Failed(e) => panic!("expected Captured(empty), got Failed({e:?})"),
+        }
+    }
+
+    /// INVARIANT: a CommitNotify trigger with an empty queue must reach the
+    /// commit closure (Captured, empty) so the cycle can send the header-only
+    /// notify — never short-circuit as NoCaptureRaceButOk.
+    #[test]
+    fn capture_commit_notify_returns_captured_empty_when_queue_empty() {
+        let smc = Rc::new(RefCell::new(fresh_memcache()));
+        match capture_replication_snapshot(&smc, ReplicationTrigger::CommitNotify) {
+            CaptureResult::Captured(d) => {
+                assert!(d.replication_snapshot.is_empty(), "CommitNotify with empty queue must produce empty Captured");
+            }
+            CaptureResult::NoCaptureRaceButOk => panic!("CommitNotify must NOT short-circuit on empty queue"),
+            CaptureResult::Failed(e) => panic!("expected Captured(empty), got Failed({e:?})"),
+        }
+    }
+
+    /// INVARIANT (leg 2, drop-at-capture): a CommitNotify that finds pending
+    /// writes yields WITHOUT draining — NoCaptureRaceButOk, queue intact — so the
+    /// write cycle immediately behind carries the index for free. (The prior
+    /// absorption behaviour drained here; leg 2 replaced it so a notify only ever
+    /// sends when the shard is provably idle at capture. Draining then dropping
+    /// would lose the pending writes: capture is destructive.)
+    #[test]
+    fn capture_commit_notify_yields_to_pending_writes() {
+        let smc = Rc::new(RefCell::new(fresh_memcache()));
+        let pcd = make_captured(&[2]).replication_snapshot.remove(0);
+        smc.borrow_mut().push_pending_replication(pcd);
+        match capture_replication_snapshot(&smc, ReplicationTrigger::CommitNotify) {
+            CaptureResult::NoCaptureRaceButOk => {
+                assert_eq!(smc.borrow().pending_replication_count(), 1, "queue must stay intact for the write cycle behind");
+            }
+            other => panic!(
+                "expected NoCapture, got {}",
+                match other {
+                    CaptureResult::Failed(_) => "Failed",
+                    CaptureResult::Captured(_) => "Captured",
+                    CaptureResult::NoCaptureRaceButOk => unreachable!(),
+                }
+            ),
         }
     }
 
@@ -1551,7 +1727,7 @@ mod tests {
 
             let node_status_for_mock = h.node_status.clone();
             let client = Rc::new(mock.with_tcp(move |_| {
-                node_status_for_mock.set(ValidatedNodeStatus::create_fenced());
+                node_status_for_mock.set(ValidatedNodeStatus::create_fenced(true));
                 Ok(())
             }));
 
@@ -1580,7 +1756,7 @@ mod tests {
             let client = Rc::new(
                 mock.unreachable()
                     .with_s3(move |_| {
-                        node_status_for_mock.set(ValidatedNodeStatus::create_fenced());
+                        node_status_for_mock.set(ValidatedNodeStatus::create_fenced(true));
                         Ok(())
                     }),
             );
@@ -1954,6 +2130,132 @@ mod tests {
             assert!(result.is_ok());
             assert!(tcp_calls.borrow().is_empty());
             assert!(s3_calls.borrow().is_empty());
+            h.close().await;
+        });
+    }
+
+    // --- commit-notify path (empty snapshot + CommitNotify trigger) ---
+
+    /// INVARIANT: a CommitNotify cycle with an empty capture sends exactly one
+    /// header-only notify (zero items) carrying the CURRENT confirmed index.
+    #[test]
+    fn commit_notify_with_empty_capture_sends_header_only_notify() {
+        glommio_test!({
+            let h = Harness::new().await;
+            seed_disk_at_wal(&h.lsc, &[1, 2, 3]).await;
+
+            let (mock, tcp_calls, s3_calls) = MockClient::build();
+            let confirmed = mock.tcp_confirmed.clone();
+            let client = Rc::new(mock);
+            let captured = ReplicationCapturedData { replication_snapshot: vec![] };
+
+            let result = h.commit_with_trigger(client, captured, ReplicationTrigger::CommitNotify, u64::MAX).await;
+            assert!(result.is_ok(), "notify cycle returns Ok; got {result:?}");
+            assert_eq!(tcp_calls.borrow().as_slice(), &[0], "exactly one empty-batches send");
+            assert_eq!(confirmed.borrow().as_slice(), &[3], "notify carries the current confirmed index");
+            assert!(s3_calls.borrow().is_empty(), "a notify never touches S3");
+            assert_eq!(h.notify_floor.get(), 3, "a delivered notify raises the trigger floor to the sent index");
+            h.close().await;
+        });
+    }
+
+    /// INVARIANT (defensive fallback): leg 2 drops a non-empty CommitNotify at
+    /// capture (NoCaptureRaceButOk), so `commit_replication` never sees one in
+    /// production. Should one ever reach it, it must still commit as a normal
+    /// write cycle — one send, the REAL batch carrying the index, never an extra
+    /// empty notify — not corrupt the cycle. This calls commit directly to prove
+    /// that fallback holds.
+    #[test]
+    fn commit_notify_absorbs_pending_capture_as_real_batch() {
+        glommio_test!({
+            let h = Harness::new().await;
+            let (mock, tcp_calls, s3_calls) = MockClient::build();
+            let client = Rc::new(mock);
+            let captured = make_captured_post_fsync(&[2], h.lsc.active_log_id());
+
+            let result = h.commit_with_trigger(client, captured, ReplicationTrigger::CommitNotify, u64::MAX).await;
+            assert!(result.is_ok(), "absorbed notify cycle returns Ok; got {result:?}");
+            assert_eq!(tcp_calls.borrow().as_slice(), &[2], "one send, the real batch — no empty notify rides along");
+            assert!(s3_calls.borrow().is_empty());
+            let read_wal = h.lsc.active().metadata.borrow().read.as_ref().map_or(0, |r| r.wal_seq);
+            assert_eq!(read_wal, 2, "the absorbed batch commits exactly like a Write cycle");
+            h.close().await;
+        });
+    }
+
+    /// A notify with nothing confirmed yet, or no reachable follower, sends
+    /// nothing and returns Ok.
+    #[test]
+    fn commit_notify_noop_rows() {
+        glommio_test!({
+            // Row: nothing confirmed (read cursor at 0).
+            let h = Harness::new().await;
+            let (mock, tcp_calls, s3_calls) = MockClient::build();
+            let client = Rc::new(mock);
+            let captured = ReplicationCapturedData { replication_snapshot: vec![] };
+            let result = h.commit_with_trigger(client, captured, ReplicationTrigger::CommitNotify, u64::MAX).await;
+            assert!(result.is_ok());
+            assert!(tcp_calls.borrow().is_empty(), "nothing confirmed: no notify to send");
+            assert!(s3_calls.borrow().is_empty());
+            h.close().await;
+
+            // Row: unreachable follower.
+            let h = Harness::new().await;
+            seed_disk_at_wal(&h.lsc, &[1]).await;
+            let (mock, tcp_calls, s3_calls) = MockClient::build();
+            let client = Rc::new(mock.unreachable());
+            let captured = ReplicationCapturedData { replication_snapshot: vec![] };
+            let result = h.commit_with_trigger(client, captured, ReplicationTrigger::CommitNotify, u64::MAX).await;
+            assert!(result.is_ok());
+            assert!(tcp_calls.borrow().is_empty(), "unreachable: no notify to send");
+            assert!(s3_calls.borrow().is_empty());
+            h.close().await;
+        });
+    }
+
+    /// INVARIANT: a failed notify send is swallowed — one attempt, Ok result,
+    /// no retry, no S3 fallback. The probe is the safety net.
+    #[test]
+    fn commit_notify_send_failure_swallowed_without_retry() {
+        glommio_test!({
+            let h = Harness::new().await;
+            seed_disk_at_wal(&h.lsc, &[1, 2]).await;
+
+            let (mock, tcp_calls, s3_calls) = MockClient::build();
+            let client = Rc::new(mock.with_tcp(|_| Err(ReplicateToFollowerError::FollowerUnexpectedResponse)));
+            let captured = ReplicationCapturedData { replication_snapshot: vec![] };
+
+            let result = h.commit_with_trigger(client, captured, ReplicationTrigger::CommitNotify, u64::MAX).await;
+            assert!(result.is_ok(), "a lost notify must not fail the cycle; got {result:?}");
+            assert_eq!(tcp_calls.borrow().as_slice(), &[0], "exactly one attempt, never retried");
+            assert!(s3_calls.borrow().is_empty(), "a lost notify never escalates to S3");
+            assert_eq!(h.notify_floor.get(), 0, "a failed send must not raise the trigger floor (the probe owns it)");
+            h.close().await;
+        });
+    }
+
+    /// INVARIANT (skip-then-late-wake): a queued notify that wakes after the
+    /// confirmed index moved past its trigger's snapshot sends the CURRENT
+    /// index and raises the trigger floor to that sent value — so a later
+    /// trigger for the same index has nothing left to notify.
+    #[test]
+    fn commit_notify_send_raises_trigger_floor_to_sent_index() {
+        glommio_test!({
+            let h = Harness::new().await;
+            seed_disk_at_wal(&h.lsc, &[1, 2, 3]).await;
+            // The trigger observed confirmed=1; two more commits landed before
+            // the queued notify woke (read cursor now 3).
+            h.notify_floor.set(1);
+
+            let (mock, tcp_calls, _s3_calls) = MockClient::build();
+            let confirmed = mock.tcp_confirmed.clone();
+            let client = Rc::new(mock);
+            let captured = ReplicationCapturedData { replication_snapshot: vec![] };
+
+            h.commit_with_trigger(client, captured, ReplicationTrigger::CommitNotify, u64::MAX).await.unwrap();
+            assert_eq!(tcp_calls.borrow().as_slice(), &[0]);
+            assert_eq!(confirmed.borrow().as_slice(), &[3], "the late-waking notify carries the current index");
+            assert_eq!(h.notify_floor.get(), 3, "a delivered notify raises the floor to the SENT index, not the trigger snapshot");
             h.close().await;
         });
     }

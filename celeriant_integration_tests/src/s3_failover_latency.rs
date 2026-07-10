@@ -13,7 +13,8 @@
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{
-    count_events, write_event, MinioContainer, ServerConfig, TestServer,
+    poll_converged_count, write_event, MinioContainer, ServerConfig, TestServer,
+    FOLLOWER_CONVERGENCE_TIMEOUT,
 };
 use celeriant_runtimes::RoutingRule;
 use celeriant_wal::aggregate_key::AggregateKey;
@@ -79,7 +80,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         write_event(&mut leader_client, &aggregate_key, i, i == 1).await?;
     }
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
-    let count = count_events(&mut follower_client, &aggregate_key).await?;
+    let count =
+        poll_converged_count(&mut follower_client, &aggregate_key, 3, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     assert_eq!(count, 3, "Follower should have replicated 3 events");
     println!("Cluster healthy: follower has {} events\n", count);
 

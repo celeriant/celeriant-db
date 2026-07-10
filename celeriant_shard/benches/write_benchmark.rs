@@ -115,6 +115,23 @@ fn create_config(
     }
 }
 
+/// Per-write latency percentiles to stderr, once per sampling batch. Criterion
+/// reports medians of batch averages; the write-latency gate needs p50 AND p99
+/// of individual writes. Reporting only — the measured value is unchanged.
+fn report_write_percentiles(label: &str, mut durations: Vec<Duration>) {
+    if durations.is_empty() {
+        return;
+    }
+    durations.sort_unstable();
+    let pct = |p: f64| durations[((durations.len() - 1) as f64 * p) as usize];
+    eprintln!(
+        "[write-latency] {label}: n={} p50={:.1?} p99={:.1?}",
+        durations.len(),
+        pct(0.50),
+        pct(0.99),
+    );
+}
+
 fn create_events(count: usize, size: usize, base_index: u64) -> Vec<DatablockAggregateEvent> {
     (0..count)
         .map(|i| DatablockAggregateEvent {
@@ -242,10 +259,12 @@ fn bench_write_fsync_delays(c: &mut Criterion) {
                                 }
 
                                 // Wait for all writes to complete and sum their durations
-                                let mut cumulative_write_time = Duration::ZERO;
+                                let mut durations = Vec::with_capacity(TOTAL_WRITES);
                                 for h in all_handles {
-                                    cumulative_write_time += h.await;
+                                    durations.push(h.await);
                                 }
+                                let cumulative_write_time: Duration = durations.iter().sum();
+                                report_write_percentiles(&format!("write_fsync_delay/multi_aggregate/{delay_name}"), durations);
 
                                 shard_wal.close().await;
                                 cumulative_write_time / TOTAL_WRITES as u32
@@ -320,10 +339,12 @@ fn bench_write_fsync_delays(c: &mut Criterion) {
                                 }
 
                                 // Wait for all writes to complete and sum their durations
-                                let mut cumulative_write_time = Duration::ZERO;
+                                let mut durations = Vec::with_capacity(TOTAL_WRITES);
                                 for h in all_handles {
-                                    cumulative_write_time += h.await;
+                                    durations.push(h.await);
                                 }
+                                let cumulative_write_time: Duration = durations.iter().sum();
+                                report_write_percentiles(&format!("write_fsync_delay/single_aggregate/{delay_name}"), durations);
 
                                 shard_wal.close().await;
                                 cumulative_write_time / TOTAL_WRITES as u32
@@ -383,7 +404,7 @@ fn bench_write_idle_latency(c: &mut Criterion) {
                                 let shard_wal = Rc::new(ShardWal::open(config, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap());
 
                                 let aggregate_key = AggregateKey::new(1, 1, 1);
-                                let mut cumulative_write_time = Duration::ZERO;
+                                let mut durations = Vec::with_capacity(SEQUENTIAL_WRITES);
 
                                 for write_id in 0..SEQUENTIAL_WRITES {
                                     let base_index = (write_id * EVENTS_PER_WRITE) as u64;
@@ -400,10 +421,13 @@ fn bench_write_idle_latency(c: &mut Criterion) {
 
                                     let start = Instant::now();
                                     let result = shard_wal.write(write_request).await;
-                                    cumulative_write_time += start.elapsed();
+                                    durations.push(start.elapsed());
 
                                     black_box(result.unwrap());
                                 }
+
+                                let cumulative_write_time: Duration = durations.iter().sum();
+                                report_write_percentiles(&format!("write_idle_latency/sequential/{delay_name}"), durations);
 
                                 shard_wal.close().await;
                                 cumulative_write_time / SEQUENTIAL_WRITES as u32
@@ -491,10 +515,12 @@ fn bench_write_cache_impact(c: &mut Criterion) {
                                 }
 
                                 // Wait for all writes to complete and sum their durations
-                                let mut cumulative_write_time = Duration::ZERO;
+                                let mut durations = Vec::with_capacity(TOTAL_WRITES);
                                 for h in all_handles {
-                                    cumulative_write_time += h.await;
+                                    durations.push(h.await);
                                 }
+                                let cumulative_write_time: Duration = durations.iter().sum();
+                                report_write_percentiles(&format!("write_cache_impact/multi_aggregate/{cache_name}"), durations);
 
                                 shard_wal.close().await;
                                 cumulative_write_time / TOTAL_WRITES as u32
@@ -567,10 +593,12 @@ fn bench_write_cache_impact(c: &mut Criterion) {
                                 }
 
                                 // Wait for all writes to complete and sum their durations
-                                let mut cumulative_write_time = Duration::ZERO;
+                                let mut durations = Vec::with_capacity(TOTAL_WRITES);
                                 for h in all_handles {
-                                    cumulative_write_time += h.await;
+                                    durations.push(h.await);
                                 }
+                                let cumulative_write_time: Duration = durations.iter().sum();
+                                report_write_percentiles(&format!("write_cache_impact/single_aggregate/{cache_name}"), durations);
 
                                 shard_wal.close().await;
                                 cumulative_write_time / TOTAL_WRITES as u32

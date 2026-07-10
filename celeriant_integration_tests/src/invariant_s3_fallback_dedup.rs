@@ -9,7 +9,8 @@
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{
-    count_events, poll_event_count, s3_cluster_config, write_event, MinioContainer, TestServer,
+    count_events, poll_converged_count, poll_event_count, s3_cluster_config, write_event,
+    MinioContainer, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
@@ -66,7 +67,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     for key in &keys {
         let lc = count_events(&mut leader_client, key).await?;
-        let fc = count_events(&mut follower_client, key).await?;
+        let fc =
+            poll_converged_count(&mut follower_client, key, 20, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
         let shard = key.aggregate_type_id % 4;
         println!("  shard {}: leader={}, follower={}", shard, lc, fc);
         assert_eq!(lc, 20, "Leader should have 20 events");
@@ -119,7 +121,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     for key in &keys {
         let lc = count_events(&mut leader_client, key).await?;
-        let fc = count_events(&mut follower_client, key).await?;
+        let fc =
+            poll_converged_count(&mut follower_client, key, 50, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
         let shard = key.aggregate_type_id % 4;
         println!("  shard {}: leader={}, follower={}", shard, lc, fc);
         assert_eq!(lc, 50, "Leader should have 50 events");
@@ -155,7 +158,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     for key in &keys {
         let lc = count_events(&mut leader_client, key).await?;
-        let fc = count_events(&mut follower_client, key).await?;
+        let fc =
+            poll_converged_count(&mut follower_client, key, 60, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
         let shard = key.aggregate_type_id % 4;
         println!("  shard {}: leader={}, follower={}", shard, lc, fc);
         assert_eq!(lc, 60, "Leader should have 60 events");

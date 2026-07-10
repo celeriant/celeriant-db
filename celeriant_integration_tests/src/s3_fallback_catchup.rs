@@ -18,7 +18,7 @@
 //! Invariants tested: 10 (post-election S3 catchup), 11 (S3 fallback)
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use crate::{count_events, poll_event_count, s3_cluster_config, write_event, MinioContainer, TestServer};
+use crate::{count_events, poll_converged_count, poll_event_count, s3_cluster_config, write_event, MinioContainer, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::disk::versioned_block::deserialise_fallback_batch;
 use std::time::Duration;
@@ -68,7 +68,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
-    let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
+    let follower_count =
+        poll_converged_count(&mut follower_client, &aggregate_key, 3, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     assert_eq!(
         follower_count, 3,
         "Follower should have 3 events after normal replication"

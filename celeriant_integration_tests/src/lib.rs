@@ -48,6 +48,7 @@ pub mod edge_s3_missing_batches;
 pub mod edge_split_brain_s3_unavailable;
 pub mod edge_stale_cache_rotation;
 pub mod edge_wal_tip_hash_divergence;
+pub mod follower_notify_liveness;
 pub mod follower_read_snapshot;
 pub mod identity_test;
 pub mod invariant_clock_drift_rejection;
@@ -123,6 +124,7 @@ pub mod s3_to_tcp_failback;
 pub mod wal_mid_datablock_truncation;
 pub mod typed_operations;
 pub mod watch_failover;
+pub mod watch_follower_promotion;
 pub mod watch_test;
 
 use std::collections::HashMap;
@@ -424,6 +426,11 @@ impl TestServer {
         config.data_root = data_root.clone();
         config.client_port = port;
         config.replication_port = port + 1;
+        // Tests run multiple servers on one host; the default metrics_port (9090)
+        // collides, so the follower would silently have no /metrics endpoint.
+        if config.metrics_port == 9090 {
+            config.metrics_port = port + 2;
+        }
 
         println!("  Starting test server on port {} (existing dir)...", port);
         println!("  Data directory: {:?}", data_root);
@@ -790,7 +797,7 @@ impl MinioContainer {
 
         // Remove any leftover container from a previous run
         let _ = Command::new("docker")
-            .args(["rm", "-f", &container_name])
+            .args(["rm", "-f", "-v", &container_name])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -834,7 +841,7 @@ impl MinioContainer {
 
         if start.elapsed() >= max_wait {
             let _ = Command::new("docker")
-                .args(["rm", "-f", &container_name])
+                .args(["rm", "-f", "-v", &container_name])
                 .status();
             return Err("MinIO failed to start within timeout".into());
         }
@@ -849,7 +856,7 @@ impl MinioContainer {
 
         if !bucket_status.success() {
             let _ = Command::new("docker")
-                .args(["rm", "-f", &container_name])
+                .args(["rm", "-f", "-v", &container_name])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
@@ -997,7 +1004,7 @@ impl Drop for MinioContainer {
     fn drop(&mut self) {
         println!("  Stopping MinIO container {}...", self.container_name);
         let _ = Command::new("docker")
-            .args(["rm", "-f", &self.container_name])
+            .args(["rm", "-f", "-v", &self.container_name])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -1011,6 +1018,7 @@ impl Drop for MinioContainer {
 pub struct TcpProxy {
     listen_port: u16,
     blocked: Arc<AtomicBool>,
+    refuse_new: Arc<AtomicBool>,
     throttle_ms: Arc<AtomicU64>,
     /// Notified when block() is called; wakes any forwarding tasks blocked in read().
     kill_notify: Arc<Notify>,
@@ -1021,6 +1029,8 @@ impl TcpProxy {
     pub async fn start(listen_port: u16, target_address: String) -> Result<Self, Box<dyn std::error::Error>> {
         let blocked = Arc::new(AtomicBool::new(false));
         let blocked_clone = blocked.clone();
+        let refuse_new = Arc::new(AtomicBool::new(false));
+        let refuse_new_clone = refuse_new.clone();
         let throttle_ms = Arc::new(AtomicU64::new(0));
         let throttle_clone = throttle_ms.clone();
         let kill_notify = Arc::new(Notify::new());
@@ -1035,7 +1045,7 @@ impl TcpProxy {
                     Err(_) => break,
                 };
 
-                if blocked_clone.load(Ordering::Relaxed) {
+                if blocked_clone.load(Ordering::Relaxed) || refuse_new_clone.load(Ordering::Relaxed) {
                     drop(client);
                     continue;
                 }
@@ -1114,7 +1124,15 @@ impl TcpProxy {
             }
         });
 
-        Ok(Self { listen_port, blocked, throttle_ms, kill_notify })
+        Ok(Self { listen_port, blocked, refuse_new, throttle_ms, kill_notify })
+    }
+
+    /// Refuse NEW connections while leaving established ones flowing.
+    /// Half of block(): lets an in-flight request/response finish on the
+    /// existing connection while denying any side-channel a fresh one.
+    pub fn refuse_new(&self) {
+        self.refuse_new.store(true, Ordering::Relaxed);
+        println!("  TcpProxy on port {}: REFUSING NEW CONNECTIONS", self.listen_port);
     }
 
     /// Block new connections and wake every forwarding task currently waiting in read().
@@ -1361,6 +1379,39 @@ pub async fn count_events(
                 _ => return Err(Box::new(e)),
             },
         }
+    }
+}
+
+/// Bound for follower read visibility to converge with the leader.
+///
+/// A follower commits on the leader's confirmed index, so its reads trail the
+/// leader's by design. Commit-notify closes the gap in milliseconds when it
+/// lands, but three by-design lost-notify paths fall back to the 5s
+/// replication probe — that probe is the honest bound; 3x it for slack.
+pub const FOLLOWER_CONVERGENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Poll an existing connection until the aggregate's event count equals
+/// `expected` or `timeout` elapses, returning the last observed count for the
+/// caller to assert. For follower reads use `FOLLOWER_CONVERGENCE_TIMEOUT`.
+///
+/// Equality, not `>=`: deletes and trims converge downward.
+///
+/// 10ms interval: healthy convergence is one commit-notify away
+/// (~replication_delay, 17ms in this harness), so the detect latency tracks
+/// it instead of overshooting to the next coarse tick.
+pub async fn poll_converged_count(
+    client: &mut CeleriantClient,
+    key: &AggregateKey,
+    expected: usize,
+    timeout: std::time::Duration,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let start = std::time::Instant::now();
+    loop {
+        let count = count_events(client, key).await?;
+        if count == expected || start.elapsed() >= timeout {
+            return Ok(count);
+        }
+        sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 

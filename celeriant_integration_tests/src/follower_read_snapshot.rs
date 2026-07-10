@@ -1,14 +1,20 @@
 //! Integration test: Follower Read Snapshot
 //!
-//! Tests that replicated data is visible when reading from the follower.
+//! Tests that replicated data becomes visible when reading from the follower.
 //! Also exercises delete and trim paths to verify they work correctly
 //! on the follower side.
+//!
+//! Follower visibility trails the leader's commit by design (the follower
+//! commits on the leader's confirmed index), so every follower read polls to
+//! the exact expected count within `FOLLOWER_CONVERGENCE_TIMEOUT`. Leader
+//! reads stay immediate.
 //!
 //! Run with: cargo run --bin follower_read_snapshot_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{
-    count_events, s3_cluster_config, write_event, MinioContainer, TestServer,
+    count_events, poll_converged_count, s3_cluster_config, write_event, MinioContainer,
+    TestServer, FOLLOWER_CONVERGENCE_TIMEOUT,
 };
 use celeriant_msg::process_client_requests::ClientRequest;
 use celeriant_msg::process_client_responses::ClientResponse;
@@ -112,10 +118,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let leader_count = count_events(&mut leader_client, &key_basic).await?;
-    let follower_count = count_events(&mut follower_client, &key_basic).await?;
+    let follower_count =
+        poll_converged_count(&mut follower_client, &key_basic, 5, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     println!("  leader={}, follower={}", leader_count, follower_count);
     assert_eq!(leader_count, 5, "leader should have 5 events");
-    assert_eq!(follower_count, 5, "follower should have 5 events");
+    assert_eq!(follower_count, 5, "follower should converge to 5 events");
     println!("  Phase 1 PASSED\n");
 
     // ── Phase 2: Trim on leader, verify follower ──
@@ -130,7 +137,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     trim_aggregate(&mut leader_client, &key_trim, 6).await?;
 
     let leader_count = count_events(&mut leader_client, &key_trim).await?;
-    let follower_count = count_events(&mut follower_client, &key_trim).await?;
+    let follower_count =
+        poll_converged_count(&mut follower_client, &key_trim, leader_count, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     println!("  After trim: leader={}, follower={}", leader_count, follower_count);
     assert_eq!(leader_count, follower_count, "trim should be visible on follower");
     println!("  Phase 2 PASSED\n");
@@ -144,7 +152,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Verify exists before delete
-    let follower_count = count_events(&mut follower_client, &key_delete).await?;
+    let follower_count =
+        poll_converged_count(&mut follower_client, &key_delete, 3, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     assert_eq!(follower_count, 3, "follower should see 3 events before delete");
 
     // Delete the aggregate
@@ -152,7 +161,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // After delete, follower should return 0 or an error
     let leader_count = count_events(&mut leader_client, &key_delete).await?;
-    let follower_count = count_events(&mut follower_client, &key_delete).await?;
+    let follower_count =
+        poll_converged_count(&mut follower_client, &key_delete, 0, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     println!("  After delete: leader={}, follower={}", leader_count, follower_count);
     assert_eq!(leader_count, 0, "leader should show 0 events after delete");
     assert_eq!(follower_count, 0, "follower should show 0 events after delete");
@@ -175,7 +185,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let leader_count = count_events(&mut leader_client, &key_recreate).await?;
-    let follower_count = count_events(&mut follower_client, &key_recreate).await?;
+    let follower_count =
+        poll_converged_count(&mut follower_client, &key_recreate, leader_count, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     println!("  After recreate: leader={}, follower={}", leader_count, follower_count);
     assert_eq!(leader_count, follower_count, "recreated aggregate should converge");
     println!("  Phase 4 PASSED\n");

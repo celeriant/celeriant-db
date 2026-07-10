@@ -44,6 +44,12 @@ pub struct LogSegmentFile {
     /// replication barrier skip its own fsync when a data fsync already covered it.
     pub last_self_acked_synced: Cell<u64>,
 
+    /// Highest read-cursor `wal_seq` known durable in this file's headers. Same
+    /// contract as `last_self_acked_synced`; lets the follower's deferred-commit
+    /// drain skip a header-only fsync when a data fsync already persisted the
+    /// advanced read cursor.
+    pub read_wal_synced: Cell<u64>,
+
     /// Last metablock file-offset written for each aggregate in THIS segment.
     /// Feeds the per-aggregate backlink at append time; node-local, never persisted,
     /// dropped with the segment. Updated only after a sync commits (transactional).
@@ -51,10 +57,14 @@ pub struct LogSegmentFile {
 }
 
 impl LogSegmentFile {
-    /// Record that a header containing `last_self_acked` reached disk. Monotonic.
-    pub fn note_header_synced(&self, last_self_acked: u64) {
+    /// Record that a header containing `last_self_acked` and a read cursor at
+    /// `read_wal_seq` reached disk. Monotonic.
+    pub fn note_header_synced(&self, last_self_acked: u64, read_wal_seq: u64) {
         if last_self_acked > self.last_self_acked_synced.get() {
             self.last_self_acked_synced.set(last_self_acked);
+        }
+        if read_wal_seq > self.read_wal_synced.get() {
+            self.read_wal_synced.set(read_wal_seq);
         }
     }
 
@@ -295,6 +305,7 @@ async fn build_log_segment(
         writer: RwLock::new(Some(Rc::new(writer))),
         reader: RwLock::new(Some(Rc::new(reader))),
         last_self_acked_synced: Cell::new(header.last_self_acked_wal_seq),
+        read_wal_synced: Cell::new(header.read.wal_seq),
         metadata: RefCell::new(LogSegmentFileMetadata::new(log_id, file_len, datablocks_carry_over, header, advance_read)),
         aggregate_chain_tips: RefCell::new(HashMap::new()),
     })

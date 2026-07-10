@@ -20,7 +20,8 @@
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{
-    count_events, s3_cluster_config, write_event, write_large_event, MinioContainer, TestServer,
+    count_events, poll_converged_count, s3_cluster_config, write_event, write_large_event,
+    MinioContainer, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
@@ -94,7 +95,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     write_event(&mut leader_client, &probe_key, 1, true).await?;
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
-    let follower_count = count_events(&mut follower_client, &probe_key).await?;
+    let follower_count =
+        poll_converged_count(&mut follower_client, &probe_key, 1, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     assert_eq!(follower_count, 1, "Initial replication should deliver 1 event to follower");
     drop(follower_client);
     println!("  Initial replication OK (1 event replicated)");
@@ -227,8 +229,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     for agg_id in 1u128..=num_aggs {
         let key = AggregateKey::new(agg_type_id, category_id, agg_id);
-        let follower_count = count_events(&mut follower_client, &key).await?;
         let leader_count = count_events(&mut leader_client, &key).await?;
+        let follower_count =
+            poll_converged_count(&mut follower_client, &key, leader_count, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
         let ok = follower_count == leader_count;
         println!(
             "  agg[{}]: follower={} / leader={}  {}",

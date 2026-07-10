@@ -1470,6 +1470,9 @@ fn clear_all_caches_clears_everything() {
     let ck = client_key(&k2, 200);
     c.put_aggregate_client_into_cache(ck.clone(), 42, false);
 
+    // Park a deferred commit
+    c.push_parked_commit(parked_pcd(1));
+
     // Verify things are populated
     let (loaded, _) = c.aggregate_load_status(&k1, CachePath::Read);
     assert!(loaded);
@@ -1492,6 +1495,113 @@ fn clear_all_caches_clears_everything() {
     assert_eq!(writes.len(), 0, "aggregate_recent_writes should be empty");
     let (loaded, _) = c.aggregate_client_load_status(&k2, &ck);
     assert!(!loaded, "aggregate_client_snapshots should be empty");
+    assert_eq!(c.parked_commit_count(), 0, "parked commits must be discarded (their entries left the chain)");
+}
+
+// ── Parked deferred commits (follower) ──
+
+fn parked_pcd(wal_seq: u64) -> PendingCommitData {
+    let mut pcd = test_pending_commit_data();
+    pcd.log_metadata.write.wal_seq = wal_seq;
+    pcd
+}
+
+/// drain_parked_commits_up_to pops exactly the wal_seq-ordered prefix the
+/// confirmed target covers, keeps the rest parked, and keeps byte accounting
+/// consistent (zero when empty).
+#[test]
+fn parked_commits_drain_exactly_the_confirmed_prefix() {
+    // (target, drained tips, remaining count)
+    let cases: [(u64, &[u64], usize); 5] = [
+        (0, &[], 3),
+        (1, &[1], 2),
+        (3, &[1, 2], 1),
+        (5, &[1, 2, 5], 0),
+        (u64::MAX, &[1, 2, 5], 0),
+    ];
+    for (target, expected, remaining) in cases {
+        let mut c = cache();
+        for seq in [1, 2, 5] {
+            c.push_parked_commit(parked_pcd(seq));
+        }
+        let bytes_before = c.parked_commit_bytes();
+        assert!(bytes_before > 0, "target {target}: parked bytes must be accounted on push");
+
+        let drained: Vec<u64> = c
+            .drain_parked_commits_up_to(target)
+            .iter()
+            .map(|p| p.log_metadata.write.wal_seq)
+            .collect();
+
+        assert_eq!(drained, expected, "target {target}: wrong drained prefix");
+        assert_eq!(c.parked_commit_count(), remaining, "target {target}: wrong remainder");
+        if remaining == 0 {
+            assert_eq!(c.parked_commit_bytes(), 0, "target {target}: bytes must be zero when empty");
+        } else if !expected.is_empty() {
+            assert!(c.parked_commit_bytes() < bytes_before, "target {target}: bytes must shrink on drain");
+        }
+
+        // A stale re-delivery of the same target must yield nothing new.
+        assert!(c.drain_parked_commits_up_to(target).is_empty(), "target {target}: re-drain must be empty");
+    }
+}
+
+/// take_all_parked_commits returns the whole tail in order (promotion commits
+/// everything); clear_parked_commits discards without returning (truncation:
+/// the entries are gone, their watch events must never fire).
+#[test]
+fn parked_commits_take_all_returns_in_order_and_clear_discards() {
+    let mut c = cache();
+    for seq in [1, 2, 3] {
+        c.push_parked_commit(parked_pcd(seq));
+    }
+    let taken: Vec<u64> = c.take_all_parked_commits().iter().map(|p| p.log_metadata.write.wal_seq).collect();
+    assert_eq!(taken, [1, 2, 3]);
+    assert_eq!(c.parked_commit_count(), 0);
+    assert_eq!(c.parked_commit_bytes(), 0);
+
+    for seq in [4, 5] {
+        c.push_parked_commit(parked_pcd(seq));
+    }
+    assert_eq!(c.clear_parked_commits(), 2);
+    assert_eq!(c.parked_commit_count(), 0);
+    assert_eq!(c.parked_commit_bytes(), 0);
+    assert!(c.drain_parked_commits_up_to(u64::MAX).is_empty(), "cleared batches must never drain");
+}
+
+/// A sealed slot must exist even when the segment sealed with an EMPTY
+/// accumulator: deferred commits for that segment can still be in flight, and
+/// update_segment_summary_for_log must route them to the sealed slot — not
+/// into the next segment's active accumulator. Fails on the old empty-skip
+/// guard (late commits leak into the next segment; the sealed sidecar is lost).
+#[test]
+fn sealed_slot_stored_when_empty_routes_late_commits_to_sealed_segment() {
+    let mut c = cache();
+    // Rotation before anything committed into segment 1: accumulator empty.
+    c.store_sealed_segment_summary(1);
+
+    // A deferred commit for segment 1 drains after the rotation.
+    let mb = test_metablock(agg(1, 1, 1), 1, 5, 100, 1);
+    c.update_segment_summary_for_log(1, &mb);
+
+    assert!(
+        c.peek_segment_summary().is_empty(),
+        "next segment's accumulator must not absorb sealed-segment commits"
+    );
+    let payload = c.take_sealed_segment_summary(1).expect("sealed slot must exist for the rotated segment");
+    assert!(!payload.is_empty(), "the late commit must land in the sealed segment's summary");
+}
+
+/// The inflight-cap tripwire reports overflow without dropping the batch —
+/// dropping would silently lose read-side commits and their watch events.
+#[test]
+fn parked_commit_overflow_reports_but_never_drops() {
+    // Cap sized for exactly one parked batch.
+    let unit = parked_pcd(1).size_bytes();
+    let mut c = cache_with(64 * 1024, 64 * 1024, 64 * 1024, unit + unit / 2);
+    assert!(!c.push_parked_commit(parked_pcd(1)), "first push fits under the cap");
+    assert!(c.push_parked_commit(parked_pcd(2)), "second push must trip the overflow report");
+    assert_eq!(c.parked_commit_count(), 2, "overflow must not drop batches");
 }
 
 // ── OCC: wal_seq-qualified client_seq cache ──

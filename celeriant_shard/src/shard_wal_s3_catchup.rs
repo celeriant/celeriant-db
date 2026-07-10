@@ -29,7 +29,8 @@ use crate::error::apply_batch_error::ApplyBatchError;
 use crate::error::s3_catchup_error::S3CatchupError;
 use crate::error::shard_fsync_error::ShardFsyncError;
 use crate::s3_downloader::{S3Downloader};
-use crate::shard_wal_sync::{capture_fsync_snapshot, commit_fsync_with_rollback, compute_entry_hash};
+use crate::shard_wal_sync::{capture_fsync_snapshot, commit_fsync_with_rollback, compute_entry_hash, CommitTarget};
+use crate::watch_event_collector::WatchEventCollector;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatchupCompletion {
@@ -482,6 +483,8 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                     log_segments_cache,
                     shard_mem_cache,
                     fsync_coordinator,
+                    watched_aggregates,
+                    &dict_codec,
                     ancestor_hash,
                     ancestor_log_id,
                     divergent_wal_seq,
@@ -489,6 +492,11 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                 )
                 .await
                 .map_err(S3CatchupError::TruncationFailed)?;
+
+                // truncate_wal emptied the parked queue (surviving prefix committed,
+                // rest discarded); same stale-gauge hazard as the sync_applied_batch
+                // drain above.
+                metrics::gauge!("celeriant_parked_commit_queue_depth", "shard_id" => shard_id.to_string()).set(0.0);
 
                 // Break inner loop so the outer loop re-lists S3 and retries
                 // from the truncated state with a fresh view of candidates.
@@ -646,6 +654,21 @@ async fn sync_applied_batch(
     shard_id: u32,
     dict_codec: Rc<DictCodec>,
 ) -> Result<(), ShardFsyncError> {
+    // Catchup full-commits on apply, so its read cursor jumps to the new write
+    // tip. Any live-TCP commits still parked cover entries below that tip on the
+    // same chain (the batch chain-validated onto them): commit them first so the
+    // read cursor stays monotonic and their watch events fire exactly once.
+    let parked = shard_mem_cache.borrow_mut().take_all_parked_commits();
+    for pcd in parked {
+        crate::shard_wal_replicate::commit_pcd(
+            log_segments_cache, shard_mem_cache, watched_aggregates, pcd, Some(&dict_codec),
+        );
+    }
+    // The deferred-commit path owns this gauge but only refreshes it on its own
+    // fsyncs/drains; without this reset an idle shard displays the pre-catchup
+    // depth forever — a permanent false drain-leak alarm.
+    metrics::gauge!("celeriant_parked_commit_queue_depth", "shard_id" => shard_id.to_string()).set(0.0);
+
     let lsc = log_segments_cache.clone();
     let smc = shard_mem_cache.clone();
     let wa = watched_aggregates.clone();
@@ -657,7 +680,7 @@ async fn sync_applied_batch(
             None,
             ShardFsyncError::WriteLockTimeout,
             move || capture_fsync_snapshot(&mc_capture),
-            move |captured| commit_fsync_with_rollback(NodeStatus::Standalone, lsc, smc, wa, captured, shard_id, dict_codec),
+            move |captured| commit_fsync_with_rollback(NodeStatus::Standalone, CommitTarget::FullCommit, lsc, smc, wa, captured, shard_id, dict_codec),
         )
         .await
 }
@@ -1123,6 +1146,8 @@ async fn truncate_wal(
     log_segments_cache: &Rc<LogSegmentsCache>,
     shard_mem_cache: &Rc<RefCell<MemCache>>,
     fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
+    watched_aggregates: &Rc<AggregateWatchers>,
+    dict_codec: &DictCodec,
     common_ancestor_hash: [u8; 32],
     divergent_log_id: u64,
     divergent_wal_seq: u64,
@@ -1163,10 +1188,42 @@ async fn truncate_wal(
 
     alarm_if_truncate_drops_self_acked(log_segments_cache, divergent_wal_seq, divergent_entry_position);
 
-    // Step 2: Clear all caches (including read snapshots and recent writes)
+    // Step 2a: Commit the surviving parked prefix. Entries below the divergence
+    // are on the authoritative chain and stay durable; their watch events fire
+    // exactly once, here. Whole batches below the divergence commit normally;
+    // the (at most one, by tip-ascending construction) batch straddling it gets
+    // only its surviving items' watch events and segment-summary contributions —
+    // deliberately NOT commit_pcd: the cursor is owned by Step 3's rewind onto
+    // the truncated tip, and the read caches are cleared right below. Items
+    // at-or-past the divergence never fire — their entries leave the chain.
+    // Summary preservation holds for the ACTIVE accumulator only: contributions
+    // routed to a sealed segment's slot are wiped by Step 2b's clear_all_caches
+    // (sealed_segment_summaries.clear()), so a sealed divergent segment keeps
+    // the listing gap it has on main — pre-existing, tracked, not widened here.
+    let surviving = shard_mem_cache.borrow_mut().drain_parked_commits_up_to(divergent_wal_seq.saturating_sub(1));
+    for pcd in surviving {
+        crate::shard_wal_replicate::commit_pcd(log_segments_cache, shard_mem_cache, watched_aggregates, pcd, Some(dict_codec));
+    }
+    {
+        let discarded = shard_mem_cache.borrow_mut().take_all_parked_commits();
+        let mut event_collector = WatchEventCollector::new();
+        {
+            let mut cache = shard_mem_cache.borrow_mut();
+            for pcd in &discarded {
+                for item in pcd.pending_queue.iter().filter(|i| i.metablock.wal_seq < divergent_wal_seq) {
+                    cache.update_segment_summary_for_log(pcd.log_id(), &item.metablock);
+                    crate::shard_wal_replicate::collect_watch_event(&mut event_collector, &item.metablock);
+                }
+            }
+        }
+        event_collector.broadcast_all(watched_aggregates);
+    }
+
+    // Step 2b: Clear all caches (read snapshots, recent writes; the parked
+    // queue is already empty from Step 2a)
     shard_mem_cache.borrow_mut().clear_all_caches();
 
-    // Step 2b: Sealed-segment ancestor - discard the active segment and any
+    // Step 2c: Sealed-segment ancestor - discard the active segment and any
     // intermediates, swap the sealed segment back in. After this call,
     // log_segments_cache.active() returns the file that will receive the
     // header rewrite below.
@@ -3205,6 +3262,238 @@ mod tests {
                 .unwrap();
 
             assert!(!late, "a file ahead of the gap must not count as a late predecessor");
+        });
+    }
+
+    /// Catchup full-commits on apply, jumping the read cursor to the extended
+    /// write tip. Live-TCP commits still parked below that tip must commit
+    /// FIRST: the read cursor never regresses and their watch events fire
+    /// exactly once, before the catchup batch's own events.
+    #[test]
+    fn catchup_commits_parked_deferred_batches_before_full_commit() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let (_id, subscriber) = tc.watched_aggregates.add_subscriber(watch_everything());
+
+            // Follower live-TCP apply of entries 1..=2, deferred: durable, parked,
+            // read still at 0.
+            apply_deferred_live_batch(&tc, 1, 2).await;
+            assert_eq!(tc.shard_mem_cache.borrow().parked_commit_count(), 1, "scaffolding: apply must park");
+            assert!(drain_watch_events(&subscriber).await.is_empty(), "nothing may fire before catchup");
+
+            // S3 catchup extends the chain with 3..=4.
+            let dl = Rc::new(MockDownloader::new());
+            let (p, d) = make_fallback_batch(0, 3, 4, tc.tip_hash());
+            dl.insert(p, d);
+            tc.catchup(&dl, 0, 10).await.unwrap();
+
+            assert_eq!(tc.shard_mem_cache.borrow().parked_commit_count(), 0, "catchup must commit parked batches");
+            let meta = tc.log_segments_cache.active().metadata.borrow().clone();
+            assert_eq!(meta.write.wal_seq, 4);
+            assert_eq!(meta.read.as_ref().map_or(0, |r| r.wal_seq), 4, "catchup full-commits to the new tip");
+
+            let writes: Vec<(u64, u64)> = drain_watch_events(&subscriber)
+                .await
+                .into_iter()
+                .filter_map(|e| match e.operation {
+                    celeriant_watch::aggregate_watch_event::AggregateWatchEventOperation::Write {
+                        from_aggregate_version, to_aggregate_version,
+                    } => Some((from_aggregate_version, to_aggregate_version)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(writes.len(), 2, "one parked broadcast then one catchup broadcast, got {writes:?}");
+            assert_eq!(writes[0], (101, 102), "parked events must fire first, exactly once");
+
+            tc.close().await;
+        });
+    }
+
+    /// Apply entries `first..=last` the way the follower live-TCP path does:
+    /// queue, fsync with the deferred target, park the read-side commit.
+    /// Aggregate versions are `100 + seq` so watch assertions can identify entries.
+    async fn apply_deferred_live_batch(tc: &TestComponents, first: u64, last: u64) {
+        let mut items = Vec::new();
+        let mut prev = tc.tip_hash();
+        for seq in first..=last {
+            let mut mb = test_metablock(seq, prev);
+            if let MetablockKind::EventBatchMetadata(ref mut eb) = mb.wal_metablock_type {
+                eb.aggregate_version = 100 + seq;
+            }
+            prev = [0u8; 32]; // only the first item's prev hash is chain-checked
+            items.push(ReplicationBatchItem { metablock: mb, datablock: None });
+        }
+        apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &items, &test_codec()).unwrap();
+        let lsc = tc.log_segments_cache.clone();
+        let smc = tc.shard_mem_cache.clone();
+        let wa = tc.watched_aggregates.clone();
+        let mc_capture = smc.clone();
+        tc.fsync_coordinator
+            .request_sync_two_phase(
+                None,
+                ShardFsyncError::WriteLockTimeout,
+                move || capture_fsync_snapshot(&mc_capture),
+                move |captured| commit_fsync_with_rollback(
+                    NodeStatus::Follower { leader_lease_epoch: 0 },
+                    CommitTarget::DeferToLeaderConfirmed,
+                    lsc, smc, wa, captured, 0, test_codec(),
+                ),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Divergence truncation with parked deferred commits spanning the
+    /// divergence point: whole batches below it commit and fire exactly once;
+    /// the straddling batch's surviving items fire their events and land in
+    /// the ACTIVE segment summary (their entries stay on the chain and become
+    /// visible via the truncated-tip cursor); nothing at-or-past the divergence
+    /// fires or is summarised; the read cursor lands on the truncated tip.
+    /// Covers the active-accumulator case only — a sealed divergent segment's
+    /// summary slot is cleared in Step 2b (pre-existing on main).
+    #[test]
+    fn truncate_commits_surviving_parked_prefix_and_discards_the_rest() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let (_id, subscriber) = tc.watched_aggregates.add_subscriber(watch_everything());
+
+            // Whole survivor 1..=2, straddler 3..=5, wholly discarded 6..=7;
+            // divergence at 5.
+            apply_deferred_live_batch(&tc, 1, 2).await;
+            let pos_after_2 = tc.log_segments_cache.active().metadata.borrow().write.metablocks_position;
+            apply_deferred_live_batch(&tc, 3, 5).await;
+            apply_deferred_live_batch(&tc, 6, 7).await;
+            assert_eq!(tc.shard_mem_cache.borrow().parked_commit_count(), 3, "scaffolding: all batches parked");
+            assert!(drain_watch_events(&subscriber).await.is_empty(), "nothing may fire before the truncate");
+
+            // Entry 5 starts two metablocks past the end of entry 2.
+            let divergent_pos = pos_after_2 + 2 * FIXED_BLOCK_SIZE_BYTES as u64;
+            truncate_wal(
+                &tc.log_segments_cache,
+                &tc.shard_mem_cache,
+                &tc.fsync_coordinator,
+                &tc.watched_aggregates,
+                &test_codec(),
+                [9u8; 32],
+                1,
+                5,
+                divergent_pos,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(tc.shard_mem_cache.borrow().parked_commit_count(), 0);
+            let meta = tc.log_segments_cache.active().metadata.borrow().clone();
+            assert_eq!(meta.write.wal_seq, 4, "write rewinds onto the truncated tip");
+            assert_eq!(meta.read.as_ref().map_or(0, |r| r.wal_seq), 4, "read lands on the truncated tip");
+
+            let writes: Vec<(u64, u64)> = drain_watch_events(&subscriber)
+                .await
+                .into_iter()
+                .filter_map(|e| match e.operation {
+                    celeriant_watch::aggregate_watch_event::AggregateWatchEventOperation::Write {
+                        from_aggregate_version, to_aggregate_version,
+                    } => Some((from_aggregate_version, to_aggregate_version)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                writes, [(101, 102), (103, 104)],
+                "whole survivor then the straddler's surviving slice, exactly once each; \
+                 versions 105..=107 never fire"
+            );
+
+            // The straddler's surviving items must reach the segment summary —
+            // losing them silently drops committed data from listings forever.
+            let summary = tc.shard_mem_cache.borrow_mut().take_segment_summary();
+            let entry = summary.aggregates.iter().find(|a| a.aggregate_id == 1)
+                .expect("summary entry for the aggregate must exist");
+            assert_eq!(entry.event_batch_count, 4, "entries 1..=4 summarised, 5..=7 not");
+            assert_eq!(entry.last_aggregate_version, 104, "summary must stop at the surviving slice");
+
+            tc.close().await;
+        });
+    }
+
+    fn watch_everything() -> celeriant_msg::request::requests::WatchRequest {
+        celeriant_msg::request::requests::WatchRequest {
+            correlation_id: None,
+            requested_latency_ms: None,
+            shard_id: None,
+            orgs: None,
+            aggregate_types: None,
+            aggregates: None,
+            operation_types: None,
+        }
+    }
+
+    async fn drain_watch_events(
+        subscriber: &Rc<RefCell<celeriant_watch::subscribed_client::SubscribedClient>>,
+    ) -> Vec<celeriant_watch::aggregate_watch_event::AggregateWatchEvent> {
+        glommio::timer::sleep(std::time::Duration::from_millis(10)).await;
+        let mut events = Vec::new();
+        while let Some(e) = futures_lite::future::poll_once(subscriber.borrow().receiver.recv()).await.flatten() {
+            events.push(e);
+        }
+        events
+    }
+
+    /// A parked deferred entry whose range the catchup's divergence check
+    /// truncates must never fire its watch events, and the competing S3 chain
+    /// wins with the read cursor landing on its tip. This is the mechanism the
+    /// promotion ordering relies on: the tail commit runs only AFTER this
+    /// catchup, so a rolled-back-then-re-authored entry can never be committed
+    /// (events fired, read persisted) and then truncated.
+    #[test]
+    fn catchup_divergence_discards_parked_fork_without_events() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = Rc::new(MockDownloader::new());
+
+            // Shared prefix 1..=5 via catchup (full-commit: read == write == 5).
+            let (p, d) = make_fallback_batch(0, 1, 5, GENESIS_HASH);
+            dl.insert(p, d);
+            tc.catchup(&dl, 0, 10).await.unwrap();
+            let tip_after_5 = tc.tip_hash();
+            let (_id, subscriber) = tc.watched_aggregates.add_subscriber(watch_everything());
+
+            // The old leader delivers entry 6 (version 106) over live TCP — it
+            // parks — then rolls it back and re-authors 6..=7 into S3 fallback.
+            apply_deferred_live_batch(&tc, 6, 6).await;
+            assert_eq!(tc.shard_mem_cache.borrow().parked_commit_count(), 1, "scaffolding: fork parked");
+            assert!(drain_watch_events(&subscriber).await.is_empty(), "nothing may fire before catchup");
+
+            dl.objects.borrow_mut().clear();
+            let (p, d) = make_fallback_batch(0, 6, 7, tip_after_5);
+            dl.insert(p, d);
+            tc.catchup(&dl, 0, 10).await.unwrap();
+
+            assert_eq!(tc.shard_mem_cache.borrow().parked_commit_count(), 0, "the truncate must not orphan the parked fork");
+            let meta = tc.log_segments_cache.active().metadata.borrow().clone();
+            assert_eq!(
+                (meta.write.wal_seq, meta.read.as_ref().map_or(0, |r| r.wal_seq)), (7, 7),
+                "the S3 chain wins and commits",
+            );
+
+            let writes: Vec<u64> = drain_watch_events(&subscriber)
+                .await
+                .into_iter()
+                .filter_map(|e| match e.operation {
+                    celeriant_watch::aggregate_watch_event::AggregateWatchEventOperation::Write {
+                        to_aggregate_version, ..
+                    } => Some(to_aggregate_version),
+                    _ => None,
+                })
+                .collect();
+            assert!(!writes.contains(&106), "events for the truncated fork must never fire: {writes:?}");
+            // The re-authored entries share one aggregate, so the catchup's single
+            // broadcast coalesces them into one Write event.
+            assert!(!writes.is_empty(), "the winning chain's events must fire");
+
+            tc.close().await;
         });
     }
 }

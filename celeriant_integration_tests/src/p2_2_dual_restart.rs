@@ -17,7 +17,7 @@
 //! Run with: cargo run --bin p2_2_dual_restart_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use crate::{count_events, is_leader, write_event, MinioContainer, ServerConfig, TestServer};
+use crate::{count_events, is_leader, poll_converged_count, write_event, MinioContainer, ServerConfig, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT};
 use celeriant_runtimes::RoutingRule;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::disk::versioned_block::deserialise_lease;
@@ -93,7 +93,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut node_b_client = CeleriantClient::connect(node_b.address()).await?;
-    let node_b_count = count_events(&mut node_b_client, &aggregate_key).await?;
+    let node_b_count =
+        poll_converged_count(&mut node_b_client, &aggregate_key, 5, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     assert_eq!(node_b_count, 5, "Node B should have 5 events");
     println!("  ✓ Cluster healthy: node B has {} events", node_b_count);
 

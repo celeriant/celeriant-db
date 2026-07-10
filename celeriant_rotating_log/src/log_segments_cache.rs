@@ -157,6 +157,37 @@ impl LogSegmentsCache {
         metadata.available_space()
     }
 
+    /// Shard-level committed (read-cursor) wal_seq for gauges/diagnostics: the
+    /// active segment's read cursor, or — right after rotation, before the
+    /// first commit lands in the new segment — the newest cached predecessor's.
+    /// Never falls back to the write cursor: a gauge on a fresh segment must
+    /// report the real lag, not hide it. 0 when nothing was ever committed (or
+    /// every predecessor holding the cursor was evicted).
+    pub fn committed_read_wal_seq(&self) -> u64 {
+        let (read_wal, mut log_id) = {
+            let active_file = self.active_file.borrow();
+            let metadata = active_file.metadata.borrow();
+            (metadata.read.as_ref().map(|r| r.wal_seq), metadata.log_id)
+        };
+        if let Some(w) = read_wal {
+            return w;
+        }
+        // peek, not get: a metrics read must not promote sealed segments to MRU.
+        let cache = self.lru_cache.borrow();
+        while log_id > FIRST_LOG_ID {
+            log_id -= 1;
+            match cache.peek(&log_id) {
+                Some(file) => {
+                    if let Some(r) = file.metadata.borrow().read.as_ref() {
+                        return r.wal_seq;
+                    }
+                }
+                None => return 0,
+            }
+        }
+        0
+    }
+
     pub async fn rotate_to_next_log(&self) -> Result<(), OpenOrCreateError> {
         let current_log_id = self.active_log_id();
         let wal_seq_at_rotation = self.active().metadata.borrow().write.wal_seq;
@@ -177,17 +208,16 @@ impl LogSegmentsCache {
         Ok(())
     }
 
-    /// Called when starting up a shard, ensures we always have an active log file to write to
-    /// Refresh both cursor gauges from the active segment, read first: a
-    /// rewind must never expose read above write to a scrape landing between
-    /// the two sets.
+    /// Refresh both cursor gauges, read first: a rewind must never expose read
+    /// above write to a scrape landing between the two sets. Read comes from
+    /// the shard-level committed cursor (a sealed predecessor may hold it).
     pub fn publish_cursor_gauges(&self) {
-        let active = self.active();
-        let meta = active.metadata.borrow();
-        metrics::gauge!("celeriant_read_wal_seq", &self.shard_label).set(meta.read.as_ref().map_or(0, |r| r.wal_seq) as f64);
-        metrics::gauge!("celeriant_wal_seq", &self.shard_label).set(meta.write.wal_seq as f64);
+        metrics::gauge!("celeriant_read_wal_seq", &self.shard_label).set(self.committed_read_wal_seq() as f64);
+        let write_wal_seq = self.active().metadata.borrow().write.wal_seq;
+        metrics::gauge!("celeriant_wal_seq", &self.shard_label).set(write_wal_seq as f64);
     }
 
+    /// Called when starting up a shard, ensures we always have an active log file to write to
     pub async fn ready_up(shard_dir: PathBuf, preallocate_bytes: u64, max_cached_files: usize, shard_id: u32) -> Result<Self, ReadyUpError> {
         // Segment needs room for the two header copies plus a metablock+datablock region, and
         // must be DMA-aligned. It does NOT need to be a multiple of the header block: the tail
@@ -610,6 +640,46 @@ mod tests {
 
             assert!(dir.join("log_2.wal").exists());
             assert!(cache.get_if_cached(1).is_some());
+
+            cache.close().await;
+        });
+    }
+
+    /// committed_read_wal_seq reports the shard's committed cursor across a
+    /// rotation with an uncommitted (parked) tail: the fresh active segment has
+    /// read=None, and the value must come from the sealed predecessor — never
+    /// from a write cursor, which would hide real lag.
+    #[test]
+    fn committed_read_wal_seq_survives_rotation_with_parked_tail() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let cache = LogSegmentsCache::ready_up(dir.clone(), FILE_SIZE, 4, 0).await.unwrap();
+
+            // Committed prefix at 5, durable tail at 9 (deferred, unconfirmed).
+            {
+                let active = cache.active();
+                let mut md = active.metadata.borrow_mut();
+                md.read = Some(LogSegmentCursor { wal_seq: 5, ..Default::default() });
+                md.write.wal_seq = 9;
+            }
+            assert_eq!(cache.committed_read_wal_seq(), 5);
+
+            // Rotation: fresh active has read=None; the cursor still sits in
+            // the sealed predecessor, and must not report 0 or the write tip.
+            cache.rotate_to_next_log().await.unwrap();
+            assert!(cache.active().metadata.borrow().read.is_none(), "scaffolding: fresh segment starts unadvanced");
+            assert_eq!(cache.committed_read_wal_seq(), 5, "cursor must come from the sealed predecessor");
+
+            // A double rotation with no commits in between walks further back.
+            cache.rotate_to_next_log().await.unwrap();
+            assert_eq!(cache.committed_read_wal_seq(), 5, "cursor must survive consecutive rotations");
+
+            // First commit into the new active takes over.
+            {
+                let active = cache.active();
+                active.metadata.borrow_mut().read = Some(LogSegmentCursor { wal_seq: 12, ..Default::default() });
+            }
+            assert_eq!(cache.committed_read_wal_seq(), 12);
 
             cache.close().await;
         });

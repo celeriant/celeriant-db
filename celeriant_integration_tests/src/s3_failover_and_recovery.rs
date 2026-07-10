@@ -16,7 +16,7 @@
 //!   3 (write gating), 15 (valid transitions), 17 (membership CAS).
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use crate::{count_events, write_event, MinioContainer, ServerConfig, TestServer};
+use crate::{poll_converged_count, write_event, MinioContainer, ServerConfig, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT};
 use celeriant_runtimes::RoutingRule;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::disk::versioned_block::deserialise_lease;
@@ -103,7 +103,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         write_event(&mut node_a_client, &aggregate_key, i, i == 1).await?;
     }
 
-    let node_b_count = count_events(&mut node_b_client, &aggregate_key).await?;
+    let node_b_count =
+        poll_converged_count(&mut node_b_client, &aggregate_key, 5, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     assert_eq!(node_b_count, 5, "Node B should have 5 events replicated");
     println!("  ✓ Initial replication verified: node B has {} events\n", node_b_count);
 
@@ -213,7 +214,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         write_event(&mut node_b_client, &aggregate_key, i, false).await?;
     }
 
-    let node_a_final_count = count_events(&mut node_a_client, &aggregate_key).await?;
+    let node_a_final_count =
+        poll_converged_count(&mut node_a_client, &aggregate_key, 10, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     assert_eq!(node_a_final_count, 10,
         "Node A should have 10 events (5 from old session + 5 replicated)");
     println!("  ✓ Replication verified: node A has {} events\n", node_a_final_count);

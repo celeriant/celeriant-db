@@ -19,7 +19,7 @@
 //! Run with: cargo run --bin s3_leader_solo_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use crate::{count_events, s3_cluster_config, write_event, MinioContainer, TestServer};
+use crate::{count_events, poll_converged_count, s3_cluster_config, write_event, MinioContainer, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::disk::versioned_block::deserialise_lease;
 use std::time::Duration;
@@ -128,7 +128,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("-------------------------------------------");
 
     let mut follower_client = CeleriantClient::connect(_follower.address()).await?;
-    let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
+    let follower_count =
+        poll_converged_count(&mut follower_client, &aggregate_key, 3, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     println!("  Follower has {} events after boot catchup", follower_count);
     assert_eq!(
         follower_count, 3,
@@ -158,7 +159,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("---------------------------------------------------");
 
     let leader_count = count_events(&mut leader_client, &aggregate_key).await?;
-    let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
+    let follower_count =
+        poll_converged_count(&mut follower_client, &aggregate_key, 6, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     println!("  Leader has {} events, follower has {} events", leader_count, follower_count);
 
     assert_eq!(leader_count, 6, "Leader should have 6 events");

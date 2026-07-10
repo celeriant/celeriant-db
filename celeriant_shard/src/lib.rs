@@ -20,3 +20,6 @@ pub mod intra_batch_chain;
 pub mod replication_backpressure;
 pub mod fetch_catchup_entries;
 pub mod replicate_follower_catchup;
+#[cfg(test)] mod follower_commit_contract_tests;
+#[cfg(test)] mod role_transition_contract_tests;
+#[cfg(test)] mod commit_notify_contract_tests;

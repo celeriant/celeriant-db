@@ -74,6 +74,11 @@ fn register_metric_descriptions() {
     describe_gauge!("celeriant_replication_queue_bytes", "Replication queue bytes awaiting send");
     describe_gauge!("celeriant_replication_queue_high_water_bytes", "Replication queue threshold for S3 fallback");
     describe_gauge!("celeriant_replication_follower_pressured", "1 when follower is falling behind (S3 fallback imminent)");
+    describe_gauge!("celeriant_follower_read_lag", "Follower durable-but-unconfirmed entries (write.wal_seq - read.wal_seq); returns to 0 when a carrier confirms the tip");
+    describe_gauge!("celeriant_parked_commit_queue_depth", "Follower deferred commits parked awaiting leader confirmation; a plateau above zero is a drain leak");
+    describe_counter!("celeriant_parked_commit_overflow_total", "Parked commit queue exceeded the inflight cap (tripwire; nothing is dropped)");
+    describe_gauge!("celeriant_last_self_acked_wal_seq", "Highest wal_seq this node acked to clients as leader (ack barrier); persists across demotion and restart");
+    describe_gauge!("celeriant_node_status_code", "Per-shard node status: 0=BootCatchup 1=Follower 2=FollowerCatchingUp 3=Promoting 4=Leader 5=Fenced 6=Standalone");
     describe_counter!("celeriant_replication_s3_fallbacks_total", "Replication S3 fallbacks");
     describe_counter!("celeriant_replication_rollback_retries_total", "Replication rollback retry attempts");
     describe_counter!("celeriant_replication_rollback_io_error_total", "Replication rollback I/O failures");
@@ -88,6 +93,10 @@ fn register_metric_descriptions() {
     describe_counter!("celeriant_replication_snapshot_returned_to_queue_total", "Replication snapshot re-queued after BudgetExhausted (avoids rollback racing in-flight S3 PUT)");
     describe_counter!("celeriant_drain_role_change_total", "Pending-replication drain attempts on role change (labels: invariant_holds=true|false)");
     describe_counter!("celeriant_promotion_batch_budget_exceeded_total", "Promotion-batch upload skipped: scan exceeded max_promotion_batch_bytes");
+
+    describe_counter!("celeriant_commit_notify_sent_total", "Post-burst commit-notify sends attempted (header-only empty batch carrying the confirmed index)");
+    describe_counter!("celeriant_commit_notify_received_total", "Guard-passing empty-batch commit-notifies accepted by the follower");
+    describe_counter!("celeriant_commit_notify_skipped_fenced_total", "Commit-notify trigger skipped: no lease budget available (fenced), distinct from exhaustion");
 
     // Probe (reachability / gap-fill)
     describe_counter!("celeriant_probe_total", "Replication probe attempts");

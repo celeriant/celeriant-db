@@ -1,6 +1,6 @@
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use glommio::sync::Semaphore;
 use tracing::{debug, info, trace, warn};
@@ -77,14 +77,25 @@ use crate::replication_client::ReplicationClient;
 use crate::s3_downloader::S3Downloader;
 use crate::shard_wal_compact::{CompactionResult, compact_segment};
 use crate::error::compaction_error::CompactionError;
-use crate::shard_wal_replicate::{capture_replication_snapshot, commit_replication, wal_positions, ReplicationTrigger};
+use crate::shard_wal_replicate::{self, capture_replication_snapshot, commit_replication, wal_positions, ReplicationTrigger};
 use crate::shard_wal_s3_catchup::{self, S3CatchupResult, catchup_from_s3};
-use crate::shard_wal_sync::{capture_fsync_snapshot, commit_fsync_with_rollback, compute_entry_hash, sync_header_only};
+use crate::shard_wal_sync::{capture_fsync_snapshot, commit_fsync_with_rollback, compute_entry_hash, sync_header_only, CommitTarget};
 
 /// Upper bound on how long a leader write waits for the read cursor to confirm
 /// its events before giving up with `LeaderFenced`. Matches the replication spin
 /// hard timeout; exceeding it means replication is wedged, not merely lagging.
 const REPLICATION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Commit-notify recency window as a multiple of `replication_delay`: the notify
+/// timer treats a data batch sent within this window as "the stream is flowing" and
+/// rearms. Sized to the measured under-load per-shard batch cadence, which is a full
+/// batch RTT (amortisation delay + follower fsync + gate time), NOT the 17ms delay
+/// alone: at 24k-connection saturation the age of the last batch at a wake runs
+/// 179-303ms per shard. 16× the 17ms delay ≈ 272ms covers the bulk; the slowest few
+/// shards can still poke over, which is the small residual notify count under load
+/// (measured ~198 vs ~4809 with the mis-sized 2× window). Pacing knob, not a
+/// correctness gate — too small fires under load, too large only staler idle tails.
+const RECENCY_WINDOW_BATCHES: u32 = 16;
 
 /// Compile a schema datablock and insert into the cache.
 /// Shared by pre_warm_cache, ensure_schema_cached, and follower replication.
@@ -116,6 +127,28 @@ impl ListCursor {
         debug_assert!(self.log_id <= u32::MAX as u64, "log_id {} overflows 32-bit cursor field", self.log_id);
         (self.log_id << 32) | self.offset as u64
     }
+}
+
+/// How `reconcile_durable_tail` treats the durable tail (entries above the read cursor)
+/// on a role transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TailReconciliation {
+    /// Promote-over-peer: peer-received tail is committed (drain all parked PCDs,
+    /// advance_visible_position, header fsync). Own-speculation tail is culled as today.
+    CommitForPromotion,
+    /// Demotion from held leadership: today's rewind_to_ack_barrier=true behavior, unchanged.
+    RewindToAckBarrier,
+    /// Non-leader under a peer's (new) lease: peer tail kept parked (no-op), own-speculation
+    /// tail culled as today (boot-after-leader-crash case).
+    ReconcileAsFollower,
+}
+
+/// Cursor targets for the tail-cull mechanics shared by every rewind arm.
+enum CullTarget {
+    /// Rewind the write cursor down to read (own-speculation tail): read stays put.
+    WriteToRead(celeriant_rotating_log::log_segment_file::log_segment_cursor::LogSegmentCursor),
+    /// Rewind both cursors to the ack barrier (demotion crash case).
+    BothToAckBarrier(celeriant_rotating_log::log_segment_file::log_segment_cursor::LogSegmentCursor),
 }
 
 /// Write-ahead log for a single shard.
@@ -230,6 +263,36 @@ pub struct ShardWal<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
     /// the cull and destroys peer-acked data applied by catchup since the demotion
     /// (read advances on apply paths, last_self_acked does not).
     ack_barrier_rewind_armed: Cell<bool>,
+
+    /// Level-triggered commit-notify obligation, both monotone. `pending_notify_seq`
+    /// is the highest confirmed seq a burst-tail drain has observed;
+    /// `pushed_to_follower_seq` is the highest seq a send actually delivered to the
+    /// follower (any batch, notify, or probe). An obligation exists exactly while
+    /// pending > pushed. Under load the next real batch raises `pushed` to meet
+    /// `pending` before the timer wakes, so no dedicated notify ever fires. Rc so
+    /// the detached timer task and replication cycle can read and raise them.
+    pending_notify_seq: Rc<Cell<u64>>,
+    pushed_to_follower_seq: Rc<Cell<u64>>,
+
+    /// Arm latch for the single notify timer: true while a timer task is sleeping
+    /// or running its cycle. Only read and set inside a synchronous region between
+    /// awaits, so concurrent drains cannot both spawn a timer.
+    notify_timer_armed: Rc<Cell<bool>>,
+
+    /// When the last real DATA batch was delivered to the follower. The notify
+    /// timer's load suppressor: while the carrier stream is flowing (a batch within
+    /// the recency window, RECENCY_WINDOW_BATCHES × replication_delay), the next batch
+    /// carries the commit index, so the timer rearms. The watermark cannot serve this — it structurally
+    /// trails `pending` by one batch under load (two-phase sends before commit), so
+    /// its disarm never samples true while writes flow. Raised only at data-batch
+    /// `Sent`; not notify (self-suppression), probe (5s scale), or S3 (carries nothing).
+    last_batch_sent_at: Rc<Cell<Instant>>,
+
+    /// Weak self-reference wired once at startup (`set_self_ref`), so the detached
+    /// notify timer can re-enter `&self` (re-read the obligation, run the cycle)
+    /// without cloning the whole field set. Weak breaks the task→shard cycle: a
+    /// dropped shard makes the upgrade fail and the timer exits.
+    notify_self_ref: OnceCell<Weak<ShardWal<R, D>>>,
 }
 
 /// Lets the replication path (any data shard) ask shard 0 to re-CAS the S3 lease
@@ -432,8 +495,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         let recovered_wal_seq = log_segments_cache.active().metadata.borrow().write.wal_seq;
         metrics::gauge!("celeriant_wal_seq", &metrics_shard_label).set(recovered_wal_seq as f64);
-        let recovered_read_wal_seq = log_segments_cache.active().metadata.borrow().read.as_ref().map_or(0, |r| r.wal_seq);
+        let recovered_read_wal_seq = log_segments_cache.committed_read_wal_seq();
         metrics::gauge!("celeriant_read_wal_seq", &metrics_shard_label).set(recovered_read_wal_seq as f64);
+        let recovered_self_acked = log_segments_cache.active().metadata.borrow().last_self_acked_wal_seq;
+        metrics::gauge!("celeriant_last_self_acked_wal_seq", &metrics_shard_label).set(recovered_self_acked as f64);
 
         Ok(Self {
             dict_codec,
@@ -461,6 +526,11 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             s3_cas_confirmed_at_ms: Rc::new(Cell::new(0)),
             lease_renewal_requester: OnceCell::new(),
             ack_barrier_rewind_armed: Cell::new(true),
+            pending_notify_seq: Rc::new(Cell::new(0)),
+            pushed_to_follower_seq: Rc::new(Cell::new(0)),
+            notify_timer_armed: Rc::new(Cell::new(false)),
+            last_batch_sent_at: Rc::new(Cell::new(Instant::now())),
+            notify_self_ref: OnceCell::new(),
         })
     }
 
@@ -468,6 +538,14 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     /// runtimes layer, after the intra-shard mesh exists).
     pub fn set_lease_renewal_requester(&self, requester: Rc<dyn LeaseRenewalRequester>) {
         let _ = self.lease_renewal_requester.set(requester);
+    }
+
+    /// Wire the weak self-reference (called once at startup after the shard is
+    /// wrapped in an `Rc`). The notify timer upgrades it per wake to re-enter
+    /// `&self`; without it the timer cannot fire, so any construction path that
+    /// exercises the notify must call this.
+    pub fn set_self_ref(self: &Rc<Self>) {
+        let _ = self.notify_self_ref.set(Rc::downgrade(self));
     }
 
     pub fn timestamp_config(&self) -> crate::timestamp_config::TimestampConfig {
@@ -2451,9 +2529,15 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let shard_id = self.config.shard_id;
         let dict_codec = self.dict_codec.clone();
 
-        // Node status goes into fsync because we need to know if we should advance read position (standalone or follower mode)
-        // We already pass lease status checks so can use raw()
+        // Node status still feeds fsync (lease epoch etc.); the commit target is the
+        // provenance-derived read-side commit rule. We already pass lease status
+        // checks so can use raw().
         let node_status = self.node_status.get().raw();
+        let commit_target = match node_status {
+            NodeStatus::Leader { .. } => CommitTarget::DeferToReplicationAck,
+            NodeStatus::Follower { .. } | NodeStatus::FollowerCatchingUp { .. } => CommitTarget::DeferToLeaderConfirmed,
+            _ => CommitTarget::FullCommit,
+        };
 
         let mc_capture = shard_mem_cache.clone();
         self.fsync_coordinator
@@ -2461,7 +2545,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 Some(self.config.fsync_delay),
                 ShardFsyncError::WriteLockTimeout,
                 move || capture_fsync_snapshot(&mc_capture),
-                move |captured| commit_fsync_with_rollback(node_status, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, shard_id, dict_codec),
+                move |captured| commit_fsync_with_rollback(node_status, commit_target, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, shard_id, dict_codec),
             )
             .await
     }
@@ -2499,6 +2583,11 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         loop {
             self.run_replication_through_coordinator(ReplicationTrigger::Write, cycle_delay).await?;
             if wal_positions(&self.log_segments_cache).1 >= write_target {
+                // Burst over (pending drained): register the commit obligation and
+                // arm the notify timer. Level-triggered — the timer, not this edge,
+                // decides whether a dedicated notify ever sends, so a momentary
+                // under-load drain no longer fires one the next batch would cover.
+                self.note_commit_and_arm_notify_timer();
                 return Ok(());
             }
             if !self.node_status.get().is_leader() {
@@ -2573,6 +2662,25 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         trigger: ReplicationTrigger,
         delay: Option<Duration>,
     ) -> Result<(), ReplicationError> {
+        let result = self.replication_cycle(trigger, delay).await;
+        // A successful commit while leading may have created an own speculative
+        // tail (written, not yet committed entries above the new ack point), so a
+        // future demotion is again entitled to one rewind-to-ack-barrier cull.
+        if result.is_ok() && self.node_status.get().is_leader() {
+            self.ack_barrier_rewind_armed.set(true);
+        }
+        result
+    }
+
+    /// One coordinator replication cycle as a 'static future: everything it
+    /// touches is cloned up front so a detached task (the notify timer's
+    /// `run_notify_timer`) can run the same cycle the write path runs.
+    fn replication_cycle(
+        &self,
+        trigger: ReplicationTrigger,
+        delay: Option<Duration>,
+    ) -> impl std::future::Future<Output = Result<(), ReplicationError>> + 'static {
+        let replication_coordinator = self.replication_coordinator.clone();
         let replication_client = self.replication_client.clone();
         let fsync_coordinator = self.fsync_coordinator.clone();
         let rotating_log_cache = self.log_segments_cache.clone();
@@ -2590,23 +2698,151 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         let mc_capture = shard_mem_cache.clone();
         let dict_codec = self.dict_codec.clone();
-        let result = self.replication_coordinator
-            .request_sync_two_phase(
-                delay,
-                ReplicationError::GateTimeout,
-                move || capture_replication_snapshot(&mc_capture, trigger),
-                move |captured| commit_replication(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, node_status, captured, trigger, max_catchup_gap_bytes, max_request_size, read_max_chunk_size, max_clock_drift_ms, shard_id, s3_cas_confirmed_at_ms, s3_lease_duration_ms, dict_codec, lease_renewal_requester),
-            )
-            .await;
-        // A successful commit while leading may have created an own speculative
-        // tail (written, not yet committed entries above the new ack point), so a
-        // future demotion is again entitled to one rewind-to-ack-barrier cull.
-        if result.is_ok() && self.node_status.get().is_leader() {
-            self.ack_barrier_rewind_armed.set(true);
+        let pushed_to_follower_seq = self.pushed_to_follower_seq.clone();
+        let last_batch_sent_at = self.last_batch_sent_at.clone();
+        async move {
+            replication_coordinator
+                .request_sync_two_phase(
+                    delay,
+                    ReplicationError::GateTimeout,
+                    move || capture_replication_snapshot(&mc_capture, trigger),
+                    move |captured| commit_replication(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, node_status, captured, trigger, max_catchup_gap_bytes, max_request_size, read_max_chunk_size, max_clock_drift_ms, shard_id, s3_cas_confirmed_at_ms, s3_lease_duration_ms, dict_codec, lease_renewal_requester, pushed_to_follower_seq, last_batch_sent_at),
+                )
+                .await
         }
-        result
     }
-    
+
+    /// Register a post-burst commit obligation and ensure the notify timer is
+    /// armed. Monotone: raises `pending_notify_seq` to the current confirmed seq,
+    /// never lowers it, and decides nothing else. Under load the next real batch
+    /// raises `pushed_to_follower_seq` to meet it before the timer wakes, so the
+    /// obligation clears with no dedicated notify.
+    fn note_commit_and_arm_notify_timer(&self) {
+        let confirmed = shard_wal_replicate::current_leader_confirmed_wal_seq(&self.log_segments_cache);
+        if confirmed > self.pending_notify_seq.get() {
+            self.pending_notify_seq.set(confirmed);
+        }
+        metrics::gauge!("celeriant_commit_notify_obligation_seq", &self.metrics_shard_label)
+            .set(self.pending_notify_seq.get().saturating_sub(self.pushed_to_follower_seq.get()) as f64);
+        self.arm_notify_timer();
+    }
+
+    /// Spawn the single notify timer if an obligation is open and none is live.
+    /// `replace(true)` is the dedup latch; it is read and set only in a
+    /// synchronous region, so two concurrent drains cannot both spawn a timer.
+    fn arm_notify_timer(&self) {
+        if self.pending_notify_seq.get() <= self.pushed_to_follower_seq.get() {
+            return;
+        }
+        if self.notify_timer_armed.replace(true) {
+            return;
+        }
+        let Some(weak) = self.notify_self_ref.get().cloned() else {
+            // Self-ref unwired: release the latch so a later arm retries once wired.
+            self.notify_timer_armed.set(false);
+            return;
+        };
+        let delay = self.config.replication_delay;
+        glommio::spawn_local(Self::run_notify_timer(weak, delay)).detach();
+    }
+
+    /// The detached notify timer. Writers never await it. Each wake decides in order:
+    /// watermark disarm (`pushed >= pending`, the idle terminator) or leadership/reach
+    /// loss; then the load suppressor — a data batch within the recency window, or queued
+    /// writes — rearms as a free deferral; then the give-up bound; then budget; else it fires.
+    /// The batch-recency check, NOT the watermark, is the load suppressor: `pushed`
+    /// structurally trails `pending` by one batch under load (two-phase sends before
+    /// commit), so the disarm never samples true while the stream flows. Disarm is
+    /// race-free: `pushed >= pending` is read and `notify_timer_armed` cleared in the
+    /// same await-free region, and a concurrent drain runs only at an await — so it
+    /// either raised `pending` before this region (seen here) or arms fresh after.
+    ///
+    /// A wake that reaches the send but does not advance the watermark — a rejection
+    /// the follower keeps returning, or a transiently-exhausted lease budget — is
+    /// unproductive. After `MAX_UNPRODUCTIVE_WAKES` the timer gives up and disarms,
+    /// leaving the 5s probe as the carrier. Without that bound a reachable follower
+    /// that persistently rejects the notify would spin the serial channel at the
+    /// pacing cadence; the notify's contract is that it never spins.
+    async fn run_notify_timer(weak: Weak<Self>, delay: Duration) {
+        const MAX_UNPRODUCTIVE_WAKES: u32 = 3;
+        let mut unproductive = 0u32;
+        loop {
+            glommio::timer::sleep(delay).await;
+            let Some(this) = weak.upgrade() else { return };
+            let (pending, pushed) = (this.pending_notify_seq.get(), this.pushed_to_follower_seq.get());
+            metrics::gauge!("celeriant_commit_notify_obligation_seq", &this.metrics_shard_label)
+                .set(pending.saturating_sub(pushed) as f64);
+
+            // Obligation met, or leadership lost: disarm and exit (terminal). The 5s
+            // probe is the carrier for the fenced/unreachable tail.
+            if pushed >= pending || !this.node_status.get().is_leader() {
+                this.notify_timer_armed.set(false);
+                return;
+            }
+            if !this.replication_client.is_follower_reachable() {
+                this.notify_timer_armed.set(false);
+                return;
+            }
+
+            // Load suppressor: while the carrier stream is flowing (a real data batch
+            // within the recency window) or writes are queued, the next batch carries
+            // the index — rearm and wait. This is the guard the watermark cannot be,
+            // since `pushed` structurally trails `pending` by one batch under load. Both
+            // are legitimate deferrals, not unproductive wakes (they must not walk the
+            // give-up bound, or sustained load would eventually give up on a live
+            // obligation). The window is sized to the measured under-load batch cadence
+            // (~40-140ms per shard at saturation, several × the amortisation delay, since
+            // a batch RTT is delay + follower fsync + gate contention), not to `delay`
+            // itself — too small and the notify fires under load; too large only staler
+            // idle tails. It is a pacing knob, not a correctness gate.
+            let recency_window = RECENCY_WINDOW_BATCHES * delay;
+            if this.last_batch_sent_at.get().elapsed() < recency_window
+                || this.shard_mem_cache.borrow().pending_replication_count() != 0
+            {
+                continue;
+            }
+
+            // Bound the loop: a reachable follower that keeps rejecting, or a budget
+            // that stays exhausted, must not spin the channel. Give up to the probe.
+            if unproductive >= MAX_UNPRODUCTIVE_WAKES {
+                metrics::counter!("celeriant_commit_notify_gave_up_total", &this.metrics_shard_label).increment(1);
+                this.notify_timer_armed.set(false);
+                return;
+            }
+
+            // Mirror acquire_lease_budget's split: None is a fence (terminal); a zero
+            // budget is transient exhaustion (the lease renews), so count it and wait
+            // rather than strand the obligation by disarming while still leader.
+            match this.node_status.get().current_budget() {
+                Some(budget) if !budget.is_zero() => {}
+                Some(_) => {
+                    metrics::counter!(
+                        "celeriant_lease_budget_exhausted_total",
+                        &[("op", "commit_notify".to_string()), ("shard_id", this.config.shard_id.to_string())],
+                    ).increment(1);
+                    unproductive += 1;
+                    continue;
+                }
+                None => {
+                    metrics::counter!("celeriant_commit_notify_skipped_fenced_total", &this.metrics_shard_label).increment(1);
+                    this.notify_timer_armed.set(false);
+                    return;
+                }
+            }
+
+            // Provably idle at this wake: run one notify cycle. It raises
+            // `pushed_to_follower_seq` to the delivered index (or drops at capture if
+            // a write raced in). A cycle that does not advance the watermark is a
+            // rejection — count it toward the give-up bound; progress resets it.
+            let _ = this.replication_cycle(ReplicationTrigger::CommitNotify, None).await;
+            if this.pushed_to_follower_seq.get() > pushed {
+                unproductive = 0;
+            } else {
+                unproductive += 1;
+            }
+        }
+    }
+
     pub async fn handle_replication_batch(
         &self, request: celeriant_msg::request::requests::ReplicationBatchRequest
     ) -> Result<ReplicationBatchResponse, FollowerReplicationWriteError> {
@@ -2669,19 +2905,37 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             })));
         }
 
-        if request.batches.is_empty() {
-            return Ok(response(ReplicationResult::Rejected(FollowerRejection::EmptyBatch)));
-        }
-
         // Fence stale leaders on the sender's current epoch, not the entries' own
         // lease_epoch: catchup replays history authored under previous tenures, so
-        // the metablock epoch is legitimately older.
+        // the metablock epoch is legitimately older. Runs BEFORE empty-batch
+        // handling: a zombie leader's commit-notify must fence as StaleLease,
+        // never pass as an accepted notify.
         let batch_lease_epoch = request.sender_lease_epoch;
         if batch_lease_epoch < leader_lease_epoch {
             return Ok(response(ReplicationResult::Rejected(FollowerRejection::StaleLease {
                 follower_lease_epoch: leader_lease_epoch,
                 received_lease_epoch: batch_lease_epoch,
             })));
+        }
+
+        // An empty-batches request that passed every guard is a commit-notify:
+        // no entries, no data fsync — just the floor update and parked drain the
+        // data path runs, so an idle commit propagates without waiting for the
+        // probe. Structurally chain-neutral (nothing to apply, write untouched).
+        // The read-cursor header fsync rides off the response path (leg 3): it
+        // holds the leader's serial replication channel for ~15ms otherwise, and
+        // a lost advance only ever shows less, never more (the crash contract).
+        if request.batches.is_empty() {
+            metrics::counter!("celeriant_commit_notify_received_total", &self.metrics_shard_label).increment(1);
+            self.update_promotion_floor(request.leader_confirmed_wal_seq);
+            let drained = self.drain_parked_commits(request.leader_confirmed_wal_seq);
+            if drained > 0 {
+                self.sweep_sealed_summaries().await;
+            }
+            self.spawn_persist_read_cursor();
+            return Ok(response(ReplicationResult::Success {
+                last_follower_metablock: None,
+            }));
         }
 
         let shard_id = self.config.shard_id;
@@ -2732,19 +2986,24 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             }
         }
 
-        // Promotion-batch floor: bounds the range we'd upload if we became leader.
-        // Monotonic max guards against retries / out-of-order arrival.
-        {
-            let new_floor = request.leader_confirmed_wal_seq.saturating_add(1);
-            let active = self.log_segments_cache.active();
-            let mut meta = active.metadata.borrow_mut();
-            if new_floor > meta.last_received_replication_wal_seq {
-                meta.last_received_replication_wal_seq = new_floor;
-            }
-        }
+        self.update_promotion_floor(request.leader_confirmed_wal_seq);
+
+        // Deferred commit, first drain: the carrier confirms previously parked
+        // batches (they are durable already), so the fsync below persists the
+        // advanced read cursor in its header for free.
+        let mut drained = self.drain_parked_commits(request.leader_confirmed_wal_seq);
 
         self.sync_durable().await
             .map_err(FollowerReplicationWriteError::ShardFSyncError)?;
+
+        // Second drain: covers the batch parked by the fsync above when the
+        // carrier confirms at-or-past our new tip (duplicate/probe retries and
+        // the clamp case), plus the crash-restart cold prefix.
+        drained += self.drain_parked_commits(request.leader_confirmed_wal_seq);
+        self.persist_read_cursor_if_advanced().await;
+        if drained > 0 {
+            self.sweep_sealed_summaries().await;
+        }
 
         let shard_label = &self.metrics_shard_label;
         let applied_bytes: u64 = request.batches.iter().map(|b| b.metablock.uncompressed_size).sum();
@@ -2756,97 +3015,436 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         }))
     }
 
-    /// Rewind write to read and drop in-flight PCDs that referenced the discarded tail.
-    /// Must run before catchup; catchup starts at write+1 and would otherwise skip
-    /// peer batches in (read, pre-cull write]. Returns true if anything was culled.
-    ///
-    /// `rewind_to_ack_barrier`: demotion path only. When true, also handles the crash-induced
-    /// case where `read == write` but `last_self_acked < read`; rewinding both cursors down
-    /// to the ack barrier so un-acked speculative data is dropped. Safe because those entries
-    /// were never acked to any client. Must NOT be set on the promotion path.
-    pub async fn cull_speculative_tail_for_promotion(&self, rewind_to_ack_barrier: bool) -> Result<bool, ShardFsyncError> {
+    /// Promotion-batch floor: bounds the range we'd upload if we became leader.
+    /// Monotonic max guards against retries / out-of-order arrival.
+    fn update_promotion_floor(&self, leader_confirmed_wal_seq: u64) {
+        let new_floor = leader_confirmed_wal_seq.saturating_add(1);
         let active = self.log_segments_cache.active();
-        // Snapshot the cursors without holding borrow_mut across the async scan.
+        let mut meta = active.metadata.borrow_mut();
+        if new_floor > meta.last_received_replication_wal_seq {
+            meta.last_received_replication_wal_seq = new_floor;
+        }
+    }
+
+    /// Commit parked deferred batches covered by `min(leader_confirmed_wal_seq, write)`.
+    /// One commit model, two triggers: this is the leader's commit_pcd driven by the
+    /// carrier's commit index instead of a replication ACK. Monotonicity is structural —
+    /// the parked queue only holds batches above the current read cursor, so a stale
+    /// carrier drains nothing. Returns the number of committed batches.
+    fn drain_parked_commits(&self, leader_confirmed_wal_seq: u64) -> usize {
+        let active = self.log_segments_cache.active();
+        let (write_wal, read_wal) = {
+            let meta = active.metadata.borrow();
+            (meta.write.wal_seq, meta.read.as_ref().map_or(0, |r| r.wal_seq))
+        };
+        let target = leader_confirmed_wal_seq.min(write_wal);
+        if target <= read_wal {
+            return 0;
+        }
+
+        let span = tracing::info_span!(
+            "follower_commit_drain",
+            shard_id = self.config.shard_id,
+            target,
+            drained_count = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+
+        let pcds = self.shard_mem_cache.borrow_mut().drain_parked_commits_up_to(target);
+        let drained = pcds.len();
+        for pcd in pcds {
+            shard_wal_replicate::commit_pcd(
+                &self.log_segments_cache, &self.shard_mem_cache, &self.watched_aggregates, pcd, Some(&self.dict_codec),
+            );
+        }
+
+        // Crash-restart cold prefix: the confirmed range has no parked batches
+        // (they died with the process) and the caches are cold, so the cursor
+        // advance IS the whole commit. Only fires when the carrier confirms
+        // exactly our durable tip; a confirmed index strictly between read and
+        // write with no parked coverage stays put (shows less, never more).
+        {
+            let mut meta = active.metadata.borrow_mut();
+            let read_now = meta.read.as_ref().map_or(0, |r| r.wal_seq);
+            if read_now < target
+                && target == meta.write.wal_seq
+                && self.shard_mem_cache.borrow().parked_commit_count() == 0
+            {
+                meta.advance_visible_position();
+            }
+        }
+
+        span.record("drained_count", drained as u64);
+        shard_wal_replicate::set_read_cursor_gauge(&self.log_segments_cache, self.config.shard_id);
+        // Shard-level committed cursor: post-rotation the active read is None
+        // while parked commits still cover the sealed predecessor.
+        let read_now = self.log_segments_cache.committed_read_wal_seq();
+        metrics::gauge!("celeriant_follower_read_lag", &self.metrics_shard_label)
+            .set(write_wal.saturating_sub(read_now) as f64);
+        metrics::gauge!("celeriant_parked_commit_queue_depth", &self.metrics_shard_label)
+            .set(self.shard_mem_cache.borrow().parked_commit_count() as f64);
+        drained
+    }
+
+    /// Detached read-cursor persist for the commit-notify response path (leg 3):
+    /// the notify returns after the in-memory drain and this header fsync runs off
+    /// the leader's held channel. Clones only the three fields the fsync needs, so
+    /// it runs in any context (no self-ref). The persist no-ops if a later carrier
+    /// already synced the cursor, so redundant spawns are free; a crash before it
+    /// runs simply shows less, never more.
+    fn spawn_persist_read_cursor(&self) {
+        let fsync_coordinator = self.fsync_coordinator.clone();
+        let log_segments_cache = self.log_segments_cache.clone();
+        let shard_id = self.config.shard_id;
+        glommio::spawn_local(async move {
+            Self::persist_read_cursor_if_advanced_inner(&fsync_coordinator, &log_segments_cache, shard_id).await;
+        })
+        .detach();
+    }
+
+    /// Persist a read-cursor advance that no data fsync covered (duplicate and
+    /// probe carriers apply nothing, so nothing else writes a header). Best
+    /// effort: losing it to a crash means restarting to show less, never more.
+    async fn persist_read_cursor_if_advanced(&self) {
+        Self::persist_read_cursor_if_advanced_inner(&self.fsync_coordinator, &self.log_segments_cache, self.config.shard_id).await;
+    }
+
+    async fn persist_read_cursor_if_advanced_inner(
+        fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
+        log_segments_cache: &Rc<LogSegmentsCache>,
+        shard_id: u32,
+    ) {
+        let active = log_segments_cache.active();
+        let read_wal = active.metadata.borrow().read.as_ref().map_or(0, |r| r.wal_seq);
+        if active.read_wal_synced.get() >= read_wal {
+            return;
+        }
+        let active_for_sync = active.clone();
+        let result = fsync_coordinator
+            .request_sync_until(
+                ShardFsyncError::WriteLockTimeout,
+                || async move { sync_header_only(active_for_sync).await },
+                || active.read_wal_synced.get() >= read_wal,
+            )
+            .await;
+        if let Err(e) = result {
+            warn!(shard_id, error = ?e, "read-cursor header fsync failed; advance remains in-memory only");
+        }
+    }
+
+    /// Write sidecars for sealed segments whose read cursor caught up after a drain.
+    async fn sweep_sealed_summaries(&self) {
+        let sealed_ready = shard_wal_replicate::collect_eligible_sealed_summaries(&self.log_segments_cache, &self.shard_mem_cache);
+        for (log_id, payload) in sealed_ready {
+            if let Err(e) = crate::shard_wal_sync::write_segment_summary_sidecar_from_payload(
+                self.log_segments_cache.shard_dir(), log_id, payload,
+            ).await {
+                tracing::error!(shard_id = self.config.shard_id, log_id, error = ?e, "Failed to write segment summary sidecar");
+            }
+        }
+    }
+
+    /// Reconcile the durable tail — entries above the read cursor — on a role
+    /// transition. Returns Ok(true) when anything changed (a tail was committed,
+    /// culled, or rewound to the ack barrier); Ok(false) for a no-op (no tail, or
+    /// a peer tail deliberately kept parked). Must run before catchup: catchup
+    /// starts at write+1 and would otherwise skip peer batches in a culled range.
+    ///
+    /// Tail disposition per mode:
+    /// - `CommitForPromotion`: a peer-received tail is committed whole — every
+    ///   parked commit drains through `commit_pcd`, the read cursor advances to
+    ///   the durable tip, the header is persisted. The old leader may have acked
+    ///   entries the observed commit index never covered, so nothing short of the
+    ///   whole tail is safe. An own-speculation tail (a crashed ex-leader
+    ///   re-winning an election) is culled instead: it is unacked by the
+    ///   persisted-read ≥ acked invariant, and committing it would fire watch
+    ///   events for entries the mandatory pre-serve S3 catchup then truncates.
+    /// - `ReconcileAsFollower`: a peer tail stays durable AND parked (it is
+    ///   unconfirmed; the new leader's carriers or catchup reconcile it). An
+    ///   own-speculation tail is culled (boot-after-leader-crash divergence risk).
+    /// - `RewindToAckBarrier`: demotion from held leadership. Rewinds write to
+    ///   read for an in-flight own tail; handles the crash-induced
+    ///   `read == write > ack barrier` case by rewinding both cursors to the
+    ///   barrier. Safe because those entries were never acked to any client. Any
+    ///   parked commits cover the culled range and are discarded with it. Must
+    ///   NOT be used on the promotion path.
+    pub async fn reconcile_durable_tail(&self, mode: TailReconciliation) -> Result<bool, ShardFsyncError> {
+        let active = self.log_segments_cache.active();
+        // Snapshot the cursors without holding borrow_mut across any await.
         let (write_seq, read_opt, last_acked, last_received) = {
             let meta = active.metadata.borrow();
             (meta.write.wal_seq, meta.read.clone(), meta.last_self_acked_wal_seq, meta.last_received_replication_wal_seq)
         };
-        // One-shot: only the first rewind-eligible cull since boot/leadership may
-        // rewind to the ack barrier. Consumed even if the rewind arm doesn't fire,
-        // because after any demotion-path cull the remaining tail above the barrier
-        // is peer data, not own speculation.
-        let rewind_armed = rewind_to_ack_barrier && self.ack_barrier_rewind_armed.replace(false);
 
-        enum CullTarget {
-            // Rewind write cursor to read (promotion path): read stays, write = read.
-            WriteToRead,
-            // Rewind both cursors to ack barrier (demotion path): write = read = ack_barrier.
-            BothToAckBarrier(celeriant_rotating_log::log_segment_file::log_segment_cursor::LogSegmentCursor),
+        match mode {
+            TailReconciliation::RewindToAckBarrier => {
+                // One-shot: only the first demotion cull since boot/leadership may
+                // rewind to the ack barrier. Consumed even if the rewind arm doesn't
+                // fire, because after any demotion-path cull the remaining tail
+                // above the barrier is peer data, not own speculation.
+                let rewind_armed = self.ack_barrier_rewind_armed.replace(false);
+                let Some(read) = read_opt else { return Ok(false) };
+                if read.wal_seq < write_seq {
+                    tracing::info!(
+                        shard_id = self.config.shard_id,
+                        write_wal_seq = write_seq,
+                        read_wal_seq = read.wal_seq,
+                        last_self_acked_wal_seq = last_acked,
+                        "reconcile_durable_tail: demotion rewinding write to read"
+                    );
+                    self.cull_tail(CullTarget::WriteToRead(read)).await?;
+                    Ok(true)
+                } else if rewind_armed && last_acked > 0 && last_acked.max(last_received) < read.wal_seq {
+                    // Demotion cull: read==write but the barrier is below read. Drop the
+                    // own un-acked range (barrier+1 .. read] by scanning backward. The
+                    // barrier is max(last_self_acked, last_received_replication_wal_seq):
+                    // data above last_acked that arrived via TCP replication is peer-ACKED
+                    // (the peer returned Ok to clients for it) and may exist nowhere else
+                    // reachable (live-TCP ranges are never uploaded to S3) — culling it
+                    // wedges convergence permanently. Only data above BOTH cursors is own
+                    // speculation that no client was ever acked for.
+                    let barrier = last_acked.max(last_received);
+                    let log_id = active.metadata.borrow().log_id;
+                    tracing::info!(
+                        shard_id = self.config.shard_id,
+                        read_wal_seq = read.wal_seq,
+                        last_self_acked_wal_seq = last_acked,
+                        last_received_replication_wal_seq = last_received,
+                        barrier,
+                        "reconcile_durable_tail: demotion rewind to ack barrier"
+                    );
+                    let cursor = self.find_cursor_at_wal_seq(barrier, &read, log_id).await?;
+                    self.cull_tail(CullTarget::BothToAckBarrier(cursor)).await?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            TailReconciliation::CommitForPromotion | TailReconciliation::ReconcileAsFollower => {
+                let read_seq = read_opt.as_ref().map_or(0, |r| r.wal_seq);
+                if write_seq <= read_seq {
+                    // Parked commits always cover (read, write]; with no tail the
+                    // queue must be empty, or a promotion would silently retain it.
+                    debug_assert_eq!(
+                        self.shard_mem_cache.borrow().parked_commit_count(), 0,
+                        "parked commits with no durable tail above read",
+                    );
+                    return Ok(false);
+                }
+                if self.durable_tail_is_peer(write_seq).await? {
+                    if mode == TailReconciliation::CommitForPromotion {
+                        self.commit_durable_tail(write_seq, read_seq).await?;
+                        Ok(true)
+                    } else {
+                        // Unconfirmed peer data stays durable and parked; the new
+                        // leader's carriers or catchup reconcile it.
+                        Ok(false)
+                    }
+                } else {
+                    let Some(read) = read_opt else {
+                        // Own tail with no read cursor: a leader that never acked
+                        // anything, so there is no commit point to rewind to. The
+                        // tail stays; if a peer authored a competing fork, the
+                        // S3-catchup divergence path truncates it.
+                        return Ok(false);
+                    };
+                    tracing::info!(
+                        shard_id = self.config.shard_id,
+                        write_wal_seq = write_seq,
+                        read_wal_seq = read.wal_seq,
+                        last_self_acked_wal_seq = last_acked,
+                        mode = ?mode,
+                        "reconcile_durable_tail: culling own-speculation tail"
+                    );
+                    // Mixed tails are impossible (a leader never chains onto foreign
+                    // unacked entries), so an own tail means nothing is parked.
+                    debug_assert_eq!(
+                        self.shard_mem_cache.borrow().parked_commit_count(), 0,
+                        "own-speculation tail with parked peer commits: tail provenance is broken",
+                    );
+                    self.cull_tail(CullTarget::WriteToRead(read)).await?;
+                    Ok(true)
+                }
+            }
+        }
+    }
+
+    /// Provenance of the durable tail (read_seq, write_seq]: peer-received
+    /// (chain-validated replication the old leader may have ACKED — must never be
+    /// culled) or own unacked speculation (safe to cull). Mixed tails are
+    /// structurally impossible: a leader never appends onto foreign unacked
+    /// entries, and the demotion cull runs before peer data is accepted.
+    ///
+    /// Two signals, cheapest first:
+    /// 1. parked deferred commits exist: only the follower replication apply parks,
+    ///    so the tail is peer-received by construction;
+    /// 2. the tail tip metablock was authored by another node: one reverse read at
+    ///    the write cursor (cold path), crossing into the previous segment when the
+    ///    active one is empty. node_id is per-node crypto-derived, and the S3
+    ///    catchup already depends on its distinctness to filter fallback batches.
+    async fn durable_tail_is_peer(&self, write_seq: u64) -> Result<bool, ShardFsyncError> {
+        if self.shard_mem_cache.borrow().parked_commit_count() > 0 {
+            return Ok(true);
+        }
+        let mut scanner = ReverseMetablockScanner::new(
+            &self.log_segments_cache,
+            self.log_segments_cache.active_log_id(),
+            None,
+            self.config.read_max_chunk_size,
+        )
+        .with_write_cursor_upper_bound();
+        let tip = scanner
+            .scan::<(u64, u128), ShardFsyncError>(|_, _, bytes| {
+                Ok(Some((metablock_bytes::read_wal_seq(bytes), metablock_bytes::read_node_id(bytes))))
+            })
+            .await
+            .map_err(|e| ShardFsyncError::MetablockSerialisationError(format!("tail provenance scan failed: {e:?}")))?;
+        match tip {
+            Some((tip_seq, tip_node_id)) => {
+                debug_assert_eq!(tip_seq, write_seq, "first block under the write cursor must be the tail tip");
+                Ok(tip_node_id != self.config.node_id)
+            }
+            // No metablock despite write > read: nothing real to commit. Let the
+            // own-tail path decide (it rewinds write to read, dropping the phantom range).
+            None => Ok(false),
+        }
+    }
+
+    /// Promotion over a peer-received tail: commit the ENTIRE durable tail. Every
+    /// acked entry is inside it (durability invariant) and an observed commit index
+    /// can lag an ack, so nothing short of the durable tip is safe. Parked commits
+    /// drain through `commit_pcd` (read caches, segment summaries, watch events —
+    /// exactly once, in wal_seq order); the read cursor then advances over any
+    /// remainder (after a crash-restart the parked commits died with the process
+    /// and the caches are cold, so the cursor advance IS the whole commit).
+    /// Write-side caches are untouched: the data is kept and they remain valid.
+    async fn commit_durable_tail(&self, write_seq: u64, read_seq: u64) -> Result<(), ShardFsyncError> {
+        let span = tracing::info_span!(
+            "promotion_tail_commit",
+            shard_id = self.config.shard_id,
+            write_wal_seq = write_seq,
+            read_wal_seq = read_seq,
+            drained_count = tracing::field::Empty,
+        );
+        let active = self.log_segments_cache.active();
+        {
+            let _entered = span.enter();
+            let pcds = self.shard_mem_cache.borrow_mut().take_all_parked_commits();
+            span.record("drained_count", pcds.len() as u64);
+            for pcd in pcds {
+                shard_wal_replicate::commit_pcd(
+                    &self.log_segments_cache, &self.shard_mem_cache, &self.watched_aggregates, pcd, Some(&self.dict_codec),
+                );
+            }
+            let mut meta = active.metadata.borrow_mut();
+            if meta.read.as_ref().map_or(0, |r| r.wal_seq) < meta.write.wal_seq {
+                meta.advance_visible_position();
+            }
         }
 
-        let cull_target = if let Some(ref read) = read_opt {
-            if read.wal_seq < write_seq {
-                // Standard cull: speculative tail above read.
-                tracing::info!(
-                    shard_id = self.config.shard_id,
-                    write_wal_seq = write_seq,
-                    read_wal_seq = read.wal_seq,
-                    last_self_acked_wal_seq = last_acked,
-                    "cull_speculative_tail: rewinding write to read before promotion catchup"
-                );
-                Some(CullTarget::WriteToRead)
-            } else if rewind_armed && last_acked > 0 && last_acked.max(last_received) < read.wal_seq {
-                // Demotion cull: read==write but the barrier is below read. Drop the
-                // own un-acked range (barrier+1 .. read] by scanning backward. The
-                // barrier is max(last_self_acked, last_received_replication_wal_seq):
-                // data above last_acked that arrived via TCP replication is peer-ACKED
-                // (the peer returned Ok to clients for it) and may exist nowhere else
-                // reachable (live-TCP ranges are never uploaded to S3) — culling it
-                // wedges convergence permanently. Only data above BOTH cursors is own
-                // speculation that no client was ever acked for.
-                let barrier = last_acked.max(last_received);
-                let log_id = active.metadata.borrow().log_id;
-                tracing::info!(
-                    shard_id = self.config.shard_id,
-                    read_wal_seq = read.wal_seq,
-                    last_self_acked_wal_seq = last_acked,
-                    last_received_replication_wal_seq = last_received,
-                    barrier,
-                    "cull_speculative_tail: demotion rewind to ack barrier"
-                );
-                let cursor = self.find_cursor_at_wal_seq(barrier, read, log_id).await?;
-                Some(CullTarget::BothToAckBarrier(cursor))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        shard_wal_replicate::set_read_cursor_gauge(&self.log_segments_cache, self.config.shard_id);
+        metrics::gauge!("celeriant_follower_read_lag", &self.metrics_shard_label).set(0.0);
+        metrics::gauge!("celeriant_parked_commit_queue_depth", &self.metrics_shard_label).set(0.0);
 
-        let demotion_cull = if let Some(target) = cull_target {
+        // Persist the committed cursor: a restart must not regress a promoted
+        // leader to a parked view, and nothing else is guaranteed to write a
+        // header before writes open.
+        let active_for_fsync = active.clone();
+        self.fsync_coordinator
+            .request_sync(
+                None,
+                ShardFsyncError::WriteLockTimeout,
+                || async move { sync_header_only(active_for_fsync).await },
+            )
+            .await?;
+
+        // Sealed segments the commit fully covered can flush their summary
+        // sidecars. Unconditional: a crash-restart promotion commits via the bare
+        // cursor advance (nothing drained), and no follower-drain will ever run
+        // on a leader to pick the sweep up later.
+        self.sweep_sealed_summaries().await;
+        Ok(())
+    }
+
+    /// Clear the promotion-batch floor. Single site: the Leader flip, on every
+    /// shard, on every promotion. The floor is set during the follower stint,
+    /// consumed by the promotion upload as its range start, and doubles as the
+    /// disk-truth "promotion incomplete" marker for crash re-entry — so nothing
+    /// may clear it earlier. Left uncleared it would also outlive the leader
+    /// stint and poison the demotion ack barrier (max(last_self_acked,
+    /// last_received)). Clearing after a failed or skipped upload stands: the
+    /// range stays on local disk and the demoted peer heals via the leader-side
+    /// S3 fallback (pre-existing no-retry gap, same semantics as the old
+    /// budget-exceeded clear). In-memory; the next header fsync persists it —
+    /// a crash before that re-enters the resume path idempotently.
+    pub fn clear_promotion_floor(&self) {
+        let active = self.log_segments_cache.active();
+        active.metadata.borrow_mut().last_received_replication_wal_seq = 0;
+    }
+
+    /// Disk-truth "promotion incomplete" check for a reacquired lease. True when
+    /// the previous incarnation crashed mid-promotion still owing the commit or
+    /// the upload. When a durable tail exists its PROVENANCE decides — a stale
+    /// floor (armed by a crash in the Leader-flip-to-floor-clear gap) must never
+    /// override an own-speculation tail into the cull that the self-reclaim
+    /// carve-out promises against. Only with no tail does the floor decide: it
+    /// catches a crash after the catchup commit left read == write while the
+    /// TCP-received range still exists in S3 nowhere.
+    pub async fn promotion_resume_owed(&self) -> Result<bool, ShardFsyncError> {
+        let (write_seq, read_seq, floor) = {
+            let active = self.log_segments_cache.active();
+            let meta = active.metadata.borrow();
+            (meta.write.wal_seq, meta.read.as_ref().map_or(0, |r| r.wal_seq), meta.last_received_replication_wal_seq)
+        };
+        if write_seq > read_seq {
+            return self.durable_tail_is_peer(write_seq).await;
+        }
+        Ok(floor > 0)
+    }
+
+    /// Belt-and-braces for the Follower→Leader status flip: a chain-valid batch
+    /// from the deposed leader can arrive inside the promotion window (after the
+    /// post-catchup reconciliation, before the flip), park, and then have nothing
+    /// left to drain it — its entry would become visible without watch events
+    /// once the new leader's own acks advance the read cursor past it. Parked
+    /// entries are peer data on our chain, so commit them. No-op when nothing is
+    /// parked, which also leaves a self-reclaimed leader's own speculative tail
+    /// untouched.
+    pub async fn commit_parked_tail_on_promotion(&self) -> Result<(), ShardFsyncError> {
+        if self.shard_mem_cache.borrow().parked_commit_count() > 0 {
+            self.reconcile_durable_tail(TailReconciliation::CommitForPromotion).await?;
+        }
+        debug_assert_eq!(
+            self.shard_mem_cache.borrow().parked_commit_count(), 0,
+            "parked commits survived the promotion status flip",
+        );
+        Ok(())
+    }
+
+    /// Rewind mechanics shared by every cull arm: move the cursor(s), rebuild the
+    /// in-segment backlink tips, drop the write-side state that referenced the
+    /// culled range, and persist the header.
+    async fn cull_tail(&self, target: CullTarget) -> Result<(), ShardFsyncError> {
+        let active = self.log_segments_cache.active();
+        let demotion_cull = matches!(target, CullTarget::BothToAckBarrier(_));
+        {
             let mut meta = active.metadata.borrow_mut();
-            let culled = match target {
-                CullTarget::WriteToRead => {
-                    let read = read_opt.as_ref().expect("read must be Some when WriteToRead");
-                    meta.write = read.clone();
+            match target {
+                CullTarget::WriteToRead(read) => {
+                    meta.write = read;
                     // read cursor unchanged: followers still sync from the existing read position.
-                    false
                 }
                 CullTarget::BothToAckBarrier(cursor) => {
                     meta.write = cursor.clone();
                     meta.read = Some(cursor);
-                    true
                 }
-            };
+            }
             // Rewinds refresh both cursor gauges, read first: a scrape
             // between the two sets must never see read above write.
             metrics::gauge!("celeriant_read_wal_seq", &self.metrics_shard_label)
                 .set(meta.read.as_ref().map_or(0, |r| r.wal_seq) as f64);
             metrics::gauge!("celeriant_wal_seq", &self.metrics_shard_label).set(meta.write.wal_seq as f64);
-            culled
-        } else {
-            return Ok(false);
-        };
+        }
 
         // The rewind orphaned the in-segment backlink tips (still pointing into the culled
         // tail); rebuild so the next append back-links to a live committed block, not a culled one.
@@ -2854,42 +3452,51 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             .await
             .map_err(|e| ShardFsyncError::MetablockSerialisationError(format!("chain-tips rebuild after cull failed: {e:?}")))?;
 
-        {
-            let (lru_client_len, lru_agg_len, drained) = {
-                let mut mc = self.shard_mem_cache.borrow_mut();
-                let lru_client_len = mc.aggregate_write_client_snapshots_len();
-                let lru_agg_len = mc.aggregate_write_snapshots_len();
-                // Demotion cull moves the read cursor down: stale read-side caches must also be
-                // cleared. Promotion cull leaves the read cursor unchanged, so read caches remain valid.
-                let drained = if demotion_cull {
-                    mc.clear_all_caches();
-                    0
-                } else {
-                    mc.clear_speculative_write_caches_for_cull()
-                };
-                (lru_client_len, lru_agg_len, drained)
-            };
-            metrics::counter!("celeriant_cull_stale_client_seq_lru").increment(lru_client_len as u64);
-            metrics::counter!("celeriant_cull_stale_agg_lru").increment(lru_agg_len as u64);
-            if lru_client_len > 0 || lru_agg_len > 0 || drained > 0 {
-                tracing::warn!(
-                    shard_id = self.config.shard_id,
-                    lru_client_len,
-                    lru_agg_len,
-                    drained,
-                    "cull_speculative_tail: cleared OCC/idempotency LRU + drained pending_replication"
-                );
+        let (lru_client_len, lru_agg_len, drained, parked_dropped) = {
+            let mut mc = self.shard_mem_cache.borrow_mut();
+            let lru_client_len = mc.aggregate_write_client_snapshots_len();
+            let lru_agg_len = mc.aggregate_write_snapshots_len();
+            // The barrier rewind moves the read cursor down, so stale read-side caches
+            // must also go (clear_all_caches, which discards parked commits too).
+            // WriteToRead leaves the read cursor, so read caches stay valid. Parked
+            // commits cover exactly the culled (read, write] range and are discarded
+            // with it: their entries left the chain, so their watch events must never
+            // fire, and an orphaned PCD would replay at the next promotion catchup.
+            // Callers route only held-leadership demotions and own-speculation tails
+            // here, so the queue should already be empty; the discard is defensive.
+            if demotion_cull {
+                mc.clear_all_caches();
+                (lru_client_len, lru_agg_len, 0, 0)
+            } else {
+                let drained = mc.clear_speculative_write_caches_for_cull();
+                let parked_dropped = mc.clear_parked_commits();
+                (lru_client_len, lru_agg_len, drained, parked_dropped)
             }
-            let active_for_fsync = active.clone();
-            self.fsync_coordinator
-                .request_sync(
-                    None,
-                    ShardFsyncError::WriteLockTimeout,
-                    || async move { sync_header_only(active_for_fsync).await },
-                )
-                .await?;
+        };
+        // Both arms emptied the parked queue outside drain_parked_commits, which
+        // otherwise owns this gauge; without the reset an idle shard shows the
+        // pre-cull depth forever.
+        metrics::gauge!("celeriant_parked_commit_queue_depth", &self.metrics_shard_label).set(0.0);
+        metrics::counter!("celeriant_cull_stale_client_seq_lru").increment(lru_client_len as u64);
+        metrics::counter!("celeriant_cull_stale_agg_lru").increment(lru_agg_len as u64);
+        if lru_client_len > 0 || lru_agg_len > 0 || drained > 0 || parked_dropped > 0 {
+            tracing::warn!(
+                shard_id = self.config.shard_id,
+                lru_client_len,
+                lru_agg_len,
+                drained,
+                parked_dropped,
+                "cull_tail: cleared OCC/idempotency LRU + drained pending_replication + dropped parked commits"
+            );
         }
-        Ok(true)
+        let active_for_fsync = active.clone();
+        self.fsync_coordinator
+            .request_sync(
+                None,
+                ShardFsyncError::WriteLockTimeout,
+                || async move { sync_header_only(active_for_fsync).await },
+            )
+            .await
     }
 
     /// Backward scan from `read.metablocks_position` to find the cursor state at `target_wal_seq`.
@@ -2962,10 +3569,12 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     }
 
     pub async fn upload_s3_promotion_batch(&self) -> Result<(), crate::error::replication_to_s3_error::ReplicateToS3Error> {
-        // Idempotent re-cull: covers any tail that accumulated since the pre-catchup cull.
-        self.cull_speculative_tail_for_promotion(false).await
+        // Idempotent re-reconcile: commits any peer tail that accumulated since the
+        // pre-catchup reconciliation (catchup applies FullCommit, so after it
+        // read == write and this is a no-op).
+        self.reconcile_durable_tail(TailReconciliation::CommitForPromotion).await
             .map_err(|e| crate::error::replication_to_s3_error::ReplicateToS3Error::SerializationFailed(
-                format!("promotion cull header fsync failed: {e:?}"),
+                format!("promotion tail reconciliation failed: {e:?}"),
             ))?;
 
         let (start_wal_seq, current_wal_seq) = {
@@ -2974,13 +3583,15 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             (metadata.last_received_replication_wal_seq, metadata.write.wal_seq)
         };
 
+        // Shard 0 uploads mid-promotion (still Promoting, pre-flip); data shards
+        // upload after their Leader flip. Anything else has no business here.
         let lease_epoch = match self.node_status.get().effective_node_status() {
-            NodeStatus::Leader { lease_epoch } => lease_epoch,
+            NodeStatus::Leader { lease_epoch } | NodeStatus::Promoting { lease_epoch } => lease_epoch,
             other => {
                 tracing::info!(
                     shard_id = self.config.shard_id,
                     start_wal_seq, current_wal_seq, status = ?other,
-                    "promotion_batch_upload skipped — not leader"
+                    "promotion_batch_upload skipped — not leader or promoting"
                 );
                 return Ok(());
             }
@@ -3017,9 +3628,6 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     "celeriant_promotion_batch_budget_exceeded_total",
                     &[("shard_id", shard_id.to_string())]
                 ).increment(1);
-                // Clear so we don't re-scan the same unbridgeable range next role change.
-                let active = self.log_segments_cache.active();
-                active.metadata.borrow_mut().last_received_replication_wal_seq = 0;
                 return Ok(());
             }
         };
@@ -3113,12 +3721,6 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             }
         }
         info!(shard_id, lease_epoch, batch_count, chunk_count, first_wal, last_wal, "promotion_batch_upload succeeded");
-
-        // Clear the field now that S3 has the data
-        {
-            let active = self.log_segments_cache.active();
-            active.metadata.borrow_mut().last_received_replication_wal_seq = 0;
-        }
 
         Ok(())
     }
@@ -3435,15 +4037,20 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
     pub async fn enter_s3_catchup(&self) -> Result<S3CatchupResult, S3CatchupError> {
 
-        let catchup_status = match self.node_status.get().raw() {
-            NodeStatus::Follower { leader_lease_epoch }
-            | NodeStatus::FollowerCatchingUp { leader_lease_epoch } => {
-                NodeStatus::FollowerCatchingUp { leader_lease_epoch }
-            }
-            NodeStatus::BootCatchup => NodeStatus::BootCatchup,
-            _ => NodeStatus::BootCatchup,
-        };
-        set_node_status_and_metric(&self.node_status, ValidatedNodeStatus::create_custom_status(catchup_status, 0, 0), self.config.shard_id);
+        // Promoting stays put through catchup: it carries the won lease's real
+        // TTL and the promotion upload gate needs to see it afterwards; the
+        // rewrite below (expiry 0) would decay it to Fenced instantly.
+        if !self.node_status.get().raw().is_promoting() {
+            let catchup_status = match self.node_status.get().raw() {
+                NodeStatus::Follower { leader_lease_epoch }
+                | NodeStatus::FollowerCatchingUp { leader_lease_epoch } => {
+                    NodeStatus::FollowerCatchingUp { leader_lease_epoch }
+                }
+                NodeStatus::BootCatchup => NodeStatus::BootCatchup,
+                _ => NodeStatus::BootCatchup,
+            };
+            set_node_status_and_metric(&self.node_status, ValidatedNodeStatus::create_custom_status(catchup_status, 0, 0), self.config.shard_id);
+        }
 
         catchup_from_s3(
             &self.log_segments_cache,
@@ -4030,7 +4637,7 @@ mod tests {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let shard = open_shard(&dir).await;
-            shard.node_status.set(ValidatedNodeStatus::create_fenced());
+            shard.node_status.set(ValidatedNodeStatus::create_fenced(false));
 
             let result = process(&shard, write_req(key(1, 1, 1), events(1))).await;
             assert!(matches!(result, Err(ShardError::Write(ShardWriteError::ShardCannotAcceptWrites { .. }))));
@@ -5970,37 +6577,54 @@ mod tests {
         });
     }
 
+    /// Promotion over a wholly-unconfirmed peer tail (parked, no carrier ever
+    /// confirmed anything) commits it: read advances to the durable tip, nothing
+    /// is culled, and write-side caches survive (the data is kept, so they are
+    /// still valid).
     #[test]
-    fn cull_fires_when_write_ahead_of_read() {
+    fn promotion_commits_parked_peer_tail() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
-            let _agg = key(1, 1, 1);
+            let agg = key(1, 1, 1);
             let client = CapturingReplicationClient::new();
             let shard = open_follower_shard_capturing(&dir, client).await;
 
-            // Replicate 3 entries so read = 3.
+            // Three peer batches, none confirmed: all park, read stays at 0.
             let mut tip = GENESIS_HASH;
             for seq in 1u64..=3 {
                 let resp = unwrap_replication(
-                    shard.handle_replication_batch(replication_batch_req(vec![replication_item_no_datablock(seq, tip)])).await,
+                    shard.handle_replication_batch(
+                        replication_batch_req_with_leader_confirmed(vec![replication_item_no_datablock(seq, tip)], 0),
+                    ).await,
                 );
                 assert!(matches!(resp.result, ReplicationResult::Success { .. }));
                 tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
             }
-            // Advance write to simulate a speculative tail: read=3, write=5.
+            assert_eq!(shard.shard_mem_cache.borrow().parked_commit_count(), 3, "precondition: whole tail parked");
+            shard.shard_mem_cache.borrow_mut().put_aggregate_write_client_snapshot_for_test(agg.clone(), 42, 7, 0);
+
+            shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 1 }, 500, now_ms() + 10_000));
+            let changed = shard.reconcile_durable_tail(TailReconciliation::CommitForPromotion).await.unwrap();
+            assert!(changed, "committing the tail is a change");
+
             {
                 let active = shard.log_segments_cache.active();
-                let mut meta = active.metadata.borrow_mut();
-                meta.write.wal_seq = 5;
-                meta.write.metablocks_position = HEADER_BLOCK_SIZE_BYTES as u64 + 5 * 512;
+                let meta = active.metadata.borrow();
+                assert_eq!(meta.write.wal_seq, 3, "promotion must not cull the peer tail");
+                assert_eq!(meta.read.as_ref().unwrap().wal_seq, 3, "promotion must commit read up to write");
             }
-
-            let culled = shard.cull_speculative_tail_for_promotion(false).await.unwrap();
-            assert!(culled, "cull must fire when write > read");
-            assert_eq!(
-                shard.log_segments_cache.active().metadata.borrow().write.wal_seq, 3,
-                "cull must rewind write down to read",
+            assert_eq!(shard.shard_mem_cache.borrow().parked_commit_count(), 0, "every parked commit drains");
+            assert!(
+                shard.shard_mem_cache.borrow().aggregate_read_snapshots_len() > 0,
+                "drained commits must populate the read-side caches",
             );
+            assert_eq!(
+                shard.shard_mem_cache.borrow_mut().get_client_seq(&agg, 42), Some(7),
+                "peer-tail commit must not clear write-side caches",
+            );
+
+            let again = shard.reconcile_durable_tail(TailReconciliation::CommitForPromotion).await.unwrap();
+            assert!(!again, "second reconciliation is a no-op (read == write)");
 
             shard.close().await;
         });
@@ -6015,7 +6639,7 @@ mod tests {
             let shard = open_follower_shard_capturing(&dir, client).await;
 
             // No speculative tail: write == read (both 0 on a fresh shard).
-            let culled = shard.cull_speculative_tail_for_promotion(false).await.unwrap();
+            let culled = shard.reconcile_durable_tail(TailReconciliation::CommitForPromotion).await.unwrap();
             assert!(!culled, "cull must be a no-op when write == read");
 
             shard.close().await;
@@ -6024,7 +6648,7 @@ mod tests {
 
     /// Regression: after a leader SIGKILL failover the demoted ex-leader may have
     /// `read == write > last_self_acked`. The existing cull (write→read) is a no-op
-    /// because read==write. With `rewind_to_ack_barrier=true` both cursors must
+    /// because read==write. With `RewindToAckBarrier` both cursors must
     /// rewind to `last_self_acked`.
     #[test]
     fn demotion_cull_rewinds_to_ack_barrier_when_read_eq_write_above_acked() {
@@ -6055,7 +6679,7 @@ mod tests {
             }
 
             // Standard cull (promotion path) must be a no-op since read==write.
-            let culled = shard.cull_speculative_tail_for_promotion(false).await.unwrap();
+            let culled = shard.reconcile_durable_tail(TailReconciliation::CommitForPromotion).await.unwrap();
             assert!(!culled, "standard cull must not fire when read==write (this was the old bug)");
 
             // Precondition: read caches are populated by the 10 writes above.
@@ -6065,7 +6689,7 @@ mod tests {
             }
 
             // Demotion cull must rewind both cursors to last_self_acked==5.
-            let culled = shard.cull_speculative_tail_for_promotion(true).await.unwrap();
+            let culled = shard.reconcile_durable_tail(TailReconciliation::RewindToAckBarrier).await.unwrap();
             assert!(culled, "demotion cull must fire when last_self_acked < read");
 
             let active = shard.log_segments_cache.active();
@@ -6111,7 +6735,7 @@ mod tests {
             }
 
             // Demotion cull with a zero ack barrier must be a no-op.
-            let culled = shard.cull_speculative_tail_for_promotion(true).await.unwrap();
+            let culled = shard.reconcile_durable_tail(TailReconciliation::RewindToAckBarrier).await.unwrap();
             assert!(!culled, "demotion cull must NOT fire when last_self_acked==0 (would wipe the caught-up chain)");
 
             let active = shard.log_segments_cache.active();
@@ -6147,7 +6771,7 @@ mod tests {
                 meta.last_received_replication_wal_seq = 8;
             }
 
-            let culled = shard.cull_speculative_tail_for_promotion(true).await.unwrap();
+            let culled = shard.reconcile_durable_tail(TailReconciliation::RewindToAckBarrier).await.unwrap();
             assert!(culled, "demotion cull must still fire for the range above both cursors");
 
             let active = shard.log_segments_cache.active();
@@ -6180,7 +6804,7 @@ mod tests {
             }
 
             // First demotion cull: armed from boot, fires.
-            let culled = shard.cull_speculative_tail_for_promotion(true).await.unwrap();
+            let culled = shard.reconcile_durable_tail(TailReconciliation::RewindToAckBarrier).await.unwrap();
             assert!(culled, "first demotion cull must fire");
             assert_eq!(shard.log_segments_cache.active().metadata.borrow().read.as_ref().unwrap().wal_seq, 5);
 
@@ -6191,14 +6815,14 @@ mod tests {
                 let active = shard.log_segments_cache.active();
                 active.metadata.borrow_mut().last_self_acked_wal_seq = 3;
             }
-            let culled = shard.cull_speculative_tail_for_promotion(true).await.unwrap();
+            let culled = shard.reconcile_durable_tail(TailReconciliation::RewindToAckBarrier).await.unwrap();
             assert!(!culled, "second demotion cull must not rewind (flag consumed)");
             assert_eq!(shard.log_segments_cache.active().metadata.borrow().read.as_ref().unwrap().wal_seq, 5, "churn cull must not destroy data above the stale ack barrier");
 
             // Re-arm (as a successful leader replication commit would) and verify the
             // rewind is available again.
             shard.ack_barrier_rewind_armed.set(true);
-            let culled = shard.cull_speculative_tail_for_promotion(true).await.unwrap();
+            let culled = shard.reconcile_durable_tail(TailReconciliation::RewindToAckBarrier).await.unwrap();
             assert!(culled, "re-armed demotion cull must fire again");
             assert_eq!(shard.log_segments_cache.active().metadata.borrow().read.as_ref().unwrap().wal_seq, 3);
 
@@ -6206,16 +6830,18 @@ mod tests {
         });
     }
 
-    /// Regression: promotion path must NOT rewind read to last_self_acked.
-    /// Phase 9 promotion behavior is unchanged by the demotion fix.
+    /// Regression: the promotion path must NOT rewind read to last_self_acked —
+    /// the ack barrier belongs to the demotion path only. On promotion the peer
+    /// tail commits UP to write regardless of the barrier value.
     #[test]
-    fn promotion_cull_does_not_rewind_read_to_ack_barrier() {
+    fn promotion_ignores_ack_barrier_and_commits_peer_tail() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let client = CapturingReplicationClient::new();
             let shard = open_follower_shard_capturing(&dir, client).await;
 
-            // Replicate 5 entries so read=5.
+            // Five peer batches, each carrier confirming seq-1: read lands at 4,
+            // seq 5 stays parked.
             let mut tip = GENESIS_HASH;
             for seq in 1u64..=5 {
                 let resp = unwrap_replication(
@@ -6224,45 +6850,32 @@ mod tests {
                 assert!(matches!(resp.result, ReplicationResult::Success { .. }));
                 tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
             }
-
-            // Advance write to simulate a speculative tail: read=5, write=8.
             {
                 let active = shard.log_segments_cache.active();
-                let mut meta = active.metadata.borrow_mut();
-                meta.write.wal_seq = 8;
-                meta.write.metablocks_position = HEADER_BLOCK_SIZE_BYTES as u64 + 8 * FIXED_BLOCK_SIZE_BYTES as u64;
-                // Inject an ack barrier below read — must be ignored on promotion path.
-                meta.last_self_acked_wal_seq = 3;
+                let meta = active.metadata.borrow();
+                assert_eq!(meta.read.as_ref().unwrap().wal_seq, 4, "precondition: deferred tail (4, 5]");
+                assert_eq!(meta.write.wal_seq, 5);
+                // Inject an ack barrier below read — must have no effect on promotion.
+                drop(meta);
+                active.metadata.borrow_mut().last_self_acked_wal_seq = 3;
             }
 
-            // Precondition: read caches are populated by the 5 replicated entries.
-            let read_snapshots_before = shard.shard_mem_cache.borrow().aggregate_read_snapshots_len();
-            assert!(read_snapshots_before > 0, "read snapshots must be populated before promotion cull");
-
-            // Promotion cull (rewind_to_ack_barrier=false): write must rewind to read=5,
-            // read must stay at 5, and ack barrier (3) must have no effect.
-            let culled = shard.cull_speculative_tail_for_promotion(false).await.unwrap();
-            assert!(culled, "promotion cull must fire when write > read");
+            shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 1 }, 500, now_ms() + 10_000));
+            let changed = shard.reconcile_durable_tail(TailReconciliation::CommitForPromotion).await.unwrap();
+            assert!(changed, "promotion must commit the deferred tail");
 
             let active = shard.log_segments_cache.active();
             let meta = active.metadata.borrow();
-            assert_eq!(meta.write.wal_seq, 5, "write must rewind to read=5");
-            assert_eq!(meta.read.as_ref().unwrap().wal_seq, 5, "read must remain at 5");
+            assert_eq!(meta.write.wal_seq, 5, "write untouched by promotion");
+            assert_eq!(meta.read.as_ref().unwrap().wal_seq, 5, "read commits to write, never to the ack barrier");
             drop(meta);
-
-            // FIX 1: promotion cull must NOT clear read caches (read cursor unchanged).
-            assert_eq!(
-                shard.shard_mem_cache.borrow().aggregate_read_snapshots_len(),
-                read_snapshots_before,
-                "promotion cull must not clear aggregate_read_snapshots"
-            );
 
             shard.close().await;
         });
     }
 
     /// Self-reclaim path (lease_changed_hands=false): the caller (set_node_role_via_s3) must NOT
-    /// call cull_speculative_tail_for_promotion. This test verifies the invariant from the caller's
+    /// call reconcile_durable_tail. This test verifies the invariant from the caller's
     /// perspective: a shard with read < write keeps write intact when the cull is skipped.
     ///
     /// Regression guard for run 1779618258/shard_2: the old code unconditionally culled on
@@ -6284,6 +6897,7 @@ mod tests {
                 assert!(matches!(resp.result, ReplicationResult::Success { .. }));
                 tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
             }
+            commit_deferred_tail(&shard);
             {
                 let active = shard.log_segments_cache.active();
                 let mut meta = active.metadata.borrow_mut();
@@ -6300,7 +6914,7 @@ mod tests {
             }
 
             // Self-reclaim: lease_changed_hands=false. The caller skips the cull entirely.
-            // Simulate by NOT calling cull_speculative_tail_for_promotion.
+            // Simulate by NOT calling reconcile_durable_tail.
             // Write must stay at 8 — the tail is the node's own content already replicated.
             let active = shard.log_segments_cache.active();
             let meta = active.metadata.borrow();
@@ -6312,46 +6926,31 @@ mod tests {
         });
     }
 
-    /// Regression guard: when lease_changed_hands=true (a peer was leader), the caller DOES
-    /// call cull_speculative_tail_for_promotion and write must rewind to read.
+    /// A changed-hands promotion over an OWN-speculation tail (a crashed
+    /// ex-leader re-winning the election with an unacked fork on disk) still
+    /// culls: committing it would fire watch events for entries the pre-serve
+    /// S3 catchup then truncates.
     #[test]
-    fn changed_hands_promotion_cull_fires_regression_guard() {
+    fn changed_hands_promotion_culls_own_speculation_tail() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
-            let client = CapturingReplicationClient::new();
-            let shard = open_follower_shard_capturing(&dir, client).await;
+            let shard = open_shard_with_own_tail(&dir, 4, 7).await;
 
-            // Replicate 4 entries (read = 4) then advance write to 7.
-            let mut tip = GENESIS_HASH;
-            for seq in 1u64..=4 {
-                let resp = unwrap_replication(
-                    shard.handle_replication_batch(replication_batch_req(vec![replication_item_no_datablock(seq, tip)])).await,
-                );
-                assert!(matches!(resp.result, ReplicationResult::Success { .. }));
-                tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
-            }
-            {
-                let active = shard.log_segments_cache.active();
-                let mut meta = active.metadata.borrow_mut();
-                meta.write.wal_seq = 7;
-                meta.write.metablocks_position = HEADER_BLOCK_SIZE_BYTES as u64 + 7 * FIXED_BLOCK_SIZE_BYTES as u64;
-            }
-
-            // lease_changed_hands=true path: caller invokes cull_speculative_tail_for_promotion.
-            let culled = shard.cull_speculative_tail_for_promotion(false).await.unwrap();
-            assert!(culled, "changed-hands promotion must cull speculative tail");
+            shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 1 }, 500, now_ms() + 10_000));
+            let changed = shard.reconcile_durable_tail(TailReconciliation::CommitForPromotion).await.unwrap();
+            assert!(changed, "changed-hands promotion must cull the own-speculation tail");
 
             let active = shard.log_segments_cache.active();
             let meta = active.metadata.borrow();
-            assert_eq!(meta.write.wal_seq, 4, "write must rewind to read=4 on changed-hands promotion");
-            assert_eq!(meta.read.as_ref().unwrap().wal_seq, 4, "read unchanged by promotion cull");
+            assert_eq!(meta.write.wal_seq, 4, "write must rewind to read=4 on an own-tail promotion");
+            assert_eq!(meta.read.as_ref().unwrap().wal_seq, 4, "read unchanged by the own-tail cull");
             drop(meta);
 
             shard.close().await;
         });
     }
 
-    /// Regression guard: the demotion cull (rewind_to_ack_barrier=true) is a separate code
+    /// Regression guard: the demotion cull (RewindToAckBarrier) is a separate code
     /// path from the self-reclaim fix and must be unaffected. became_follower_from_leader_or_fenced
     /// always triggers the cull regardless of lease_changed_hands.
     #[test]
@@ -6372,7 +6971,7 @@ mod tests {
 
             // became_follower_from_leader_or_fenced always triggers demotion cull.
             // self-reclaim fix does not gate this path.
-            let culled = shard.cull_speculative_tail_for_promotion(true).await.unwrap();
+            let culled = shard.reconcile_durable_tail(TailReconciliation::RewindToAckBarrier).await.unwrap();
             assert!(culled, "demotion cull must fire when last_self_acked < read");
 
             let active = shard.log_segments_cache.active();
@@ -6389,21 +6988,11 @@ mod tests {
     fn cull_then_restart_preserves_post_cull_state() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
-            let agg = key(1, 1, 1);
 
             {
-                let shard = open_shard(&dir).await;
-                for _ in 0..3 {
-                    write_ok(&shard, write_req(agg.clone(), events(1))).await;
-                }
-                {
-                    let active = shard.log_segments_cache.active();
-                    let mut meta = active.metadata.borrow_mut();
-                    meta.write.wal_seq = 10;
-                    meta.write.metablocks_position = HEADER_BLOCK_SIZE_BYTES as u64 + 10 * FIXED_BLOCK_SIZE_BYTES as u64;
-                }
-                let culled = shard.cull_speculative_tail_for_promotion(false).await.unwrap();
-                assert!(culled, "cull should fire when write > read");
+                let shard = open_shard_with_own_tail(&dir, 3, 10).await;
+                let culled = shard.reconcile_durable_tail(TailReconciliation::CommitForPromotion).await.unwrap();
+                assert!(culled, "cull should fire on an own tail with write > read");
                 shard.close().await;
             }
 
@@ -6413,6 +7002,623 @@ mod tests {
             assert_eq!(meta.write.wal_seq, 3, "post-cull write.wal_seq must survive restart");
             assert_eq!(meta.read.as_ref().unwrap().wal_seq, 3, "read.wal_seq stays at 3");
             drop(meta);
+            shard.close().await;
+        });
+    }
+
+    fn watch_writes_request() -> celeriant_msg::request::requests::WatchRequest {
+        let mut ops = HashSet::new();
+        ops.insert(celeriant_watch::aggregate_watch_event::AggregateWatchEvent::WRITE);
+        celeriant_msg::request::requests::WatchRequest {
+            correlation_id: None,
+            requested_latency_ms: None,
+            shard_id: None,
+            orgs: None,
+            aggregate_types: None,
+            aggregates: None,
+            operation_types: Some(ops),
+        }
+    }
+
+    /// Non-blocking watch poll after letting the executor settle: by then an
+    /// event is either in the channel or was never broadcast.
+    async fn poll_watch_event(
+        subscriber: &Rc<RefCell<celeriant_watch::subscribed_client::SubscribedClient>>,
+    ) -> Option<celeriant_watch::aggregate_watch_event::AggregateWatchEvent> {
+        glommio::timer::sleep(Duration::from_millis(10)).await;
+        futures_lite::future::poll_once(subscriber.borrow().receiver.recv()).await.flatten()
+    }
+
+    /// ReconcileAsFollower with a peer tail is a keep-parked no-op: durable tail
+    /// intact, still invisible, still parked — and the queue keeps working
+    /// afterwards: new batches park in order and a later covering carrier drains
+    /// everything, firing each parked watch event exactly once.
+    #[test]
+    fn reconcile_as_follower_keeps_peer_tail_until_covering_carrier() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_follower_shard(&dir).await;
+            let (_id, subscriber) = shard.watched_aggregates().add_subscriber(watch_writes_request());
+
+            let mut tip = GENESIS_HASH;
+            for seq in 1u64..=2 {
+                let resp = unwrap_replication(
+                    shard.handle_replication_batch(
+                        replication_batch_req_with_leader_confirmed(vec![replication_item_no_datablock(seq, tip)], 0),
+                    ).await,
+                );
+                assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+                tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
+            }
+
+            let changed = shard.reconcile_durable_tail(TailReconciliation::ReconcileAsFollower).await.unwrap();
+            assert!(!changed, "keeping the parked peer tail is a no-op");
+            {
+                let active = shard.log_segments_cache.active();
+                let meta = active.metadata.borrow();
+                assert_eq!(meta.write.wal_seq, 2, "peer tail must stay durable");
+                assert_eq!(meta.read.as_ref().map_or(0, |r| r.wal_seq), 0, "peer tail must stay invisible");
+            }
+            assert_eq!(shard.shard_mem_cache.borrow().parked_commit_count(), 2, "peer tail must stay parked");
+            assert!(poll_watch_event(&subscriber).await.is_none(), "nothing committed, no events");
+
+            // The queue keeps accepting: a new chain-extending batch parks in order.
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(
+                    replication_batch_req_with_leader_confirmed(vec![replication_item_no_datablock(3, tip)], 0),
+                ).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+            assert_eq!(shard.shard_mem_cache.borrow().parked_commit_count(), 3);
+
+            // Covering carrier (duplicate of the tip, skipped on apply) drains all.
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(
+                    replication_batch_req_with_leader_confirmed(vec![replication_item_no_datablock(3, GENESIS_HASH)], 3),
+                ).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+            {
+                let active = shard.log_segments_cache.active();
+                let meta = active.metadata.borrow();
+                assert_eq!((meta.write.wal_seq, meta.read.as_ref().unwrap().wal_seq), (3, 3), "covering carrier commits the kept tail");
+            }
+            assert_eq!(shard.shard_mem_cache.borrow().parked_commit_count(), 0);
+            for seq in 1u64..=3 {
+                assert!(
+                    poll_watch_event(&subscriber).await.is_some(),
+                    "parked event {seq} must fire when the covering carrier commits it",
+                );
+            }
+            assert!(poll_watch_event(&subscriber).await.is_none(), "exactly once per parked entry");
+
+            shard.close().await;
+        });
+    }
+
+    /// ReconcileAsFollower with an OWN-speculation tail culls it exactly like the
+    /// old promotion cull (boot-after-leader-crash: divergence risk with the
+    /// promoted peer).
+    #[test]
+    fn reconcile_as_follower_culls_own_speculation_tail() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard_with_own_tail(&dir, 3, 5).await;
+
+            let changed = shard.reconcile_durable_tail(TailReconciliation::ReconcileAsFollower).await.unwrap();
+            assert!(changed, "own-speculation tail must be culled");
+
+            let active = shard.log_segments_cache.active();
+            let meta = active.metadata.borrow();
+            assert_eq!(meta.write.wal_seq, 3, "write rewinds to read");
+            assert_eq!(meta.read.as_ref().unwrap().wal_seq, 3, "read unchanged");
+            drop(meta);
+
+            shard.close().await;
+        });
+    }
+
+    /// The demotion rewind discards parked commits covering the culled range and
+    /// their watch events never fire (goal edge 8, discard direction). Callers
+    /// route only held-leadership demotions here, so the queue should already be
+    /// empty; this locks the defensive disposition — an orphaned PCD would
+    /// replay at the next promotion catchup.
+    #[test]
+    fn demotion_rewind_discards_parked_commits_without_events() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_follower_shard(&dir).await;
+            let (_id, subscriber) = shard.watched_aggregates().add_subscriber(watch_writes_request());
+
+            // seq 1 confirmed (read=1, its event fires); seq 2 parked.
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(
+                    replication_batch_req_with_leader_confirmed(vec![replication_item_no_datablock(1, GENESIS_HASH)], 0),
+                ).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+            let tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(
+                    replication_batch_req_with_leader_confirmed(vec![replication_item_no_datablock(2, tip)], 1),
+                ).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+            assert!(poll_watch_event(&subscriber).await.is_some(), "confirming seq 1 fires its event");
+            assert_eq!(shard.shard_mem_cache.borrow().parked_commit_count(), 1, "precondition: seq 2 parked");
+
+            let changed = shard.reconcile_durable_tail(TailReconciliation::RewindToAckBarrier).await.unwrap();
+            assert!(changed, "demotion rewind must cull the (read, write] tail");
+
+            {
+                let active = shard.log_segments_cache.active();
+                let meta = active.metadata.borrow();
+                assert_eq!((meta.write.wal_seq, meta.read.as_ref().unwrap().wal_seq), (1, 1));
+            }
+            assert_eq!(
+                shard.shard_mem_cache.borrow().parked_commit_count(), 0,
+                "parked commits covering the culled range must be discarded, not orphaned",
+            );
+            assert!(
+                poll_watch_event(&subscriber).await.is_none(),
+                "events for a culled range must never fire",
+            );
+
+            shard.close().await;
+        });
+    }
+
+    /// Real-disk crash-restart-then-promote: the deferred tail exists only in the
+    /// persisted header (read < write, no parked state survives the crash), and
+    /// promotion still commits it — durably.
+    #[test]
+    fn crash_restart_then_promote_commits_ondisk_tail() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            {
+                let shard = open_follower_shard(&dir).await;
+                let resp = unwrap_replication(
+                    shard.handle_replication_batch(
+                        replication_batch_req_with_leader_confirmed(vec![replication_item_no_datablock(1, GENESIS_HASH)], 0),
+                    ).await,
+                );
+                assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+                let tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
+                let resp = unwrap_replication(
+                    shard.handle_replication_batch(
+                        replication_batch_req_with_leader_confirmed(vec![replication_item_no_datablock(2, tip)], 1),
+                    ).await,
+                );
+                assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+                shard.close().await;
+            }
+
+            let shard = open_follower_shard(&dir).await;
+            {
+                let active = shard.log_segments_cache.active();
+                let meta = active.metadata.borrow();
+                assert_eq!((meta.write.wal_seq, meta.read.as_ref().unwrap().wal_seq), (2, 1), "precondition: deferred tail on disk");
+            }
+            assert_eq!(shard.shard_mem_cache.borrow().parked_commit_count(), 0, "precondition: parked state died with the process");
+
+            shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 1 }, 500, now_ms() + 10_000));
+            let changed = shard.reconcile_durable_tail(TailReconciliation::CommitForPromotion).await.unwrap();
+            assert!(changed, "promotion must commit the on-disk tail");
+            shard.close().await;
+
+            let shard = open_follower_shard(&dir).await;
+            let active = shard.log_segments_cache.active();
+            let meta = active.metadata.borrow();
+            assert_eq!((meta.write.wal_seq, meta.read.as_ref().unwrap().wal_seq), (2, 2), "the commit must be persisted");
+            drop(meta);
+            shard.close().await;
+        });
+    }
+
+    /// Mixed history on real disk (goal edge 5): lead-and-ack, speculate
+    /// unackably, demote (cull), follow a peer and park its batches, re-promote.
+    /// Order must hold: the pre-demotion speculation never resurrects and the
+    /// re-promotion commits exactly the acked prefix plus the peer tail.
+    #[test]
+    fn mixed_history_demotion_then_repromotion_commits_only_peer_tail() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let (acked_agg, spec_agg) = (key(1, 1, 1), key(1, 1, 99));
+
+            // Lease valid 1200ms so the unackable write fences quickly.
+            let client = SwitchableReplicationClient::new();
+            let shard = ShardWal::open(
+                test_config(&dir),
+                ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 0 }, 500, now_ms() + 1200),
+                client,
+                StubS3Downloader,
+            ).await.unwrap();
+
+            write_ok(&shard, write_req(acked_agg.clone(), events(1))).await;
+            shard.replication_client.should_fail.set(true);
+            let fenced = process(&shard, write_req(spec_agg.clone(), events(1))).await;
+            assert!(fenced.is_err(), "a dark-replication leader write must not ack, got {fenced:?}");
+            {
+                let active = shard.log_segments_cache.active();
+                let meta = active.metadata.borrow();
+                assert_eq!((meta.write.wal_seq, meta.read.as_ref().unwrap().wal_seq), (2, 1), "precondition: own speculation at seq 2");
+            }
+
+            // Demotion: the cull must remove the speculation before peer data lands.
+            shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Follower { leader_lease_epoch: 1 }, 500, now_ms() + 10_000));
+            let culled = shard.reconcile_durable_tail(TailReconciliation::RewindToAckBarrier).await.unwrap();
+            assert!(culled, "demotion must cull the unacked speculation");
+
+            // The new leader extends the shared prefix; both batches stay parked.
+            let mut tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
+            for seq in 2u64..=3 {
+                let mut req = replication_batch_req_with_leader_confirmed(vec![replication_item_no_datablock(seq, tip)], 1);
+                req.sender_lease_epoch = 1;
+                let resp = unwrap_replication(shard.handle_replication_batch(req).await);
+                assert!(matches!(resp.result, ReplicationResult::Success { .. }), "peer batch {seq} failed: {resp:?}");
+                tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
+            }
+            assert_eq!(shard.shard_mem_cache.borrow().parked_commit_count(), 2, "precondition: peer tail parked");
+
+            // Re-promotion commits exactly the parked peer tail.
+            shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 2 }, 500, now_ms() + 10_000));
+            let changed = shard.reconcile_durable_tail(TailReconciliation::CommitForPromotion).await.unwrap();
+            assert!(changed, "re-promotion must commit the parked peer tail");
+
+            {
+                let active = shard.log_segments_cache.active();
+                let meta = active.metadata.borrow();
+                assert_eq!((meta.write.wal_seq, meta.read.as_ref().unwrap().wal_seq), (3, 3), "acked prefix plus peer tail, fully committed");
+            }
+            let spec = process(&shard, read_req(spec_agg.clone())).await;
+            assert!(
+                matches!(spec, Err(ShardError::Read(ShardReadError::AggregateNotExists))),
+                "pre-demotion speculation must NOT resurrect on re-promotion, got {spec:?}",
+            );
+            let acked = process(&shard, read_req(acked_agg.clone())).await;
+            assert!(matches!(acked, Ok(ClientResponse::Read(_))), "the acked prefix must survive, got {acked:?}");
+
+            shard.close().await;
+        });
+    }
+
+    /// A stale promotion floor must never disguise an own fork as a peer tail.
+    /// The common clean failover manufactures the staleness: a fully caught-up
+    /// follower promotes with floor = read+1 > write. Driving the REAL status
+    /// sequence (Promoting at the upload, Leader flip clearing the floor), the
+    /// node then speculates unackably as leader and rejoins; both
+    /// reconciliation modes must classify the fork by its author and cull it —
+    /// keeping it wedges catchup on the rejoin leg, and the re-win leg would
+    /// commit a fork the pre-serve catchup then truncates.
+    #[test]
+    fn stale_promotion_floor_does_not_disguise_own_fork_as_peer() {
+        glommio_test!({
+            for (name, mode) in [
+                ("rejoin_as_follower", TailReconciliation::ReconcileAsFollower),
+                ("rewin_promotion", TailReconciliation::CommitForPromotion),
+            ] {
+                let (_tmp, dir) = test_dir();
+                // Caught-up follower: entry 1 confirmed by a covering carrier.
+                let client = SwitchableReplicationClient::new();
+                let shard = ShardWal::open(
+                    test_config(&dir),
+                    ValidatedNodeStatus::create_custom_status(NodeStatus::Follower { leader_lease_epoch: 0 }, 500, now_ms() + 10_000),
+                    client,
+                    StubS3Downloader,
+                ).await.unwrap();
+                let resp = unwrap_replication(
+                    shard.handle_replication_batch(
+                        replication_batch_req_with_leader_confirmed(vec![replication_item_no_datablock(1, GENESIS_HASH)], 1),
+                    ).await,
+                );
+                assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+                {
+                    let active = shard.log_segments_cache.active();
+                    let meta = active.metadata.borrow();
+                    assert_eq!(
+                        (meta.read.as_ref().unwrap().wal_seq, meta.last_received_replication_wal_seq), (1, 2),
+                        "[{name}] precondition: caught up with the floor above read",
+                    );
+                }
+
+                // CAS win: the upload runs mid-window under Promoting (no range
+                // here — start > write), then the Leader flip clears the floor.
+                shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Promoting { lease_epoch: 1 }, 500, now_ms() + 1200));
+                shard.upload_s3_promotion_batch().await.unwrap();
+                assert_eq!(
+                    shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_seq, 2,
+                    "[{name}] the upload skip must not clear the floor (it is the crash re-entry marker)",
+                );
+                shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 1 }, 500, now_ms() + 1200));
+                shard.clear_promotion_floor();
+                assert_eq!(
+                    shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_seq, 0,
+                    "[{name}] the flip is the single floor-clear site",
+                );
+
+                // Unackable leader speculation at seq 2, then crash.
+                shard.replication_client.should_fail.set(true);
+                let fenced = process(&shard, write_req(key(1, 1, 99), events(1))).await;
+                assert!(fenced.is_err(), "[{name}] a dark-replication leader write must not ack");
+                shard.close().await;
+
+                // Rejoin: the fork's provenance is decided from disk alone.
+                let shard = open_follower_shard(&dir).await;
+                if mode == TailReconciliation::CommitForPromotion {
+                    shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 2 }, 500, now_ms() + 10_000));
+                }
+                let changed = shard.reconcile_durable_tail(mode).await.unwrap();
+                assert!(changed, "[{name}] the own fork must be culled");
+                {
+                    let active = shard.log_segments_cache.active();
+                    let meta = active.metadata.borrow();
+                    assert_eq!(
+                        (meta.write.wal_seq, meta.read.as_ref().unwrap().wal_seq), (1, 1),
+                        "[{name}] the fork is gone, the acked prefix stays",
+                    );
+                }
+                shard.close().await;
+            }
+        });
+    }
+
+    /// Shard 0 uploads its promotion batch MID-window, before the Leader flip:
+    /// the status gate must admit Promoting or the TCP-received range never
+    /// reaches S3 and the demoted peer's catchup gap is unbridgeable. (Red on
+    /// the old gate, which admitted only Leader — dead upload on shard 0.)
+    #[test]
+    fn promotion_upload_reaches_s3_under_promoting_status() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let client = CapturingReplicationClient::new();
+            let shard = open_follower_shard_capturing(&dir, client).await;
+
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(replication_batch_req(vec![replication_item_no_datablock(1, GENESIS_HASH)])).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+            commit_deferred_tail(&shard);
+
+            // CAS win publishes Promoting; the upload runs before any Leader flip.
+            shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Promoting { lease_epoch: 1 }, 500, now_ms() + 10_000));
+            shard.upload_s3_promotion_batch().await.unwrap();
+
+            let uploads = shard.replication_client.s3_uploads.borrow();
+            assert_eq!(uploads.len(), 1, "the TCP-received range must reach S3 under Promoting");
+            assert_eq!(uploads[0][0].metablock.wal_seq, 1);
+            drop(uploads);
+
+            shard.close().await;
+        });
+    }
+
+    /// While Promoting, ALL TCP replication is rejected — nothing can park
+    /// inside the promotion window (the flip drain is fail-loud on an
+    /// impossible state because of this gate).
+    #[test]
+    fn replication_rejected_while_promoting() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_follower_shard(&dir).await;
+            shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Promoting { lease_epoch: 1 }, 500, now_ms() + 10_000));
+
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(replication_batch_req(vec![replication_item_no_datablock(1, GENESIS_HASH)])).await,
+            );
+            assert!(
+                matches!(resp.result, ReplicationResult::Rejected(FollowerRejection::NotAFollower)),
+                "a promoting node must not accept replication batches, got {:?}",
+                resp.result,
+            );
+            assert_eq!(shard.shard_mem_cache.borrow().parked_commit_count(), 0, "nothing may park mid-window");
+
+            shard.close().await;
+        });
+    }
+
+    /// The catchup status rewrite must not touch a promoting shard: Promoting
+    /// carries the won lease's real TTL and the promotion upload gate needs it
+    /// afterwards — a fallthrough to the rewrite's expiry-0 status would decay
+    /// the fence to Fenced instantly and reopen the mid-window hazards.
+    #[test]
+    fn promoting_status_survives_s3_catchup_with_original_expiry() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_follower_shard(&dir).await;
+            let expiry = now_ms() + 10_000;
+            shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Promoting { lease_epoch: 3 }, 500, expiry));
+
+            shard.enter_s3_catchup().await.unwrap();
+
+            let status = shard.node_status.get();
+            assert_eq!(status.raw(), NodeStatus::Promoting { lease_epoch: 3 }, "catchup must preserve the Promoting fence");
+            assert_eq!(status.lease_expires_at_ms(), expiry, "catchup must preserve the fence's real TTL");
+
+            shard.close().await;
+        });
+    }
+
+    /// Disk-truth resume marker for a reacquired lease (crash mid-promotion).
+    /// Rows name the crash exit they model; the floor row is the
+    /// crash-after-catchup-commit-before-upload exit, where no tail remains but
+    /// the TCP-received range exists in S3 nowhere.
+    #[test]
+    fn promotion_resume_owed_by_disk_state() {
+        glommio_test!({
+            // Row 1: peer tail on disk (crash before/during catchup) -> owed.
+            {
+                let (_tmp, dir) = test_dir();
+                let shard = open_follower_shard(&dir).await;
+                let resp = unwrap_replication(
+                    shard.handle_replication_batch(
+                        replication_batch_req_with_leader_confirmed(vec![replication_item_no_datablock(1, GENESIS_HASH)], 0),
+                    ).await,
+                );
+                assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+                shard.close().await;
+                let shard = open_follower_shard(&dir).await;
+                assert!(
+                    shard.promotion_resume_owed().await.unwrap(),
+                    "[peer_tail] an on-disk peer tail owes the resumed promotion",
+                );
+                shard.close().await;
+            }
+
+            // Row 2: no tail, floor persisted (crash after the catchup commit,
+            // before the upload/flip) -> owed.
+            {
+                let (_tmp, dir) = test_dir();
+                let shard = open_follower_shard(&dir).await;
+                let resp = unwrap_replication(
+                    shard.handle_replication_batch(
+                        replication_batch_req_with_leader_confirmed(vec![replication_item_no_datablock(1, GENESIS_HASH)], 1),
+                    ).await,
+                );
+                assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+                {
+                    let active = shard.log_segments_cache.active();
+                    let meta = active.metadata.borrow();
+                    assert_eq!(
+                        (meta.write.wal_seq, meta.read.as_ref().unwrap().wal_seq, meta.last_received_replication_wal_seq),
+                        (1, 1, 2),
+                        "[floor_marker] precondition: committed tail, uncleared floor",
+                    );
+                }
+                shard.close().await;
+                let shard = open_follower_shard(&dir).await;
+                assert!(
+                    shard.promotion_resume_owed().await.unwrap(),
+                    "[floor_marker] an uncleared floor owes the resumed promotion (upload leg)",
+                );
+                shard.close().await;
+            }
+
+            // Row 3: own speculative tail, no floor (classic self-reclaim) -> not owed.
+            {
+                let (_tmp, dir) = test_dir();
+                let shard = open_shard_with_own_tail(&dir, 1, 3).await;
+                assert!(
+                    !shard.promotion_resume_owed().await.unwrap(),
+                    "[own_tail] self-reclaim keeps its speculation; nothing owed",
+                );
+                shard.close().await;
+            }
+
+            // Row 3b: own speculative tail WITH a stale floor (crash in the
+            // Leader-flip-to-floor-clear gap) -> provenance beats the floor;
+            // still not owed, the carve-out keeps the tail.
+            {
+                let (_tmp, dir) = test_dir();
+                let shard = open_shard_with_own_tail(&dir, 1, 3).await;
+                shard.log_segments_cache.active().metadata.borrow_mut().last_received_replication_wal_seq = 2;
+                assert!(
+                    !shard.promotion_resume_owed().await.unwrap(),
+                    "[own_tail_stale_floor] a stale floor must not route an own tail into the resume cull",
+                );
+                {
+                    let active = shard.log_segments_cache.active();
+                    let meta = active.metadata.borrow();
+                    assert_eq!(meta.write.wal_seq, 3, "[own_tail_stale_floor] the tail is kept");
+                }
+                shard.close().await;
+            }
+
+            // Row 4: clean disk (completed promotion: no tail, floor cleared) -> not owed.
+            {
+                let (_tmp, dir) = test_dir();
+                let shard = open_follower_shard(&dir).await;
+                assert!(!shard.promotion_resume_owed().await.unwrap(), "[clean] nothing owed on a clean disk");
+                shard.close().await;
+            }
+        });
+    }
+
+    /// The Follower-to-Leader status-flip drain commits a batch that parked
+    /// inside the promotion window (a deposed leader's late delivery) — and is a
+    /// strict no-op for a self-reclaimed leader's own speculative tail.
+    #[test]
+    fn promotion_flip_drain_commits_late_parked_batch_only() {
+        glommio_test!({
+            // A batch parked after the post-catchup reconcile: the flip commits it.
+            let (_tmp, dir) = test_dir();
+            let shard = open_follower_shard(&dir).await;
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(
+                    replication_batch_req_with_leader_confirmed(vec![replication_item_no_datablock(1, GENESIS_HASH)], 0),
+                ).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+            assert_eq!(shard.shard_mem_cache.borrow().parked_commit_count(), 1, "precondition: late batch parked");
+
+            shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 1 }, 500, now_ms() + 10_000));
+            shard.commit_parked_tail_on_promotion().await.unwrap();
+            assert_eq!(shard.shard_mem_cache.borrow().parked_commit_count(), 0, "the flip drain must commit the late batch");
+            {
+                let active = shard.log_segments_cache.active();
+                let meta = active.metadata.borrow();
+                assert_eq!((meta.write.wal_seq, meta.read.as_ref().unwrap().wal_seq), (1, 1));
+            }
+            shard.close().await;
+
+            // Self-reclaim shape: own speculative tail, nothing parked — untouched.
+            let (_tmp2, dir2) = test_dir();
+            let shard = open_shard_with_own_tail(&dir2, 1, 3).await;
+            shard.commit_parked_tail_on_promotion().await.unwrap();
+            {
+                let active = shard.log_segments_cache.active();
+                let meta = active.metadata.borrow();
+                assert_eq!(meta.write.wal_seq, 3, "self-reclaim keeps its speculative tail");
+                assert_eq!(meta.read.as_ref().unwrap().wal_seq, 1, "read stays behind on self-reclaim");
+            }
+            shard.close().await;
+        });
+    }
+
+    /// The provenance scan must find the tail tip in the sealed predecessor when
+    /// the active segment is empty (promotion right after a rotation, restart
+    /// having cleared the parked state and a prior upload the floor). A scan that
+    /// cannot cross the boundary would misread the peer tail as own and cull it.
+    #[test]
+    fn provenance_scan_finds_peer_tail_tip_across_rotation() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_follower_shard(&dir).await;
+
+            let mut tip = GENESIS_HASH;
+            for seq in 1u64..=2 {
+                let resp = unwrap_replication(
+                    shard.handle_replication_batch(
+                        replication_batch_req_with_leader_confirmed(vec![replication_item_no_datablock(seq, tip)], 0),
+                    ).await,
+                );
+                assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+                tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
+            }
+            shard.log_segments_cache.rotate_to_next_log().await.unwrap();
+
+            // Restart-equivalent state: parked commits died with the process, a
+            // previous promotion upload cleared the floor. Only the disk knows the
+            // tail's provenance now.
+            shard.shard_mem_cache.borrow_mut().take_all_parked_commits();
+            shard.log_segments_cache.active().metadata.borrow_mut().last_received_replication_wal_seq = 0;
+            {
+                let active = shard.log_segments_cache.active();
+                let meta = active.metadata.borrow();
+                assert_eq!(
+                    (meta.read.as_ref().map_or(0, |r| r.wal_seq), meta.write.wal_seq), (0, 2),
+                    "precondition: empty active segment atop the peer tail",
+                );
+            }
+
+            shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 1 }, 500, now_ms() + 10_000));
+            let changed = shard.reconcile_durable_tail(TailReconciliation::CommitForPromotion).await.unwrap();
+            assert!(changed, "the peer tail behind the rotation must be committed");
+
+            let active = shard.log_segments_cache.active();
+            let meta = active.metadata.borrow();
+            assert_eq!(meta.read.as_ref().map(|r| r.wal_seq), Some(2), "read commits to the durable tip");
+            drop(meta);
+
             shard.close().await;
         });
     }
@@ -6575,14 +7781,23 @@ mod tests {
         });
     }
 
+    /// INVARIANT: a guard-passing empty batch is a commit-notify — Success,
+    /// and on a fresh follower with nothing parked it moves no cursor.
+    /// (Stale-epoch and drift-failing empty batches keep their guard's
+    /// rejection; guard order is locked by the commit-notify contract suite.)
     #[test]
-    fn replication_rejects_empty_batch() {
+    fn replication_accepts_empty_batch_as_commit_notify() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let shard = open_follower_shard(&dir).await;
 
             let resp = unwrap_replication(shard.handle_replication_batch(replication_batch_req(vec![])).await);
-            assert!(matches!(resp.result, ReplicationResult::Rejected(FollowerRejection::EmptyBatch)));
+            assert!(
+                matches!(resp.result, ReplicationResult::Success { .. }),
+                "guarded empty batch must be accepted as a commit-notify, got {:?}",
+                resp.result
+            );
+            assert_eq!(wal_positions(&shard.log_segments_cache), (0, 0), "a notify with nothing parked moves nothing");
 
             shard.close().await;
         });
@@ -6676,6 +7891,305 @@ mod tests {
         });
     }
 
+    // ── Commit-notify sender (post-burst detached spawn) ──
+
+    /// Records every replicate_to_follower call as (item_count, confirmed).
+    /// `fail_empty` turns commit-notify sends into failures while real batches
+    /// keep succeeding — the withheld-notify oracle.
+    struct TcpRecordingClient {
+        tcp_calls: RefCell<Vec<(usize, u64)>>,
+        fail_empty: Cell<bool>,
+    }
+
+    impl TcpRecordingClient {
+        fn new() -> Self {
+            Self { tcp_calls: RefCell::new(vec![]), fail_empty: Cell::new(false) }
+        }
+
+        fn empty_calls(&self) -> Vec<u64> {
+            self.tcp_calls.borrow().iter().filter(|(n, _)| *n == 0).map(|(_, c)| *c).collect()
+        }
+
+        fn real_item_total(&self) -> usize {
+            self.tcp_calls.borrow().iter().map(|(n, _)| *n).sum()
+        }
+    }
+
+    impl ReplicationClient for TcpRecordingClient {
+        fn set_follower_address(&self, _address: Option<String>) {}
+        fn set_follower_reachable(&self, _: bool) {}
+        fn is_follower_reachable(&self) -> bool { true }
+        fn current_heartbeat_started_at_unix_ms(&self) -> Option<u64> { None }
+        fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
+        fn reset_heartbeat_state(&self) {}
+        async fn replicate_to_follower(&self, batches: Vec<ReplicationBatchItem>, leader_confirmed_wal_seq: u64, _sender_lease_epoch: u64) -> Result<(), ReplicateToFollowerError> {
+            self.tcp_calls.borrow_mut().push((batches.len(), leader_confirmed_wal_seq));
+            if batches.is_empty() && self.fail_empty.get() {
+                return Err(ReplicateToFollowerError::FollowerUnexpectedResponse);
+            }
+            Ok(())
+        }
+        async fn replicate_to_s3(&self, _batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error> { Ok(()) }
+        async fn send_heartbeat(&self, unix_epoch_now_ms: u64, _lease_epoch: u64) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
+            Ok(celeriant_msg::response::responses::HeartbeatResult::Ack { follower_timestamp_ms: unix_epoch_now_ms + 10, follower_can_accept_tcp_replication: true })
+        }
+        async fn send_kick(&self) -> Result<bool, crate::error::send_heartbeat_error::SendHeartbeatError> { Ok(true) }
+    }
+
+    /// Leader shard with coalescing delays so one spawned wave of writes rides
+    /// one fsync and one replication cycle.
+    async fn open_recording_leader(dir: &std::path::Path) -> ShardWal<TcpRecordingClient, StubS3Downloader> {
+        let mut config = test_config(dir);
+        config.fsync_delay = Duration::from_millis(5);
+        config.replication_delay = Duration::from_millis(5);
+        ShardWal::open(
+            config,
+            ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 0 }, 500, now_ms() + 10_000),
+            TcpRecordingClient::new(),
+            StubS3Downloader,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Let the detached notify timer reach its idle-tail fire: it only fires once
+    /// the last data batch is older than the recency window (RECENCY_WINDOW_BATCHES ×
+    /// the 5ms test replication_delay), so this must exceed that window plus a cycle.
+    async fn quiesce_notify() {
+        glommio::timer::sleep(Duration::from_millis(RECENCY_WINDOW_BATCHES as u64 * 5 + 45)).await;
+    }
+
+    /// INVARIANT: a concurrent write burst produces exactly ONE commit-notify,
+    /// strictly after the burst's data sends, carrying the post-commit
+    /// confirmed index — never a notify per writer, never one mid-burst.
+    #[test]
+    fn commit_notify_fires_exactly_once_after_burst() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = Rc::new(open_recording_leader(&dir).await);
+            shard.set_self_ref();
+
+            let handles: Vec<_> = (1..=5u128)
+                .map(|i| {
+                    let shard = shard.clone();
+                    glommio::spawn_local(async move {
+                        write_ok(&*shard, client_write_req(key(1, 1, i), events(1))).await;
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.await;
+            }
+            quiesce_notify().await;
+
+            let calls = shard.replication_client.tcp_calls.borrow().clone();
+            let empties = shard.replication_client.empty_calls();
+            assert_eq!(empties.len(), 1, "exactly one notify per burst (5 completers dedup to one), calls: {calls:?}");
+            assert_eq!(calls.last().map(|(n, _)| *n), Some(0), "the notify follows every data send, calls: {calls:?}");
+            assert_eq!(shard.replication_client.real_item_total(), 5, "all burst items ride data batches, calls: {calls:?}");
+            assert_eq!(empties[0], 5, "the notify carries the post-commit confirmed index");
+            assert_eq!(wal_positions(&shard.log_segments_cache), (5, 5));
+
+            Rc::try_unwrap(shard).ok().expect("burst tasks done, no clones held").close().await;
+        });
+    }
+
+    /// INVARIANT: the level-triggered notify dedups on the watermark. An index a
+    /// send already delivered (`pushed >= pending`) fires nothing; only a real gap
+    /// (`pending > pushed`) fires exactly one, whose delivery raises `pushed` so a
+    /// re-arm at that index is silent and the timer disarms.
+    #[test]
+    fn commit_notify_dedups_by_watermark() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = Rc::new(open_recording_leader(&dir).await);
+            shard.set_self_ref();
+            write_ok(&*shard, client_write_req(key(1, 1, 1), events(1))).await;
+            quiesce_notify().await;
+            let after_write = shard.replication_client.empty_calls().len();
+            assert_eq!(after_write, 1, "the write's idle tail fires exactly one notify");
+            assert_eq!(shard.replication_client.empty_calls()[0], 1, "carrying the confirmed index");
+            assert_eq!(shard.pending_notify_seq.get(), 1);
+            assert_eq!(shard.pushed_to_follower_seq.get(), 1, "the delivered notify raised the watermark");
+
+            // Watermark dedup: re-arming at an already-pushed index sends nothing.
+            shard.note_commit_and_arm_notify_timer();
+            quiesce_notify().await;
+            assert_eq!(shard.replication_client.empty_calls().len(), after_write, "pending <= pushed: no dedicated notify");
+
+            // A real batch racing ahead (pushed >= pending) also silences the arm.
+            shard.pending_notify_seq.set(9);
+            shard.pushed_to_follower_seq.set(9);
+            shard.arm_notify_timer();
+            quiesce_notify().await;
+            assert_eq!(shard.replication_client.empty_calls().len(), after_write, "a batch that already carried the index needs no notify");
+
+            // A genuine gap (pending > pushed) fires exactly one, carrying the
+            // current confirmed index, and raises the watermark to it.
+            shard.pushed_to_follower_seq.set(0);
+            shard.pending_notify_seq.set(1);
+            shard.arm_notify_timer();
+            quiesce_notify().await;
+            assert_eq!(shard.replication_client.empty_calls().len(), after_write + 1, "a real gap fires one notify");
+            assert_eq!(shard.replication_client.empty_calls().last(), Some(&1), "carrying the current confirmed index");
+            assert_eq!(shard.pushed_to_follower_seq.get(), 1, "delivery raised the watermark");
+            assert!(!shard.notify_timer_armed.get(), "the timer disarms once the obligation is met");
+
+            Rc::try_unwrap(shard).ok().expect("no clones held").close().await;
+        });
+    }
+
+    /// INVARIANT: an exhausted lease budget never sends and never strands the
+    /// obligation — the timer retries (budget is transient) and, if it stays
+    /// exhausted, gives up to the probe rather than spinning; a fence disarms
+    /// terminally; and a restored budget fires the standing obligation.
+    #[test]
+    fn commit_notify_timer_skips_on_exhausted_budget() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = Rc::new(open_recording_leader(&dir).await);
+            shard.set_self_ref();
+            write_ok(&*shard, client_write_req(key(1, 1, 1), events(1))).await;
+            quiesce_notify().await;
+            let before = shard.replication_client.empty_calls().len();
+
+            // Stage a real obligation (pending > pushed), then exhaust the budget:
+            // lease inside the drift window — still leader, zero budget.
+            shard.pushed_to_follower_seq.set(0);
+            shard.pending_notify_seq.set(1);
+            shard.node_status.set(ValidatedNodeStatus::create_custom_status(
+                NodeStatus::Leader { lease_epoch: 0 }, 500, now_ms() + 400,
+            ));
+            shard.arm_notify_timer();
+            quiesce_notify().await;
+            assert_eq!(shard.replication_client.empty_calls().len(), before, "exhausted budget never sends");
+            assert!(!shard.notify_timer_armed.get(), "a budget that stays exhausted gives up to the probe, not a spin");
+
+            // Fenced (no budget at all): the wake's leader check disarms terminally.
+            shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Fenced, 500, 0));
+            shard.arm_notify_timer();
+            quiesce_notify().await;
+            assert_eq!(shard.replication_client.empty_calls().len(), before, "fenced skips the send");
+            assert!(!shard.notify_timer_armed.get(), "fenced skip disarms");
+
+            // Budget restored: the obligation still stands, so the timer fires it.
+            shard.node_status.set(ValidatedNodeStatus::create_custom_status(
+                NodeStatus::Leader { lease_epoch: 0 }, 500, now_ms() + 10_000,
+            ));
+            shard.arm_notify_timer();
+            quiesce_notify().await;
+            assert_eq!(shard.replication_client.empty_calls().len(), before + 1, "restored budget fires the pending notify");
+
+            Rc::try_unwrap(shard).ok().expect("no clones held").close().await;
+        });
+    }
+
+    /// INVARIANT (leg 1 load suppressor): while the data-batch stream is flowing
+    /// (a batch within the recency window) the timer rearms and never fires — the
+    /// watermark cannot do this because `pushed` structurally trails `pending` under
+    /// load. When the stream stops, exactly one notify fires and the timer disarms.
+    /// The idle fire also proves the recency rearm is a free deferral: had it counted
+    /// toward the give-up bound, ~5 stream wakes would have disarmed before idle.
+    #[test]
+    fn commit_notify_recency_suppresses_under_stream_then_fires_at_idle() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = Rc::new(open_recording_leader(&dir).await);
+            shard.set_self_ref();
+            write_ok(&*shard, client_write_req(key(1, 1, 1), events(1))).await;
+            quiesce_notify().await;
+            let before = shard.replication_client.empty_calls().len();
+
+            // Open an obligation, then keep the batch stream "flowing" by refreshing
+            // last_batch_sent_at for LONGER than the recency window — so suppression is
+            // the stream, not just a single recent batch.
+            let window_ms = RECENCY_WINDOW_BATCHES as u64 * 5; // 16 × the 5ms test delay
+            shard.pushed_to_follower_seq.set(0);
+            shard.pending_notify_seq.set(1);
+            shard.last_batch_sent_at.set(Instant::now());
+            shard.arm_notify_timer();
+            let ticker_shard = shard.clone();
+            let ticker = glommio::spawn_local(async move {
+                for _ in 0..(window_ms / 10 + 6) {
+                    ticker_shard.last_batch_sent_at.set(Instant::now());
+                    glommio::timer::sleep(Duration::from_millis(10)).await;
+                }
+            });
+            ticker.await;
+            assert_eq!(shard.replication_client.empty_calls().len(), before, "a flowing batch stream suppresses the notify past the window");
+
+            // Stream stops: once the window elapses with no batch, exactly one fires.
+            glommio::timer::sleep(Duration::from_millis(window_ms + 60)).await;
+            assert_eq!(shard.replication_client.empty_calls().len(), before + 1, "the idle tail fires exactly one notify once the stream stops");
+            assert!(!shard.notify_timer_armed.get(), "and the timer disarms");
+
+            Rc::try_unwrap(shard).ok().expect("no clones held").close().await;
+        });
+    }
+
+    /// INVARIANT: a stale batch stream (idle) with an open obligation fires exactly
+    /// one notify carrying the confirmed index; delivery raises the watermark to
+    /// pending and the next wake disarms. Also the lone-write fast-path regime: a
+    /// single write, no burst, still reaches the follower within the timer window —
+    /// the case the rejected spawn-time quiet window would have skipped.
+    #[test]
+    fn commit_notify_stale_batch_fires_once_then_disarms() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = Rc::new(open_recording_leader(&dir).await);
+            shard.set_self_ref();
+            write_ok(&*shard, client_write_req(key(1, 1, 1), events(1))).await;
+            quiesce_notify().await;
+            assert_eq!(shard.replication_client.empty_calls().len(), 1, "the lone write's tail reaches the follower");
+            let before = shard.replication_client.empty_calls().len();
+
+            shard.pushed_to_follower_seq.set(0);
+            shard.pending_notify_seq.set(1);
+            shard.last_batch_sent_at.set(Instant::now() - Duration::from_secs(10)); // far past any window
+            shard.arm_notify_timer();
+            quiesce_notify().await;
+            assert_eq!(shard.replication_client.empty_calls().len(), before + 1, "stale stream: exactly one notify");
+            assert_eq!(shard.replication_client.empty_calls().last(), Some(&1), "carrying the confirmed index");
+            assert_eq!(shard.pushed_to_follower_seq.get(), 1, "delivery raises the watermark to pending");
+            assert!(!shard.notify_timer_armed.get(), "next wake disarms");
+
+            Rc::try_unwrap(shard).ok().expect("no clones held").close().await;
+        });
+    }
+
+    /// INVARIANT (write-latency): the client ack never waits on the notify. The
+    /// notify runs on a detached timer, so even with every notify send failing the
+    /// write commits and acks at read == write, and the next write is undisturbed.
+    /// The level timer retries a failing notify off the write path (the watermark
+    /// never catches up); that is by design and bounded by reachability elsewhere,
+    /// so this test asserts the ack decoupling, not a retry count.
+    #[test]
+    fn write_ack_never_waits_on_withheld_notify() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = Rc::new(open_recording_leader(&dir).await);
+            shard.set_self_ref();
+            shard.replication_client.fail_empty.set(true);
+
+            write_ok(&*shard, client_write_req(key(1, 1, 1), events(1))).await;
+            assert_eq!(wal_positions(&shard.log_segments_cache), (1, 1), "ack semantics: committed at ack, notify pending");
+            quiesce_notify().await;
+
+            write_ok(&*shard, client_write_req(key(1, 1, 2), events(1))).await;
+            assert_eq!(wal_positions(&shard.log_segments_cache), (2, 2), "a failing notify must not disturb the next write");
+            quiesce_notify().await;
+
+            assert!(!shard.replication_client.empty_calls().is_empty(), "the withheld notify was attempted off the ack path");
+            assert_eq!(shard.replication_client.real_item_total(), 2, "both writes replicated normally");
+
+            // Silence the failure and let the watermark catch up so the detached
+            // timer disarms before close (no lingering Rc held across an await).
+            shard.replication_client.fail_empty.set(false);
+            quiesce_notify().await;
+            Rc::try_unwrap(shard).ok().expect("no clones held").close().await;
+        });
+    }
+
     // ── Promotion batch upload ──
 
     struct CapturingReplicationClient {
@@ -6751,6 +8265,38 @@ mod tests {
         ShardWal::open(test_config(dir), ValidatedNodeStatus::create_custom_status(NodeStatus::Follower { leader_lease_epoch: 0 }, 500, now_ms() + 10_000), client, StubS3Downloader)
             .await
             .unwrap()
+    }
+
+    /// Real own-speculation tail on real disk: `total` standalone writes (every
+    /// metablock stamped with this node's id, read == write after each fsync),
+    /// then the read cursor is rewound to its snapshot at `acked` — the exact
+    /// header a leader leaves after acking `acked` and speculating to `total`.
+    async fn open_shard_with_own_tail(dir: &std::path::Path, acked: u64, total: u64) -> ShardWal<StubReplicationClient, StubS3Downloader> {
+        let shard = open_shard(dir).await;
+        let agg = key(1, 1, 1);
+        let mut snapshot = None;
+        for seq in 1..=total {
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            if seq == acked {
+                snapshot = Some(shard.log_segments_cache.active().metadata.borrow().write.clone());
+            }
+        }
+        let read = snapshot.expect("acked must be <= total");
+        shard.log_segments_cache.active().metadata.borrow_mut().read = Some(read);
+        shard
+    }
+
+    /// Commit a follower's parked deferred tail — the state a covering carrier
+    /// (or a promotion tail-commit) produces — without touching the
+    /// promotion-batch floor the way a real carrier would.
+    fn commit_deferred_tail<R: ReplicationClient + 'static, D: S3Downloader>(shard: &ShardWal<R, D>) {
+        let pcds = shard.shard_mem_cache.borrow_mut().take_all_parked_commits();
+        for pcd in pcds {
+            shard_wal_replicate::commit_pcd(
+                &shard.log_segments_cache, &shard.shard_mem_cache, &shard.watched_aggregates, pcd, Some(&shard.dict_codec),
+            );
+        }
+        shard.log_segments_cache.active().metadata.borrow_mut().advance_visible_position();
     }
 
     async fn open_follower_shard_capturing_with_promotion_cap(
@@ -6909,7 +8455,7 @@ mod tests {
     }
 
     #[test]
-    fn upload_promotion_batch_uploads_and_clears() {
+    fn upload_promotion_batch_uploads_range_and_leaves_floor_for_flip() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let client = CapturingReplicationClient::new();
@@ -6919,6 +8465,7 @@ mod tests {
                 shard.handle_replication_batch(replication_batch_req(vec![replication_item_no_datablock(1, GENESIS_HASH)])).await,
             );
             assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+            commit_deferred_tail(&shard);
 
             shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 1 }, 500, now_ms() + 10_000));
             shard.upload_s3_promotion_batch().await.unwrap();
@@ -6929,13 +8476,20 @@ mod tests {
             assert_eq!(uploads[0][0].metablock.wal_seq, 1);
             drop(uploads);
 
-            // Field should be cleared
+            // The upload consumes the floor but must not clear it: it doubles as
+            // the crash re-entry marker until the Leader flip.
             let idx = shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_seq;
-            assert_eq!(idx, 0, "field should be cleared after upload");
+            assert_eq!(idx, 1, "the upload must leave the floor in place");
 
-            // Second call should be a noop
+            // A pre-flip retry re-uploads the same range (idempotent PUT).
             shard.upload_s3_promotion_batch().await.unwrap();
-            assert_eq!(shard.replication_client.s3_uploads.borrow().len(), 1, "should not re-upload");
+            assert_eq!(shard.replication_client.s3_uploads.borrow().len(), 2, "pre-flip retry re-uploads idempotently");
+
+            // The flip is the single clear site; after it the upload is a noop.
+            shard.clear_promotion_floor();
+            assert_eq!(shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_seq, 0);
+            shard.upload_s3_promotion_batch().await.unwrap();
+            assert_eq!(shard.replication_client.s3_uploads.borrow().len(), 2, "no floor, nothing to upload");
 
             shard.close().await;
         });
@@ -6960,6 +8514,7 @@ mod tests {
                 shard.handle_replication_batch(replication_batch_req(vec![replication_item_no_datablock(2, tip)])).await,
             );
             assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+            commit_deferred_tail(&shard);
 
             // Upload should contain only entries from wal_seq 2 onward (last batch)
             shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 1 }, 500, now_ms() + 10_000));
@@ -7007,6 +8562,7 @@ mod tests {
                 assert!(matches!(resp.result, ReplicationResult::Success { .. }), "replication {seq} failed: {resp:?}");
                 tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
             }
+            commit_deferred_tail(&shard);
 
             shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 1 }, 500, now_ms() + 10_000));
             shard.upload_s3_promotion_batch().await.unwrap();
@@ -7019,7 +8575,7 @@ mod tests {
             drop(uploads);
 
             let idx = shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_seq;
-            assert_eq!(idx, 0, "field cleared only after ALL chunks landed");
+            assert_eq!(idx, 1, "the floor survives the upload (cleared only at the Leader flip)");
 
             shard.close().await;
         });
@@ -7043,6 +8599,7 @@ mod tests {
                 shard.handle_replication_batch(replication_batch_req(vec![replication_item_no_datablock(1, GENESIS_HASH)])).await,
             );
             assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+            commit_deferred_tail(&shard);
 
             shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 1 }, 500, now_ms() + 10_000));
             shard.upload_s3_promotion_batch().await.unwrap();
@@ -7051,16 +8608,18 @@ mod tests {
             assert_eq!(shard.replication_client.s3_uploads.borrow().len(), 1);
 
             let idx = shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_seq;
-            assert_eq!(idx, 0, "field cleared after retried upload landed");
+            assert_eq!(idx, 1, "the floor survives the upload (cleared only at the Leader flip)");
 
             shard.close().await;
         });
     }
 
-    /// Scan exceeds `max_promotion_batch_bytes` → skip upload, clear the floor, return Ok.
-    /// Demoted peer recovers via the leader-side S3 fallback path.
+    /// Scan exceeds `max_promotion_batch_bytes` → skip upload, return Ok; the
+    /// Leader flip then clears the floor so the same unbridgeable range is not
+    /// re-scanned on the next role change. Demoted peer recovers via the
+    /// leader-side S3 fallback path.
     #[test]
-    fn upload_promotion_batch_skips_and_clears_when_budget_exceeded() {
+    fn upload_promotion_batch_skips_when_budget_exceeded() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let client = CapturingReplicationClient::new();
@@ -7082,6 +8641,7 @@ mod tests {
             );
             assert!(matches!(resp.result, ReplicationResult::Success { .. }));
 
+            commit_deferred_tail(&shard);
             // Pin the floor at 1 so the scan covers all three metablocks.
             shard.log_segments_cache.active().metadata.borrow_mut().last_received_replication_wal_seq = 1;
 
@@ -7094,21 +8654,118 @@ mod tests {
             );
             assert_eq!(
                 shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_seq,
+                1,
+                "the skip must not clear the floor (that is the flip's job)",
+            );
+            shard.clear_promotion_floor();
+            assert_eq!(
+                shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_seq,
                 0,
-                "floor must be cleared so subsequent role changes don't re-scan the same range",
+                "the flip clears the floor so later role changes don't re-scan the range",
             );
 
             shard.close().await;
         });
     }
 
+    /// A follower rotating while commits are parked must not write the sealed
+    /// segment's summary sidecar at rotation — the summary is incomplete until
+    /// the parked read-side commits drain. A covering carrier drains them and
+    /// the sweep then writes the sidecar.
     #[test]
-    fn upload_s3_promotion_batch_culls_unreplicated_tail_before_promoting() {
+    fn follower_rotation_defers_summary_sidecar_until_covering_carrier() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let client = CapturingReplicationClient::new();
+            let mut cfg = test_config(&dir);
+            cfg.shard_log_preallocate_bytes = 1024 * 1024;
+            let shard = ShardWal::open(
+                cfg,
+                ValidatedNodeStatus::create_custom_status(NodeStatus::Follower { leader_lease_epoch: 0 }, 500, now_ms() + 10_000),
+                client,
+                StubS3Downloader,
+            ).await.unwrap();
+
+            // Replicate 100-entry batches, never confirming, until the log rotates.
+            // Only the first item's previous_tip_hash is chain-checked; sync()
+            // recomputes the rest.
+            let mut next_seq = 1u64;
+            let mut rotated = false;
+            for _ in 0..12 {
+                let tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
+                let items: Vec<_> = (0..100u64)
+                    .map(|i| replication_item_no_datablock(next_seq + i, if i == 0 { tip } else { GENESIS_HASH }))
+                    .collect();
+                let resp = unwrap_replication(
+                    shard.handle_replication_batch(replication_batch_req_with_leader_confirmed(items, 0)).await,
+                );
+                assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+                next_seq += 100;
+                if shard.log_segments_cache.active_log_id() > 1 {
+                    rotated = true;
+                    break;
+                }
+            }
+            assert!(rotated, "scaffolding: 1MB preallocate must rotate within 1200 entries");
+            assert!(shard.shard_mem_cache.borrow().parked_commit_count() > 0, "scaffolding: unconfirmed batches must be parked");
+            assert!(
+                !crate::shard_wal_sync::summary_path(&dir, 1).exists(),
+                "sidecar must not be written while the sealed range is unconfirmed"
+            );
+
+            // Confirm only the first batch: its commit lands in the sealed
+            // segment while the active segment's read stays None. The
+            // shard-level committed cursor (the read/lag gauge source) must
+            // report it instead of collapsing to 0.
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(replication_batch_req_with_leader_confirmed(
+                    vec![replication_item_no_datablock(100, GENESIS_HASH)],
+                    100,
+                )).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+            assert!(shard.log_segments_cache.active().metadata.borrow().read.is_none(),
+                "scaffolding: active segment must still be unadvanced");
+            assert_eq!(shard.log_segments_cache.committed_read_wal_seq(), 100,
+                "committed cursor must survive the rotation via the sealed predecessor");
+            assert!(
+                !crate::shard_wal_sync::summary_path(&dir, 1).exists(),
+                "a partial confirm must not release the sealed sidecar"
+            );
+
+            // Covering carrier: duplicate of the last entry (skipped on apply),
+            // confirming the tip.
+            let tip_seq = next_seq - 1;
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(replication_batch_req_with_leader_confirmed(
+                    vec![replication_item_no_datablock(tip_seq, GENESIS_HASH)],
+                    tip_seq,
+                )).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+
+            assert_eq!(shard.shard_mem_cache.borrow().parked_commit_count(), 0, "covering carrier must drain every parked commit");
+            assert!(
+                crate::shard_wal_sync::summary_path(&dir, 1).exists(),
+                "sidecar must appear once the drain covers the sealed segment"
+            );
+
+            shard.close().await;
+        });
+    }
+
+    /// The upload's reconcile prefix COMMITS an unconfirmed peer tail before
+    /// scanning the promotion range, so the upload covers entries no carrier
+    /// ever confirmed (they may be acked on the dead leader's side).
+    #[test]
+    fn upload_s3_promotion_batch_commits_deferred_tail_before_promoting() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let client = CapturingReplicationClient::new();
             let shard = open_follower_shard_capturing(&dir, client).await;
 
+            // Carriers confirm seq-1: read lands at 4, seq 5 stays parked and the
+            // promotion floor is 5.
             let mut tip = GENESIS_HASH;
             for seq in 1u64..=5 {
                 let resp = unwrap_replication(
@@ -7117,15 +8774,7 @@ mod tests {
                 assert!(matches!(resp.result, ReplicationResult::Success { .. }));
                 tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
             }
-
-            // Speculative tail at seqs 6..=10.
-            {
-                let active = shard.log_segments_cache.active();
-                let mut meta = active.metadata.borrow_mut();
-                meta.write.wal_seq = 10;
-                meta.write.metablocks_position = HEADER_BLOCK_SIZE_BYTES as u64 + 10 * 512;
-                meta.last_received_replication_wal_seq = 2;
-            }
+            assert_eq!(shard.shard_mem_cache.borrow().parked_commit_count(), 1, "precondition: seq 5 parked");
 
             shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 1 }, 500, now_ms() + 10_000));
             shard.upload_s3_promotion_batch().await.unwrap();
@@ -7133,15 +8782,16 @@ mod tests {
             {
                 let active = shard.log_segments_cache.active();
                 let meta = active.metadata.borrow();
-                assert_eq!(meta.write.wal_seq, 5, "cull must reset write.wal_seq to read.wal_seq");
-                assert_eq!(meta.read.as_ref().unwrap().wal_seq, 5, "read.wal_seq unchanged");
+                assert_eq!(meta.write.wal_seq, 5, "the deferred tail must survive promotion");
+                assert_eq!(meta.read.as_ref().unwrap().wal_seq, 5, "the deferred tail must be committed before the upload");
             }
 
             let uploads = shard.replication_client.s3_uploads.borrow();
             assert_eq!(uploads.len(), 1, "exactly one promotion upload");
-            assert!(
-                uploads[0].iter().all(|item| item.metablock.wal_seq <= 5),
-                "uploaded batch must not contain entries above read.wal_seq=5 (unreplicated tail was culled)"
+            assert_eq!(
+                uploads[0].iter().map(|item| item.metablock.wal_seq).collect::<Vec<_>>(),
+                vec![5],
+                "the upload range starts at the floor and includes the committed tail"
             );
 
             shard.close().await;
@@ -7152,21 +8802,7 @@ mod tests {
     fn cull_clears_aggregate_write_client_snapshots_lru() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
-            let client = CapturingReplicationClient::new();
-            let shard = open_follower_shard_capturing(&dir, client).await;
-
-            {
-                let active = shard.log_segments_cache.active();
-                let mut meta = active.metadata.borrow_mut();
-                meta.write.wal_seq = 10;
-                meta.write.metablocks_position = HEADER_BLOCK_SIZE_BYTES as u64 + 10 * 512;
-                meta.read = Some({
-                    let mut r = meta.write.clone();
-                    r.wal_seq = 5;
-                    r.metablocks_position = HEADER_BLOCK_SIZE_BYTES as u64 + 5 * 512;
-                    r
-                });
-            }
+            let shard = open_shard_with_own_tail(&dir, 5, 10).await;
 
             let agg = AggregateKey::new(1, 1, 1);
             shard.shard_mem_cache.borrow_mut().put_aggregate_write_client_snapshot_for_test(agg.clone(), 42, 7, 0);
@@ -7181,7 +8817,7 @@ mod tests {
             {
                 let active = shard.log_segments_cache.active();
                 let meta = active.metadata.borrow();
-                assert_eq!(meta.write.wal_seq, 5, "cull must rewind write to read");
+                assert_eq!(meta.write.wal_seq, 5, "own-tail cull must rewind write to read");
             }
 
             assert_eq!(
@@ -7268,22 +8904,9 @@ mod tests {
 
         glommio_test!({
             let (_tmp, dir) = test_dir();
-            let client = CapturingReplicationClient::new();
-            let shard = open_follower_shard_capturing(&dir, client).await;
+            // Own tail (5, 10]: write=10 unreplicated speculation, read=5 acked.
+            let shard = open_shard_with_own_tail(&dir, 5, 10).await;
 
-            // write=10 (unreplicated tail), read=5 (last confirmed).
-            {
-                let active = shard.log_segments_cache.active();
-                let mut meta = active.metadata.borrow_mut();
-                meta.write.wal_seq = 10;
-                meta.write.metablocks_position = HEADER_BLOCK_SIZE_BYTES as u64 + 10 * 512;
-                meta.read = Some({
-                    let mut r = meta.write.clone();
-                    r.wal_seq = 5;
-                    r.metablocks_position = HEADER_BLOCK_SIZE_BYTES as u64 + 5 * 512;
-                    r
-                });
-            }
             // Stale PCD captured pre-cull (write.wal_seq=10), returned to pending after
             // replication failure.
             {

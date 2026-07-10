@@ -11,7 +11,8 @@
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::list_operations::{ListAggregatesIterator, ListOptions};
 use crate::{
-    count_events, write_event, MinioContainer, ServerConfig, TestServer, TcpProxy,
+    count_events, poll_converged_count, write_event, MinioContainer, ServerConfig, TestServer,
+    TcpProxy, FOLLOWER_CONVERGENCE_TIMEOUT,
 };
 use celeriant_runtimes::RoutingRule;
 use celeriant_wal::aggregate_key::AggregateKey;
@@ -102,7 +103,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let leader_count = count_events(&mut leader_client, &key).await?;
-    let follower_count = count_events(&mut follower_client, &key).await?;
+    let follower_count =
+        poll_converged_count(&mut follower_client, &key, 3, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
     assert_eq!(leader_count, 3, "leader should see 3 events");
     assert_eq!(follower_count, 3, "follower should see 3 events via proxy");
     println!("  Cluster healthy: leader={}, follower={}", leader_count, follower_count);

@@ -9,6 +9,11 @@ license.workspace = true
 name = "celeriant-chaos"
 path = "src/main.rs"
 
+# Dev tool: replay stored run JSONs through the comparator checks. Not CI-gated.
+[[bin]]
+name = "replay"
+path = "src/bin/replay.rs"
+
 [dependencies]
 celeriant_bench = { path = "../celeriant_bench" }
 tokio.workspace = true

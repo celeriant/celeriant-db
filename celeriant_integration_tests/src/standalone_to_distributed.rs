@@ -21,8 +21,9 @@
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{
-    copy_shard_dirs, count_events, is_leader, s3_cluster_config, write_event, write_large_event,
-    MinioContainer, RoutingRule, ServerConfig, TestServer,
+    copy_shard_dirs, is_leader, poll_converged_count, s3_cluster_config, write_event,
+    write_large_event, MinioContainer, RoutingRule, ServerConfig, TestServer,
+    FOLLOWER_CONVERGENCE_TIMEOUT,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
@@ -68,7 +69,7 @@ async fn assert_event_counts(
     label: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for (i, key) in keys.iter().enumerate() {
-        let count = count_events(client, key).await?;
+        let count = poll_converged_count(client, key, expected, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
         assert_eq!(
             count, expected,
             "{} shard {}: expected {} events, got {}",

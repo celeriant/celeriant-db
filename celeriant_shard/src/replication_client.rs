@@ -227,10 +227,9 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
     }
 
     async fn replicate_to_follower(&self, batches: Vec<ReplicationBatchItem>, leader_confirmed_wal_seq: u64, sender_lease_epoch: u64) -> Result<(), ReplicateToFollowerError> {
-        if batches.is_empty() {
-            return Ok(());
-        }
-
+        // Empty batches are legal: a commit-notify carries only the header
+        // (leader_confirmed_wal_seq) so an idle follower commits its parked
+        // tail without waiting for the probe.
         let mut guard = write_with_timeout(&self.replication_conn, "replicate_to_follower").await
             .map_err(|_| ReplicateToFollowerError::LockTimeout)?;
 

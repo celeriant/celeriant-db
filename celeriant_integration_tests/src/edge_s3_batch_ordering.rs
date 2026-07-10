@@ -23,7 +23,8 @@
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{
-    count_events, is_leader, s3_cluster_config, write_event, MinioContainer, TestServer,
+    count_events, is_leader, poll_converged_count, s3_cluster_config, write_event,
+    MinioContainer, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
@@ -111,7 +112,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     for agg in &aggregates {
-        let count = count_events(&mut follower_client, agg).await?;
+        let count =
+            poll_converged_count(&mut follower_client, agg, 1, FOLLOWER_CONVERGENCE_TIMEOUT).await?;
         assert_eq!(
             count, 1,
             "Follower should have 1 event for aggregate {:?}, got {}",
@@ -233,7 +235,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut failures: Vec<String> = Vec::new();
 
     for agg in &aggregates {
-        let follower_count = count_events(&mut follower_client2, agg).await?;
+        let follower_count = poll_converged_count(
+            &mut follower_client2,
+            agg,
+            events_per_aggregate as usize,
+            FOLLOWER_CONVERGENCE_TIMEOUT,
+        )
+        .await?;
         let leader_count = count_events(&mut leader_client, agg).await?;
 
         follower_total += follower_count;

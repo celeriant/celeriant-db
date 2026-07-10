@@ -33,6 +33,14 @@ pub fn read_server_timestamp(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
+/// Authoring node of a metablock. Replication and catchup write the author's
+/// serialized metablock verbatim, so this survives on the receiving node's disk.
+#[inline]
+pub fn read_node_id(bytes: &[u8]) -> u128 {
+    let offset = HEADER_SIZE + Metablock::OFFSET_NODE_ID;
+    read_u128_le(bytes, offset)
+}
+
 #[inline]
 pub fn read_compressed_size(bytes: &[u8]) -> u64 {
     let offset = HEADER_SIZE + Metablock::OFFSET_COMPRESSED_SIZE;
