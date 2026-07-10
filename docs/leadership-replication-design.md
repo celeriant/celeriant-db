@@ -1,1023 +1,478 @@
 # Leadership & Replication Design
 
-*WARNING - LLM Synthesised From Codebase - Pending Human Review*
-
-## Celeriant
-
 Celeriant is a distributed, append-only event store built for the write side of
-event sourcing. Rust, thread-per-core (Glommio/io_uring), Direct I/O, one WAL
-per shard. Two-node clusters with S3 for coordination and fallback replication.
-Every write is fsynced to disk on both nodes before the client gets an ACK. No
-write is ever acknowledged until it exists on two storage systems.
+event sourcing. Rust, thread-per-core (Glommio/io_uring), Direct I/O, one WAL per
+shard. Two-node clusters coordinate through S3 and fall back to it for
+replication. Every acknowledged write is fsynced on the leader and durable on a
+second storage system (follower disk or S3) before the client sees Ok.
 
-## S3 Conditional Writes as a Consensus Protocol
+This is the implementation spec for cluster coordination, election, replication,
+and the visibility model. Enough detail to re-implement from scratch.
 
-Celeriant does not use Raft or Paxos. Leader election and coordination run
-entirely through S3 conditional writes (CAS on a single `cluster/lease.json`
-object using etag-based preconditions). A monotonically increasing `lease_epoch`
-prevents ABA races. Nodes self-fence via asymmetric TTLs: the leader fences
-early (at `expires_at - max_clock_drift`), the follower challenges late (at full
-`expires_at`), guaranteeing the leader stops writing before the follower can win
-an election. S3 also serves as a fallback replication target when the follower is
-unreachable, so it functions as both the coordination plane and the durability
-safety net. The trade-offs are explicit: clock dependency (bounded by
-`max_clock_drift_ms`), a hard two-node ceiling, ~1.5s failover latency, and an
-external object store dependency during partitions. In exchange, there is no
-third node, no log matching, no pre-vote protocol, no joint consensus for
-membership changes, and zero coordination traffic on the write path during
-healthy steady-state operation.
+## S3 Conditional Writes as the Consensus Protocol
 
-This document is the implementation specification for Celeriant's cluster
-coordination, leadership election, and data replication. Sufficient detail to
-re-implement from scratch.
+Celeriant does not run Raft or Paxos. Why carry a third node, log matching,
+pre-vote, and joint consensus when the deployment target is exactly two nodes and
+an object store is already in the stack for fallback durability?
 
----
+Election and coordination run entirely through S3 conditional writes: CAS on a
+single `cluster/lease.json` object using etag preconditions. A monotonic
+`lease_epoch` kills ABA races. Nodes self-fence on asymmetric TTLs, so the leader
+stops writing before the follower can win an election.
+
+The trade-offs are explicit: a clock dependency bounded by `max_clock_drift_ms`,
+a hard two-node ceiling, ~1.5s failover, and an object-store dependency during
+partitions. In exchange: zero coordination traffic on the healthy write path. In
+steady state with both nodes reachable, S3 is never touched. Not for lease
+renewal, not for data. The chaos baseline enforces this (`NoS3Fallbacks`,
+`NoHeartbeatFailures`).
 
 ## Node States
 
+Seven states (`node_status.rs`):
+
 ```
-Standalone ──────────────────────────────────────────────────────
-BootCatchup ──► Leader    BootCatchup ──► Follower
-Leader ──► Follower       Leader ──► Fenced
+Standalone                                  writes accepted, no cluster
+BootCatchup ──► Leader | Follower           process start
 Follower ──► FollowerCatchingUp ──► Follower
-Follower ──► Fenced ──► Leader / Follower / BootCatchup
+Follower ──► Promoting ──► Leader           won the CAS, flip in progress
+Leader ──► Follower | Fenced
+Promoting ──► Follower | Fenced             lost the race / overran
+Fenced ──► Leader | Follower | BootCatchup
 ```
 
-**Invalid transitions:**
-- `FollowerCatchingUp` cannot go directly to `Leader` (must return to `Follower` first)
-- `BootCatchup` cannot go to `FollowerCatchingUp` (different entry points)
+Rules that matter:
 
-**TTL decay:**
-- `Leader` and `Follower` decay to `Fenced` when `now > expires_at - max_clock_drift`
-- `BootCatchup` and `FollowerCatchingUp` are TTL-exempt (never decay)
-- Only `Leader` and `Standalone` accept writes
+- Only `Leader` and `Standalone` accept writes. Every write path checks
+  `effective_node_status()` synchronously before entering the pipeline.
+- `Leader`, `Follower`, and `Promoting` decay to `Fenced` at
+  `expires_at - max_clock_drift`. An overrunning promotion self-fences the same
+  way an expiring leader does; there is no state a node can hide in past its TTL.
+- `BootCatchup`, `FollowerCatchingUp`, `Fenced`, and `Standalone` are TTL-exempt.
+- `Leader ──► Promoting` and `Standalone ──► Promoting` are invalid. Promoting is
+  reachable only from the follower side of an election.
+- `FollowerCatchingUp` cannot go directly to `Leader`. It returns to `Follower`
+  first, then challenges like any follower.
 
----
+`Promoting` exists because the window between winning the CAS and opening writes
+has real work in it (tail reconciliation, S3 catchup, promotion upload, the
+flip-drain). Publishing `Promoting` to every shard at CAS-win closes the window's
+races: TCP replication from the old leader is rejected, zombie heartbeats are
+refused unless they carry a higher epoch, and the promotion-batch upload gate
+admits the node before the final flip.
 
 ## Leader Election
 
-S3 holds a single `cluster/lease.json` object. No Raft, no quorum. Election is a
-conditional PUT (CAS) on this object using its etag.
+S3 holds one `cluster/lease.json`. Election is a conditional PUT on its etag.
 
 ```mermaid
 flowchart TD
-    A[run_election_to_acquire_s3_lease] --> B{Lease exists?}
-    B -->|No| C[Create lease: lease_epoch=1, self as leader]
-    C --> D{put_lease_create_only}
-    D -->|Success| E[Become Leader]
-    D -->|AlreadyExists| F[Fetch lease, Become Follower]
-
-    B -->|Yes| G{Expired or held by self?}
-    G -->|Valid, other node| H[Become Follower unconditionally]
-    G -->|Expired or self| I[Promote: lease_epoch+1, self as leader]
-    I --> J{put_lease_conditional etag}
-    J -->|Success| E
-    J -->|PreconditionFailed| K[Fetch new lease, Become Follower]
+    A[set_node_role_via_s3] --> B{Lease exists?}
+    B -->|No| C[Create-only PUT: epoch=1, self leader]
+    C -->|Success| E[Promoting -> Leader]
+    C -->|AlreadyExists| F[Fetch, become Follower]
+    B -->|Yes| G{Expired, or held by self?}
+    G -->|Valid, other node| H[Become Follower, no CAS]
+    G -->|Yes| I[CAS: epoch+1, self leader]
+    I -->|Success| E
+    I -->|PreconditionFailed| F
 ```
 
-**Key property:** A node seeing a valid unexpired lease from another node becomes
-follower without attempting CAS. Only expired or self-held leases trigger a race.
+A node that sees a valid unexpired lease held by the other node becomes follower
+without attempting the CAS. Only an expired or self-held lease triggers a race.
 
-`lease_epoch` is strictly monotonic and never reused.
-
-**Election return value:** `ElectionOutcome { status: ValidatedNodeStatus, peer_info: Option<NodeInfo> }`.
-The status is `Leader` or `Follower` with TTL set from the S3 lease. `peer_info`
-contains the other node's client and replication addresses from the S3 membership
-object (may be `None` if no peer registered yet).
-
----
+`lease_epoch` increments only on `promote` (leadership changing hands or being
+re-taken). `renew` holds the epoch constant. The epoch is therefore strictly
+monotonic across hand-offs, and every metablock a leader writes carries it.
 
 ## S3 Object Layout
 
-All cluster state lives under a single S3 prefix:
-
 ```
 cluster/
-├── lease.json                  (leader lease, CAS-protected)
-├── membership.json             (2-slot node registry)
+├── lease.json          leader_node_id, lease_epoch, acquired_at_ms, expires_at_ms
+├── membership.json     [Option<NodeInfo>; 2] — a third node cannot join
 └── fallback/
-    ├── shard_000/
-    │   └── batch_{start:09}_{end:09}_{node_uuid}.bin
-    ├── shard_001/
-    │   └── ...
-    └── ...
+    └── shard_{id:03}/
+        └── batch_{start:09}_{end:09}_{node_uuid}.bin
 ```
 
-**Lease object** (`cluster/lease.json`): JSON-serialized.
-Fields: `leader_node_id` (u128), `lease_epoch` (u64), `acquired_at_ms` (u64),
-`expires_at_ms` (u64).
+`NodeInfo` is `node_id` (u128), `client_address`, `replication_address`. Each
+node registers itself at boot; the leader discovers the follower's replication
+address from membership, not from heartbeats.
 
-**Membership object** (`cluster/membership.json`): JSON-serialized.
-Fixed 2-slot array: `nodes: [Option<NodeInfo>; 2]`. A third node cannot join.
-Each `NodeInfo` contains: `node_id` (u128), `client_address` (String),
-`replication_address` (String).
-
-**Fallback batch objects**: Bincode-serialized with 8-byte header
-(`[CRC32C 4B LE] [Version 4B LE]`, version = 1). Filename encodes shard ID
-(3-digit zero-padded), WAL sequence range (9-digit zero-padded), and uploader
-node ID (UUID format). Zero-padding ensures lexicographic ordering matches
-temporal ordering.
-
----
+Fallback batches are bincode with an 8-byte header (`[CRC32C 4B LE][version 4B
+LE]`, version 1). Zero-padded names make lexicographic order equal temporal
+order.
 
 ## Heartbeat Protocol
 
-Heartbeats flow leader-to-follower only, handled exclusively on shard 0. The
-leader sends every `heartbeat_interval` (default 500ms). The follower extends its
-TTL on each received heartbeat.
+Heartbeats flow leader-to-follower only, on shard 0 only, every
+`heartbeat_interval` (500ms). The follower extends its TTL to
+`max(current, leader_ts + heartbeat_lease_duration)` and acks with
+`follower_can_accept_tcp_replication`. The leader extends its own TTL on each
+ack and broadcasts `StatusUpdate` + `FollowerReachable` to all shards.
 
-```mermaid
-sequenceDiagram
-    participant L as Leader (shard 0)
-    participant F as Follower (shard 0)
+**Asymmetric fencing.** The leader fences itself at
+`expires_at - max_clock_drift` (500ms early). The follower challenges only at
+full `expires_at`. That gap is the guarantee: the leader has stopped writing
+before the follower can win.
 
-    loop Every 500ms
-        L->>F: Heartbeat(timestamp, lease_epoch)
-        F->>F: Validate state (must be follower/fenced)
-        F->>F: Check clock drift
-        F->>F: Extend TTL = max(current, leader_ts + 1500ms)
-        F->>F: Broadcast StatusUpdate to all shards
-        F-->>L: Ack(follower_timestamp, follower_can_accept_tcp_replication)
-        L->>L: set follower_reachable = follower_can_accept_tcp_replication
-        L->>L: Extend own TTL = now + 1500ms
-        L->>L: Broadcast StatusUpdate + FollowerReachable to all shards
-    end
-```
+**Hard timeout.** Each heartbeat send is wrapped in
+`heartbeat_timeout × heartbeat_hard_timeout_multiplier` (default ×4 = 2s).
+Kernel TCP retransmits under saturation can block a kTLS send for 20+ seconds;
+without the outer timeout that starves the heartbeat task and costs leadership.
 
-**Asymmetric fencing:**
-- Leader fences early: `now > expires_at - max_clock_drift` (~1000ms before expiry)
-- Follower challenges late: waits for full `expires_at` expiry (~1500ms)
-- This gap ensures the leader self-fences before the follower can win an election
+**Failure path (leader side):**
 
-**Heartbeat hard timeout:**
-Each heartbeat send is wrapped in a hard timeout of `heartbeat_timeout * heartbeat_hard_timeout_multiplier`
-(default 500ms × 4 = 2s). This prevents kernel TCP retransmit delays (which can block kTLS send
-for 20+ seconds under network saturation) from starving the heartbeat task and causing
-unintended leadership loss.
-
-**Heartbeat failure path (leader side):**
-- No peer known: exponential backoff peer discovery (1s, 2s, 4s, capped at `s3_lease_duration / 2`)
-- Peer known, first failure (was previously reachable): **preemptive S3 lease renewal** immediately
-  via `set_node_role_via_s3()`. Extends lease before S3 fallback upload storm saturates MinIO.
-- Peer known but unreachable (subsequent failures): check S3 when `lease_time_remaining <= s3_lease_duration / 2`
-- While TCP heartbeats succeed, S3 lease is never renewed (cost saving)
-
----
+- No peer known: exponential backoff discovery (1s, 2s, 4s, capped at
+  `s3_lease_duration / 2`).
+- First failure after the peer was reachable: preemptive S3 lease renewal,
+  immediately. Renew before the fallback upload load lands on the object store.
+- Peer known, still unreachable: check S3 when
+  `lease_remaining <= s3_lease_duration / 2`.
+- While TCP heartbeats succeed: S3 is never touched.
 
 ## Connection Management
 
-The leader maintains **two separate TCP connections** to the follower, each with
-its own lock. This prevents replication traffic from starving heartbeats and
-vice versa.
+The leader holds two TCP connections to the follower, separately locked, so
+replication traffic cannot starve heartbeats.
 
-**Replication connection:**
-- Used for: batch replication, kick messages
-- Reuse: persistent across batches within a replication cycle, reset only on error
-- Timeouts: `connection_timeout` for TCP establishment, `request_timeout` per request
-
-**Heartbeat connection:**
-- Used for: heartbeat messages only
-- Reuse: **always resets** (fresh TCP connection every attempt)
-- Timeout: `heartbeat_timeout` applies to both connection and request, with a hard
-  outer timeout of `heartbeat_timeout * heartbeat_hard_timeout_multiplier` (default 2s)
-  to catch kernel-level TCP retransmit stalls
-- Rationale: a stale connection could block for `request_timeout` (10s) when the
-  peer is unreachable, preventing timely self-fencing
-
-**Address discovery:** The leader discovers the follower's replication address
-from the S3 membership object after election, not from heartbeat responses.
-Each node registers itself on the membership object at boot.
-
----
+- **Replication connection:** batches, kicks, commit-notifies. Persistent, reset
+  on error.
+- **Heartbeat connection:** heartbeats only. A fresh TCP connection every
+  attempt. A reused connection could block in the kernel for the full
+  `request_timeout` against a dead peer, which is precisely when the heartbeat
+  must fail fast.
 
 ## Boot Sequence
 
-Every non-standalone node starts in `BootCatchup` state. The boot orchestrator
-runs exclusively on shard 0 and drives the node from boot to steady state.
+Every non-standalone node starts in `BootCatchup`. The orchestrator runs on
+shard 0: register on membership, run S3 catchup across all shards, then elect.
 
-```mermaid
-flowchart TD
-    A[Process Start] --> B[Status = BootCatchup]
-    B --> C[Register self on S3 membership]
-    C --> D[Enter main orchestrator loop]
-    D --> E{Current status?}
+Client connections are accepted immediately at boot. Reads serve at any time;
+writes reject with `WRITE_NOT_LEADER` until `Leader` or `Standalone`.
 
-    E -->|BootCatchup| F[Run S3 catchup across all shards]
-    F --> G[set_node_role_via_s3: S3 election]
-    G --> H{Won election?}
-    H -->|Yes| I[Run post-promotion S3 catchup]
-    I --> J[Upload promotion batch to S3]
-    J --> K[Become Leader]
-    H -->|No| L[Become Follower]
+**Boot grace.** A fast restart lands in milliseconds, but the lease is only
+renewed on heartbeat failure, so a healthy leader's lease can be wall-clock
+expired in S3. If catchup finds a foreign lease that is also expired, the node
+waits up to `min(heartbeat_lease_duration_ms, 5000ms)` for an incoming heartbeat
+before challenging. A live heartbeat means defer; silence means challenge. One
+S3 GET, boot only.
 
-    E -->|Leader| M[Heartbeat loop]
-    E -->|Follower/Fenced| N[Wait for lease expiry then challenge]
-    E -->|FollowerCatchingUp| O[Run S3 catchup across all shards]
-    O --> P{Was kicked by live leader?}
-    P -->|Yes| Q[Resume as Follower, skip election]
-    P -->|No, boot catchup| G
-```
+**Post-election, in order:** record metrics, broadcast `UpdatePeerNodeId`, and
+then on the promotion path: publish `Promoting` to all shards, reconcile the
+durable tail, run post-promotion S3 catchup, upload the promotion batch. Then
+set addresses, broadcast `UpdateLeaderClientAddress` and `UpdateFollower`, and
+publish the final `StatusUpdate` that flips the node `Leader`.
 
-**Client connections are accepted immediately at boot.** Reads work at any time
-(serving stale data). Writes are rejected with `WRITE_NOT_LEADER` until the node
-reaches `Leader` or `Standalone`.
+## Shard 0 Coordination
 
-**Standalone mode** bypasses the boot orchestrator entirely. The node starts in
-`Standalone` state and accepts writes immediately. No S3, no replication.
+Shard 0 orchestrates through an intrashard mesh (bounded channels, retried
+sends). The message set: `Shutdown`, `ClientConnectionRedirect`,
+`ClusterConnectionRedirect`, `ExtensionConnectionRedirect`,
+`CullSpeculativeTail{TailReconciliation}`, `RenewS3LeaseNow`, `EnterS3Catchup`,
+`S3CatchupComplete`, `StatusUpdate`, `UpdatePeerNodeId`, `UpdateFollower`,
+`FollowerReachable`, `PeriodicProbe`, `HeartbeatInFlightStarted`,
+`HeartbeatInFlightCleared`, `UpdateLeaderClientAddress`, `SchemaRegistration`,
+`SchemaRegistrationComplete`.
 
-### Post-Catchup Boot Grace
+With `reserve_coordinator_shard` enabled, data routing skips shard 0
+(`routing_id % (num_shards - 1) + 1`) so write load cannot starve the heartbeat
+task. Shard 0 still binds a client listener; schema registration and redirects
+land there.
 
-A fast restart can land back up in milliseconds. `lease.bin` is only renewed on
-heartbeat failure, so an active leader's lease in S3 can be wall-clock-expired while
-the leader is healthy and writing. A naive challenge would race the leader's
-preemptive renewal and trigger a split-brain CAS.
-
-After S3 catchup completes, before challenging for leadership, peek `cluster/lease.json`.
-If another node holds the lease (even if S3 says expired), wait up to
-`min(heartbeat_lease_duration_ms, 5000ms)` for an incoming heartbeat. Three outcomes:
-- Heartbeat arrives confirming a live peer. Defer to it, become Follower.
-- Wait elapses with no heartbeat. Challenge via CAS.
-- Lease is held by us (last leader was us) or no lease exists. Proceed immediately.
-
-`peek_lease` is a single S3 GET, only on boot. No per-write S3 cost.
-
-### Post-Election Processing
-
-When `set_node_role_via_s3` completes, it performs these steps in order:
-
-1. Record election metrics
-2. Broadcast `UpdatePeerNodeId` to all shards (used to filter S3 batches)
-3. If promoted to leader: run S3 catchup (safety check), upload promotion batch
-4. Set leader/follower client and replication addresses
-5. Broadcast `UpdateLeaderClientAddress` and `UpdateFollower` to all shards
-6. Activate new node status and broadcast `StatusUpdate` to all shards
-
----
-
-## Shard 0 Coordination Protocol
-
-Shard 0 orchestrates all cluster-wide operations through an intrashard message
-mesh. Messages are sent via bounded channels with retry (10 attempts).
-
-**Intrashard message types:**
-
-| Message | Direction | Purpose |
-|---------|-----------|---------|
-| `EnterS3Catchup` | Shard 0 → all | Start S3 catchup on each shard |
-| `S3CatchupComplete` | All → shard 0 | Report catchup result per shard |
-| `StatusUpdate` | Shard 0 → all | Broadcast role/TTL changes |
-| `UpdatePeerNodeId` | Shard 0 → all | Share discovered peer node ID |
-| `UpdateFollower` | Shard 0 → all | Share follower replication address |
-| `UpdateLeaderClientAddress` | Shard 0 → all | Share leader client address for redirects |
-| `FollowerReachable` | Shard 0 → all | Notify shards that follower TCP is reachable |
-| `SchemaRegistration` | Any → shard 0 | Register schema via coordinator shard |
-| `SchemaRegistrationComplete` | Shard 0 → requester | Schema registration result |
-| `Shutdown` | Shard 0 → all | Initiate graceful shutdown |
-
-**S3 catchup orchestration:**
-
-```mermaid
-sequenceDiagram
-    participant S0 as Shard 0
-    participant S1 as Shard 1
-    participant SN as Shard N
-    participant S3 as MinIO
-
-    S0->>S1: EnterS3Catchup
-    S0->>SN: EnterS3Catchup
-    S0->>S3: Shard 0 catchup (synchronous)
-    S1->>S3: Shard 1 catchup (async)
-    SN->>S3: Shard N catchup (async)
-    S1-->>S0: S3CatchupComplete { shard_id: 1, result }
-    SN-->>S0: S3CatchupComplete { shard_id: N, result }
-    S0->>S0: Collect all results
-    alt Fatal error in any shard
-        S0->>S1: Shutdown
-        S0->>SN: Shutdown
-    else Retriable error
-        S0->>S0: Sleep 5s, retry from EnterS3Catchup
-    else All success
-        S0->>S0: Return true
-    end
-```
-
-Shard 0 performs its own catchup synchronously, then collects results from all
-other shards via a channel. Fatal errors trigger cluster shutdown. Retriable
-errors (transient S3 failures) retry after 5 seconds.
-
-**Shard 0 isolation (`reserve_coordinator_shard`):**
-- When enabled, shard 0 does not bind a client TCP listener
-- Client routing: `routing_id % (num_shards - 1) + 1` (skips shard 0)
-- Shard 0 handles: heartbeat, kick, schema registration, intrashard messages
-- Prevents write load from starving the heartbeat task
-
----
+S3 catchup fan-out: shard 0 broadcasts `EnterS3Catchup`, runs its own catchup
+synchronously, and collects `S3CatchupComplete` from every shard. Fatal errors
+shut the cluster down; transient S3 errors retry after 5s.
 
 ## Write Pipeline
 
-A client write passes through four sequential phases. The client ACK is withheld
-until all four complete.
-
-```mermaid
-flowchart LR
-    subgraph "Phase 1: Validate"
-        V[Load snapshots, OCC, idempotency, schema]
-    end
-    subgraph "Phase 2: Append"
-        A[Queue in memcache]
-    end
-    subgraph "Phase 3: Fsync"
-        F[Coordinator batches writers]
-        F --> F1[Write datablocks]
-        F1 --> F2[Write metablocks]
-        F2 --> F3[Write dual headers]
-        F3 --> F4[fdatasync]
-    end
-    subgraph "Phase 4: Replicate"
-        R[Coordinator batches]
-        R --> R1{TCP to follower?}
-        R1 -->|Success| R2[Commit: advance read, bump last_self_acked, fsync header]
-        R1 -->|Fail| R3[S3 fallback + kick]
-        R3 -->|Success| R2
-        R3 -->|Fail| R4[Spin: backoff + retry, 30s hard cap]
-        R4 --> R1
-    end
-    V --> A --> F --> R
-```
-
-**Fsync coordinator (two-phase):**
-1. First writer becomes leader, sleeps `fsync_delay` (17ms) for batching
-2. Subsequent writers become followers, share the result
-3. Leader captures snapshot, clears orchestrator, acquires `sync_gate`, fsyncs
-4. `sync_gate` ensures one fsync at a time
-
-**Visibility:**
-- After fsync on leader: data is on disk but invisible to readers (in `pending_replication_batches`)
-- After replication commit: read cursor advances, data visible to readers
-- After fsync on follower/standalone: data immediately visible (read cursor advances in fsync)
-
----
-
-## Replication Capture, Send, and Commit
-
-Phase 4 (Replicate) has three distinct sub-phases. Understanding these is critical
-for getting visibility semantics right.
-
-### Capture
-
-After fsync, each batch is pushed to `pending_replication_batches` in the memcache.
-The replication coordinator uses the same two-phase pattern as fsync: first writer
-sleeps `replication_delay`, subsequent writers share the result.
-
-The capture function drains the entire queue atomically (`std::mem::take`), then
-checks state in this exact order:
-
-1. Take snapshot (drain `pending_replication_batches`, reset `pending_replication_bytes` to 0)
-2. Check rollback flag (if set, return `Failed(RollbackInProgress)`)
-3. Check if snapshot is empty (if so, return `NoCaptureRaceButOk`)
-
-**The ordering matters.** Checking the rollback flag after the drain distinguishes
-"empty because idle" from "empty because rollback cleared it". The two-phase
-capture pattern (capture while orchestrator event is held, clear orchestrator,
-then process) prevents a race where a new coordinator leader finds an empty queue.
-
-**Capture result:**
-- `Captured(data)`: proceed to send
-- `Failed(RollbackInProgress)`: previous replication failed and rolled back
-- `NoCaptureRaceButOk`: empty queue, harmless race
-
-**What gets captured:** `PendingCommitData` per fsync batch, containing:
-- `log_metadata`: the log segment's write cursor position at fsync time
-- `pending_queue`: vector of `PendingCacheItem` (metablock + datablock pairs)
-
-The `pending_replication_batches` queue is intentionally unbounded. Queue pressure
-is detected via `pending_replication_bytes > pending_replication_high_water_bytes`,
-which triggers S3 fallback at the replication coordinator level.
-
-### Send
-
-The send phase is the TCP replication and S3 fallback logic described in the
-following sections. This is where the captured batches are transmitted to the
-follower or uploaded to S3.
-
-### Commit
-
-After successful replication (TCP or S3), the commit phase makes data visible
-to readers and pushes the ack horizon out to clients. Steps in order:
-
-1. **Bump `last_self_acked_wal_seq` and synchronously fsync the header.** This is the
-   ack barrier the S3 catchup truncate path consults. Coalesced via `sync_gate` with
-   concurrent fsyncs. Ok is returned to the client only after this fsync completes,
-   so a crash post-Ok still has the bumped value durable. Without this, a leadership
-   transition after shutdown could let catchup truncate below the ack horizon and
-   drop wal_seqs the cluster acknowledged.
-
-2. **Advance read cursor per-segment:** For each batch, copy the write cursor
-   to the read cursor: `metadata.read = Some(commit_data.log_metadata.write.clone())`.
-   Only updates cached log segments.
-
-3. **Update caches per-item:** For each metablock in the batch:
-   - `EventBatchMetadata`: update segment summary, commit position to read snapshot,
-     cache recent write with metablock and datablock data
-   - `SoftTrim`: update aggregate min aggregate version on both write and read paths
-   - `SoftDelete`: mark aggregate as deleted in read snapshot cache
-   - `SchemaRegistration`: follower compiles and caches the schema on fsync
-     (leader caches at write time). Both nodes have schemas available for reads.
-
-4. **Finalize sealed segments:** If a non-active log segment is now fully replicated
-   (`read.wal_seq == write.wal_seq`), extract its sealed segment summary from
-   memcache for sidecar file write. This is best-effort (errors logged, not fatal).
-
-5. **Broadcast watch events:** Events are collected during step 3 and broadcast
-   in fixed order: Create, Write, Delete, Trim. Watch events only fire after
-   durable replication on the leader (or after fsync on non-leader).
-
----
-
-## TCP Replication (Leader to Follower)
-
-The replication coordinator batches pending writes, then attempts TCP replication
-in paginated chunks bounded by `max_request_size`.
-
-```mermaid
-sequenceDiagram
-    participant L as Leader
-    participant F as Follower
-    participant S3 as MinIO
-
-    L->>L: Capture replication snapshot from memcache
-    L->>L: Check is_leader() — fence + rollback if expired
-
-    loop For each chunk (≤ max_request_size)
-        L->>L: Re-check is_leader() (lease may expire mid-pipeline)
-        L->>F: ReplicationBatch(items)
-
-        alt Success
-            F->>F: apply_external_batch (WAL sequence + hash check)
-            F->>F: sync_durable (fsync as Standalone)
-            F-->>L: Success
-            L->>L: Drain sent items from workset
-
-        else WalSeqMismatch (follower behind)
-            F-->>L: Rejected(WalSeqMismatch { max_follower_wal_seq })
-            L->>L: fetch_catchup_entries from local WAL
-            alt Entries found (within max_catchup_gap_bytes)
-                L->>L: Prepend catchup entries to workset
-                L->>F: Retry with catchup + original entries
-            else FollowerTooFarBehind
-                L->>S3: replicate_to_s3(all remaining)
-                L->>F: send_kick()
-            end
-
-        else Connection error / other rejection
-            L->>S3: replicate_to_s3(all remaining)
-            L->>F: send_kick()
-        end
-    end
-
-    L->>L: commit_replication (advance read cursor, notify watchers)
-```
-
-**Mid-spin fencing:** The spin loop re-checks `is_leader()` at the top of every
-iteration and after each successful replicate before bumping `last_self_acked_wal_seq`.
-Pipeline stalls (S3 upload, retry backoff, catchup fetch) routinely exceed the ~1s
-lease TTL. If the lease expired mid-pipeline, the loop returns `LeaderFenced` and
-leaves the captured snapshot in pending. No rollback. A new leader's cull or the
-next replication trigger resolves the orphan. The post-publish check closes the
-in-process leg of dual-ack where a fence flipped between TCP success and
-`last_self_acked` bump.
-
-**Follower validation on receive:**
-1. WAL sequence continuity: `current + 1 == batch[0].wal_seq`
-2. Hash chain: `current_tip_hash == batch[0].previous_tip_hash`
-3. Batch internal contiguity: each item's WAL sequence is previous + 1
-4. Lease epoch: `batch.lease_epoch >= follower.leader_lease_epoch`
-
-**After successful TCP receive, the follower records `last_received_replication_wal_seq`
-in the log segment header.** This survives crashes and is used during promotion to
-upload the batch to S3 (see Promotion Batch Upload below).
-
-**Authentication:** mTLS on the replication port (always required, hardcoded).
-Per-request `lease_epoch` validation prevents stale leaders from overwriting data.
-No separate API key or token for replication.
-
----
-
-## S3 Fallback Replication
-
-When TCP replication fails (follower offline, too far behind, or connection error),
-the leader uploads the batch to MinIO as a `FallbackBatch`. Each batch is a single
-S3 object named by shard, WAL range, and uploader node ID.
-
-**Triggers:**
-- Follower offline (TCP connection fails)
-- `workset_size_bytes > max_catchup_gap_bytes` (follower falling behind)
-- `pending_replication_bytes > pending_replication_high_water_bytes` (queue pressure)
-- Second TCP rejection after catchup retry
-
-**After successful S3 upload, the leader fires a kick** via `try_acquire_kick` /
-`release_kick` — a fire-and-forget `spawn_local` task, not awaited on the commit path.
-At most one kick task is in-flight per shard (latch-based, not per-cycle). This
-decouples commit latency from `internode_request_timeout` (~2s) when the follower is
-slow or dead. The kick transitions the follower from `Follower` to `FollowerCatchingUp`.
-
-**S3 upload concurrency:** All shards share a global semaphore capped at
-`s3_max_concurrent_fallback_uploads` (default 2). This prevents MinIO saturation
-during follower outages, which could starve shard 0's S3 lease renewal and cause
-leadership loss.
-
-**FallbackBatch structure:**
-- `fallback_index` (u64): first WAL sequence in the batch
-- `end_wal_seq` (u64): last WAL sequence in the batch
-- `shard_id` (u32)
-- `uploaded_by_node_id` (u128)
-- `items`: Vec of (metablock, optional datablock) pairs
-
----
-
-## Kick and Catchup Flow
-
-```mermaid
-sequenceDiagram
-    participant L as Leader
-    participant F as Follower (shard 0)
-    participant S3 as MinIO
-
-    L->>F: KickFollower (via replication connection)
-    F->>F: Follower → FollowerCatchingUp
-    F->>F: Broadcast StatusUpdate to all shards
-
-    Note over F: Boot orchestrator sees FollowerCatchingUp
-
-    F->>S3: List fallback batches for each shard
-    F->>S3: Download and apply batches
-    F->>F: Delete consumed batches from S3
-
-    alt Kicked by live leader (has leader_lease_epoch)
-        F->>F: Resume as Follower (skip S3 election)
-        Note over F: Leader proved alive by kicking us
-    else Boot catchup (no leader_lease_epoch)
-        F->>S3: run_election_to_acquire_s3_lease
-        F->>F: Become Leader or Follower
-    end
-```
-
-**Kick message:** A minimal request (`KickFollowerRequest` with only a correlation ID),
-sent on the **replication connection** (not heartbeat). Returns `acknowledged: bool`.
-A non-follower node rejects with `acknowledged: false`.
-
-**FollowerCatchingUp vs BootCatchup:**
-
-| Aspect | BootCatchup | FollowerCatchingUp |
-|--------|-------------|-------------------|
-| When set | Process start | Leader sends kick |
-| Carries leader_lease_epoch | No | Yes |
-| Post-catchup action | S3 election | Resume as Follower |
-| TTL behavior | Exempt | Exempt |
-| Heartbeat Ack `follower_can_accept_tcp_replication` | `false` | `false` |
-
-During both catchup states, the follower ACKs heartbeats (it's alive) but signals
-`follower_can_accept_tcp_replication = false`. The leader uses this to route commits
-straight to S3 fallback without attempting TCP replication that would be rejected.
-
-**S3 catchup per-shard:**
-1. List S3 objects, filter by peer node ID (ignore self-uploads and stale generations)
-2. Deduplicate: same start index, keep largest end index
-3. Validate inter-batch contiguity: `batch[i].end + 1 == batch[i+1].start`
-4. For each batch: download, skip already-applied entries, apply, fsync, delete from S3
-5. On `TipHashMismatch`: find divergence point. `find_divergence_via_s3` returns the
-   start of the matched S3 batch (conservative; that batch often contains entries this
-   node already has byte-identically from prior TCP replication). A byte-match walk
-   then advances `divergent_wal_seq` past any byte-identical prefix. Truncate proceeds
-   only if `divergent_wal_seq > last_self_acked_wal_seq` (the ack barrier). Below the
-   barrier means the truncate would drop a wal_seq this node returned Ok to a client
-   for: refuse with `TruncateRefusedByAckBarrier`, retriable so the shard catchup
-   driver keeps retrying instead of crashing.
-6. On `WalSeqMismatch` (batch starts ahead): defer to TCP replication
-
----
-
-## Replication Failure Handling
-
-TCP and S3 fallback both fail? The writer's await stays pending. Replication spins
-in-place: 50ms backoff capped at 500ms, hard timeout 30s, `is_leader()` re-checked
-on every iteration.
-
-Three terminal outcomes:
-- A retry succeeds. Write returns Ok normally.
-- Hard timeout elapses. Writer gets `ReplicationError::LeaderFenced`.
-- Lease lapses mid-spin. Writer gets `LeaderFenced`. The captured snapshot stays in
-  `pending_replication_batches` for the next replication trigger.
-
-No rollback. No cursor rewind. Pending data sits until either the spin completes, or
-a role transition cull sweeps it. Holding the writer's await blocking on the snapshot
-in pending is what prevents silent loss when a writer disconnects mid-retry; the old
-rollback-then-return-Err path could lose the snapshot if no later writer triggered the
-next replication cycle.
-
-`is_terminal_replication_error` lists what bails out immediately: auth failures,
-serialization errors, malformed batches. Everything else spins.
-
-Idle clusters need a kick. A 5s periodic reachability probe in the heartbeat loop
-fires `probe_replicate` when the follower is reachable, so any tail that didn't land
-before writers paused drains without waiting on the next client write.
-
----
-
-## Promotion Batch Upload
-
-Covers a specific partition scenario where a TCP-replicated batch exists on the
-follower but was rolled back by the leader and never uploaded to S3.
-
-**Scenario:**
-1. Leader writes batch X, TCP-replicates to follower, follower fsyncs and ACKs
-2. Network partition: leader cannot reach follower or S3
-3. Leader rolls back batch X (both paths failed)
-4. Follower keeps batch X (received and fsynced before partition)
-5. Leader's S3 lease expires, follower wins election
-6. Follower becomes leader, starts writing X+1, X+2... (S3 fallback since old leader offline)
-7. S3 has X+1, X+2... but NOT X
-8. Old leader rejoins, enters S3 catchup: gap at X
-
-**Fix:** Two steps run on promotion, before accepting writes:
-
-1. **Cull speculative tail.** If `read.wal_seq < write.wal_seq`, the node has an
-   unreplicated tail from a prior leadership stint. Rewind `write` to `read`, drain
-   pending PCDs that reference the discarded range, clear the OCC and aggregate write
-   LRUs (surgical: queue positions, schema cache, and rollback_generation are left
-   alone). Fsync the header. A `CullSpeculativeTail` intrashard message broadcasts
-   to non-coordinator shards before S3 catchup runs, since catchup's apply filter
-   starts at `write + 1` and would otherwise skip peer batches in the `[read+1, write]`
-   range.
-
-2. **Upload promotion batch.** The last TCP-received batch (tracked via
-   `last_received_replication_wal_seq`) goes to S3 so a partitioned old leader can
-   catch up via S3 catchup on reconnect.
-
-**Limitation:** Only fires on leadership change. If the original leader stays leader,
-the gap between TCP-replicated and S3-uploaded entries is not backfilled. The follower
-handles this via `WalSeqMismatch` deferral to TCP replication.
-
----
-
-## Boot Orchestrator Steady-State Loops
-
-After boot completes, the orchestrator loop continues running on shard 0.
-The loop has four mutually exclusive branches based on current node status.
-
-### Steady-State S3 Invariant
-
-In a healthy two-node cluster where both nodes are reachable and clocks are
-within drift tolerance, **S3 is never touched**. No lease renewal, no fallback
-replication, no S3 reads. All coordination flows over TCP heartbeats (shard 0),
-all data flows over TCP replication (all shards). The chaos baseline enforces
-this via `NoS3Fallbacks` and `NoHeartbeatFailures`.
-
-S3 activates only on failure: follower unreachable (TCP replication fails →
-S3 fallback), lease renewal needed (heartbeat fails → S3 CAS), or node restart
-(boot catchup reads S3 fallback batches). This keeps steady-state latency
-independent of S3 round-trip time and avoids MinIO cost under normal load.
-
-### Leader Steady State
+Four sequential phases; the client ack waits for all four.
+
+1. **Validate.** Snapshots, OCC, idempotency, schema.
+2. **Append.** Queue in memcache.
+3. **Fsync.** Coordinator batches writers: first writer sleeps `fsync_delay`
+   (17ms) to batch, captures the snapshot, and fsyncs under `sync_gate` (one
+   fsync at a time). Datablocks, metablocks, dual headers, fdatasync.
+4. **Replicate.** Coordinator batches again, sends TCP (or S3 fallback), and
+   commits.
+
+Two pipeline guards matter for latency and correctness:
+
+- **Fast path gate.** The replication coordinator's low-latency fast path is
+  gated on `last_two_phase_batched`, so a free coordinator under load does not
+  fragment batches and de-amortise the pipeline.
+- **Confirmation gate.** The write's ack is not released until the read cursor
+  confirms the write tip; the gate re-enters the coordinator until it does. A
+  TCP success whose commit did not land yet cannot produce a premature ack.
+
+## The Visibility Model: Three Commit Rules
+
+Durability and visibility are decoupled everywhere. An fsync makes bytes
+durable; a *commit* makes them visible: advance the read cursor, populate read
+snapshots and the recent-write cache, contribute to segment summaries, fire
+watch events. `commit_pcd` is the single commit implementation; the only thing
+that varies is who triggers it, and when.
+
+`CommitTarget` (`shard_wal_sync.rs`) picks the rule by write provenance, not by
+`is_leader()`:
+
+| Provenance | CommitTarget | Commit trigger |
+|---|---|---|
+| Leader client write | `DeferToReplicationAck` | replication ack |
+| Follower live-TCP apply | `DeferToLeaderConfirmed` | carrier's `leader_confirmed_wal_seq` |
+| S3 catchup, standalone | `FullCommit` | the fsync itself |
+
+### Leader: commit on replication ack
+
+After a successful replicate, in order: `commit_pcd` applies the read-side
+commit (cursor, caches, watch events), then `last_self_acked_wal_seq` is bumped
+and the header is synchronously fsynced, then the client gets Ok. The ack
+barrier is durable before the ack exists, so a crash after Ok can never be
+truncated below what clients were told.
+
+The commit also finalizes sealed segments (a non-active segment whose
+`read == write` gets its sidecar summary written, best-effort) and broadcasts
+watch events in fixed order: Create, Write, Delete, Trim.
+
+### Follower: park, then drain on confirmation
+
+The follower fsyncs replicated batches durable but *invisible*. A batch that
+would have committed at fsync time instead parks: the fsync pushes its
+`PendingCommitData` onto a wal_seq-ordered queue in the shard memcache
+(`push_parked_commit`). The queue never drops; exceeding the byte cap only
+trips `celeriant_parked_commit_overflow_total`.
+
+Visibility advances when a carrier proves the leader committed:
 
 ```
-loop {
-    sleep(heartbeat_interval)                           // 500ms default
-    send_heartbeat(timestamp, lease_epoch)              // hard timeout: 2s default
-
-    if Ack { follower_can_accept_tcp_replication }:
-        has_peer = true
-        reset peer_discovery_backoff to 1s
-        follower_reachable = follower_can_accept_tcp_replication
-        broadcast FollowerReachable to all shards
-        extend own TTL = now + heartbeat_lease_duration
-        broadcast StatusUpdate to all shards
-        continue                                        // skip S3 check
-
-    // Heartbeat failed
-    increment heartbeat_failures counter
-
-    if no peer known:
-        should_check_s3 = backoff elapsed               // 1s, 2s, 4s... capped
-    else if peer was reachable, now unreachable (first failure):
-        should_check_s3 = true                          // preemptive lease renewal
-    else (peer known, still unreachable):
-        should_check_s3 = lease_remaining < half_s3_lease OR expired
-
-    if !should_check_s3: continue                       // retry next interval
-
-    set_node_role_via_s3()                              // S3 lease renewal/election
-    update peer_discovery_backoff
-}
+read = max(read, min(leader_confirmed_wal_seq, write))
 ```
 
-### Follower Steady State
+Every replication request carries the leader's confirmed index. The drain pops
+parked batches whose fsync-time tip the carrier covers and runs `commit_pcd` on
+each, in order. Two drains bracket the data fsync: one before (`sync_durable`'s
+own header write then persists the advanced cursor for free) and one after (for
+carriers that confirm at-or-past the new tip). Confirm-only carriers with no
+data fsync are followed by a coordinator-serialized header-only sync, tracked by
+`read_wal_synced`, so the advanced cursor is never left memory-only.
 
-```
-loop {
-    check effective status (may auto-fence if TTL expired)
-    remaining = lease_expires_at - now
-    sleep(min(remaining, 500ms))                        // 500ms cap for shutdown
+Two structural cases fall out of the same formula. A stale carrier drains
+nothing (the queue only holds batches above read). After a crash-restart the
+queue is empty but the durable prefix is real: when the carrier confirms exactly
+the write tip and nothing is parked, a bare cursor advance is the whole commit,
+because the caches are cold anyway.
 
-    if lease was refreshed by heartbeat handler: continue
-    if status changed (e.g., kicked): continue
+Schema registrations compile on drain on the follower (`commit_pcd` takes the
+codec; the leader compiled at write time and passes nothing).
 
-    // Lease expired, leader presumed dead
-    set_node_role_via_s3()                              // challenge for leadership
-}
-```
+Watch semantics follow directly: a follower-side subscriber sees an event only
+at-or-after the leader committed it, exactly once, in order. The parked tail's
+events fire at the drain that commits it, never at fsync.
 
-The follower's heartbeat reception happens on a separate task (the TCP connection
-handler on shard 0), not in the orchestrator loop. The handler extends the TTL
-and broadcasts the status update. The orchestrator loop only detects expiry.
+### Commit-notify: idle convergence without polling
 
----
+Under load, carriers arrive constantly and the follower's read lag is
+batch-scale. At idle the last batch's confirmation has no later carrier to ride.
+Waiting for the 5s reachability probe would leave a multi-second visibility gap
+on an idle cluster.
 
-## Component Interaction
+The leader closes it with a commit-notify: after a burst completes, a detached
+post-burst task sends an empty-batches replication request carrying the
+confirmed index. On the receiver, an empty request that passes every existing
+guard (time drift, epoch, state) *is* the notify: it runs the same floor-update,
+parked drain, and cursor persistence the data path runs, and is structurally
+chain-neutral. An empty batch failing a guard is rejected with that guard's
+reason; a zombie leader's notify fences as `StaleLease` like any other request.
 
-```mermaid
-flowchart TB
-    subgraph "Shard 0 (Coordinator)"
-        BO[Boot Orchestrator]
-        HB[Heartbeat Task Queue]
-        KH[Kick Handler]
-    end
+The sender's floor rises to the index actually sent, so overlapping bursts do
+not re-notify stale values. The spawn is budget-gated; the gate's metrics
+distinguish fenced from exhausted. Notify loss is legal (rollback-flag death,
+reachability flip, latch skip) because the probe nets every survivor: follower
+visibility lag is bounded by the probe interval, not the notify window.
 
-    subgraph "Shards 1..N (Data)"
-        CL[Client Listener]
-        WP[Write Pipeline]
-        FC[Fsync Coordinator]
-        RC[Replication Coordinator]
-    end
+`celeriant_commit_notify_sent_total` on the leader equals
+`celeriant_commit_notify_received_total` on the follower when no notify was
+lost; chaos runs assert the pairing.
 
-    subgraph "External"
-        S3[MinIO / S3]
-        PEER[Peer Node]
-    end
+## Replication: Capture, Send, Commit
 
-    CL --> WP
-    WP --> FC
-    FC --> RC
-    RC -->|TCP| PEER
-    RC -->|S3 fallback| S3
-    RC -->|kick| KH
+**Capture.** The replication coordinator uses the same two-phase pattern as
+fsync. Capture checks the rollback flag first, then drains
+`pending_replication_batches` atomically, then checks empty
+(`NoCaptureRaceButOk` for the harmless race). Checking rollback before the drain
+distinguishes "empty because idle" from "cleared by rollback".
 
-    BO -->|heartbeat| PEER
-    BO -->|election| S3
-    BO -->|S3 catchup| S3
+**Backpressure.** The pending queue is bounded indirectly: a 64MiB inflight-byte
+cap rejects new writes at admission. Queue pressure pushes back on clients; it
+does not silently reroute to S3.
 
-    HB -.->|Latency::Matters| BO
-```
+**Send.** TCP in chunks bounded by `max_request_size` (16MiB). The follower
+validates each batch four ways: WAL sequence continuity, tip-hash chain, internal
+contiguity, and sender epoch at-or-above its own (plus time-drift). On
+`WalSeqMismatch` (follower behind), the leader fetches the gap from its own WAL
+and sends it as separate chunked catchup requests, then retries the original.
+Too far behind, or any second rejection: S3 fallback plus a kick.
 
----
+**Mid-spin fencing.** Replication failure spins in place: 50ms backoff doubling
+to an effective 400ms cap, 30s hard timeout, `is_leader()` re-checked every
+iteration and again after each successful send before the ack-barrier bump. A
+lease that lapses mid-pipeline returns `LeaderFenced` and leaves the captured
+snapshot in pending — no rollback, no cursor rewind. The next trigger or a role
+transition sweeps it. Holding the writer's await on the pending snapshot is what
+prevents silent loss when a client disconnects mid-retry.
 
-## Timeline: Normal Operation
+Terminal errors (auth, serialization, malformed batches) bail immediately;
+everything else spins.
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant L as Leader
-    participant F as Follower
-    participant S3 as MinIO
+**Idle drains.** A 5s reachability probe in the heartbeat loop fires
+`probe_replicate` so a tail that missed its window drains without waiting for
+the next client write.
 
-    Note over L,F: Stable state: L is leader, F is follower, heartbeats flowing
+## S3 Fallback
 
-    C->>L: Write(data)
-    L->>L: Validate + append + fsync
-    L->>F: TCP replicate batch
-    F->>F: apply + fsync
-    F-->>L: ACK
-    L->>L: Advance read cursor (visible to readers)
-    L-->>C: Success
+When TCP fails (follower offline, too far behind, connection error), the leader
+uploads the batch as a `FallbackBatch` object and fires a kick: a fire-and-forget
+task, latch-limited to one in flight per shard, so commit latency never waits on
+a dead follower's connect timeout. Uploads across all shards share a global cap
+(`s3_max_concurrent_fallback_uploads`, default 128).
 
-    L->>F: Heartbeat
-    F-->>L: Ack (extends both TTLs)
-```
+The kick flips the follower to `FollowerCatchingUp`. In that state (and in
+`BootCatchup`) the follower still acks heartbeats but reports
+`follower_can_accept_tcp_replication = false`, so the leader routes commits
+straight to S3 without burning a rejected TCP round-trip.
 
----
+**Catchup per shard:** list objects, filter to the peer's uploads, dedupe (same
+start, keep largest end), validate contiguity, then download-apply-fsync-delete.
+Catchup applies with `FullCommit` — no leader confirmation is needed because an
+S3-listable batch was durably uploaded by a leader before it acked. Any parked
+live-TCP commits below the new tip are committed first, so the cursor stays
+monotonic and their watch events fire exactly once.
 
-## Timeline: Cable Pull (Follower Offline)
+A kicked follower resumes as `Follower` without an election: the kick itself
+proved the leader alive. Boot catchup ends in an election instead.
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant L as Leader
-    participant F as Follower
-    participant S3 as MinIO
+**Divergence.** On `TipHashMismatch`, `find_divergence_via_s3` returns a
+conservative divergence floor (the start of the matched batch), and a byte-match
+walk advances it past every byte-identical entry. Truncation then runs only above
+the ack barrier: a truncate at-or-below `last_self_acked_wal_seq` would rewrite
+history this node acked, so it refuses loudly (`TruncateRefusedByAckBarrier`,
+retriable) and stays in catching-up until an operator looks. Truncation commits
+the surviving parked prefix below the divergence point (their events fire exactly
+once, here) and discards the rest without firing anything — those entries left
+the chain.
 
-    Note over L,F: Stable state, then follower cable pulled
+## Promotion and Demotion
 
-    C->>L: Write(data)
-    L->>L: Validate + append + fsync
-    L->>F: TCP replicate batch
-    Note over L,F: Connection timeout
-    L->>S3: S3 fallback upload
-    L->>F: send_kick (may fail, cable still out)
-    L-->>C: Success (S3 replication satisfied durability)
+The durable tail at a role transition is the dangerous asset. Whether to commit
+it or destroy it is a provenance question, and provenance survives crashes only
+on disk: a reverse scan of the tip metablock's author `node_id` decides. Mixed
+tails are impossible; a leader never chains onto unacked foreign speculation, and
+the demotion cull runs before peer data is accepted.
 
-    Note over F: Cable restored
+`TailReconciliation` names the three transitions:
 
-    L->>F: Heartbeat resumes
-    L->>F: send_kick (succeeds now)
-    F->>F: Follower → FollowerCatchingUp
-    F->>S3: Download fallback batches
-    F->>F: Apply + fsync
-    F->>S3: Delete consumed batches
-    F->>F: Resume as Follower (leader proved alive via kick)
+- **`CommitForPromotion`** — the winner's tail is peer-received replicated data
+  the dead leader may have acked. The flip-drain takes every parked commit,
+  runs `commit_pcd` on each, advances the cursor, and fsyncs the header. An
+  error here fails the election (`PromotionFlipGate::Abort`); a node that cannot
+  commit its tail must not open writes. Losing the CAS race mid-window steps
+  down gracefully (`LostRace` adopts the observed follower status).
+- **`RewindToAckBarrier`** — demotion from held leadership. Own speculation
+  above the ack barrier is unacked by construction (the barrier fsync precedes
+  every Ok), so the write cursor rewinds to read, the culled range's parked and
+  pending state clears without firing events, and the OCC/write LRUs drop.
+- **`ReconcileAsFollower`** — boot as follower behind a peer's lease. A peer
+  tail stays parked for normal confirmation; an own-speculation tail culls as in
+  demotion.
 
-    L->>F: TCP replicate (normal path resumes)
-```
+**Promotion floor.** Followers track `last_received_replication_wal_seq` as
+`confirmed + 1`, monotonic. At promotion it bounds the S3 upload of the
+unconfirmed range, so a partitioned old leader can later catch up from S3 a
+batch the dead leader never uploaded. A fully-confirmed idle follower has floor
+= tip + 1 and correctly uploads nothing. The floor clears only at the final
+Leader flip, which doubles as the crash re-entry marker: a node that died
+mid-promotion resumes the pipeline (`promotion_resume_owed`) instead of
+assuming the flip completed.
 
----
+The upload gate admits `Leader | Promoting`, so the upload runs inside the
+promotion window on every shard, coordinator included.
 
-## Timeline: Cable Pull (Leader Offline)
+## Steady-State Loops
 
-```mermaid
-sequenceDiagram
-    participant L as Leader
-    participant F as Follower
-    participant S3 as MinIO
+**Leader:** heartbeat every 500ms; on ack, extend TTL and broadcast; on failure,
+the escalation ladder from the heartbeat section. While heartbeats succeed the
+loop never touches S3.
 
-    Note over L,F: Stable state, then leader cable pulled
-
-    Note over F: Heartbeat TTL expires (1500ms)
-    F->>F: Follower → Fenced (effective)
-    F->>F: Wait for full lease expiry
-    F->>S3: run_election (leader's S3 lease expired)
-    F->>F: Win election → FollowerCatchingUp
-    F->>S3: S3 catchup (sanity check)
-    F->>S3: upload_s3_promotion_batch (if pending)
-    F->>F: Become Leader
-
-    Note over L: Leader cable restored
-    L->>L: Heartbeat send fails (peer unreachable during partition)
-    L->>S3: S3 lease renewal attempt
-    L->>L: Discover higher lease_epoch → step down to Follower
-
-    F->>L: Heartbeat (new leader → old leader)
-    L->>L: Accept heartbeat (higher lease_epoch)
-    L->>L: Leader → Follower
-```
-
----
-
-## Edge Cases for Gap Analysis
-
-These are the scenarios where a WAL sequence gap can form between a follower's local
-WAL and the S3 fallback batches:
-
-### 1. TCP-only entries before S3 transition
-
-**Sequence:** Leader TCP-replicates batch A to follower. Follower ACKs. Leader
-commits. Next batch B: follower offline, S3 fallback. S3 has B but not A.
-
-**Gap?** No gap on the follower (it has A on disk). Gap only affects a THIRD node
-or a follower that lost A (crash without fsync, but the follower fsyncs before ACK).
-
-**Risk:** If the follower's data directory is wiped but S3 is not, the follower
-cannot rebuild from S3 alone (A is missing). This is by design. S3 is a
-catch-up mechanism, not a full backup.
-
-### 2. Leader rollback with leadership change
-
-**Sequence:** Leader sends batch X via TCP (follower ACKs). Leader then tries
-batch Y: TCP fails, S3 fails, rollback (Y reverted). Leader's S3 lease expires.
-Follower wins election, becomes leader. S3 has no X (TCP-only). Follower writes
-X+1 via S3. Old leader rejoins: S3 has X+1 but not X.
-
-**Mitigation:** `upload_s3_promotion_batch`. The new leader uploads X to S3 on
-promotion, before accepting writes.
-
-### 3. Leader rollback without leadership change
-
-**Sequence:** Leader sends batch X via TCP (follower ACKs). Leader then tries
-batch Y: TCP fails, S3 fails, rollback. Leader stays leader. New writes resume
-from rollback point. Follower goes offline. Leader falls back to S3 for new
-batches. S3 starts after rollback point but TCP-replicated batch X exists only
-on both local disks.
-
-**Gap?** No gap. Both nodes have X. When follower catches up from S3, it already
-has X locally. The S3 batch's `skip` logic handles the overlap.
-
-### 4. Partial TCP delivery
-
-**Sequence:** Leader sends paginated batch (chunk 1: A..B, chunk 2: C..D).
-Chunk 1 succeeds (drained from workset). Chunk 2: connection drops mid-send.
-Leader falls back to S3 for remaining entries (C..D). Next cycle: new entries
-(E..F) also go to S3.
-
-**Gap?** No. S3 batches are C..D and E..F, contiguous. Follower has A..B from
-TCP and C..F from S3.
-
-### 5. Fsync delay window on follower
-
-**Sequence:** Follower receives TCP batch, queues in memcache. Fsync coordinator
-hasn't fired yet (17ms delay). Cable pulled. Follower restarts. Write cursor
-is at pre-batch position (fsync never completed).
-
-**Gap?** No gap from S3 perspective. The follower didn't ACK (fsync didn't complete),
-so the leader didn't drain those entries. The leader retries (TCP or S3 fallback)
-with the same entries.
-
-### 6. S3 batch consumed then crash
-
-**Sequence:** Follower downloads S3 batch for shard 1, applies + deletes from S3.
-Then shard 3's batch fails. Process crashes. On restart: shard 1's batch is gone
-from S3 (deleted), shard 3's batch is still there.
-
-**Gap?** No gap per-shard. S3 deletion is per-shard. Shard 1 already applied its
-batch (durable). Shard 3 retries from the same position.
-
-### 7. Stale data from previous crash-loop
-
-**Sequence:** Follower crash-loops through multiple S3 catchup attempts. Each
-attempt may partially truncate the WAL (TipHashMismatch handling). WAL ends up
-at an inconsistent position relative to what S3 has. On next clean startup, S3
-batches don't align with the truncated WAL.
-
-**Gap?** Possible. The truncation + crash leaves the WAL at a position that
-doesn't match any S3 batch boundary. Mitigation: `WalSeqMismatch` deferral
-to TCP replication.
-
----
-
-## Default Configuration Values
-
-| Parameter | Default | Purpose |
-|-----------|---------|---------|
-| `heartbeat_interval_ms` | 500 | Leader heartbeat send interval |
-| `heartbeat_lease_duration_ms` | 1500 | Follower TTL extension per heartbeat |
-| `max_clock_drift_ms` | 500 | Clock drift tolerance, early fencing margin |
-| `heartbeat_hard_timeout_multiplier` | 4 | Hard timeout = heartbeat_timeout × this (catches kernel TCP stalls) |
-| `s3_max_concurrent_fallback_uploads` | 2 | Global semaphore cap on concurrent S3 fallback uploads |
-| `fsync_delay` | 17ms | Batching window for fsync coordinator |
-| `max_request_size` | 16 MiB | TCP replication chunk size bound |
-| `max_response_size` | 64 MiB | Response size bound |
-
----
+**Follower:** sleep until TTL expiry (500ms cap for shutdown responsiveness).
+Heartbeat reception lives on the shard-0 connection handler, which extends the
+TTL and broadcasts; the orchestrator loop only detects expiry and challenges.
 
 ## Split-Brain Prevention
 
-Four overlapping mechanisms prevent two nodes from writing simultaneously:
+Five overlapping mechanisms:
 
-**1. Asymmetric TTL decay (leader self-fences early):**
-Every shard checks `effective_node_status()` before accepting a write. The leader
-fences at `expires_at - max_clock_drift` (default: 500ms early). The follower waits
-for the full `expires_at` before challenging. This creates a guaranteed window where
-the leader has stopped writing before the follower can win an election.
+1. **Asymmetric TTL decay.** The leader self-fences `max_clock_drift` early;
+   the follower challenges at full expiry. The gap guarantees a stopped leader
+   before a new one can exist.
+2. **Monotonic `lease_epoch` on every metablock.** A superseded leader cannot
+   produce a current epoch; the follower rejects `StaleLease` on TCP, catchup,
+   and commit-notify alike.
+3. **Per-shard write gating.** Every write checks `effective_node_status()`
+   synchronously. Fenced means rejected before the pipeline.
+4. **Post-publish lease re-check.** After a successful replicate and before the
+   `last_self_acked` bump, the leader re-reads its status and refuses the bump
+   if fenced. Closes the in-process dual-ack leg where the fence flipped between
+   TCP success and the ack. Local atomic read, no S3 on the write path.
+5. **Ack-barrier truncate refusal.** Catchup cannot truncate at-or-below
+   `last_self_acked_wal_seq`, ever. Even if the other four miss, a node's own
+   acked history cannot be silently rewritten.
 
-**2. Monotonic `lease_epoch` on every batch:**
-Every metablock carries the leader's `lease_epoch`. A stale leader (whose lease
-expired and was superseded) cannot produce a `lease_epoch` >= the new leader's.
-The follower rejects `StaleLease` on both TCP replication and S3 catchup paths.
+Residual risk: clock drift beyond `max_clock_drift_ms` closes the asymmetric
+window. The epoch check is the last line then. Deployment keeps
+`heartbeat_lease_duration_ms << s3_lease_duration_ms` to bound the degraded-mode
+dual-ack geometrically, and the cluster nodes run chrony (continuous discipline,
+~1ms relative drift) rather than step-only time sync.
 
-**3. Write gating per-shard:**
-Every write path checks `effective_node_status()` synchronously before entering
-the pipeline. Once fenced, new writes are immediately rejected with
-`ShardCannotAcceptWrites`. In-flight writes that already passed the gate but
-haven't replicated yet will be rejected by the follower's `lease_epoch` check.
+## Observability
 
-**4. Post-publish lease check:**
-After a successful replicate (TCP or S3) and before bumping `last_self_acked_wal_seq`,
-the leader re-reads `node_status` and refuses the bump if it has fenced. Local atomic
-read, no S3 round-trip per write. Closes the in-process leg of dual-ack where the
-fence flipped between TCP success and the ack bump. Cross-node degraded-mode dual-ack
-(local HB-extended TTL drifting above S3-confirmed expiry) is bounded geometrically by
-requiring `heartbeat_lease_duration_ms` << `s3_lease_duration_ms` in deployment config.
+The visibility split is instrumented end to end, per shard:
 
-**5. Ack barrier on S3 catchup truncate:**
-S3 catchup refuses to truncate at any wal_seq <= `last_self_acked_wal_seq`. Even if a
-new leader's chain diverges, the old leader's local can't be silently rewritten over
-its own client acks. The barrier is the last line of defence when the other four miss
-something; refusal is loud (`TruncateRefusedByAckBarrier`) and retriable so the node
-stays alive in catching-up state until operator intervention.
+- `celeriant_wal_seq` / `celeriant_read_wal_seq` — durable tip and committed
+  cursor. The read gauge sources `committed_read_wal_seq()`, which is
+  rotation-aware (an active segment's read is None right after rotation while
+  the cursor sits in the predecessor).
+- `celeriant_follower_read_lag` — write minus read; batch-scale under load,
+  zero at quiesce.
+- `celeriant_parked_commit_queue_depth` — refreshed at every queue mutation:
+  deferred fsync, drain, promotion flip, catchup drain, truncate, cull. A
+  plateau above zero on an idle shard is a drain leak.
+- `celeriant_parked_commit_overflow_total` — inflight-cap tripwire; nothing is
+  dropped.
+- `celeriant_commit_notify_sent_total` / `..._received_total` — pair equality
+  means no notify lost.
+- `celeriant_last_self_acked_wal_seq` — the ack barrier, set at the bump and on
+  boot recovery. Survives demotion and restart.
+- `celeriant_node_status_code` — per-shard status (0=BootCatchup, 1=Follower,
+  2=FollowerCatchingUp, 3=Promoting, 4=Leader, 5=Fenced, 6=Standalone).
 
-**Historical failure mode (fixed):** S3 fallback upload storms during follower
-outages saturated MinIO, preventing shard 0 from renewing the S3 lease. The leader's
-lease expired while it was still writing. Fixed by: (a) preemptive S3 lease renewal
-on first heartbeat failure, (b) S3 upload semaphore limiting concurrent uploads,
-(c) heartbeat hard timeout preventing kernel TCP retransmit stalls from blocking
-the heartbeat task.
+The chaos suite asserts the model's two cross-node invariants on every named
+scenario: **NeverAhead** (in steady follower windows, the follower's committed
+cursor never exceeds what any leader tenure confirmed — bounded by the
+all-tenure leader-read high-water and the follower's own ack barrier) and
+**ReadConvergedAtQuiesce** (read equals write on both nodes, every shard, at
+end-of-run quiesce). NeverAhead is proven red against a build that commits at
+follower fsync; restart-scenario passes attest steady windows clean, by design.
 
-**Remaining risk:** If clock drift exceeds `max_clock_drift_ms`, the asymmetric
-fencing window closes and both nodes could believe they are leader simultaneously.
-The `lease_epoch` check on the follower is the last line of defence in this case.
+## Configuration Defaults
 
----
-
-## Open Questions
-
-1. **S3 continuity on TCP-to-S3 transition:** When the leader transitions from TCP
-   to S3 replication mid-stream, is S3 guaranteed to have all entries from the
-   follower's perspective? The leader only uploads the current batch, not
-   historical TCP-only entries. Under what conditions does this create an
-   unrecoverable gap?
-
-2. **Promotion batch upload failure:** If `upload_s3_promotion_batch` fails
-   (S3 temporarily unavailable), the new leader proceeds without uploading.
-   The old leader can only catch up via TCP. What if TCP catchup also fails
-   (entries compacted away)?
-
-3. **Coordinator shard isolation:** With `reserve_coordinator_shard`, shard 0
-   has no write load. But schema registration still routes to shard 0. Under
-   what schema write patterns could shard 0 become a bottleneck?
+| Parameter | Default | Purpose |
+|---|---|---|
+| `heartbeat_interval_ms` | 500 | leader heartbeat cadence |
+| `heartbeat_lease_duration_ms` | 1500 | TTL extension per heartbeat |
+| `max_clock_drift_ms` | 500 | drift tolerance; early-fence margin |
+| `heartbeat_hard_timeout_multiplier` | 4 | outer heartbeat timeout vs kernel stalls |
+| `s3_max_concurrent_fallback_uploads` | 128 | global fallback upload cap |
+| `fsync_delay` | 17ms | fsync coordinator batching window |
+| `max_request_size` | 16 MiB | TCP replication chunk bound |
+| `max_response_size` | 64 MiB | response bound |
