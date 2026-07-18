@@ -153,12 +153,16 @@ struct PayloadFail {
 }
 
 /// Fetch all events for a single aggregate from the given pool and verify each
-/// event's payload. Returns `(verified_count, failures)`.
+/// event's payload. Returns `(verified_count, failures, unreadable)`.
+///
+/// `unreadable` is true when the read itself failed (open or collect) — N6:
+/// this must be counted, not folded into a silent `(0, [])` that a cluster-wide
+/// read outage would misreport as "nothing to verify, all clean".
 async fn verify_one_aggregate(
     node: &str,
     pool: &Arc<Pool>,
     ack: &TaskAckSummary,
-) -> (u64, Vec<PayloadFail>) {
+) -> (u64, Vec<PayloadFail>, bool) {
     let mut verified: u64 = 0;
     let mut failures = Vec::new();
 
@@ -166,10 +170,8 @@ async fn verify_one_aggregate(
     let iter = match pool.read_all(ack.aggregate_key.clone(), None).await {
         Ok(it) => it,
         Err(e) => {
-            // read_all open failed — treat as zero verified, no payload failures
-            // (this is a connectivity issue, not a payload mismatch)
             eprintln!("payload-verify: read_all open failed for {:?}: {e}", ack.aggregate_key);
-            return (verified, failures);
+            return (verified, failures, true);
         }
     };
 
@@ -177,7 +179,7 @@ async fn verify_one_aggregate(
         Ok(b) => b,
         Err(e) => {
             eprintln!("payload-verify: collect failed for {:?}: {e}", ack.aggregate_key);
-            return (verified, failures);
+            return (verified, failures, true);
         }
     };
 
@@ -205,7 +207,7 @@ async fn verify_one_aggregate(
         }
     }
 
-    (verified, failures)
+    (verified, failures, false)
 }
 
 /// Verify payload bytes for a deterministic sample of acked aggregates on
@@ -241,6 +243,7 @@ pub async fn verify_payload_roundtrip(
     let mut all_failures: Vec<PayloadFail> = Vec::new();
     let mut total_verified: u64 = 0;
     let mut node_aggregate_count: usize = 0;
+    let mut total_unreadable: u64 = 0;
 
     for (host, addr) in [
         (cfg.leader_host.clone(), cfg.leader_addr()),
@@ -268,21 +271,35 @@ pub async fn verify_payload_roundtrip(
 
         for ack in &eligible {
             node_aggregate_count += 1;
-            let (verified, failures) = verify_one_aggregate(&host, &pool, ack).await;
+            let (verified, failures, unreadable) = verify_one_aggregate(&host, &pool, ack).await;
             total_verified += verified;
             all_failures.extend(failures);
+            if unreadable {
+                total_unreadable += 1;
+            }
         }
     }
 
-    if all_failures.is_empty() {
-        CheckResult::pass_with_detail(
-            "PayloadRoundTrip",
-            format!(
-                "{total_verified} events verified across {} aggregate×node pairs",
-                node_aggregate_count
-            ),
-        )
-    } else {
+    payload_roundtrip_verdict(total_verified, node_aggregate_count, total_unreadable, &all_failures)
+}
+
+/// Maximum unreadable aggregate×node reads tolerated before PayloadRoundTrip
+/// fails closed. Mirrors `data_integrity_check`'s tasks_unreadable/max_unreadable:
+/// a small allowance for transient connectivity blips under chaos load, but a
+/// read outage across the sample must not report as "nothing to verify, clean".
+const MAX_UNREADABLE: u64 = 2;
+
+/// Decision logic for `verify_payload_roundtrip`, extracted so it's testable
+/// without a live `Pool` (N6): a mismatch always fails; otherwise an
+/// unreadable count past `MAX_UNREADABLE` fails closed instead of reading as
+/// a silent pass.
+fn payload_roundtrip_verdict(
+    total_verified: u64,
+    node_aggregate_count: usize,
+    total_unreadable: u64,
+    all_failures: &[PayloadFail],
+) -> CheckResult {
+    if !all_failures.is_empty() {
         let capped: Vec<String> = all_failures
             .iter()
             .take(PAYLOAD_FAIL_CAP)
@@ -298,14 +315,29 @@ pub async fn verify_payload_roundtrip(
             })
             .collect();
         let total = all_failures.len();
-        CheckResult::fail(
+        return CheckResult::fail(
             "PayloadRoundTrip",
             format!(
                 "{total} payload mismatch(es) (showing up to {PAYLOAD_FAIL_CAP}): {}",
                 capped.join("; ")
             ),
-        )
+        );
     }
+    if total_unreadable > MAX_UNREADABLE {
+        return CheckResult::fail(
+            "PayloadRoundTrip",
+            format!(
+                "{total_unreadable} of {node_aggregate_count} aggregate×node reads were unreadable \
+                 (allowed {MAX_UNREADABLE}) — payload verification incomplete, not clean",
+            ),
+        );
+    }
+    CheckResult::pass_with_detail(
+        "PayloadRoundTrip",
+        format!(
+            "{total_verified} events verified across {node_aggregate_count} aggregate×node pairs ({total_unreadable} unreadable)"
+        ),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +399,43 @@ mod tests {
         let seq: u64 = 17;
         let correct = expected_payload(id, seq);
         assert_eq!(correct, b"[t-3-s-17]");
+    }
+
+    // --- payload_roundtrip_verdict fail-closed tests (N6) ---
+
+    #[test]
+    fn verdict_fails_closed_when_unreadable_exceeds_tolerance() {
+        // A cluster-wide read outage: 0 verified, 0 failures, but every read
+        // errored. Was: silent pass ("nothing to verify"). Must fail closed.
+        let r = payload_roundtrip_verdict(0, 10, MAX_UNREADABLE + 1, &[]);
+        assert!(!r.passed);
+        assert!(r.detail.contains("unreadable"), "{}", r.detail);
+    }
+
+    #[test]
+    fn verdict_passes_within_unreadable_tolerance() {
+        let r = payload_roundtrip_verdict(20, 24, MAX_UNREADABLE, &[]);
+        assert!(r.passed, "{}", r.detail);
+    }
+
+    #[test]
+    fn verdict_passes_when_nothing_unreadable_and_clean() {
+        let r = payload_roundtrip_verdict(48, 24, 0, &[]);
+        assert!(r.passed, "{}", r.detail);
+    }
+
+    #[test]
+    fn verdict_fails_on_mismatch_regardless_of_unreadable_count() {
+        let fail = PayloadFail {
+            node: "cs1".into(),
+            aggregate_id: 1,
+            client_seq: 2,
+            expected: b"[t-1-s-2]".to_vec(),
+            got: b"[t-1-s-3]".to_vec(),
+        };
+        let r = payload_roundtrip_verdict(10, 24, 0, &[fail]);
+        assert!(!r.passed);
+        assert!(r.detail.contains("mismatch"), "{}", r.detail);
     }
 
     #[test]

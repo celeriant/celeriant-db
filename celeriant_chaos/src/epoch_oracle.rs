@@ -62,8 +62,10 @@ pub async fn run_epoch_oracle(cfg: &ClusterConfig, shard_count: u32) -> Vec<Chec
     })
     .await
     .unwrap_or_else(|_| vec![
-        CheckResult::pass_with_detail("EpochMonotonicPerChain", "(skipped: task panicked)"),
-        CheckResult::pass_with_detail("EpochUniquePerWalSeq", "(skipped: task panicked)"),
+        // A panic inside the SSH/parse task is a harness bug, not evidence
+        // of correctness — must not read as PASS.
+        CheckResult::fail("EpochMonotonicPerChain", "oracle task panicked — unattestable"),
+        CheckResult::fail("EpochUniquePerWalSeq", "oracle task panicked — unattestable"),
     ])
 }
 
@@ -128,19 +130,24 @@ fn run_epoch_oracle_sync(leader: &str, follower: &str, shard_count: u32) -> Vec<
         format!("{shards_checked} shard(s) checked, skipped: {}", skipped.join("; "))
     };
 
-    let mono_result = if monotonic_issues.is_empty() {
-        CheckResult::pass_with_detail("EpochMonotonicPerChain", skip_suffix.clone())
-    } else {
-        CheckResult::fail("EpochMonotonicPerChain", format!("{} — {}", monotonic_issues.join("; "), skip_suffix))
-    };
-
-    let unique_result = if unique_issues.is_empty() {
-        CheckResult::pass_with_detail("EpochUniquePerWalSeq", skip_suffix)
-    } else {
-        CheckResult::fail("EpochUniquePerWalSeq", format!("{} — {}", unique_issues.join("; "), skip_suffix))
-    };
+    let mono_result = epoch_verdict("EpochMonotonicPerChain", shards_checked, &monotonic_issues, skip_suffix.clone());
+    let unique_result = epoch_verdict("EpochUniquePerWalSeq", shards_checked, &unique_issues, skip_suffix);
 
     vec![mono_result, unique_result]
+}
+
+/// Fail-closed verdict shared by the epoch oracles: 0 shards checked (SSH/tool
+/// unavailable on every shard) means the invariant was never verified and
+/// must not report PASS. Mirrors `tip_fork::verdict`.
+fn epoch_verdict(name: &'static str, shards_checked: u32, issues: &[String], detail_suffix: String) -> CheckResult {
+    if shards_checked == 0 {
+        return CheckResult::fail(name, format!("no shards checked — oracle unattestable ({detail_suffix})"));
+    }
+    if issues.is_empty() {
+        CheckResult::pass_with_detail(name, detail_suffix)
+    } else {
+        CheckResult::fail(name, format!("{} — {}", issues.join("; "), detail_suffix))
+    }
 }
 
 /// Get the last wal_seq on a shard via `bounds`, returning None on SSH error
@@ -329,7 +336,9 @@ pub async fn run_acked_durability_oracle(
     })
     .await
     .unwrap_or_else(|_| vec![
-        CheckResult::pass_with_detail("AckedSubsetDurableBothNodes", "(skipped: task panicked)"),
+        // Same policy as run_epoch_oracle: a panicked oracle task proves
+        // nothing and must not read as PASS.
+        CheckResult::fail("AckedSubsetDurableBothNodes", "oracle task panicked — unattestable"),
     ])
 }
 
@@ -682,6 +691,28 @@ mod tests {
         let mut issues = Vec::new();
         check_epoch_cross_node(1, &leader, &follower, "cs1", "cs2", &mut issues);
         assert!(issues.is_empty());
+    }
+
+    // --- epoch_verdict fail-closed tests ---
+
+    #[test]
+    fn epoch_verdict_fails_closed_on_zero_shards_checked() {
+        let r = epoch_verdict("EpochMonotonicPerChain", 0, &[], "0 shard(s) checked".into());
+        assert!(!r.passed);
+        assert!(r.detail.contains("oracle unattestable"), "{}", r.detail);
+    }
+
+    #[test]
+    fn epoch_verdict_passes_when_shards_checked_and_clean() {
+        let r = epoch_verdict("EpochMonotonicPerChain", 2, &[], "2 shard(s) checked".into());
+        assert!(r.passed, "{}", r.detail);
+    }
+
+    #[test]
+    fn epoch_verdict_fails_on_real_issue() {
+        let r = epoch_verdict("EpochUniquePerWalSeq", 1, &["shard_1: mismatch".to_string()], "1 shard(s) checked".into());
+        assert!(!r.passed);
+        assert!(r.detail.contains("mismatch"));
     }
 
     // --- sampling determinism tests ---

@@ -207,31 +207,31 @@ pub fn run_all(data: &RunData, expect: &ScenarioExpectations) -> Vec<CheckResult
     let mut out = vec![
         check_exactly_one_leader(data, expect),
         check_leader_stable(data, expect),
-        check_counter("NoUnexpectedElections", data, |s| s.leader_elections_total, expect.max_leader_elections),
-        check_counter("NoS3Fallbacks", data, |s| s.s3_fallbacks_total, expect.max_s3_fallbacks),
-        check_counter("NoHeartbeatFailures", data, |s| s.heartbeat_failures_total, expect.max_heartbeat_failures),
-        check_counter("NoShardPanics", data, |s| s.shard_panics_total, expect.max_shard_panics),
-        check_counter("NoNodeStarts", data, |s| s.node_starts_total, expect.max_node_starts),
+        check_counter("NoUnexpectedElections", "celeriant_leader_elections_total", data, |s| s.leader_elections_total, expect.max_leader_elections),
+        check_counter("NoS3Fallbacks", "celeriant_replication_s3_fallbacks_total", data, |s| s.s3_fallbacks_total, expect.max_s3_fallbacks),
+        check_counter("NoHeartbeatFailures", "celeriant_heartbeat_failures_total", data, |s| s.heartbeat_failures_total, expect.max_heartbeat_failures),
+        check_counter("NoShardPanics", "celeriant_shard_panics_total", data, |s| s.shard_panics_total, expect.max_shard_panics),
+        check_counter("NoNodeStarts", "celeriant_node_starts_total", data, |s| s.node_starts_total, expect.max_node_starts),
         check_bench_errors(data, expect),
         check_bench_throughput_floor(data),
         check_wal_seq_advanced(data),
         check_read_within_write(data),
         // Fsynced PCDs popped after rollback then dropped without commit or re-queue.
-        check_counter("NoCaptureDroppedItems", data, |s| s.capture_dropped_items_total, 0),
+        check_counter("NoCaptureDroppedItems", "celeriant_replication_capture_dropped_items_total", data, |s| s.capture_dropped_items_total, 0),
         // Truncate dropped wal_seqs this node acked as leader. Should be impossible
         // unless the ack barrier was bypassed.
-        check_counter("NoTruncateDroppedSelfAcked", data, |s| s.truncate_dropped_self_acked_events_total, 0),
+        check_counter("NoTruncateDroppedSelfAcked", "celeriant_truncate_dropped_self_acked_events_total", data, |s| s.truncate_dropped_self_acked_events_total, 0),
         // Two same-(lease_epoch) S3 batches at one start with divergent content:
         // the content-immutability invariant violated (cull-skip regressed). Should
         // be impossible.
-        check_counter("NoSameEpochDivergence", data, |s| s.s3_catchup_same_epoch_divergence_total, 0),
+        check_counter("NoSameEpochDivergence", "celeriant_s3_catchup_same_epoch_divergence_total", data, |s| s.s3_catchup_same_epoch_divergence_total, 0),
         // TCP catchup fetch errored — retried as transient on every write, so a
         // persistent error is a convergence livelock.
-        check_counter("NoCatchupFetchErrors", data, |s| s.catchup_fetch_error_total, 0),
+        check_counter("NoCatchupFetchErrors", "celeriant_catchup_fetch_error_total", data, |s| s.catchup_fetch_error_total, 0),
         // Catchup resolved a nonzero follower gap to zero entries and declared the
         // follower caught up. With no compaction in chaos scenarios this is always
         // a livelock signature.
-        check_counter("NoCatchupEmptyFetch", data, |s| s.catchup_empty_fetch_total, 0),
+        check_counter("NoCatchupEmptyFetch", "celeriant_catchup_empty_fetch_total", data, |s| s.catchup_empty_fetch_total, 0),
     ];
     if expect.require_leader_retained {
         out.push(check_leader_retained(data));
@@ -336,13 +336,53 @@ fn check_leader_stable(data: &RunData, expect: &ScenarioExpectations) -> CheckRe
     }
 }
 
+/// The Prometheus counter keys `check_counter` guards, in `run_all` order.
+/// Test-only convenience for building a NodeSample that "attests" every
+/// guarded counter (the normal case) without repeating the list at each
+/// call site.
+#[cfg(test)]
+const ALL_GUARDED_COUNTER_KEYS: &[&str] = &[
+    "celeriant_leader_elections_total",
+    "celeriant_replication_s3_fallbacks_total",
+    "celeriant_heartbeat_failures_total",
+    "celeriant_shard_panics_total",
+    "celeriant_node_starts_total",
+    "celeriant_replication_capture_dropped_items_total",
+    "celeriant_truncate_dropped_self_acked_events_total",
+    "celeriant_s3_catchup_same_epoch_divergence_total",
+    "celeriant_catchup_fetch_error_total",
+    "celeriant_catchup_empty_fetch_total",
+];
+
+/// Metrics eligible for the presence-absent guard in `check_counter`.
+/// Most `celeriant_*` counters are registered LAZILY (first appear in
+/// `/metrics` only after their first increment), so on a healthy run most
+/// guarded counters are legitimately absent on both nodes — failing closed
+/// on absence for those would false-RED every healthy scenario. Empirically
+/// confirmed present on BOTH nodes at startup regardless of activity: only
+/// these two. (`celeriant_heartbeat_failures_total` is present on the
+/// leader but absent on the follower, so it's excluded too.) Narrow this
+/// list only after confirming eager registration on both nodes.
+const PRESENCE_GUARDED_METRIC_KEYS: &[&str] = &[
+    "celeriant_leader_elections_total",
+    "celeriant_node_starts_total",
+];
+
+/// `metric_key` is the raw Prometheus counter name backing `field` (see
+/// `sample::parse_metrics`'s COUNTERS whitelist). For keys in
+/// `PRESENCE_GUARDED_METRIC_KEYS`, an absent/renamed metric fails closed
+/// (A4) rather than silently reading a constant 0. Every other counter is
+/// lazily-registered — "absent" is indistinguishable from "healthy zero" —
+/// so it keeps the old unwrap_or(0)-and-pass-at-0 behavior.
 fn check_counter(
     name: &'static str,
+    metric_key: &'static str,
     data: &RunData,
     field: fn(&NodeSample) -> u64,
     allowed: u64,
 ) -> CheckResult {
     let mut worst = (0u64, "".to_string());
+    let mut attested = false;
     for host in [data.leader_host, data.follower_host] {
         let first = data.samples[data.bench_start_idx..=data.bench_end_idx]
             .iter()
@@ -352,11 +392,17 @@ fn check_counter(
             .rev()
             .find(|s| s.host == host && s.ok);
         if let (Some(a), Some(b)) = (first, last) {
+            if a.metric_keys_present.contains(metric_key) && b.metric_keys_present.contains(metric_key) {
+                attested = true;
+            }
             let delta = field(b).saturating_sub(field(a));
             if delta > worst.0 {
                 worst = (delta, format!("{host}: {} → {}", field(a), field(b)));
             }
         }
+    }
+    if !attested && PRESENCE_GUARDED_METRIC_KEYS.contains(&metric_key) {
+        return CheckResult::fail(name, format!("metric {metric_key} not exported — oracle blind"));
     }
     if worst.0 > allowed {
         CheckResult::fail(name, format!("delta {} exceeds allowed {} ({})", worst.0, allowed, worst.1))
@@ -781,7 +827,11 @@ fn check_read_within_write(data: &RunData) -> CheckResult {
             }
         }
     }
-    if violations.is_empty() {
+    if ticks_audited == 0 {
+        // Mirrors check_read_converged_at_quiesce: no read-cursor gauges means
+        // the invariant was never actually observed, not that it held (N5).
+        CheckResult::fail(NAME, "no read-cursor gauges — oracle lost its instrument")
+    } else if violations.is_empty() {
         CheckResult::pass_with_detail(
             NAME,
             format!("{ticks_audited} ticks audited ({single_tick_races} single-tick render races ignored)"),
@@ -1137,6 +1187,10 @@ mod tests {
             position_snapshot_stale_commit_total: 0,
             commit_notify_sent_total: 0,
             commit_notify_received_total: 0,
+            // All guarded counters "exported": these tests target the
+            // read-cursor/leader-stability checks, not check_counter's
+            // presence guard (covered by its own tests below).
+            metric_keys_present: ALL_GUARDED_COUNTER_KEYS.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -1153,6 +1207,77 @@ mod tests {
             bench_throughput: 1000.0,
             throughput_floor: 0.0,
         }
+    }
+
+    // --- check_counter presence-guard tests (A4) ---
+
+    #[test]
+    fn check_counter_fails_closed_when_allowlisted_metric_never_exported() {
+        // metric_keys_present empty on every sample: an allowlisted metric
+        // (eagerly registered at startup on both nodes) going absent means
+        // a rename/removal, not a healthy-zero — must not read as PASS.
+        let mut a = sample(LEADER, 0, &[(1, 100)]);
+        a.metric_keys_present = std::collections::BTreeSet::new();
+        let mut b = sample(LEADER, 500, &[(1, 200)]);
+        b.metric_keys_present = std::collections::BTreeSet::new();
+        let mut c = sample(FOLLOWER, 0, &[(1, 100)]);
+        c.metric_keys_present = std::collections::BTreeSet::new();
+        let mut d = sample(FOLLOWER, 500, &[(1, 200)]);
+        d.metric_keys_present = std::collections::BTreeSet::new();
+        let samples = [a, b, c, d];
+        let data = run_data(&samples);
+        let r = check_counter(
+            "NoUnexpectedElections",
+            "celeriant_leader_elections_total",
+            &data,
+            |s| s.leader_elections_total,
+            0,
+        );
+        assert!(!r.passed);
+        assert!(r.detail.contains("not exported"), "{}", r.detail);
+    }
+
+    #[test]
+    fn check_counter_passes_at_zero_when_non_allowlisted_metric_absent() {
+        // celeriant_shard_panics_total is lazily-registered: absent on a
+        // healthy cluster is normal, not an oracle-blind signal. Must NOT
+        // fail closed — that would false-RED every healthy run.
+        let mut a = sample(LEADER, 0, &[(1, 100)]);
+        a.metric_keys_present = std::collections::BTreeSet::new();
+        let mut b = sample(LEADER, 500, &[(1, 200)]);
+        b.metric_keys_present = std::collections::BTreeSet::new();
+        let mut c = sample(FOLLOWER, 0, &[(1, 100)]);
+        c.metric_keys_present = std::collections::BTreeSet::new();
+        let mut d = sample(FOLLOWER, 500, &[(1, 200)]);
+        d.metric_keys_present = std::collections::BTreeSet::new();
+        let samples = [a, b, c, d];
+        let data = run_data(&samples);
+        let r = check_counter("NoShardPanics", "celeriant_shard_panics_total", &data, |s| s.shard_panics_total, 0);
+        assert!(r.passed, "{}", r.detail);
+    }
+
+    #[test]
+    fn check_counter_passes_when_metric_present_and_within_bound() {
+        // sample() populates metric_keys_present with every guarded counter.
+        let a = sample(LEADER, 0, &[(1, 100)]);
+        let b = sample(LEADER, 500, &[(1, 200)]);
+        let samples = [a, b];
+        let data = run_data(&samples);
+        let r = check_counter("NoShardPanics", "celeriant_shard_panics_total", &data, |s| s.shard_panics_total, 0);
+        assert!(r.passed, "{}", r.detail);
+    }
+
+    #[test]
+    fn check_counter_still_fails_on_real_delta_when_attested() {
+        let mut a = sample(LEADER, 0, &[(1, 100)]);
+        a.shard_panics_total = 0;
+        let mut b = sample(LEADER, 500, &[(1, 200)]);
+        b.shard_panics_total = 3;
+        let samples = [a, b];
+        let data = run_data(&samples);
+        let r = check_counter("NoShardPanics", "celeriant_shard_panics_total", &data, |s| s.shard_panics_total, 0);
+        assert!(!r.passed);
+        assert!(r.detail.contains("delta 3"), "{}", r.detail);
     }
 
     /// Phase 8a failure mode: one shard (shard_3) permanently forked and frozen,
@@ -1275,13 +1400,14 @@ mod tests {
     }
 
     #[test]
-    fn read_check_skips_samples_without_read_gauges() {
-        // Pre-upgrade binaries export no read cursor: vacuous pass, 0 ticks.
+    fn read_check_fails_closed_without_read_gauges() {
+        // Was: vacuous pass with "0 ticks" (N5). No read-cursor gauge means
+        // the invariant was never observed, so the check must fail closed.
         let samples = vec![sample(LEADER, 0, &[(1, 100)])];
         let data = run_data(&samples);
         let r = check_read_within_write(&data);
-        assert!(r.passed);
-        assert!(r.detail.contains("0 ticks"), "{}", r.detail);
+        assert!(!r.passed);
+        assert!(r.detail.contains("oracle lost its instrument"), "{}", r.detail);
     }
 
     /// Sample with explicit role and per-shard (write, read) cursor pairs.

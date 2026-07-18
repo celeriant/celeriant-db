@@ -55,8 +55,8 @@ pub fn write_run_report(dir: &RunDir, scenarios: &[ScenarioReport]) -> Result<()
     for s in scenarios {
         md.push_str(&format!("## {}\n\n", s.name));
         md.push_str(&format!(
-            "Params: {} tasks, {}s, throughput floor {:.0} req/s\n\n",
-            s.params.tasks, s.params.duration_secs, s.params.throughput_floor
+            "Params: {} tasks, {}s, throughput floor {:.0} req/s, seed {:#x}\n\n",
+            s.params.tasks, s.params.duration_secs, s.params.throughput_floor, s.params.seed
         ));
         md.push_str(&format!(
             "Bench: {} req, {} errors, {:.0} req/s, avg {:.1}ms, P50 {}ms, P95 {}ms, P99 {}ms, P99.9 {}ms\n\n",

@@ -139,6 +139,12 @@ pub struct NodeSample {
     pub commit_notify_sent_total: u64,
     /// Guard-passing empty-batch commit-notifies accepted (follower side).
     pub commit_notify_received_total: u64,
+    /// Prometheus counter names (from the COUNTERS whitelist) that actually
+    /// appeared in this scrape. A4: `unwrap_or(0)` at parse time makes an
+    /// absent (renamed/removed) metric indistinguishable from a present-but-
+    /// zero one; `check_counter` uses this set to fail closed on the former.
+    #[serde(default)]
+    pub metric_keys_present: std::collections::BTreeSet<String>,
 }
 
 impl NodeSample {
@@ -199,6 +205,7 @@ impl NodeSample {
             position_snapshot_stale_commit_total: 0,
             commit_notify_sent_total: 0,
             commit_notify_received_total: 0,
+            metric_keys_present: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -355,6 +362,8 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
     }
 
     let get = |k: &str| -> u64 { sums.get(k).copied().unwrap_or(0) };
+    let metric_keys_present: std::collections::BTreeSet<String> =
+        sums.keys().map(|k| k.to_string()).collect();
 
     NodeSample {
         host,
@@ -412,6 +421,7 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         commit_notify_received_total: get("celeriant_commit_notify_received_total"),
         barrier_sync_fsync_total: get("celeriant_barrier_sync_fsync_total"),
         barrier_sync_fsync_failed_total: get("celeriant_barrier_sync_fsync_failed_total"),
+        metric_keys_present,
     }
 }
 

@@ -307,10 +307,20 @@ pub fn check_no_divergent_shard_tips(leader_host: &str, follower_host: &str) -> 
         format!("{checked} shard(s) checked, skipped: {}", skipped.join("; "))
     };
 
+    verdict(NAME, checked, &issues, detail_suffix)
+}
+
+/// Fail-closed verdict shared by the disk-truth oracles: an oracle that
+/// checked nothing (SSH/tool unavailable, every shard skipped) has not
+/// verified the invariant and must not report PASS.
+fn verdict(name: &'static str, checked: u32, issues: &[String], detail_suffix: String) -> CheckResult {
+    if checked == 0 {
+        return CheckResult::fail(name, format!("no shards checked — oracle unattestable ({detail_suffix})"));
+    }
     if issues.is_empty() {
-        CheckResult::pass_with_detail(NAME, detail_suffix)
+        CheckResult::pass_with_detail(name, detail_suffix)
     } else {
-        CheckResult::fail(NAME, format!("{} — {}", issues.join("; "), detail_suffix))
+        CheckResult::fail(name, format!("{} — {}", issues.join("; "), detail_suffix))
     }
 }
 
@@ -454,5 +464,26 @@ mod tests {
         let ahead_prev_tip = "aabbccdd";
         let is_fork = ahead_prev_tip != behind_tip;
         assert!(!is_fork, "identical hashes must be classified as clean-prefix lag");
+    }
+
+    #[test]
+    fn verdict_fails_closed_on_zero_shards_checked() {
+        // Every shard skipped (SSH/tool unavailable) — must not read as PASS.
+        let r = verdict("NoDivergentShardTips", 0, &[], "0 shard(s) checked, skipped: shard_1: no WAL header".into());
+        assert!(!r.passed);
+        assert!(r.detail.contains("oracle unattestable"), "{}", r.detail);
+    }
+
+    #[test]
+    fn verdict_passes_when_shards_checked_and_clean() {
+        let r = verdict("NoDivergentShardTips", 3, &[], "3 shard(s) checked".into());
+        assert!(r.passed, "{}", r.detail);
+    }
+
+    #[test]
+    fn verdict_fails_on_real_issue_even_with_shards_checked() {
+        let r = verdict("NoDivergentShardTips", 1, &["shard_1 DIVERGENT-TIP FORK".to_string()], "1 shard(s) checked".into());
+        assert!(!r.passed);
+        assert!(r.detail.contains("DIVERGENT-TIP FORK"));
     }
 }

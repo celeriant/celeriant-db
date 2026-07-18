@@ -27,11 +27,22 @@ pub struct ScenarioParams {
     /// thundering-herd envelope); fault scenarios keep the herd — it is
     /// part of their stress.
     pub connect_ramp_secs: Option<u64>,
+    /// Run-varying seed (N3): drives `NemesisPrng`, the clock-scramble
+    /// splitmix, and the epoch-oracle's aggregate sample. Printed at run
+    /// start and persisted in `ScenarioReport` so a Heisenbug is
+    /// reproducible instead of every run replaying the same fault schedule.
+    pub seed: u64,
 }
 
 impl Default for ScenarioParams {
     fn default() -> Self {
-        Self { tasks: 4000, duration_secs: 60, throughput_floor: 500.0, connect_ramp_secs: None }
+        Self {
+            tasks: 4000,
+            duration_secs: 60,
+            throughput_floor: 500.0,
+            connect_ramp_secs: None,
+            seed: 0xCE1E_51A7,
+        }
     }
 }
 
@@ -79,6 +90,10 @@ pub struct ScenarioParamsJson {
     pub tasks: usize,
     pub duration_secs: u64,
     pub throughput_floor: f64,
+    /// Seed for this run's fault schedule / clock skew / oracle sampling
+    /// (N3), persisted so a failing run's fault plan is reproducible via
+    /// `--seed`.
+    pub seed: u64,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -289,6 +304,7 @@ pub async fn finish_history_and_check(
     cfg: &ClusterConfig,
     history: Option<Arc<HistoryRecorder>>,
     acks: &[TaskAckSummary],
+    seed: u64,
 ) -> Vec<CheckResult> {
     let Some(arc) = history else { return Vec::new() };
     let Ok(recorder) = Arc::try_unwrap(arc) else {
@@ -360,7 +376,7 @@ pub async fn finish_history_and_check(
         })
         .collect();
     if !acked.is_empty() {
-        checks.extend(crate::epoch_oracle::run_acked_durability_oracle(cfg, &acked, 0xce1e51a7).await);
+        checks.extend(crate::epoch_oracle::run_acked_durability_oracle(cfg, &acked, seed).await);
     }
     checks
 }
@@ -418,7 +434,10 @@ pub async fn tear_down_and_evaluate_with_audit(
     // under 8k-task load.
     const MAX_DISK_TRUTH_ENTRIES: usize = 64;
 
-    let disk_truth_report: Option<Vec<crate::disk_truth::DiskTruthEntry>> =
+    // Paired with a `total_flagged` count so the NoClientSeqGaps override
+    // below can tell "every flagged aggregate was disk-verified" from
+    // "only the first MAX_DISK_TRUTH_ENTRIES of a larger set were" (N2).
+    let disk_truth_computed: Option<(Vec<crate::disk_truth::DiskTruthEntry>, usize)> =
         integrity.as_ref().filter(|i| !i.failing_task_acks.is_empty()).map(|i| {
             use celeriant_bench::DeepAuditEntry;
             let by_key: std::collections::HashMap<String, &DeepAuditEntry> = deep_audit
@@ -466,8 +485,13 @@ pub async fn tear_down_and_evaluate_with_audit(
                 "[{scenario_name}] disk-truth: {} aggregates checked, audit overreported {} seqs, actually missing {} seqs",
                 verified.len(), overreported, truly_missing
             );
-            verified
+            (verified, total_flagged)
         });
+    let (disk_truth_report, disk_truth_total_flagged): (Option<Vec<crate::disk_truth::DiskTruthEntry>>, usize) =
+        match disk_truth_computed {
+            Some((v, total_flagged)) => (Some(v), total_flagged),
+            None => (None, 0),
+        };
 
     let executor = ActionExecutor::new(cfg);
 
@@ -535,18 +559,26 @@ pub async fn tear_down_and_evaluate_with_audit(
     checks.extend(extra_checks);
 
     // Disk-truth overrides NoClientSeqGaps: audit can over-report under post-chaos load.
+    // Only safe when EVERY flagged aggregate was actually disk-verified — if
+    // the flagged set exceeded MAX_DISK_TRUTH_ENTRIES, the unverified
+    // remainder could hide a real gap, so the override must not fire (N2).
     if let Some(entries) = disk_truth_report.as_ref() {
-        if !entries.is_empty() && entries.iter().all(|e| e.actually_missing.is_empty()) {
+        if disk_truth_override_applies(entries, disk_truth_total_flagged, MAX_DISK_TRUTH_ENTRIES) {
             let overreported: u64 = entries.iter().map(|e| e.audit_overreported.len() as u64).sum();
             for check in checks.iter_mut() {
                 if check.name == "NoClientSeqGaps" && !check.passed {
                     check.passed = true;
                     check.detail = format!(
-                        "audit reported gaps but disk-truth verified all {} flagged aggregates are clean ({} seqs overreported)",
-                        entries.len(), overreported,
+                        "audit reported gaps but disk-truth verified all {} of {} flagged aggregates are clean ({} seqs overreported)",
+                        entries.len(), disk_truth_total_flagged, overreported,
                     );
                 }
             }
+        } else if disk_truth_total_flagged > MAX_DISK_TRUTH_ENTRIES && !entries.is_empty() {
+            println!(
+                "[{scenario_name}] disk-truth: {} of {} flagged aggregates verified — cannot rule out the remaining {} unverified, NoClientSeqGaps stays failing",
+                entries.len(), disk_truth_total_flagged, disk_truth_total_flagged - entries.len(),
+            );
         }
     }
 
@@ -554,14 +586,29 @@ pub async fn tear_down_and_evaluate_with_audit(
 
     // Journals are now fetched on EVERY run (not just failures) so they can be
     // asserted: panics, aborts, BorrowMutError, and error storms fail the run
-    // even when no metric or history check noticed.
+    // even when no metric or history check noticed. Both nodes are expected up
+    // at teardown, so a missing or unreadable journal is itself a fail (N4) —
+    // it must not silently drop the JournalNoPanics/NoAbort/NoErrorStorm
+    // checks and count a crashed node as never-run.
     let log_files = harvest_logs(cfg, scenario_name, outcome.wall_start, outcome.wall_end, run_dir);
+    for (label, _host) in [("cs1", &cfg.leader_host), ("cs2", &cfg.follower_host)] {
+        let basename = format!("{scenario_name}.{label}.log");
+        if !log_files.contains(&basename) {
+            checks.push(CheckResult::fail(
+                "JournalHarvested",
+                format!("{label}: journal unavailable — crash-safety unattestable (SSH/journalctl fetch failed)"),
+            ));
+        }
+    }
     for rel in &log_files {
         let path = run_dir.join(rel);
         let node = rel.split('.').nth(1).unwrap_or("node").to_string();
         match std::fs::read_to_string(&path) {
             Ok(text) => checks.extend(crate::journal_assert::journal_checks(&node, &text)),
-            Err(e) => println!("[{scenario_name}] journal assert skipped for {rel}: {e}"),
+            Err(e) => checks.push(CheckResult::fail(
+                "JournalHarvested",
+                format!("{node}: journal unavailable — crash-safety unattestable (read failed: {e})"),
+            )),
         }
     }
 
@@ -577,6 +624,7 @@ pub async fn tear_down_and_evaluate_with_audit(
             tasks: params.tasks,
             duration_secs: params.duration_secs,
             throughput_floor: params.throughput_floor,
+            seed: params.seed,
         },
         bench: BenchmarkSummary::from(&bench_result),
         checks,
@@ -677,6 +725,67 @@ pub fn data_integrity_check(report: &DataIntegrityReport, max_unreadable: u64) -
         };
     }
     CheckResult::pass(NAME)
+}
+
+/// Whether the disk-truth sample is a safe basis for overriding a failing
+/// NoClientSeqGaps to PASS. Requires every flagged aggregate to have been
+/// disk-verified (not just a capped sample of a larger flagged set) and
+/// every verified entry to be actually clean (N2 — a >64-flagged run must
+/// not report "verified" for aggregates it never looked at on disk).
+fn disk_truth_override_applies(
+    entries: &[crate::disk_truth::DiskTruthEntry],
+    total_flagged: usize,
+    cap: usize,
+) -> bool {
+    total_flagged <= cap
+        && !entries.is_empty()
+        && entries.iter().all(|e| e.actually_missing.is_empty())
+}
+
+#[cfg(test)]
+mod disk_truth_override_tests {
+    use super::disk_truth_override_applies;
+    use crate::disk_truth::DiskTruthEntry;
+
+    fn clean_entry() -> DiskTruthEntry {
+        DiskTruthEntry {
+            aggregate_key_str: "1/1/1".into(),
+            client_id: 1,
+            max_acked: 5,
+            audit_missing: vec![3],
+            actually_missing: Vec::new(),
+            audit_overreported: vec![3],
+            leader_summary: String::new(),
+            follower_summary: String::new(),
+        }
+    }
+
+    #[test]
+    fn applies_when_all_flagged_were_verified_and_clean() {
+        let entries = vec![clean_entry(), clean_entry()];
+        assert!(disk_truth_override_applies(&entries, 2, 64));
+    }
+
+    #[test]
+    fn does_not_apply_when_flagged_exceeds_cap() {
+        // 100 flagged, only 64 verified (the cap) — the other 36 were never
+        // looked at on disk, so a clean sample cannot vouch for the whole set.
+        let entries: Vec<DiskTruthEntry> = (0..64).map(|_| clean_entry()).collect();
+        assert!(!disk_truth_override_applies(&entries, 100, 64));
+    }
+
+    #[test]
+    fn does_not_apply_when_a_verified_entry_is_actually_missing() {
+        let mut missing = clean_entry();
+        missing.actually_missing = vec![7];
+        let entries = vec![clean_entry(), missing];
+        assert!(!disk_truth_override_applies(&entries, 2, 64));
+    }
+
+    #[test]
+    fn does_not_apply_to_an_empty_verified_set() {
+        assert!(!disk_truth_override_applies(&[], 0, 64));
+    }
 }
 
 /// Delete/trim side-load run concurrently with a scenario's main bench:
@@ -1011,7 +1120,7 @@ async fn run_watch_storm_inner(
     );
 
     let mut extra_checks: Vec<CheckResult> = Vec::new();
-    extra_checks.extend(finish_history_and_check(SCEN, cfg, watch_history, &[]).await);
+    extra_checks.extend(finish_history_and_check(SCEN, cfg, watch_history, &[], params.seed).await);
 
     // 1) Delivery survived the churn.
     extra_checks.push(if flood.events_received > 0 {
@@ -1282,7 +1391,7 @@ pub async fn run_idempotency_audit_baseline(
     let integrity_check = data_integrity_check(&integrity, 0);
 
     let mut extra_checks = vec![integrity_check];
-    extra_checks.extend(finish_history_and_check(SCEN, cfg, history, &outcome.task_acks).await);
+    extra_checks.extend(finish_history_and_check(SCEN, cfg, history, &outcome.task_acks, params.seed).await);
 
     // No fault is injected, but high task counts brush saturation: a stray
     // retry attempt is bench noise, not a fault. Integrity is asserted
@@ -1372,7 +1481,7 @@ pub async fn run_duplicate_replay(
     };
 
     let mut extra_checks = vec![integrity_check, replay_check];
-    extra_checks.extend(finish_history_and_check(SCEN, cfg, history, &outcome.task_acks).await);
+    extra_checks.extend(finish_history_and_check(SCEN, cfg, history, &outcome.task_acks, params.seed).await);
 
     // Every op costs two round trips, so the floor halves relative to the
     // plain idempotent bench.
@@ -1532,7 +1641,7 @@ pub async fn run_cas_storm_scenario(
         client_id: 9_000,
         max_acked_client_seq: storm.ok_writes + 1,
     }];
-    extra_checks.extend(finish_history_and_check(scen, cfg, history, &storm_acks).await);
+    extra_checks.extend(finish_history_and_check(scen, cfg, history, &storm_acks, params.seed).await);
 
     let expectations = if with_partition {
         ScenarioExpectations {
@@ -1786,7 +1895,7 @@ pub async fn run_single_node_isolation(
     let integrity_check = data_integrity_check(&integrity, (params.tasks as u64 / 50).max(5));
 
     let mut extra_checks = vec![integrity_check];
-    extra_checks.extend(finish_history_and_check(SCEN, cfg, history, &outcome.task_acks).await);
+    extra_checks.extend(finish_history_and_check(SCEN, cfg, history, &outcome.task_acks, params.seed).await);
 
     let expectations = ScenarioExpectations {
         max_leader_elections: 40,
@@ -1833,7 +1942,7 @@ pub async fn run_clock_scrambler(
     run_dir: &PathBuf,
 ) -> Result<ScenarioReport, String> {
     const SCEN: &str = "clock_scrambler";
-    const SEED: u64 = 0xCE1E_51A7;
+    let seed = params.seed;
     const ROUNDS: u64 = 4;
 
     let up = bring_up_cluster(cfg, SCEN, run_dir).await?;
@@ -1848,7 +1957,7 @@ pub async fn run_clock_scrambler(
         hosts.iter().map(|h| Action::RestoreClock { host: h.clone() }).collect();
 
     let bench_window_start_ms = up.elapsed_ms();
-    println!("[{SCEN}] bench: {} tasks, {}s (skew seed {SEED:#x})", params.tasks, params.duration_secs);
+    println!("[{SCEN}] bench: {} tasks, {}s (skew seed {seed:#x})", params.tasks, params.duration_secs);
     let pool_clone = pool.clone();
     let tasks = params.tasks;
     let dur = params.duration_secs;
@@ -1858,7 +1967,7 @@ pub async fn run_clock_scrambler(
 
     // splitmix64 over (seed, round, host): offsets in ±1..=3s, well past the
     // 500ms drift tolerance, small enough that NTP re-sync is quick.
-    let mut rng_state = SEED;
+    let mut rng_state = seed;
     let mut splitmix = move || {
         rng_state = rng_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = rng_state;
@@ -2036,7 +2145,7 @@ pub async fn run_idempotency_audit_minio_outage(
     scen_params.throughput_floor = (params.throughput_floor * 0.5).max(50.0);
 
     let mut extra_checks = vec![integrity_check];
-    extra_checks.extend(finish_history_and_check(SCEN, cfg, history, &outcome.task_acks).await);
+    extra_checks.extend(finish_history_and_check(SCEN, cfg, history, &outcome.task_acks, params.seed).await);
 
     tear_down_and_evaluate_with_audit(
         SCEN,
@@ -3768,7 +3877,7 @@ pub async fn run_idempotency_audit_partition_then_kill_minio(
     scen_params.duration_secs = AUDIT_BENCH_SECS;
 
     let mut extra_checks = vec![integrity_check];
-    extra_checks.extend(finish_history_and_check(SCEN, cfg, history, &outcome.task_acks).await);
+    extra_checks.extend(finish_history_and_check(SCEN, cfg, history, &outcome.task_acks, params.seed).await);
 
     tear_down_and_evaluate_with_audit(
         SCEN,
@@ -3917,7 +4026,7 @@ pub async fn run_idempotency_audit_fast_blackout(
     scen_params.duration_secs = FAST_BENCH_SECS;
 
     let mut extra_checks = vec![integrity_check];
-    extra_checks.extend(finish_history_and_check(SCEN, cfg, history, &outcome.task_acks).await);
+    extra_checks.extend(finish_history_and_check(SCEN, cfg, history, &outcome.task_acks, params.seed).await);
 
     tear_down_and_evaluate_with_audit(
         SCEN,
@@ -4350,11 +4459,11 @@ pub async fn run_clock_skew_follower(
         // The fenced follower challenges for leadership each TTL cycle
         // (~500ms) and loses each S3 CAS against the healthy leader.
         // Each challenge bumps `leader_elections_total`. With ~10s of
-        // skewed clock and 500ms TTL, we see ~20 challenges. Runs have
-        // been observed in the 18-22 range due to timing variance.
-        // Bumped from 20 → 30 for headroom; the intent is "real
-        // leader change" which would be a single-digit delta.
-        max_leader_elections: 30,
+        // skewed clock and 500ms TTL, we see ~20 challenges, but the
+        // NTP restore slews rather than steps, so the fence window can
+        // overrun (31 observed under 4k-task load). 40 absorbs slew
+        // latency; a fence that never heals produces ~80-120.
+        max_leader_elections: 40,
         // Leader falls back to S3 for the 10s while follower is fenced.
         max_s3_fallbacks: 500,
         // Heartbeat handler fences on drift — the heartbeat itself
@@ -4748,6 +4857,7 @@ pub async fn run_bench_load_sweep(
             tasks: last_tasks,
             duration_secs: base_params.duration_secs,
             throughput_floor: base_params.throughput_floor,
+            seed: base_params.seed,
         },
         bench: BenchmarkSummary::from(&last_result),
         checks: vec![CheckResult::pass("BenchLoadSweepCompleted")],
@@ -5206,10 +5316,10 @@ pub async fn run_nemesis_composition(
     run_dir: &PathBuf,
 ) -> Result<ScenarioReport, String> {
     const SCEN: &str = "nemesis_composition";
-    const NEMESIS_SEED: u64 = 0xDEAD_BEEF_C0DE_CAFEu64;
+    let nemesis_seed = params.seed;
     const BENCH_SECS: u64 = 90;
 
-    println!("[{SCEN}] nemesis seed: {NEMESIS_SEED:#x}");
+    println!("[{SCEN}] nemesis seed: {nemesis_seed:#x}");
 
     let up = bring_up_cluster(cfg, SCEN, run_dir).await?;
     let pool = build_bench_pool(cfg, &up, params).await?;
@@ -5272,7 +5382,7 @@ pub async fn run_nemesis_composition(
     // --- Loop A: partition flap ---
     let deploy_dir_a = deploy_dir.clone();
     let loop_a = tokio::spawn(async move {
-        let mut prng = NemesisPrng::new(NEMESIS_SEED);
+        let mut prng = NemesisPrng::new(nemesis_seed);
         let mut partitioned = false;
         let mut done_rx = done_rx_a;
         loop {
@@ -5356,7 +5466,7 @@ pub async fn run_nemesis_composition(
     // --- Loop B: clock jitter ---
     let deploy_dir_b = deploy_dir.clone();
     let loop_b = tokio::spawn(async move {
-        let mut prng = NemesisPrng::new(NEMESIS_SEED.wrapping_add(0x0101_0101_0101_0101));
+        let mut prng = NemesisPrng::new(nemesis_seed.wrapping_add(0x0101_0101_0101_0101));
         let mut skewed_host: Option<String> = None;
         let mut done_rx = done_rx_b;
         let hosts = [leader_b.clone(), follower_b.clone()];
@@ -5431,7 +5541,7 @@ pub async fn run_nemesis_composition(
 
     let history = new_history_recorder(SCEN, run_dir);
     let bench_window_start_ms = up.elapsed_ms();
-    println!("[{SCEN}] idempotent bench: {} tasks, {}s (seed {NEMESIS_SEED:#x})", params.tasks, BENCH_SECS);
+    println!("[{SCEN}] idempotent bench: {} tasks, {}s (seed {nemesis_seed:#x})", params.tasks, BENCH_SECS);
     let pool_clone = pool.clone();
     let history_clone = history.clone();
     let tasks = params.tasks;
@@ -5483,7 +5593,7 @@ pub async fn run_nemesis_composition(
     let integrity_check = data_integrity_check(&integrity, (params.tasks as u64 / 50).max(5));
 
     let mut extra_checks = vec![integrity_check];
-    extra_checks.extend(finish_history_and_check(SCEN, cfg, history, &outcome.task_acks).await);
+    extra_checks.extend(finish_history_and_check(SCEN, cfg, history, &outcome.task_acks, params.seed).await);
 
     // Loose timing bounds; strict correctness at zero.
     let expectations = ScenarioExpectations {

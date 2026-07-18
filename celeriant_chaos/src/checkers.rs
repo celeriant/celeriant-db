@@ -7,8 +7,9 @@
 //! Soundness under incomplete history: dropped records can only HIDE
 //! evidence, never invent it, for every check except idempotency (which
 //! infers a violation from the *absence* of a prior ack/info for a 2002).
-//! `check_idempotency` therefore degrades to a skip when any record was
-//! dropped; the others stay sound.
+//! `check_idempotency` therefore fails closed (indeterminate) when any
+//! record was dropped, rather than reporting an unearned pass; the others
+//! stay sound under drops.
 //!
 //! `aggregate_version` semantics: the idempotent bench writes 1-event
 //! batches with `client_seq` starting at 1, so a node's
@@ -95,9 +96,13 @@ fn agg_client(op: &OpRecord) -> AggClient {
 fn check_idempotency(ops: &[&OpRecord], records_dropped: u64) -> CheckResult {
     const NAME: &str = "HistoryIdempotency";
     if records_dropped > 0 {
-        return CheckResult::pass_with_detail(
+        // Absence-based inference (a 2002 with no prior ack in history) is
+        // unsound once history is incomplete — dropped records are exactly
+        // what a fault would drop. The only caller (finish_history_and_check)
+        // always expects a verdict, so failing closed here is ungated.
+        return CheckResult::fail(
             NAME,
-            format!("skipped: history incomplete ({records_dropped} records dropped) — absence-based inference unsound"),
+            format!("indeterminate: history incomplete ({records_dropped} records dropped) — absence-based inference unsound"),
         );
     }
 
@@ -645,11 +650,14 @@ mod tests {
     }
 
     #[test]
-    fn idempotency_skips_when_history_dropped() {
+    fn idempotency_fails_closed_when_history_dropped() {
+        // Was: passed with "skipped: ..." (unsound-by-skip). Dropped history
+        // means the absence-based idempotency inference can't be trusted, so
+        // the checker must fail closed, not report a false verdict.
         let lines = vec![op(3, OpOutcome::Fail, Some("ClientIdempotencyViolation"))];
         let r = results(&lines, 5);
-        assert!(r["HistoryIdempotency"].passed);
-        assert!(r["HistoryIdempotency"].detail.contains("skipped"));
+        assert!(!r["HistoryIdempotency"].passed);
+        assert!(r["HistoryIdempotency"].detail.contains("indeterminate"));
     }
 
     #[test]

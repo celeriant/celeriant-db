@@ -114,6 +114,12 @@ pub struct DeleteTrimAuditReport {
     /// Pinned per-node reads disagreed on min/deleted state for a flagged
     /// aggregate — a node-visibility bug, distinct from durable loss.
     pub node_divergences: u64,
+    /// A pooled read looked like acked_version_loss or a trim_floor_breach,
+    /// but per-node ground truth showed at least one node caught up — the
+    /// pooled read legally lagged the write cursor (N10). NOT a violation:
+    /// excluded from `violations()`, kept only so reconciled-away cases stay
+    /// visible instead of being silently dropped.
+    pub read_lag_observed: u64,
     pub tasks_unreadable: u64,
     pub samples: Vec<String>,
 }
@@ -491,7 +497,20 @@ pub async fn audit_delete_trim_pinned(
             }).await {
                 Ok(d) => {
                     deleted_observed = d.is_deleted;
+                    // Poll-on-stale (N10, cheap defense): the pooled read can
+                    // legally lag the write cursor, so a version below what
+                    // was acked is often transient, not loss — retry before
+                    // committing to it. Only for the version-check path;
+                    // `expect_deleted` ledgers want is_deleted, not a higher
+                    // version, so they must not retry on this condition.
+                    let stale = !ledger.expect_deleted
+                        && !d.is_deleted
+                        && d.max_aggregate_version < ledger.highest_acked_version;
                     details = Some(d);
+                    if stale && attempt < READ_MAX_ATTEMPTS {
+                        jittered_backoff(&mut backoff_ms, ledger.client_id as u64, attempt as u64).await;
+                        continue;
+                    }
                     break;
                 }
                 Err(ClientError::Server(ServerError::Details {
@@ -512,13 +531,13 @@ pub async fn audit_delete_trim_pinned(
         // On a violation, re-read from every pinned node: "durably lost"
         // (all nodes agree) and "invisible on one node" have entirely
         // different root causes, and the sample must say which.
-        let flag = |report: &mut DeleteTrimAuditReport, base: String, per_node: Option<(String, bool)>| {
+        let flag = |report: &mut DeleteTrimAuditReport, base: String, per_node: Option<&PerNodeState>| {
             let s = match per_node {
-                Some((nodes, disagree)) => {
-                    if disagree {
+                Some(p) => {
+                    if p.disagree {
                         report.node_divergences += 1;
                     }
-                    format!("{base} [{nodes}]")
+                    format!("{base} [{}]", p.summary)
                 }
                 None => base,
             };
@@ -540,7 +559,7 @@ pub async fn audit_delete_trim_pinned(
                         "{}: delete acked but aggregate reads live at v{}",
                         ledger.aggregate_key,
                         details.as_ref().map(|d| d.max_aggregate_version).unwrap_or(0),
-                    ), per_node);
+                    ), per_node.as_ref());
                 }
             }
             continue;
@@ -555,20 +574,48 @@ pub async fn audit_delete_trim_pinned(
 
         if let Some(d) = details {
             if d.max_aggregate_version < ledger.highest_acked_version {
-                report.acked_version_loss += 1;
+                // N10: the pooled read can legally lag the write cursor —
+                // reconcile against per-node durable truth before counting
+                // this as data loss. Only genuine if no readable node is
+                // caught up (or there's no ground truth to check against).
                 let per_node = per_node_state(pinned, &ledger.aggregate_key).await;
-                flag(&mut report, format!(
-                    "{}: acked v{} but server reports v{}",
-                    ledger.aggregate_key, ledger.highest_acked_version, d.max_aggregate_version,
-                ), per_node);
+                let per_node_maxes: Vec<Option<u64>> = per_node
+                    .as_ref()
+                    .map(|p| p.states.iter().map(|s| s.map(|(_, _, max)| max)).collect())
+                    .unwrap_or_default();
+                if version_loss_verdict(ledger.highest_acked_version, d.max_aggregate_version, &per_node_maxes) {
+                    report.acked_version_loss += 1;
+                    flag(&mut report, format!(
+                        "{}: acked v{} but server reports v{}",
+                        ledger.aggregate_key, ledger.highest_acked_version, d.max_aggregate_version,
+                    ), per_node.as_ref());
+                } else {
+                    report.read_lag_observed += 1;
+                    flag(&mut report, format!(
+                        "{}: pooled read stale at v{} (acked v{}) but per-node ground truth confirms durable — read-lag, not loss",
+                        ledger.aggregate_key, d.max_aggregate_version, ledger.highest_acked_version,
+                    ), per_node.as_ref());
+                }
             }
             if ledger.acked_trim_floor > 0 && d.min_aggregate_version < ledger.acked_trim_floor {
-                report.trim_floor_breaches += 1;
                 let per_node = per_node_state(pinned, &ledger.aggregate_key).await;
-                flag(&mut report, format!(
-                    "{}: trim to {} acked but min_aggregate_version is {}",
-                    ledger.aggregate_key, ledger.acked_trim_floor, d.min_aggregate_version,
-                ), per_node);
+                let per_node_mins: Vec<Option<u64>> = per_node
+                    .as_ref()
+                    .map(|p| p.states.iter().map(|s| s.map(|(_, min, _)| min)).collect())
+                    .unwrap_or_default();
+                if trim_floor_breach_verdict(ledger.acked_trim_floor, d.min_aggregate_version, &per_node_mins) {
+                    report.trim_floor_breaches += 1;
+                    flag(&mut report, format!(
+                        "{}: trim to {} acked but min_aggregate_version is {}",
+                        ledger.aggregate_key, ledger.acked_trim_floor, d.min_aggregate_version,
+                    ), per_node.as_ref());
+                } else {
+                    report.read_lag_observed += 1;
+                    flag(&mut report, format!(
+                        "{}: pooled read shows stale min_aggregate_version {} (trim floor {} acked) but per-node ground truth confirms durable — read-lag, not breach",
+                        ledger.aggregate_key, d.min_aggregate_version, ledger.acked_trim_floor,
+                    ), per_node.as_ref());
+                }
             }
         }
     }
@@ -576,12 +623,22 @@ pub async fn audit_delete_trim_pinned(
     report
 }
 
-/// One details read per pinned node. Returns the rendered per-node summary
-/// and whether any two readable nodes disagree on (deleted, min, max).
+/// Per-node read result: the rendered summary line, whether any two
+/// readable nodes disagree on (deleted, min, max), and the raw per-node
+/// `(is_deleted, min, max)` states (`None` where that node's read errored)
+/// so callers can reconcile a pooled-read violation against durable truth,
+/// not just display it (N10).
+struct PerNodeState {
+    summary: String,
+    disagree: bool,
+    states: Vec<Option<(bool, u64, u64)>>,
+}
+
+/// One details read per pinned node.
 async fn per_node_state(
     pinned: &[(String, Arc<CeleriantPool>)],
     key: &AggregateKey,
-) -> Option<(String, bool)> {
+) -> Option<PerNodeState> {
     if pinned.is_empty() {
         return None;
     }
@@ -610,5 +667,102 @@ async fn per_node_state(
     }
     let known: Vec<&(bool, u64, u64)> = states.iter().flatten().collect();
     let disagree = known.len() >= 2 && known.windows(2).any(|w| w[0] != w[1]);
-    Some((parts.join("; "), disagree))
+    Some(PerNodeState { summary: parts.join("; "), disagree, states })
+}
+
+/// Reconciles a pooled `acked_version_loss` candidate against per-node
+/// durable truth (N10). The pooled read can legally lag the write cursor
+/// (read-cursor-behind-write is a legal state; only cluster-wide
+/// invisibility is a contract breach), so `pooled_max < highest_acked` alone
+/// is not proof of loss.
+///
+/// Returns `true` (genuine loss) when either there is no per-node ground
+/// truth to check against (empty `per_node_maxes`, or every node's read
+/// errored — falls back to trusting the pooled read, matching the
+/// non-pinned `audit_delete_trim` path), or EVERY readable node also shows
+/// a version below `highest_acked`. If ANY readable node is caught up, the
+/// pooled read was stale, not lossy — returns `false`.
+fn version_loss_verdict(highest_acked: u64, pooled_max: u64, per_node_maxes: &[Option<u64>]) -> bool {
+    if pooled_max >= highest_acked {
+        return false;
+    }
+    let readable: Vec<u64> = per_node_maxes.iter().filter_map(|m| *m).collect();
+    if readable.is_empty() {
+        return true;
+    }
+    readable.iter().all(|&m| m < highest_acked)
+}
+
+/// Same reconciliation as `version_loss_verdict`, for `trim_floor_breaches`:
+/// genuine only if no per-node ground truth exists, or EVERY readable node
+/// also shows `min < acked_trim_floor`.
+fn trim_floor_breach_verdict(acked_trim_floor: u64, pooled_min: u64, per_node_mins: &[Option<u64>]) -> bool {
+    if pooled_min >= acked_trim_floor {
+        return false;
+    }
+    let readable: Vec<u64> = per_node_mins.iter().filter_map(|m| *m).collect();
+    if readable.is_empty() {
+        return true;
+    }
+    readable.iter().all(|&m| m < acked_trim_floor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- version_loss_verdict (N10) ---
+
+    #[test]
+    fn version_loss_not_counted_when_pooled_read_is_fresh() {
+        // pooled_max >= highest_acked: no loss regardless of per-node state.
+        assert!(!version_loss_verdict(178, 178, &[]));
+        assert!(!version_loss_verdict(178, 179, &[Some(100)]));
+    }
+
+    #[test]
+    fn version_loss_reconciled_away_when_any_pinned_node_caught_up() {
+        // Reported bug: pooled read stale at v177, but a pinned node reads
+        // v178 — read-lag on the pooled read, not durable loss.
+        assert!(!version_loss_verdict(178, 177, &[Some(178), None]));
+        assert!(!version_loss_verdict(178, 177, &[Some(176), Some(178)]));
+    }
+
+    #[test]
+    fn version_loss_genuine_when_every_readable_node_also_behind() {
+        assert!(version_loss_verdict(178, 177, &[Some(176), Some(177)]));
+    }
+
+    #[test]
+    fn version_loss_genuine_when_no_ground_truth_at_all() {
+        // pinned empty (non-pinned audit_delete_trim path) — falls back to
+        // trusting the pooled read, matching pre-fix behavior.
+        assert!(version_loss_verdict(178, 177, &[]));
+        // pinned non-empty but every node's read errored: still no ground
+        // truth to override with, same fallback.
+        assert!(version_loss_verdict(178, 177, &[None, None]));
+    }
+
+    // --- trim_floor_breach_verdict (N10) ---
+
+    #[test]
+    fn trim_floor_breach_not_counted_when_pooled_read_is_fresh() {
+        assert!(!trim_floor_breach_verdict(50, 50, &[]));
+        assert!(!trim_floor_breach_verdict(50, 60, &[Some(0)]));
+    }
+
+    #[test]
+    fn trim_floor_breach_reconciled_away_when_one_node_correct() {
+        assert!(!trim_floor_breach_verdict(50, 10, &[Some(50), Some(10)]));
+    }
+
+    #[test]
+    fn trim_floor_breach_genuine_when_all_nodes_breached() {
+        assert!(trim_floor_breach_verdict(50, 10, &[Some(10), Some(20)]));
+    }
+
+    #[test]
+    fn trim_floor_breach_genuine_when_no_ground_truth() {
+        assert!(trim_floor_breach_verdict(50, 10, &[]));
+    }
 }

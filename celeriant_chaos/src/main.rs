@@ -68,6 +68,27 @@ struct Args {
     /// failing iteration aborts the soak. Has no effect outside soak mode.
     #[arg(long)]
     soak_continue_on_failure: bool,
+
+    /// Seed driving nemesis fault schedules, clock-skew jitter, and oracle
+    /// sample selection. Default: derived from wall-clock entropy so every
+    /// run explores a different fault plan (N3). Fix it to replay a run
+    /// exactly, e.g. after triaging a Heisenbug from a printed seed.
+    #[arg(long)]
+    seed: Option<u64>,
+}
+
+/// Entropy source for the default seed: no `rand` crate dependency here, so
+/// mix wall-clock nanos with `RandomState`'s per-process random keys (both
+/// vary run-to-run without needing a PRNG library).
+fn entropy_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(nanos);
+    hasher.finish()
 }
 
 #[tokio::main]
@@ -81,6 +102,8 @@ async fn main() -> Result<(), String> {
     };
     let cfg = ClusterConfig::load(deploy_dir)?;
 
+    let seed = args.seed.unwrap_or_else(entropy_seed);
+
     println!("=== celeriant-chaos ===");
     println!("  project root: {}", project_root.display());
     println!("  leader:       {}", cfg.leader_host);
@@ -88,6 +111,7 @@ async fn main() -> Result<(), String> {
     println!("  infra:        {}", cfg.infra_host.as_deref().unwrap_or("(none — managed by deploy)"));
     println!("  tasks:        {}", args.tasks);
     println!("  duration:     {}s", args.duration);
+    println!("  seed:         {seed:#x}  (reproduce with --seed {seed})");
     println!();
 
     let params = ScenarioParams {
@@ -95,6 +119,7 @@ async fn main() -> Result<(), String> {
         duration_secs: args.duration,
         throughput_floor: args.throughput_floor,
         connect_ramp_secs: args.connect_ramp,
+        seed,
     };
 
     let scenarios_to_run: Vec<&str> = match args.scenario.as_deref() {
@@ -291,13 +316,17 @@ async fn run_soak(
         iteration += 1;
         let elapsed = start.elapsed().as_secs();
         let remaining = soak_secs.saturating_sub(elapsed);
+        // Per-iteration seed (N3): otherwise a 24h soak replays the identical
+        // fault schedule hundreds of times instead of exploring a distribution.
+        let iter_seed = params.seed ^ (iteration as u64);
+        let iter_params = ScenarioParams { seed: iter_seed, ..params };
         println!();
         println!(
-            "=== SOAK iteration {iteration}: elapsed {}s / {}s ({}s remaining) ===",
+            "=== SOAK iteration {iteration}: elapsed {}s / {}s ({}s remaining), seed {iter_seed:#x} ===",
             elapsed, soak_secs, remaining,
         );
 
-        let (reports, dir) = match run_one_iteration(cfg, params, scenarios_to_run).await {
+        let (reports, dir) = match run_one_iteration(cfg, iter_params, scenarios_to_run).await {
             Ok(pair) => pair,
             Err(e) => {
                 eprintln!("soak iteration {iteration} bring-up or report write failed: {e}");
