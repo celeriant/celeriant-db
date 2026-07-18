@@ -23,3 +23,14 @@ target
 data
 data_leader
 data_follower
+
+# Sandbox guard marker (disposable sandbox — never commit)
+.sandbox
+
+# Session run logs (large; chaos-full-*.log can exceed GitHub's file limit)
+session/*.log
+
+# AFL fuzzing artifacts (regenerated per run; binary — curated reproducers live in fuzz/known_crashes/)
+fuzz/out/
+fuzz/corpus/
+fuzz/campaign_status.txt

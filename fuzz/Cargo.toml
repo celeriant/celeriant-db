@@ -1,0 +1,59 @@
+[workspace]
+members = ["."]
+
+[package]
+name = "celeriant_fuzz"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Separate workspace from the main repo on purpose: AFL instrumentation cfg
+# (`cargo afl build`) must not leak into the product build. Path deps below
+# pull in only the runtime-free crates (celeriant_wire/celeriant_wal/celeriant_msg
+# depend on neither glommio nor tokio).
+[dependencies]
+celeriant_wire = { path = "../celeriant_wire" }
+celeriant_wal = { path = "../celeriant_wal" }
+celeriant_msg = { path = "../celeriant_msg" }
+bincode = "2.0.1"
+crc32c = "0.6.8"
+futures-lite = "2.6.1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+afl = "0.18.2"
+
+[[bin]]
+name = "fuzz_bincode_decode"
+path = "src/bin/fuzz_bincode_decode.rs"
+
+[[bin]]
+name = "fuzz_wire_header"
+path = "src/bin/fuzz_wire_header.rs"
+
+[[bin]]
+name = "fuzz_serialised_datablock"
+path = "src/bin/fuzz_serialised_datablock.rs"
+
+[[bin]]
+name = "fuzz_versioned_block"
+path = "src/bin/fuzz_versioned_block.rs"
+
+[[bin]]
+name = "fuzz_sbbf"
+path = "src/bin/fuzz_sbbf.rs"
+
+[[bin]]
+name = "fuzz_metablock_bytes"
+path = "src/bin/fuzz_metablock_bytes.rs"
+
+[[bin]]
+name = "fuzz_dual_header_recovery"
+path = "src/bin/fuzz_dual_header_recovery.rs"
+
+[[bin]]
+name = "fuzz_multi_block_segment_scan"
+path = "src/bin/fuzz_multi_block_segment_scan.rs"
+
+[profile.release]
+# cargo-afl needs debug assertions off for realistic exec speed but panics
+# must still abort (default) so AFL sees crashes, not unwinds.
+debug = true
