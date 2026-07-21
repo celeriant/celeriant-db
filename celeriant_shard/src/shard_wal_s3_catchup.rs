@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
@@ -44,6 +44,74 @@ pub struct S3CatchupResult {
     pub bytes_downloaded: u64,
     pub rounds: u32,
     pub completion: CatchupCompletion,
+    /// Retry exit taken because unconsumable data sits at-or-ahead of the local
+    /// position and the view is stable. The caller uses this to bound its retry
+    /// loop: a persistently stalled shard must hand recovery back to the
+    /// TCP/kick path instead of pinning the node in catchup forever.
+    pub stalled_awaiting_s3: bool,
+}
+
+/// Why this catchup is running. A promoting leader-elect has no TCP fallback
+/// and must consume everything S3 holds before serving. A follower must get
+/// out of TCP's way instead: pinned in catchup it rejects TCP, forcing every
+/// leader commit onto S3 fallback, which feeds the very catchup it is stuck
+/// in (self-sustaining storm).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatchupRole {
+    Promoting,
+    Following,
+    /// First catchup after process start. The chain is unvalidated against
+    /// authority: consume (or divergence-handle) every visible covering file
+    /// before serving, never yield to TCP.
+    Boot,
+}
+
+/// Disposition of a catchup round that applied nothing and truncated nothing.
+///
+/// The round's S3 listing (after self/peer filtering, minus already-processed
+/// paths) is summarised by whether anything is visible at all and whether any
+/// unprocessed candidate ends at-or-ahead of `next_wal_seq`; the node's role
+/// and its position relative to the last observed leader tip decide how much
+/// patience a behind-only view deserves. "Caught" may only be declared from a
+/// view with nothing consumable ahead AND no evidence the leader holds more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoProgressVerdict {
+    /// Nothing in S3 for this shard (or a follower at/past the observed leader
+    /// tip): caught up now, no waiting.
+    CaughtNow,
+    /// Promoting with a non-empty view: run the drain-settle barrier; declare
+    /// Caught only if no new file lands in the window.
+    DrainThenCaught,
+    /// More data is coming (unprocessed files at-or-ahead, or a follower still
+    /// behind the observed leader tip): keep catchup open (drain/re-list). If
+    /// the view stalls, exit Retry: loud and fail-closed, never Caught.
+    AwaitMore,
+}
+
+pub(crate) fn no_progress_verdict(
+    any_peer_candidates_visible: bool,
+    unprocessed_at_or_ahead: bool,
+    role: CatchupRole,
+    next_beyond_observed_leader: bool,
+) -> NoProgressVerdict {
+    if unprocessed_at_or_ahead {
+        return NoProgressVerdict::AwaitMore;
+    }
+    // A follower behind the observed leader tip awaits even an EMPTY view: the
+    // gap was committed while we weren't accepting TCP, so it is in the
+    // leader's upload queue and will land (kicked-before-first-file ordering).
+    // Boot included for fail-closed dominance, though its observed target is
+    // always 0 so the behind-target combination is unreachable in practice.
+    if matches!(role, CatchupRole::Following | CatchupRole::Boot) && !next_beyond_observed_leader {
+        return NoProgressVerdict::AwaitMore;
+    }
+    if !any_peer_candidates_visible {
+        return NoProgressVerdict::CaughtNow;
+    }
+    match role {
+        CatchupRole::Promoting => NoProgressVerdict::DrainThenCaught,
+        CatchupRole::Following | CatchupRole::Boot => NoProgressVerdict::CaughtNow,
+    }
 }
 
 struct FallbackBatchRef {
@@ -84,38 +152,55 @@ struct CatchupCandidate {
     end_wal_seq: u64,
 }
 
-// Bounded settle window for the promotion-catchup drain barrier.
+// Bounded settle window for the catchup drain barrier.
 //
-// After winning the S3 lease (CAS), the predecessor is fenced for future uploads.
-// However, uploads that were in-flight BEFORE the CAS may still land or become
-// list-visible after our final list. The drain re-lists up to this many times
-// with a short sleep between each, waiting for S3 list visibility to stabilise.
+// The barrier guards every would-be `Caught` reached with a non-empty S3 view:
+// the uploader's fallback queue drains through a throttled pipeline
+// (s3_replication_delay × bounded concurrency), so files covering our position
+// can become list-visible seconds AFTER we first look. The drain re-lists up
+// to this many times with a short sleep between each; any NEW peer file (any
+// range) proves the queue is still draining and re-opens the main loop.
 //
-// Production: DRAIN_MAX_ROUNDS × DRAIN_SETTLE_INTERVAL = 5 × 500ms = 2.5s maximum wait.
-// Justified by: S3 PUT round-trip is typically <1s; predecessor is fenced so
-// its pre-fence set is finite and drains quickly. The wait is one-shot per
-// catchup completion, not a hot path.
+// Production: DRAIN_MAX_ROUNDS × DRAIN_SETTLE_INTERVAL = 8 × 750ms = 6s of
+// stability required, sized above the per-shard upload lulls of a few seconds
+// observed under chaos load. Cold recovery path only, never hot.
 //
 // In tests the interval is collapsed to 1ms so the drain logic is exercised
 // without adding seconds to every test that applies a batch.
 #[cfg(not(test))]
-const DRAIN_MAX_ROUNDS: u32 = 5;
+const DRAIN_MAX_ROUNDS: u32 = 8;
 #[cfg(test)]
 const DRAIN_MAX_ROUNDS: u32 = 3;
 
 #[cfg(not(test))]
-const DRAIN_SETTLE_INTERVAL: Duration = Duration::from_millis(500);
+const DRAIN_SETTLE_INTERVAL: Duration = Duration::from_millis(750);
 #[cfg(test)]
 const DRAIN_SETTLE_INTERVAL: Duration = Duration::from_millis(1);
 
+// Max drain-settle cycles a PROMOTING catchup invocation may burn before
+// yielding Retry so the caller can renew the promotion lease. Bounds drain
+// waits only: consume rounds are unbounded, so a live upload feed can still
+// hold one invocation open indefinitely.
+const PROMOTING_MAX_DRAIN_CONTINUES: u32 = 2;
+
+// Visible backlog (entries between next_wal_seq and the newest visible file's
+// end) below which a beyond-target follower treats covering files as the
+// leader's live tail and yields to TCP instead of consuming. Roughly one
+// internode replication batch: TCP bridges it in a round-trip once we flip.
+const LIVE_TAIL_EPSILON_ENTRIES: u64 = 5_000;
+
 /// Re-list S3 up to `DRAIN_MAX_ROUNDS` times with `DRAIN_SETTLE_INTERVAL` sleep
-/// between attempts, looking for late-landing covering files not yet in `processed_paths`.
+/// between attempts, looking for peer files that were neither in the round's
+/// listing (`seen_paths`) nor already consumed (`processed_paths`).
 ///
-/// Returns `true` if at least one new covering candidate was found (caller should
-/// continue the main loop to apply it). Returns `false` if the settle window passed
-/// with no new covering candidates (safe to declare `Caught`).
+/// Returns `true` if at least one new peer file landed (caller should continue
+/// the main loop to re-list and act on it). Returns `false` if the settle
+/// window passed with no new files: the S3 view is stable.
 ///
-/// Logs and counts each late file caught. Also logs the drain outcome summary.
+/// Any new file holds the barrier open, not just one covering `next_wal_seq`:
+/// the uploader's queue lands files in rough per-shard ascending order, so a
+/// new file strictly behind or ahead of us is evidence the drain is still in
+/// flight and the bridging file may be next.
 async fn drain_settle_barrier<D: S3Downloader + 'static>(
     downloader: &Rc<D>,
     prefix: &str,
@@ -124,6 +209,7 @@ async fn drain_settle_barrier<D: S3Downloader + 'static>(
     peer_node_id: Option<u128>,
     next_wal_seq: u64,
     processed_paths: &HashSet<String>,
+    seen_paths: &HashSet<String>,
 ) -> Result<bool, S3CatchupError> {
     let mut late_files_caught: u32 = 0;
 
@@ -133,7 +219,7 @@ async fn drain_settle_barrier<D: S3Downloader + 'static>(
         let objects = downloader.list_objects(prefix).await?;
 
         for obj in &objects {
-            let Some((_sid, start_wal_seq, end_wal_seq, source_node_id)) = parse_fallback_path(&obj.path) else {
+            let Some((_sid, _start_wal_seq, end_wal_seq, source_node_id)) = parse_fallback_path(&obj.path) else {
                 continue;
             };
             if source_node_id == node_id {
@@ -144,16 +230,13 @@ async fn drain_settle_barrier<D: S3Downloader + 'static>(
                     continue;
                 }
             }
-            // Only a file that actually covers the gap can advance us. A file
-            // strictly ahead of an unfilled next_wal_seq is not a bridging
-            // predecessor and must not hold the barrier open.
-            if start_wal_seq <= next_wal_seq && end_wal_seq >= next_wal_seq && !processed_paths.contains(&obj.path) {
+            if !processed_paths.contains(&obj.path) && !seen_paths.contains(&obj.path) {
                 tracing::warn!(
                     shard_id,
                     path = %obj.path,
                     late_wal_seq = end_wal_seq,
                     drain_round = round,
-                    "promotion catchup drain caught a late predecessor S3 file"
+                    "catchup drain caught a late-landing S3 file"
                 );
                 metrics::counter!(
                     "celeriant_catchup_drain_late_files_total",
@@ -169,7 +252,7 @@ async fn drain_settle_barrier<D: S3Downloader + 'static>(
                 drain_rounds = round + 1,
                 late_files_caught,
                 next_wal_seq,
-                "promotion catchup drain: late files found, continuing catchup"
+                "catchup drain: late files found, continuing catchup"
             );
             return Ok(true);
         }
@@ -180,7 +263,7 @@ async fn drain_settle_barrier<D: S3Downloader + 'static>(
         drain_rounds = DRAIN_MAX_ROUNDS,
         late_files_caught = 0u32,
         next_wal_seq,
-        "promotion catchup drain: settle window stable, declaring Caught"
+        "catchup drain: settle window stable"
     );
     Ok(false)
 }
@@ -205,12 +288,16 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
     peer_node_id: Option<u128>,
     max_catchup_gap_bytes: Option<u64>,
     dict_codec: Rc<DictCodec>,
+    role: CatchupRole,
+    observed_leader_wal_seq: u64,
+    live_tail_yielded_wal_seq: &Cell<u64>,
 ) -> Result<S3CatchupResult, S3CatchupError> {
     let mut result = S3CatchupResult {
         batches_applied: 0,
         bytes_downloaded: 0,
         rounds: 0,
         completion: CatchupCompletion::Retry,
+        stalled_awaiting_s3: false,
     };
     let current_wal_seq = {
         let active = log_segments_cache.active();
@@ -221,8 +308,13 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
     // List all available files we can work with
     let prefix = fallback_shard_prefix(shard_id);
 
-    let mut first_iteration = true;
     let mut processed_paths: HashSet<String> = HashSet::new();
+    // A promoting leader-elect chasing a still-uploading (not-yet-fenced) peer
+    // can outlive its own lease inside one invocation, stranding the cluster
+    // leaderless. Capping the settle-and-continue cycles stops drain waits
+    // from doing that; consume rounds stay unbounded, so a live upload feed
+    // can still hold the invocation open.
+    let mut drain_continues = 0u32;
 
     loop {
         result.rounds += 1;
@@ -273,23 +365,40 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
             .map(|c| c.size)
             .sum();
 
-        if !first_iteration && max_catchup_gap_bytes.map_or(true, |cap| remaining_bytes < cap) {
-            // Run the drain barrier before declaring Caught, but only if we applied
-            // at least one batch this invocation. If batches_applied==0, there are no
-            // predecessor uploads to drain (no predecessor chain was established with us).
-            if result.batches_applied > 0 {
-                // A predecessor's in-flight uploads may still be landing / becoming
-                // list-visible after our final list. The predecessor is fenced (we won the
-                // CAS), so this set is finite and drains within the settle window.
-                let late_found = drain_settle_barrier(downloader, &prefix, shard_id, node_id, peer_node_id, next_wal_seq, &processed_paths).await?;
-                if late_found {
-                    // Late files found — outer loop re-lists and applies them.
-                    first_iteration = true;
-                    continue;
-                }
+        // Live-tail gate: at/past everything the leader was known to hold, a
+        // small covering tail is the leader's live uploads, which exist only
+        // because our catching-up status forces every commit onto S3 fallback.
+        // Consuming would chase that tail forever; yield and let TCP carry it.
+        // Bounded by backlog size, not just position: a leader in permanent
+        // fallback never sends the TCP batch whose rejection would teach
+        // observed_leader_wal_seq, so a large backlog behind observed=0 must
+        // be consumed. Latched to one yield per position: a second catchup at
+        // the same next_wal_seq means TCP did not deliver, so consume instead.
+        // Boot is exempt: an unvalidated chain must consume before serving.
+        if role == CatchupRole::Following && next_wal_seq > observed_leader_wal_seq {
+            let has_unprocessed_covering = entries
+                .values()
+                .flatten()
+                .any(|c| c.start_wal_seq <= next_wal_seq && c.end_wal_seq >= next_wal_seq && !processed_paths.contains(&c.path));
+            let max_visible_end = entries
+                .values()
+                .flatten()
+                .filter(|c| !processed_paths.contains(&c.path))
+                .map(|c| c.end_wal_seq)
+                .max()
+                .unwrap_or(0);
+            if has_unprocessed_covering
+                && max_visible_end.saturating_sub(next_wal_seq) < LIVE_TAIL_EPSILON_ENTRIES
+                && live_tail_yielded_wal_seq.get() != next_wal_seq
+            {
+                live_tail_yielded_wal_seq.set(next_wal_seq);
+                metrics::counter!(
+                    "celeriant_s3_catchup_live_tail_yield_total",
+                    "shard_id" => shard_id.to_string()
+                ).increment(1);
+                result.completion = CatchupCompletion::Caught;
+                break;
             }
-            result.completion = CatchupCompletion::Caught;
-            break;
         }
 
         loop {
@@ -365,11 +474,17 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                     Some((prev, _)) => key > (prev.lease_epoch, prev.upload_sequence),
                     None => true,
                 };
+                // A dedupe loser is permanently stale ((lease_epoch, upload_sequence)
+                // is monotonic per start): mark it processed so later rounds never
+                // re-download it, or apply the stale chain on its own once the
+                // winner is consumed or skipped.
                 if replace {
                     if let Some((prev_batch, prev_cand)) = by_start.insert(start, (batch, cand)) {
+                        processed_paths.insert(prev_cand.path.clone());
                         tracing::debug!(shard_id, path = %prev_cand.path, stale_lease = prev_batch.lease_epoch, stale_seq = prev_batch.upload_sequence, "excluded stale same-start batch");
                     }
                 } else if let Some((winner_batch, _)) = by_start.get(&start) {
+                    processed_paths.insert(cand.path.clone());
                     tracing::debug!(shard_id, path = %cand.path, stale_lease = batch.lease_epoch, stale_seq = batch.upload_sequence, winner_lease = winner_batch.lease_epoch, winner_seq = winner_batch.upload_sequence, "excluded stale same-start batch");
                 }
             }
@@ -485,6 +600,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                     fsync_coordinator,
                     watched_aggregates,
                     &dict_codec,
+                    shard_id,
                     ancestor_hash,
                     ancestor_log_id,
                     divergent_wal_seq,
@@ -526,31 +642,67 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
         }
 
         if !truncated && result.batches_applied == inner_applied {
-            // No progress this iteration. If the remaining gap is small,
-            // TCP replication can bridge it once we exit catchup. Otherwise
-            // leave the default Retry; leader is likely still uploading.
-            if max_catchup_gap_bytes.map_or(true, |cap| remaining_bytes < cap) {
-                // Run the drain barrier before declaring Caught, but only if we applied
-                // at least one batch this invocation (same rationale as the pre-inner-loop
-                // check above: zero applied means no predecessor stream to drain).
-                if result.batches_applied > 0 {
-                    let late_found = drain_settle_barrier(downloader, &prefix, shard_id, node_id, peer_node_id, next_wal_seq, &processed_paths).await?;
-                    if late_found {
-                        first_iteration = true;
-                        continue;
-                    }
-                }
-                result.completion = CatchupCompletion::Caught;
+            // No progress this round. Fail-closed disposition: `Caught` may only
+            // come out of a view that is both consumable-free and settled. The
+            // uploader's fallback queue drains slowly, so an absent covering file
+            // usually means "not landed yet", not "nothing to fetch".
+            if max_catchup_gap_bytes.is_some_and(|cap| remaining_bytes >= cap) {
+                // Explicitly configured large-gap escape: leave Retry to the caller.
                 break;
             }
-            break;
+            let seen_paths: HashSet<String> = entries.values().flatten().map(|c| c.path.clone()).collect();
+            let unprocessed_at_or_ahead = entries
+                .values()
+                .flatten()
+                .any(|c| c.end_wal_seq >= next_wal_seq && !processed_paths.contains(&c.path));
+            let next_beyond_observed_leader = next_wal_seq > observed_leader_wal_seq;
+            match no_progress_verdict(!seen_paths.is_empty(), unprocessed_at_or_ahead, role, next_beyond_observed_leader) {
+                NoProgressVerdict::CaughtNow => {
+                    result.completion = CatchupCompletion::Caught;
+                    break;
+                }
+                NoProgressVerdict::DrainThenCaught => {
+                    let late_found = drain_settle_barrier(downloader, &prefix, shard_id, node_id, peer_node_id, next_wal_seq, &processed_paths, &seen_paths).await?;
+                    if late_found {
+                        drain_continues += 1;
+                        if role == CatchupRole::Promoting && drain_continues >= PROMOTING_MAX_DRAIN_CONTINUES {
+                            break; // Retry: yield so the caller can renew the promotion lease
+                        }
+                        continue;
+                    }
+                    result.completion = CatchupCompletion::Caught;
+                    break;
+                }
+                NoProgressVerdict::AwaitMore => {
+                    let late_found = drain_settle_barrier(downloader, &prefix, shard_id, node_id, peer_node_id, next_wal_seq, &processed_paths, &seen_paths).await?;
+                    if late_found {
+                        drain_continues += 1;
+                        if role == CatchupRole::Promoting && drain_continues >= PROMOTING_MAX_DRAIN_CONTINUES {
+                            break; // Retry: yield so the caller can renew the promotion lease
+                        }
+                        continue;
+                    }
+                    // More data is provably coming (files ahead we cannot chain
+                    // onto, or we are behind the leader's observed tip) but the
+                    // view stalled: exit loudly so the caller keeps retrying.
+                    // Never claim Caught over a known hole.
+                    tracing::warn!(
+                        shard_id,
+                        next_wal_seq,
+                        observed_leader_wal_seq,
+                        unprocessed_at_or_ahead,
+                        remaining_bytes,
+                        "S3 catchup stalled awaiting S3 data: retrying, not caught up"
+                    );
+                    metrics::counter!(
+                        "celeriant_s3_catchup_stalled_total",
+                        "shard_id" => shard_id.to_string()
+                    ).increment(1);
+                    result.stalled_awaiting_s3 = true;
+                    break;
+                }
+            }
         }
-
-        // After a truncation, force the next round to attempt apply regardless
-        // of remaining_bytes: the replacement chain covering the truncated range
-        // typically fits well under max_catchup_gap_bytes, and the pre-inner
-        // bailout would otherwise declare "fully caught up" without ever trying.
-        first_iteration = truncated;
     }
 
     Ok(result)
@@ -956,7 +1108,13 @@ async fn scan_local_metablocks_for_hashes(
 ) -> Result<([u8; 32], u64, u64, u64), S3CatchupError> {
     const READ_CHUNK_SIZE: u64 = 64 * 1024;
     let active_log_id = log_segments_cache.active_log_id();
-    let mut scanner = ReverseMetablockScanner::new(log_segments_cache, active_log_id, None, READ_CHUNK_SIZE);
+    // Write-cursor bound, not the default read bound: the divergence scan
+    // examines the durable chain (same rationale as fetch_catchup_entries),
+    // and a fresh boot leaves the read cursor None until the first
+    // commit-notify. Under the read bound the scan would return nothing and
+    // fork recovery could never find an ancestor on a restarted node.
+    let mut scanner = ReverseMetablockScanner::new(log_segments_cache, active_log_id, None, READ_CHUNK_SIZE)
+        .with_write_cursor_upper_bound();
 
     enum ScanHit {
         Match([u8; 32], u64, u64, u64),
@@ -1148,6 +1306,7 @@ async fn truncate_wal(
     fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
     watched_aggregates: &Rc<AggregateWatchers>,
     dict_codec: &DictCodec,
+    shard_id: u32,
     common_ancestor_hash: [u8; 32],
     divergent_log_id: u64,
     divergent_wal_seq: u64,
@@ -1290,7 +1449,11 @@ async fn truncate_wal(
         .await
         .map_err(|e| ShardFsyncError::MetablockSerialisationError(format!("chain-tips rebuild after truncate failed: {e:?}")))?;
 
-    tracing::warn!(divergent_count, new_wal_seq, "WAL truncated due to divergent entries");
+    tracing::warn!(shard_id, divergent_count, new_wal_seq, "WAL truncated due to divergent entries");
+    metrics::counter!(
+        "celeriant_wal_divergent_truncations_total",
+        "shard_id" => shard_id.to_string()
+    ).increment(1);
 
     Ok(divergent_count)
 }
@@ -1298,11 +1461,6 @@ async fn truncate_wal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
-    use std::collections::{HashMap, HashSet};
-    use std::path::PathBuf;
-
-    use bytes::Bytes;
     use celeriant_wal::datablocks::datablock::Datablock;
     use celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
     use celeriant_wal::datablocks::datablock_kind::DatablockKind;
@@ -1312,12 +1470,11 @@ mod tests {
 
     use celeriant_distributed::paths::fallback_batch_path;
     use celeriant_wal::aggregate_key::AggregateKey;
-    use celeriant_wal::constants::{GENESIS_HASH, WIRE_VERSION_S3_FALLBACK_BATCH};
+    use celeriant_wal::constants::GENESIS_HASH;
     use celeriant_wal::metablocks::metablock::Metablock;
     use celeriant_wal::s3::fallback_batch::{FallbackBatch, FallbackItem};
-    use celeriant_wire::disk::versioned_block::serialize_versioned_message_heap;
 
-    use crate::s3_downloader::S3ObjectRef;
+    use crate::catchup_test_support::*;
 
     macro_rules! glommio_test {
         ($body:expr) => {
@@ -1327,62 +1484,6 @@ mod tests {
                 .join()
                 .unwrap()
         };
-    }
-
-    const PREALLOCATE: u64 = 4 * 1024 * 1024;
-
-    fn test_dir() -> (tempfile::TempDir, PathBuf) {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("shard");
-        (tmp, dir)
-    }
-
-    fn test_metablock(wal_seq: u64, previous_tip_hash: [u8; 32]) -> Metablock {
-        let mut mb = Metablock::default_inline_event_batch_metadata(AggregateKey::new(1, 1, 1));
-        mb.wal_seq = wal_seq;
-        mb.previous_tip_hash = previous_tip_hash;
-        mb
-    }
-
-    fn serialize_fallback_batch(batch: &FallbackBatch) -> Bytes {
-        let data = serialize_versioned_message_heap(batch, WIRE_VERSION_S3_FALLBACK_BATCH).unwrap();
-        Bytes::from(data)
-    }
-
-    fn make_fallback_batch(shard_id: u32, start: u64, end: u64, tip_hash: [u8; 32]) -> (String, Bytes) {
-        make_fallback_batch_with_node(shard_id, start, end, tip_hash, 0)
-    }
-
-    fn make_fallback_batch_with_node(shard_id: u32, start: u64, end: u64, tip_hash: [u8; 32], node_id: u128) -> (String, Bytes) {
-        make_fallback_batch_with_seq(shard_id, start, end, tip_hash, node_id, 0)
-    }
-
-    fn make_fallback_batch_with_seq(shard_id: u32, start: u64, end: u64, tip_hash: [u8; 32], node_id: u128, upload_sequence: u64) -> (String, Bytes) {
-        make_fallback_batch_with_lease_seq(shard_id, start, end, tip_hash, node_id, upload_sequence, 0)
-    }
-
-    fn make_fallback_batch_with_lease_seq(shard_id: u32, start: u64, end: u64, tip_hash: [u8; 32], node_id: u128, upload_sequence: u64, lease_epoch: u64) -> (String, Bytes) {
-        let mut batch = FallbackBatch::new(start, end, shard_id, node_id, upload_sequence, lease_epoch);
-        for wal_seq in start..=end {
-            let mut mb = test_metablock(wal_seq, tip_hash);
-            mb.lease_epoch = lease_epoch;
-            batch.push_item(FallbackItem {
-                metablock: mb,
-                datablock: None,
-            });
-        }
-        let path = fallback_batch_path(shard_id, start, end, node_id);
-        (path, serialize_fallback_batch(&batch))
-    }
-
-    fn build_batch(start: u64, prevs: &[[u8; 32]], lease_epoch: u64) -> FallbackBatch {
-        let mut b = FallbackBatch::new(start, start + prevs.len() as u64 - 1, 0, 0, 0, lease_epoch);
-        for (i, &prev) in prevs.iter().enumerate() {
-            let mut mb = test_metablock(start + i as u64, prev);
-            mb.lease_epoch = lease_epoch;
-            b.push_item(FallbackItem { metablock: mb, datablock: None });
-        }
-        b
     }
 
     /// The content-immutability-per-epoch detector flags a same-epoch chain that
@@ -1416,238 +1517,6 @@ mod tests {
         assert!(!same_epoch_content_divergence(&empty, &full));
         assert!(!same_epoch_content_divergence(&full, &empty));
         assert!(!same_epoch_content_divergence(&empty, &empty));
-    }
-
-    // ── Mock S3Downloader ──
-
-    struct MockDownloader {
-        objects: RefCell<HashMap<String, Bytes>>,
-        download_log: RefCell<Vec<String>>,
-        delete_log: RefCell<Vec<String>>,
-        list_call_count: Cell<u32>,
-        on_list_hooks: RefCell<HashMap<u32, Vec<Box<dyn Fn(&MockDownloader)>>>>,
-        fail_paths: RefCell<HashSet<String>>,
-    }
-
-    impl MockDownloader {
-        fn new() -> Self {
-            Self {
-                objects: RefCell::new(HashMap::new()),
-                download_log: RefCell::new(Vec::new()),
-                delete_log: RefCell::new(Vec::new()),
-                list_call_count: Cell::new(0),
-                on_list_hooks: RefCell::new(HashMap::new()),
-                fail_paths: RefCell::new(HashSet::new()),
-            }
-        }
-
-        fn insert(&self, path: String, data: Bytes) {
-            self.objects.borrow_mut().insert(path, data);
-        }
-
-        fn fail_download(&self, path: String) {
-            self.fail_paths.borrow_mut().insert(path);
-        }
-
-        fn downloaded_paths(&self) -> Vec<String> {
-            self.download_log.borrow().clone()
-        }
-
-        fn deleted_paths(&self) -> Vec<String> {
-            self.delete_log.borrow().clone()
-        }
-
-        fn on_list(&self, call_index: u32, hook: impl Fn(&Self) + 'static) {
-            self.on_list_hooks.borrow_mut().entry(call_index).or_default().push(Box::new(hook));
-        }
-    }
-
-    impl S3Downloader for MockDownloader {
-        async fn list_objects(&self, prefix: &str) -> Result<Vec<S3ObjectRef>, S3CatchupError> {
-            let call = self.list_call_count.get();
-            self.list_call_count.set(call + 1);
-            if let Some(hooks) = self.on_list_hooks.borrow_mut().remove(&call) {
-                for hook in hooks {
-                    hook(self);
-                }
-            }
-            Ok(self
-                .objects
-                .borrow()
-                .iter()
-                .filter(|(k, _)| k.starts_with(prefix))
-                .map(|(k, v)| S3ObjectRef {
-                    path: k.clone(),
-                    size: v.len() as u64,
-                })
-                .collect())
-        }
-
-        async fn download(&self, path: &str) -> Result<Bytes, S3CatchupError> {
-            self.download_log.borrow_mut().push(path.to_string());
-            if self.fail_paths.borrow().contains(path) {
-                return Err(S3CatchupError::S3GetFailed {
-                    path: path.to_string(),
-                    message: "injected failure".to_string(),
-                });
-            }
-            self.objects.borrow().get(path).cloned().ok_or_else(|| S3CatchupError::S3GetFailed {
-                path: path.to_string(),
-                message: "not found".to_string(),
-            })
-        }
-
-        async fn delete(&self, path: &str) -> Result<(), S3CatchupError> {
-            self.objects.borrow_mut().remove(path);
-            self.delete_log.borrow_mut().push(path.to_string());
-            Ok(())
-        }
-    }
-
-    // ── Component setup ──
-
-    struct TestComponents {
-        log_segments_cache: Rc<LogSegmentsCache>,
-        shard_mem_cache: Rc<RefCell<MemCache>>,
-        fsync_coordinator: Rc<Coordinator<ShardFsyncError>>,
-        watched_aggregates: Rc<AggregateWatchers>,
-    }
-
-    fn test_codec() -> Rc<DictCodec> {
-        use celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES;
-        Rc::new(DictCodec::new(BUILTIN_DICT_BYTES, 3).expect("builtin dict must compile"))
-    }
-
-    impl TestComponents {
-        async fn new(dir: &std::path::Path) -> Self {
-            let log_segments_cache = LogSegmentsCache::ready_up(dir.to_path_buf(), PREALLOCATE, 4, 0).await.unwrap();
-            Self {
-                log_segments_cache: Rc::new(log_segments_cache),
-                shard_mem_cache: Rc::new(RefCell::new(MemCache::new(
-                    64 * 1024 * 1024,
-                    64 * 1024 * 1024,
-                    32 * 1024 * 1024,
-                    4 * 1024 * 1024,
-                    64 * 1024 * 1024,
-                ))),
-                fsync_coordinator: Rc::new(Coordinator::new()),
-                watched_aggregates: Rc::new(AggregateWatchers::new()),
-            }
-        }
-
-        fn wal_seq(&self) -> u64 {
-            self.log_segments_cache.active().metadata.borrow().write.wal_seq
-        }
-
-        fn tip_hash(&self) -> [u8; 32] {
-            self.log_segments_cache.active().metadata.borrow().write.tip_hash
-        }
-
-        async fn catchup(&self, downloader: &Rc<MockDownloader>, shard_id: u32, _max_rounds: u32) -> Result<S3CatchupResult, S3CatchupError> {
-            self.catchup_with_peer(downloader, shard_id, None).await
-        }
-
-        async fn catchup_with_peer(
-            &self,
-            downloader: &Rc<MockDownloader>,
-            shard_id: u32,
-            peer_node_id: Option<u128>,
-        ) -> Result<S3CatchupResult, S3CatchupError> {
-            catchup_from_s3(
-                &self.log_segments_cache,
-                &self.shard_mem_cache,
-                &self.fsync_coordinator,
-                &self.watched_aggregates,
-                downloader,
-                shard_id,
-                99,
-                peer_node_id,
-                Some(100), // max_catchup_gap_bytes
-                test_codec(),
-            )
-            .await
-        }
-
-        async fn close(&self) {
-            self.log_segments_cache.close().await;
-        }
-
-        /// Apply 1..=end. Returns the tip captured at wal=end-1, which equals
-        /// local @ wal=end's previous_tip_hash.
-        async fn seed_chain(&self, end: u64) -> [u8; 32] {
-            assert!(end >= 2);
-            let dl = Rc::new(MockDownloader::new());
-            let (p, d) = make_fallback_batch(0, 1, end - 1, GENESIS_HASH);
-            dl.insert(p, d);
-            self.catchup(&dl, 0, 10).await.unwrap();
-            let prev = self.tip_hash();
-            let (p, d) = make_fallback_batch(0, end, end, prev);
-            dl.insert(p, d);
-            self.catchup(&dl, 0, 10).await.unwrap();
-            prev
-        }
-    }
-
-    fn pos_at(wal_seq: u64) -> u64 {
-        HEADER_BLOCK_SIZE_BYTES as u64 + (wal_seq - 1) * FIXED_BLOCK_SIZE_BYTES as u64
-    }
-
-    fn test_metablock_for_agg(wal_seq: u64, prev: [u8; 32], agg: AggregateKey) -> Metablock {
-        let mut mb = Metablock::default_inline_event_batch_metadata(agg);
-        mb.wal_seq = wal_seq;
-        mb.previous_tip_hash = prev;
-        mb
-    }
-
-    /// Apply 1..=end one wal_seq at a time, returning tips[i] = tip after wal_seq=i+1.
-    async fn seed_capturing_tips(tc: &TestComponents, end: u64) -> Vec<[u8; 32]> {
-        let dl = Rc::new(MockDownloader::new());
-        let mut tips = Vec::with_capacity(end as usize);
-        for wal_seq in 1..=end {
-            let prev = *tips.last().unwrap_or(&GENESIS_HASH);
-            let (p, d) = make_fallback_batch(0, wal_seq, wal_seq, prev);
-            dl.insert(p, d);
-            tc.catchup(&dl, 0, 10).await.unwrap();
-            tips.push(tc.tip_hash());
-        }
-        tips
-    }
-
-    /// Local at wal_seq=6; S3 holds a 6..=8 chain anchored at tip_after_5, which
-    /// trips TipHashMismatch on local's wal_seq=7 expectation and drives
-    /// truncate_wal at divergent_wal_seq=6. Returns the prepped downloader.
-    async fn divergence_at_6(tc: &TestComponents) -> Rc<MockDownloader> {
-        let dl = Rc::new(MockDownloader::new());
-        let (p, d) = make_fallback_batch(0, 1, 5, GENESIS_HASH);
-        dl.insert(p, d);
-        tc.catchup(&dl, 0, 10).await.unwrap();
-        let tip_after_5 = tc.tip_hash();
-        let (p, d) = make_fallback_batch(0, 6, 6, tip_after_5);
-        dl.insert(p, d);
-        tc.catchup(&dl, 0, 10).await.unwrap();
-        dl.objects.borrow_mut().clear();
-        let (p, d) = make_fallback_batch(0, 6, 8, tip_after_5);
-        dl.insert(p, d);
-        dl
-    }
-
-    /// After find_divergence_via_s3 truncates, drop the stale trigger and plant a fresh
-    /// one anchored at the live local tip so catchup can converge.
-    fn resume_after_truncate(
-        dl: &Rc<MockDownloader>,
-        lsc: Rc<LogSegmentsCache>,
-        bad_trigger_path: String,
-        resume_start: u64,
-        resume_end: u64,
-    ) {
-        dl.on_list(2, move |dl| {
-            dl.objects.borrow_mut().remove(&bad_trigger_path);
-        });
-        dl.on_list(3, move |dl| {
-            let tip = lsc.active().metadata.borrow().write.tip_hash;
-            let (p, d) = make_fallback_batch(0, resume_start, resume_end, tip);
-            dl.insert(p, d);
-        });
     }
 
     // ── apply_external_batch tests ──
@@ -3208,7 +3077,11 @@ mod tests {
                 dl.insert(path, data);
             });
 
-            let result = tc.catchup(&dl, 0, 10).await.unwrap();
+            // Promoting role: a leader-elect has no TCP fallback, so it must
+            // settle the view and consume late predecessor uploads before
+            // serving. A follower with no observed leader target exits fast
+            // and leaves the residue to TCP (see s3_catchup_contract_tests).
+            let result = tc.catchup_as_promoting(&dl, 0).await.unwrap();
 
             // The drain barrier must have caught the late file and applied it.
             assert_eq!(
@@ -3244,24 +3117,44 @@ mod tests {
         });
     }
 
-    /// A file strictly ahead of an unfilled gap (start > next_wal_seq) is not a
-    /// bridging predecessor and must not hold the drain barrier open. Otherwise an
-    /// unfillable middle gap (corrupt/deleted batch) wedges catchup forever instead
-    /// of handing the gap to TCP extended catchup.
+    /// The drain barrier holds open on any NEW peer file (uploads still landing),
+    /// but a file already observed in the round's listing (`seen_paths`) or already
+    /// consumed (`processed_paths`) never re-triggers it: otherwise an unconsumable
+    /// file ahead of a gap would wedge catchup in the barrier forever.
     #[test]
-    fn drain_barrier_ignores_file_beyond_gap() {
+    fn drain_barrier_counts_only_files_not_yet_seen_or_processed() {
         glommio_test!({
-            let dl = Rc::new(MockDownloader::new());
-            // Waiting on seq 3, but the only visible file covers 5..=5 — ahead of the gap.
-            let (path, data) = make_fallback_batch(0, 5, 5, GENESIS_HASH);
-            dl.insert(path, data);
-
             let prefix = celeriant_distributed::paths::fallback_shard_prefix(0);
-            let late = drain_settle_barrier(&dl, &prefix, 0, 99, None, 3, &std::collections::HashSet::new())
+            let (path, data) = make_fallback_batch(0, 5, 5, GENESIS_HASH);
+
+            // New file (ahead of the gap at 3, but never observed before):
+            // evidence the upload queue is still draining, so the barrier stays open.
+            let dl = Rc::new(MockDownloader::new());
+            dl.insert(path.clone(), data.clone());
+            let late = drain_settle_barrier(&dl, &prefix, 0, 99, None, 3, &std::collections::HashSet::new(), &std::collections::HashSet::new())
+                .await
+                .unwrap();
+            assert!(late, "a never-before-seen peer file must hold the barrier open");
+
+            // Same file already in seen_paths: stable view, barrier closes.
+            let dl = Rc::new(MockDownloader::new());
+            dl.insert(path.clone(), data.clone());
+            let seen: std::collections::HashSet<String> = [path.clone()].into_iter().collect();
+            let late = drain_settle_barrier(&dl, &prefix, 0, 99, None, 3, &std::collections::HashSet::new(), &seen)
+                .await
+                .unwrap();
+            let late_seen = late;
+
+            // Same file already processed: consumed/poison, barrier closes.
+            let dl = Rc::new(MockDownloader::new());
+            dl.insert(path.clone(), data);
+            let processed: std::collections::HashSet<String> = [path].into_iter().collect();
+            let late = drain_settle_barrier(&dl, &prefix, 0, 99, None, 3, &processed, &std::collections::HashSet::new())
                 .await
                 .unwrap();
 
-            assert!(!late, "a file ahead of the gap must not count as a late predecessor");
+            assert!(!late_seen, "a file already in the round's listing must not re-trigger the barrier");
+            assert!(!late, "an already-processed file must not re-trigger the barrier");
         });
     }
 
@@ -3376,6 +3269,7 @@ mod tests {
                 &tc.fsync_coordinator,
                 &tc.watched_aggregates,
                 &test_codec(),
+                0,
                 [9u8; 32],
                 1,
                 5,

@@ -28,9 +28,18 @@ pub enum IntrashardMessages {
     },
     CullSpeculativeTail { mode: TailReconciliation },
     RenewS3LeaseNow { requesting_shard: usize },
-    EnterS3Catchup,
+    EnterS3Catchup {
+        role: celeriant_shard::shard_wal_s3_catchup::CatchupRole,
+        /// Catchup generation. Cycles can overlap (a kicked node's previous
+        /// per-shard catchup may still be running when the next cycle starts)
+        /// and the completion channel persists across cycles, so an untagged
+        /// completion from an old cycle would satisfy the new cycle's
+        /// accounting instantly and wrongly (kick/catchup livelock).
+        attempt: u64,
+    },
     S3CatchupComplete {
         shard_id: usize,
+        attempt: u64,
         result: Result<S3CatchupResult, S3CatchupError>
     },
     StatusUpdate {

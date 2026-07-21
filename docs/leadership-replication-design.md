@@ -181,9 +181,14 @@ With `reserve_coordinator_shard` enabled, data routing skips shard 0
 task. Shard 0 still binds a client listener; schema registration and redirects
 land there.
 
-S3 catchup fan-out: shard 0 broadcasts `EnterS3Catchup`, runs its own catchup
-synchronously, and collects `S3CatchupComplete` from every shard. Fatal errors
-shut the cluster down; transient S3 errors retry after 5s.
+S3 catchup fan-out: shard 0 picks the catchup role from its own status,
+broadcasts `EnterS3Catchup` to every shard, runs its own catchup synchronously,
+then waits for an `S3CatchupComplete` from each. The broadcast carries a
+generation tag because cycles can overlap: a shard may still be finishing the
+previous catchup when the next one starts, and the completion channel sticks
+around between cycles. Without the tag, a leftover completion from the old
+cycle would count toward the new one and finish it early. Fatal errors shut the
+cluster down; transient S3 errors retry after 5s.
 
 ## Write Pipeline
 
@@ -327,7 +332,13 @@ everything else spins.
 
 **Idle drains.** A 5s reachability probe in the heartbeat loop fires
 `probe_replicate` so a tail that missed its window drains without waiting for
-the next client write.
+the next client write. The probe can also kick the follower into S3 catchup:
+if its TCP catchup bails to S3, the gap can only be closed from the fallback
+files, and the follower won't go looking for those until something kicks it.
+The commit path's kick is fire-and-forget and can be lost, which would leave a
+rejoining follower stranded, so the probe sends the kick itself (same latch
+and lease budget as the commit path) and a lost kick is simply retried on the
+next probe.
 
 ## S3 Fallback
 
@@ -343,11 +354,104 @@ The kick flips the follower to `FollowerCatchingUp`. In that state (and in
 straight to S3 without burning a rejected TCP round-trip.
 
 **Catchup per shard:** list objects, filter to the peer's uploads, dedupe (same
-start, keep largest end), validate contiguity, then download-apply-fsync-delete.
-Catchup applies with `FullCommit` — no leader confirmation is needed because an
-S3-listable batch was durably uploaded by a leader before it acked. Any parked
-live-TCP commits below the new tip are committed first, so the cursor stays
-monotonic and their watch events fire exactly once.
+start, keep the highest `(lease_epoch, upload_sequence)`; the loser is
+permanently stale and marked processed), validate contiguity, then
+download-apply-fsync-delete. Catchup applies with `FullCommit`: no leader
+confirmation is needed because an S3-listable batch was durably uploaded by a
+leader before it acked.
+
+Parked live-TCP commits below the new tip are drained first. Their bytes are
+already on disk from live replication; what's outstanding is visibility. They
+were parked waiting for a leader confirmation, and those confirmations stopped
+arriving when TCP did. The covering S3 batch is that proof, so catchup runs
+their commits in order before applying it: the cursor stays monotonic and
+their watch events fire exactly once instead of being skipped.
+
+### Catchup exit discipline
+
+Knowing when to stop catchup matters as much as the catchup itself. A node in
+catchup rejects TCP replication, so the leader is forced to push every commit
+through S3 fallback, and those uploads land as new files in the very listing
+the catching-up node is trying to drain. With a naive "consume until S3 is
+empty" loop, the node chases the leader's live uploads forever and the whole
+cluster is stuck in fallback mode. The exit rules below exist to break that
+loop.
+
+The right exit depends on why the node is catching up, so every catchup runs
+under a role. Shard 0 decides the role once and sends it in the fan-out
+message instead of letting each shard read its own status: the `Promoting`
+status broadcast can be dropped under queue pressure, and a shard that runs a
+promotion catchup as `Following` would exit early and skip data the dead
+leader already acked.
+
+- **`Boot`**: first catchup after process start. The node has not checked its
+  chain against anyone yet, so it must consume (or divergence-handle) every
+  visible file covering its position before it serves. It never hands off to
+  TCP.
+- **`Following`**: a kicked follower. Its goal is to get back onto live TCP
+  replication, not to drain S3. It knows roughly where the leader is, because
+  every TCP batch it rejected named the leader's tip. Once at or past that tip
+  with only a small covering backlog left, that backlog is the leader's live
+  upload tail: stop, become `Follower`, and let TCP carry it. This yield
+  happens at most once per position. If the next catchup starts at the same
+  place, TCP evidently did not bridge the gap, so consume from S3 after all.
+- **`Promoting`**: a leader-elect. There is no TCP to fall back to (the other
+  node is dead or partitioned), so it keeps draining until the S3 view stops
+  changing.
+
+Declaring `Caught` is fail-closed, because an S3 listing lies by omission: the
+leader's fallback uploads flow through a throttled pipeline, so a file
+covering our gap can appear seconds after we first looked. Any exit through
+`Caught` from a non-empty view must first pass the drain-settle barrier, a few
+re-lists spread over several seconds with no new file landing. If the view
+stalls while we know there is a hole (a file ahead we cannot chain onto, or a
+follower still behind the leader's tip), the round exits `Retry`, loudly. It
+never claims `Caught` over a known hole. After several consecutive attempts
+stall with zero progress, the orchestrator gives up on catchup entirely and
+hands recovery back to the TCP/kick path.
+
+One round of the loop:
+
+```mermaid
+flowchart TD
+    A[List S3 for this shard] --> LT{Following, at or past the
+observed leader tip, only a small
+covering backlog visible?}
+    LT -->|yes, first time at this position| Y[Caught: yield the
+live tail to TCP]
+    LT -->|no| AP[Apply every batch that
+chains onto the local WAL]
+    AP --> B{Progress? Applied
+or truncated?}
+    B -->|yes| A
+    B -->|no| D{File ahead we cannot chain onto,
+or follower still behind
+the observed leader tip?}
+    D -->|yes, more must be coming| G[Drain-settle barrier:
+re-list until stable]
+    G -->|new file landed| A
+    G -->|view stable| R[Retry: stalled, loud.
+Repeated zero-progress stalls
+bail catchup back to TCP and kick]
+    D -->|no| E{Any peer files
+visible at all?}
+    E -->|no| K[Caught]
+    E -->|yes, Boot or Following| K
+    E -->|yes, Promoting| F[Drain-settle barrier]
+    F -->|new file landed| A
+    F -->|view stable| K
+```
+
+Two more rules keep the exits honest:
+
+- Every exit under a live leader flips the node back to `Follower` explicitly.
+  Heartbeats extend a catching-up node's TTL without changing its status, so a
+  "lease is alive, nothing to do" exit would leave the node pinned in catchup:
+  the storm again.
+- A promotion whose catchup spans multiple attempts renews its lease between
+  them; otherwise the lease decays mid-catchup and the cluster is left
+  leaderless. If the other node took the lease in the meantime, the promotion
+  yields: the flip gate resolves it as `LostRace`, never a zombie leader.
 
 A kicked follower resumes as `Follower` without an election: the kick itself
 proved the leader alive. Boot catchup ends in an election instead.

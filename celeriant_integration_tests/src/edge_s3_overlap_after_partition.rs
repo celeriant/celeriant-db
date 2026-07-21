@@ -19,7 +19,7 @@
 //! Invariants tested: 7 (WAL continuity), 10 (S3 catchup), 13 (divergence recovery)
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use crate::{count_events, poll_converged_count, s3_cluster_config, write_event, MinioContainer, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT};
+use crate::{count_events, poll_converged_count, s3_cluster_config, wait_for_leader, write_event, MinioContainer, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT};
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
 
@@ -109,8 +109,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     node_b.restart().await?;
     println!("  B restarted");
 
+    // Stale-lease TTL (~10s) plus the promotion drain-settle window (~6s over
+    // A's fallback objects) before B serves as leader. Poll rather than sleep.
     println!("  Waiting for B to win election + S3 catchup...");
-    tokio::time::sleep(Duration::from_secs(12)).await;
+    wait_for_leader(&format!("127.0.0.1:{}", node_b_port), Duration::from_secs(30)).await?;
 
     let mut client_b = CeleriantClient::connect(&format!("127.0.0.1:{}", node_b_port)).await?;
 

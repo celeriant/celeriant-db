@@ -31,7 +31,7 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 - On standalone/follower, writes become readable immediately after fsync.
 - Two separate LRU caches exist: `aggregate_write_snapshots` (updated after fsync, used for OCC/idempotency) and `aggregate_read_snapshots` (updated after replication on leader, used by reads).
 - The recent-write cache filters by `visible_wal_seq`. Entries with `wal_seq > visible_wal_seq` are excluded from reads.
-- The reverse metablock scanner defaults to the `read` cursor: not-yet-replicated bytes are invisible to client reads. Write-side scans opt into the write-cursor bound (`with_write_cursor_upper_bound`): OCC/idempotency cache loads and replication catchup — catchup ships durable bytes, not reader-visible bytes, so a sealed `read < write` tail is still bridgeable.
+- The reverse metablock scanner defaults to the `read` cursor: not-yet-replicated bytes are invisible to client reads. Write-side scans opt into the write-cursor bound (`with_write_cursor_upper_bound`): OCC/idempotency cache loads, replication catchup (catchup ships durable bytes, not reader-visible bytes, so a sealed `read < write` tail is still bridgeable), and the S3 divergence ancestor scan (a restarted node's read cursor is `None` until its first commit; under the read bound, fork recovery would never find an ancestor).
 - Read operations are never rejected based on node status. A fenced or catching-up node serves stale reads silently.
 - There is no cross-shard transactional consistency. Multi-shard listings are sequential per-shard with no cross-shard snapshot isolation.
 
@@ -76,6 +76,7 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 ## Kick Follower
 
 - A kick is attempted after S3 fallback replication succeeds, gated by `try_acquire_kick` (skipped if a previous kick is still in-flight). Delivery is best-effort.
+- The reachability probe also kicks, inline, when its TCP catchup bails to S3: the follower's recovery source is then the S3 fallback files, and only a kick re-opens its catchup. Shares the commit path's kick latch and lease budget; delivery stays best-effort with the probe cadence as the retry.
 - Kick triggers when S3 fallback is used because: follower is offline, workset exceeds `max_catchup_gap_bytes`, or pending queue exceeds `pending_replication_high_water_bytes`.
 - The commit path does not await `send_kick`. The kick is spawned fire-and-forget via `try_acquire_kick` / `release_kick`; at most one in-flight kick task per shard. Commits never pay `internode_request_timeout` waiting on a slow/dead follower.
 - Kick is always routed to shard 0. Shard 0 broadcasts the state change to all local shards.
@@ -114,7 +115,7 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 
 ## S3 Catchup (Follower)
 
-- Among S3 batches covering overlapping wal_seq ranges, the authoritative chain is selected by `(lease_epoch, upload_sequence)` lexicographically. `lease_epoch` is globally monotonic via the S3 CAS election protocol and is the primary comparator: a batch from a higher-lease leader always supersedes one from a lower-lease leader regardless of `upload_sequence`. `upload_sequence` is per-process and serves only as a within-lease tiebreaker; it resets to zero on each leader handover, so it is not meaningful across leaders.
+- Among S3 batches covering overlapping wal_seq ranges, the authoritative chain is selected by `(lease_epoch, upload_sequence)` lexicographically. `lease_epoch` is globally monotonic via the S3 CAS election protocol and is the primary comparator: a batch from a higher-lease leader always supersedes one from a lower-lease leader regardless of `upload_sequence`. `upload_sequence` is per-process and serves only as a within-lease tiebreaker; it resets to zero on each leader handover, so it is not meaningful across leaders. A dedupe loser is permanently stale (the comparator is monotonic per start position) and is marked processed so it is never applied on its own in a later round.
 - A node never applies a batch it uploaded itself.
 - A follower doesn't need to be caught-up to the WAL tip of the leader, just close enough to re-join as follower using TCP. It can catchup 'offline' via S3, and when close enough to the leader's WAL tip, it can rejoin.
 - Leader will always ensure S3 contains the data required to catch up. If there is no active TCP follower, the leader never ACKs to clients until it has replicated the WAL data to S3.
@@ -127,6 +128,12 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 - Never truncate unless S3 has gap-free contiguous coverage from the ancestor's wal_seq up through the current write position. Truncating into a range S3 cannot re-supply would destroy entries that cannot be reconstructed.
 - S3 catchup fsyncs as `Standalone`: read position advances with write position, no replication gate.
 - Post-catchup, the node must win an S3 CAS election before accepting writes.
+- Catchup runs under a role (`Boot`, `Following`, `Promoting`) decided once by shard 0 and carried in the `EnterS3Catchup` message. Never re-derived from the shard's own status: the `Promoting` StatusUpdate broadcast is droppable under queue pressure, and a promotion catchup run as `Following` fast-exits without consuming the dead peer's acked data.
+- `Caught` is fail-closed. It requires nothing consumable at-or-ahead of the local position, no evidence the leader holds more, and (for a non-empty view) a passed drain-settle barrier: fallback uploads become list-visible seconds after the first look, so an absent covering file means "not landed yet" until the view settles. A stalled view over a known hole exits Retry loudly, never Caught.
+- Catchup must not pin a node. A catching-up node rejects TCP replication, forcing every leader commit onto S3 fallback, which feeds the catchup it is stuck in (self-sustaining storm). Two rules break the loop: every catchup exit under a live leader resumes `Follower` explicitly (heartbeats refresh a catching-up node's TTL without changing its status, so "lease alive, do nothing" is a wedge), and bounded consecutive zero-progress stalled attempts bail catchup so TCP/kick recovery proceeds.
+- A `Following` catchup at-or-past the observed leader tip (taught by the last wal_seq of rejected TCP batches) yields a small covering backlog to TCP instead of consuming it: that backlog is the leader's live upload tail. The yield fires at most once per position; a second catchup at the same position consumes from S3. `Boot` never yields: an unvalidated chain must consume or divergence-handle every covering file before the node serves.
+- A promoting node renews its lease between catchup attempts. Supersession mid-catchup adopts the observed status and yields; the promotion flip gate resolves it as `LostRace`, never a zombie leader.
+- Catchup completions are generation-tagged and stale tags are discarded. Cycles overlap (a kicked node's previous per-shard catchup may still be running when the next cycle starts) and the completion channel persists across cycles; an untagged stale completion satisfies the new cycle's accounting instantly (kick/catchup livelock).
 
 ## Sharding and Concurrency
 

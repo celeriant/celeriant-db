@@ -18,7 +18,7 @@
 //! Run with: cargo run --bin s3_lease_monotonicity_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use crate::{count_events, poll_converged_count, write_event, MinioContainer, ServerConfig, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT};
+use crate::{count_events, poll_converged_count, wait_for_leader, write_event, MinioContainer, ServerConfig, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT};
 use celeriant_runtimes::RoutingRule;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::disk::versioned_block::deserialise_lease;
@@ -216,6 +216,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     assert_ne!(lease_3.leader_node_id, node_b_id, "leader should not be B");
     println!("  ✓ Lease updated: lease_epoch {} → {}, leader is A again",
         lease_epoch_after_failover_1, lease_3.lease_epoch);
+
+    // The CAS is won (lease verified above) but A is still Promoting: with B's
+    // fallback objects visible it holds a ~6s drain-settle window before
+    // flipping to Leader and serving writes. Poll for the flip.
+    wait_for_leader(leader_a.address(), Duration::from_secs(20)).await?;
 
     println!("  Writing events 6-7 to re-promoted leader A...");
     for i in 6..=7 {

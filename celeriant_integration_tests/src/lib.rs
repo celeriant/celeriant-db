@@ -1735,7 +1735,34 @@ pub async fn is_leader(address: &str) -> Result<bool, Box<dyn std::error::Error>
         .write_events_with(probe_key, vec![event], 0, WriteEventsOptions { allow_create: false, ..Default::default() })
         .await
     {
+        // Only the leader's expected rejection proves leadership. Anything
+        // else (ServerBusy, timeouts, dropped connections during churn) is
+        // inconclusive and must not read as "leader".
+        Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Write {
+            kind: celeriant_client_tokio::server_error::WriteError::AggregateNotExists, ..
+        })) => Ok(true),
         Err(ClientError::NotLeader { .. }) => Ok(false),
-        _ => Ok(true),
+        Ok(_) => Ok(true), // write accepted: only a leader can
+        Err(e) => Err(e.into()),
     }
+}
+
+/// Poll `is_leader` until the node serves as leader or the timeout expires.
+///
+/// A promoting node that sees peer fallback objects in S3 holds a ~6s
+/// drain-settle window (fail-closed: the dead/partitioned peer's upload queue
+/// may still be landing files) before flipping to Leader, so fixed
+/// promotion sleeps sized to the old sub-second flip race it. Poll instead.
+pub async fn wait_for_leader(address: &str, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
+    let start = std::time::Instant::now();
+    let mut last_outcome = String::from("no probe completed");
+    while start.elapsed() < timeout {
+        match is_leader(address).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => last_outcome = "NotLeader".into(),
+            Err(e) => last_outcome = e.to_string(), // inconclusive probe; keep polling
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err(format!("node {address} not leader after {timeout:?} (last probe: {last_outcome})").into())
 }

@@ -490,6 +490,32 @@ async fn run_probe_send<R: ReplicationClient + 'static>(
                 crate::replicate_follower_catchup::CatchupOutcome::FallbackToS3 => {
                     metrics::counter!("celeriant_probe_gap_send_failed_total").increment(1);
                     debug!(shard_id, "Probe catchup needs S3 fallback; next real write will route through S3");
+                    // TCP cannot close this gap; the follower's recovery source is
+                    // the S3 fallback files, and only a kick re-opens its catchup.
+                    // Sent inline and logged: the fire-and-forget kick path swallows
+                    // failures, which left rejoining followers stranded behind a
+                    // drained upload queue. Shares spawn_kick's latch (no overlapping
+                    // kicks on the conn) and lease budget (a fenced ex-leader must
+                    // not kick); the periodic probe cadence is the retry.
+                    if replication_client.try_acquire_kick() {
+                        let kick_result = match node_status.get().current_budget() {
+                            Some(b) if !b.is_zero() => with_budget(b, replication_client.send_kick()).await,
+                            _ => None,
+                        };
+                        replication_client.release_kick();
+                        match kick_result {
+                            Some(Ok(accepted)) => {
+                                metrics::counter!("celeriant_probe_kick_total", "shard_id" => shard_id.to_string()).increment(1);
+                                info!(shard_id, accepted, gap = gap_size, "Probe: kicked follower to re-enter S3 catchup");
+                            }
+                            Some(Err(e)) => {
+                                warn!(shard_id, error = ?e, gap = gap_size, "Probe: kick send failed; will retry next probe");
+                            }
+                            None => {
+                                metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "kick".to_string()), ("shard_id", shard_id.to_string())]).increment(1);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1263,6 +1289,7 @@ mod tests {
         tcp_confirmed: Rc<RefCell<Vec<u64>>>,
         s3_calls: Rc<RefCell<Vec<usize>>>,
         tcp_pre_delay: Cell<Option<Duration>>,
+        kicks_sent: Cell<u32>,
     }
 
     impl MockClient {
@@ -1277,6 +1304,7 @@ mod tests {
                 tcp_confirmed: Rc::new(RefCell::new(Vec::new())),
                 s3_calls: s3_calls.clone(),
                 tcp_pre_delay: Cell::new(None),
+                kicks_sent: Cell::new(0),
             };
             (mc, tcp_calls, s3_calls)
         }
@@ -1327,6 +1355,7 @@ mod tests {
         }
 
         async fn send_kick(&self) -> Result<bool, crate::error::send_heartbeat_error::SendHeartbeatError> {
+            self.kicks_sent.set(self.kicks_sent.get() + 1);
             Ok(true)
         }
     }
@@ -2093,6 +2122,36 @@ mod tests {
                 "probe ping (1 entry) + catchup gap (entries 2..=3, 2 items)",
             );
             assert!(s3_calls.borrow().is_empty(), "probe catchup runs over TCP");
+            h.close().await;
+        });
+    }
+
+    /// When probe catchup cannot close the gap over TCP (chunk rejected →
+    /// FallbackToS3), the probe must kick the follower: its recovery source is
+    /// the S3 fallback files, and only a kick re-opens its catchup. A successful
+    /// TCP catchup must NOT kick.
+    #[test]
+    fn probe_kicks_follower_when_tcp_catchup_bails_to_s3() {
+        glommio_test!({
+            // Leg 1: catchup chunk rejected → kick sent.
+            let h = Harness::new().await;
+            seed_disk_at_wal(&h.lsc, &[1, 2, 3]).await;
+            let (mock, _tcp_calls, _s3_calls) = MockClient::build();
+            let client = Rc::new(mock.with_tcp(programmed_tcp(vec![Err(wal_mismatch(1)), Err(wal_mismatch(1))])));
+            let captured = ReplicationCapturedData { replication_snapshot: vec![] };
+            let result = h.commit_with_trigger(client.clone(), captured, ReplicationTrigger::Probe, u64::MAX).await;
+            assert!(result.is_ok(), "probe + catchup-bail returns Ok; got {result:?}");
+            assert_eq!(client.kicks_sent.get(), 1, "TCP-unbridgeable gap must kick the follower into S3 catchup");
+            h.close().await;
+
+            // Leg 2: catchup succeeds over TCP → no kick.
+            let h = Harness::new().await;
+            seed_disk_at_wal(&h.lsc, &[1, 2, 3]).await;
+            let (mock, _tcp_calls, _s3_calls) = MockClient::build();
+            let client = Rc::new(mock.with_tcp(programmed_tcp(vec![Err(wal_mismatch(1)), Ok(())])));
+            let captured = ReplicationCapturedData { replication_snapshot: vec![] };
+            h.commit_with_trigger(client.clone(), captured, ReplicationTrigger::Probe, u64::MAX).await.unwrap();
+            assert_eq!(client.kicks_sent.get(), 0, "a TCP-bridged gap must not kick");
             h.close().await;
         });
     }

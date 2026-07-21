@@ -24,14 +24,17 @@
 //!   does. Which flavor fires per shard depends on what S3 batches exist;
 //!   phase K asserts the outcome and the ack barrier, and reports the
 //!   mechanism counters.
-//! - **Phase R (kill → forced reframe).** Phase K's orchestration, plus:
-//!   before the old leader restarts, every S3 batch at/below the tail base
-//!   is deleted — simulating S3 GC (the documented ancestor-skew edge,
-//!   `evaluation-todo.md` item 3). Find-ancestor-by-download then has
-//!   nothing to match, so only the reframe (an S3 batch chaining onto the
-//!   read tip) can recover the node. Pins the `be3c6b4` liveness fix:
-//!   reframe fires on every shard, the node rejoins instead of looping on
-//!   "no common ancestor".
+//! - **Phase R (kill → recovery without S3 ancestors).** Phase K's
+//!   orchestration, plus: before the old leader restarts, every S3 batch
+//!   at/below the tail base is deleted, simulating S3 GC (the ancestor-skew
+//!   edge). Find-ancestor-by-
+//!   download then has nothing to match. Two sanctioned recoveries remain:
+//!   the write-cursor-bound LOCAL scan matching the shared prefix on disk
+//!   (divergent truncation), or the `be3c6b4` reframe (an S3 batch chaining
+//!   onto the read tip). Pins the liveness fix: one of the two fires on
+//!   every shard, the node rejoins instead of looping on "no common
+//!   ancestor". (Historically reframe-only: the local scan was blind on a
+//!   fresh boot until it was bounded by the write cursor.)
 //!
 //! Both phases share the oracles: speculative writes must never be ACKed;
 //! the tail's distinct payload marker (4KB incompressible vs ~15B
@@ -261,7 +264,7 @@ async fn phase_fence_demotion_cull(port_base: u16) -> Result<(), Box<dyn std::er
     // tail and the divergence machinery cleaned up after it.
     let m = scrape_mechanism_counters(a_metrics_port).await?;
     println!("  A counters: {}", m.report());
-    if m.reframed != 0 || m.divergence_advanced != 0 {
+    if m.reframed != 0 || m.truncations != 0 || m.divergence_advanced != 0 {
         return Err(format!(
             "tail removed by truncation/reframe ({}) — reconcile_durable_tail \
              did not fire before catchup on the in-process demotion", m.report()
@@ -278,9 +281,10 @@ async fn phase_fence_demotion_cull(port_base: u16) -> Result<(), Box<dyn std::er
 /// divergence machinery (ancestor truncation or reframe, per shard).
 ///
 /// `force_reframe`: before the restart, delete every S3 batch at/below the
-/// tail base (simulated S3 GC) so no download can match an ancestor — the
-/// reframe-at-read-cursor is then the only recovery, and it is asserted to
-/// fire on every shard.
+/// tail base (simulated S3 GC) so no download can match an ancestor. The
+/// divergence machinery must still remove the tail on every shard, via the
+/// write-cursor-bound local scan (divergent truncation) or, if that misses,
+/// the reframe-at-read-cursor.
 async fn phase_kill_boot_truncation(port_base: u16, force_reframe: bool) -> Result<(), Box<dyn std::error::Error>> {
     let ports = PhasePorts::new(port_base);
     let (node_a_port, node_b_port, minio_port) = (ports.node_a, ports.node_b, ports.minio);
@@ -479,13 +483,19 @@ async fn phase_kill_boot_truncation(port_base: u16, force_reframe: bool) -> Resu
     println!("  A counters (post-restart): {}", m.report());
     m.assert_barrier_clean()?;
     if force_reframe {
-        // With the ancestors GC'd, the reframe is the only legal recovery and
-        // must have fired on every shard; rejoining at all (poll above) is
-        // the be3c6b4 liveness assertion.
-        if m.reframed < NUM_SHARDS as u64 {
+        // With the S3 ancestors GC'd, only the divergence machinery may remove
+        // the tail: local-ancestor truncation (the write-cursor-bound scan
+        // matches the shared prefix on disk) or the reframe-at-read-cursor.
+        // Either flavor ends in truncate_wal, so truncations alone counts
+        // per-shard recoveries (reframed also increments truncations; summing
+        // them would double-count and let a half-recovered node pass).
+        // Rejoining at all (poll above) is the be3c6b4 liveness assertion;
+        // zero activity here would mean the tail was silently absorbed.
+        if m.truncations < NUM_SHARDS as u64 {
             return Err(format!(
-                "reframe fired on {} of {} shards despite GC'd ancestors — node recovered \
-                 through a path that should have been impossible", m.reframed, NUM_SHARDS
+                "divergence machinery fired on {} of {} shards despite GC'd ancestors ({}): \
+                 node recovered through a path that should have been impossible",
+                m.truncations, NUM_SHARDS, m.report()
             ).into());
         }
         println!("Phase R passed.");
@@ -509,6 +519,7 @@ fn parse_batch_range(key: &str) -> Option<(u64, u64)> {
 
 struct MechanismCounters {
     reframed: u64,
+    truncations: u64,
     divergence_advanced: u64,
     dropped_self_acked: u64,
     barrier_refusals: u64,
@@ -517,8 +528,8 @@ struct MechanismCounters {
 impl MechanismCounters {
     fn report(&self) -> String {
         format!(
-            "reframed_at_read={} divergence_advanced={} dropped_self_acked={} barrier_refusals={}",
-            self.reframed, self.divergence_advanced, self.dropped_self_acked, self.barrier_refusals
+            "reframed_at_read={} truncations={} divergence_advanced={} dropped_self_acked={} barrier_refusals={}",
+            self.reframed, self.truncations, self.divergence_advanced, self.dropped_self_acked, self.barrier_refusals
         )
     }
 
@@ -539,6 +550,7 @@ impl MechanismCounters {
 async fn scrape_mechanism_counters(metrics_port: u16) -> Result<MechanismCounters, Box<dyn std::error::Error>> {
     Ok(MechanismCounters {
         reframed: scrape_counter("127.0.0.1", metrics_port, "celeriant_s3_catchup_reframed_at_read_total").await?,
+        truncations: scrape_counter("127.0.0.1", metrics_port, "celeriant_wal_divergent_truncations_total").await?,
         divergence_advanced: scrape_counter("127.0.0.1", metrics_port, "celeriant_truncate_divergence_advanced_total").await?,
         dropped_self_acked: scrape_counter("127.0.0.1", metrics_port, "celeriant_truncate_dropped_self_acked_events_total").await?,
         barrier_refusals: scrape_counter("127.0.0.1", metrics_port, "celeriant_truncate_refused_due_to_ack_barrier_total").await?,

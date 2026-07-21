@@ -223,6 +223,20 @@ pub struct ShardWal<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
     /// stale fallback batches from previous cluster generations.
     pub peer_node_id: Cell<Option<u128>>,
 
+    /// Highest wal_seq this shard has SEEN the leader hold, learned from the
+    /// last wal_seq of replication batches we rejected (WalSeqMismatch /
+    /// TipHashMismatch). Monotonic max, in-memory only (resets to 0 at boot).
+    /// S3 catchup uses it as the convergence target for a kicked follower: at
+    /// or past it, live TCP is the better channel and catchup exits.
+    pub observed_leader_wal_seq: Cell<u64>,
+
+    /// The `next_wal_seq` at which the last live-tail yield to TCP happened
+    /// (0 = never). S3 catchup consults it so a kicked follower yields a small
+    /// covering backlog to TCP at most once per position: a second catchup at
+    /// the same position means TCP did not bridge, so consume from S3 instead.
+    /// In-memory only, resets at boot.
+    pub live_tail_yielded_wal_seq: Cell<u64>,
+
     /// Monotonic timestamp of the most recent replication rollback. Used by
     /// the write path to apply a cooldown window (ReplicationBackpressure error).
     /// Happens if the network is slow or s3/minio having issues
@@ -519,6 +533,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             replication_client: Rc::new(replication_client),
             leader_client_address: RefCell::new(None),
             peer_node_id: Cell::new(None),
+            observed_leader_wal_seq: Cell::new(0),
+            live_tail_yielded_wal_seq: Cell::new(0),
             last_rollback_at: Rc::new(Cell::new(None)),
             last_logged_rollback_at: Cell::new(None),
             last_logged_starve_at: Cell::new(None),
@@ -2939,11 +2955,22 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         }
 
         let shard_id = self.config.shard_id;
+        // Rejecting a batch still teaches us where the leader is: its last
+        // wal_seq is a durable-on-leader floor and becomes the catchup target.
+        let record_observed_leader = || {
+            if let Some(last) = request.batches.last() {
+                let observed = last.metablock.wal_seq;
+                if observed > self.observed_leader_wal_seq.get() {
+                    self.observed_leader_wal_seq.set(observed);
+                }
+            }
+        };
         match shard_wal_s3_catchup::apply_external_batch(
             &self.log_segments_cache, &self.shard_mem_cache, &request.batches, &self.dict_codec,
         ) {
             Ok(()) => {}
             Err(ApplyBatchError::WalSeqMismatch { current, batch_first }) => {
+                record_observed_leader();
                 tracing::warn!(
                     shard_id,
                     follower_wal = current,
@@ -2956,6 +2983,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 })));
             }
             Err(ApplyBatchError::TipHashMismatch { current, current_wal_seq, batch, batch_wal_seq }) => {
+                record_observed_leader();
                 tracing::warn!(
                     shard_id,
                     follower_wal = current_wal_seq,
@@ -4035,7 +4063,11 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         event_batches
     }
 
-    pub async fn enter_s3_catchup(&self) -> Result<S3CatchupResult, S3CatchupError> {
+    /// `role` is decided by the orchestrating shard and carried in the message
+    /// (never re-derived from this shard's own status: the Promoting
+    /// StatusUpdate broadcast can lag or drop, and a promotion catchup run as
+    /// Following would fast-exit without consuming the peer's acked data).
+    pub async fn enter_s3_catchup(&self, role: shard_wal_s3_catchup::CatchupRole) -> Result<S3CatchupResult, S3CatchupError> {
 
         // Promoting stays put through catchup: it carries the won lease's real
         // TTL and the promotion upload gate needs to see it afterwards; the
@@ -4063,6 +4095,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             self.peer_node_id.get(),
             self.config.max_catchup_gap_bytes,
             self.dict_codec.clone(),
+            role,
+            self.observed_leader_wal_seq.get(),
+            &self.live_tail_yielded_wal_seq,
         ).await
 
     }
@@ -7428,7 +7463,7 @@ mod tests {
             let expiry = now_ms() + 10_000;
             shard.node_status.set(ValidatedNodeStatus::create_custom_status(NodeStatus::Promoting { lease_epoch: 3 }, 500, expiry));
 
-            shard.enter_s3_catchup().await.unwrap();
+            shard.enter_s3_catchup(shard_wal_s3_catchup::CatchupRole::Promoting).await.unwrap();
 
             let status = shard.node_status.get();
             assert_eq!(status.raw(), NodeStatus::Promoting { lease_epoch: 3 }, "catchup must preserve the Promoting fence");

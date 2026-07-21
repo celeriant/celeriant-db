@@ -21,7 +21,7 @@
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{
-    copy_shard_dirs, is_leader, poll_converged_count, s3_cluster_config, write_event,
+    copy_shard_dirs, is_leader, poll_converged_count, s3_cluster_config, wait_for_leader, write_event,
     write_large_event, MinioContainer, RoutingRule, ServerConfig, TestServer,
     FOLLOWER_CONVERGENCE_TIMEOUT,
 };
@@ -223,14 +223,11 @@ async fn run_scenario(
             )
             .await?;
 
-            // B catches up from S3, waits for A's S3 lease to expire, then becomes leader
+            // B catches up from S3, waits for A's S3 lease to expire (~10s), then
+            // promotes, which holds a ~6s drain-settle window over A's fallback
+            // objects before flipping to Leader. Poll rather than sleep.
             println!("  Waiting for B to catch up from S3, S3 lease expiry, and become leader...");
-            tokio::time::sleep(Duration::from_secs(12)).await;
-
-            assert!(
-                is_leader(node_b.address()).await?,
-                "Node B must be leader (only node running)"
-            );
+            wait_for_leader(node_b.address(), Duration::from_secs(30)).await?;
 
             // Restart A, it joins as follower
             node_a.restart_with_config(distributed_config).await?;

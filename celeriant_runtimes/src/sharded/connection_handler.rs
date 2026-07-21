@@ -48,6 +48,7 @@ pub enum PortType {
 
 pub struct CatchupCompletionMsg {
     pub shard_id: usize,
+    pub attempt: u64,
     pub result: Result<S3CatchupResult, S3CatchupError>,
 }
 
@@ -275,13 +276,15 @@ pub fn handle_redirected_cluster_connection<R: ReplicationClient + 'static, D: S
 
 pub fn handle_enter_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     ctx: ConnectionContext<R, D, S>,
+    role: celeriant_shard::shard_wal_s3_catchup::CatchupRole,
+    attempt: u64,
 ) {
     glommio::spawn_local(async move {
-        let result = ctx.shard_wal.enter_s3_catchup().await;
+        let result = ctx.shard_wal.enter_s3_catchup(role).await;
 
         if let Err(e) = try_send_with_retry(
             ctx.intrashard_sender.as_ref(), 0,
-            IntrashardMessages::S3CatchupComplete { shard_id: ctx.current_shard_id, result }, 10
+            IntrashardMessages::S3CatchupComplete { shard_id: ctx.current_shard_id, attempt, result }, 10
         ).await {
             panic!("Shard {} failed to send S3CatchupComplete to shard 0 after retries: {e:?}", ctx.current_shard_id);
         }

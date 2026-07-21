@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
-use crate::{poll_converged_count, s3_cluster_config, write_event, MinioContainer, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT};
+use crate::{poll_converged_count, s3_cluster_config, wait_for_leader, write_event, MinioContainer, TestServer, FOLLOWER_CONVERGENCE_TIMEOUT};
 use celeriant_msg::{
     process_client_requests::ClientRequest,
     request::requests::{RegisterSchemaRequest, SingleAggregateWrite, WriteRequest},
@@ -230,8 +230,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     node_b.stop();
     println!("  Node B stopped");
 
+    // Heartbeat loss + CAS win, then A's Promoting catchup holds a ~6s
+    // drain-settle window over B's fallback objects before serving. Poll.
     println!("  Waiting for node A to take over (heartbeat lease 1.5s + S3 race)...");
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    wait_for_leader(node_a.address(), Duration::from_secs(20)).await?;
 
     let mut node_a_client = CeleriantClient::connect(node_a.address()).await?;
     write_event(&mut node_a_client, &aggregate_key, 11, false).await?;
