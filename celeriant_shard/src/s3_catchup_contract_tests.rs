@@ -622,6 +622,304 @@ fn moved_position_rearms_live_tail_yield() {
     });
 }
 
+/// PASS: a yield at wal 10, then the position bridged to 15 WITHOUT the
+/// latch being read again (a fresh-latch catchup at target 15 models TCP
+/// carrying the tail), then a fresh small tail 16..=20: the ORIGINAL latch
+/// yields again at the new position — Caught, nothing applied, wal stays 15.
+/// FAIL: a latch that remembers only "already yielded" (not the position)
+/// spends its one yield on kick 1 and drags 16..=20 through S3 even though
+/// TCP just proved it was delivering. This is the sequence that separates
+/// the per-position Cell from a consumed-on-read bool: no intervening
+/// same-position consume ever reads the latch.
+#[test]
+fn bridged_position_rearms_live_tail_yield() {
+    glommio_test!({
+        let (_tmp, dir) = test_dir();
+        let tc = TestComponents::new(&dir).await;
+        tc.seed_chain(10).await;
+        let tip = tc.tip_hash();
+
+        let dl = Rc::new(MockDownloader::new());
+        let (p, d) = make_fallback_batch(0, 11, 15, tip);
+        dl.insert(p, d);
+
+        let latch = std::cell::Cell::new(0u64);
+
+        let first = tc
+            .catchup_full_with_latch(&dl, 0, None, None, CatchupRole::Following, 10, &latch)
+            .await
+            .expect("first kick must not error");
+        assert_eq!(first.batches_applied, 0, "scaffolding: the first kick must yield, not consume");
+        assert_eq!(tc.wal_seq(), 10, "scaffolding: the yield must not move the wal");
+
+        // Bridge the position without touching the original latch: at target
+        // 15 the live-tail gate never evaluates (next 11 <= target), so this
+        // consumes 11..=15 the way TCP would have delivered it.
+        let bridge_latch = std::cell::Cell::new(0u64);
+        tc.catchup_full_with_latch(&dl, 0, None, None, CatchupRole::Following, 15, &bridge_latch)
+            .await
+            .expect("bridging catchup must not error");
+        assert_eq!(tc.wal_seq(), 15, "scaffolding: the bridge must land the wal at 15");
+
+        let (p, d) = make_fallback_batch(0, 16, 20, tc.tip_hash());
+        dl.insert(p, d);
+
+        let third = tc
+            .catchup_full_with_latch(&dl, 0, None, None, CatchupRole::Following, 10, &latch)
+            .await
+            .expect("third kick must not error");
+        assert!(
+            matches!(third.completion, CatchupCompletion::Caught),
+            "a bridged position must yield again, got {}",
+            completion_name(&third.completion)
+        );
+        assert_eq!(third.batches_applied, 0, "the re-armed yield must apply nothing: TCP is delivering");
+        assert_eq!(tc.wal_seq(), 15, "the re-armed yield must not move the wal, wal={}", tc.wal_seq());
+        tc.close().await;
+    });
+}
+
+// ── AB: attempt bound ──
+//
+// Phase 1 contract: a single catchup invocation returns control in bounded
+// work no matter how the S3 view evolves. `rounds` never exceeds the bound
+// (MAX_CONSUME_ROUNDS = 8, same in test and production builds); a bound-exit
+// with consumable data still visible is Retry, never Caught; every batch
+// consumed before the exit is durably applied; a follow-up invocation resumes
+// exactly where the last one stopped.
+
+/// Pre-planned chain of `len` contiguous single-entry fallback files. Tips
+/// come from consuming the chain on a scratch component set (the batch
+/// builder cannot compute chain tips).
+async fn chained_single_entry_files(len: u64) -> Vec<(String, Bytes)> {
+    let (_tmp, dir) = test_dir();
+    let tc = TestComponents::new(&dir).await;
+    let tips = seed_capturing_tips(&tc, len).await;
+    tc.close().await;
+    (1..=len)
+        .map(|wal_seq| {
+            let prev = if wal_seq == 1 { GENESIS_HASH } else { tips[wal_seq as usize - 2] };
+            make_fallback_batch(0, wal_seq, wal_seq, prev)
+        })
+        .collect()
+}
+
+/// Live feed: file k becomes visible only at list call k, one fresh covering
+/// file per list. Finite by construction: a wedged implementation exhausts
+/// the feed and fails an assertion instead of hanging the runner.
+fn arm_drip_feed(dl: &Rc<MockDownloader>, files: &[(String, Bytes)]) {
+    for (k, (p, d)) in files.iter().enumerate() {
+        let (p, d) = (p.clone(), d.clone());
+        dl.on_list(k as u32, move |dl| dl.insert(p.clone(), d.clone()));
+    }
+}
+
+/// PASS: a Promoting catchup under a live feed exits at the round bound:
+/// rounds <= 8, Retry (consumable data still visible ahead), progress made
+/// (batches_applied >= 1, not stalled), and the local wal advanced by exactly
+/// the entries applied. FAIL: the invocation chases the feed for ~100 rounds
+/// and never hands control back to its caller.
+#[test]
+fn promoting_live_feed_exits_at_round_bound() {
+    glommio_test!({
+        let files = chained_single_entry_files(100).await;
+        let (_tmp, dir) = test_dir();
+        let tc = TestComponents::new(&dir).await;
+        let wal_before = tc.wal_seq();
+
+        let dl = Rc::new(MockDownloader::new());
+        arm_drip_feed(&dl, &files);
+
+        let res = tc.catchup_as_promoting(&dl, 0).await.expect("catchup must not error");
+
+        assert!(res.rounds <= 8, "one invocation must exit at the round bound, rounds={}", res.rounds);
+        assert!(
+            matches!(res.completion, CatchupCompletion::Retry),
+            "bound-exit with data still visible must be Retry, got {}",
+            completion_name(&res.completion)
+        );
+        assert!(res.batches_applied >= 1, "the invocation must make progress before yielding, applied={}", res.batches_applied);
+        assert!(!res.stalled_awaiting_s3, "a batch was applied this invocation: not stalled awaiting S3");
+        assert_eq!(
+            tc.wal_seq() - wal_before,
+            res.batches_applied as u64,
+            "single-entry batches: the wal must advance by exactly the entries applied"
+        );
+        tc.close().await;
+    });
+}
+
+/// PASS: Boot under the same live feed exits at the round bound with Retry:
+/// visible unconsumed covering data means Boot must not claim Caught.
+/// FAIL: Boot chases the feed unbounded, or declares a false Caught with
+/// consumable files visible ahead.
+#[test]
+fn boot_live_feed_exits_at_round_bound_with_retry() {
+    glommio_test!({
+        let files = chained_single_entry_files(100).await;
+        let (_tmp, dir) = test_dir();
+        let tc = TestComponents::new(&dir).await;
+
+        let dl = Rc::new(MockDownloader::new());
+        arm_drip_feed(&dl, &files);
+
+        let res = tc.catchup_as_boot(&dl, 0).await.expect("boot catchup must not error");
+
+        assert!(res.rounds <= 8, "one boot invocation must exit at the round bound, rounds={}", res.rounds);
+        assert!(
+            matches!(res.completion, CatchupCompletion::Retry),
+            "boot bound-exit with data still visible must be Retry, got {}",
+            completion_name(&res.completion)
+        );
+        tc.close().await;
+    });
+}
+
+/// PASS: a Following node well behind a high observed leader target (wal 0 vs
+/// target 100) under the live feed still exits at the round bound. FAIL: the
+/// behind-target patience overrides the bound and the invocation chases the
+/// feed to the end of the chain.
+#[test]
+fn following_behind_target_live_feed_exits_at_round_bound() {
+    glommio_test!({
+        let files = chained_single_entry_files(100).await;
+        let (_tmp, dir) = test_dir();
+        let tc = TestComponents::new(&dir).await;
+
+        let dl = Rc::new(MockDownloader::new());
+        arm_drip_feed(&dl, &files);
+
+        let res = tc.catchup_with_target(&dl, 0, 100).await.expect("catchup must not error");
+
+        assert!(res.rounds <= 8, "one behind-target invocation must exit at the round bound, rounds={}", res.rounds);
+        assert!(
+            matches!(res.completion, CatchupCompletion::Retry),
+            "bound-exit with data still visible must be Retry, got {}",
+            completion_name(&res.completion)
+        );
+        assert!(res.batches_applied >= 1, "the invocation must make progress before yielding, applied={}", res.batches_applied);
+        tc.close().await;
+    });
+}
+
+/// Never-covering drip: single-entry files at seq 10.. with a permanent hole
+/// below, one fresh file per list call. Every round is a zero-progress
+/// AwaitMore whose drain barrier catches the next late file. Content is never
+/// downloaded (nothing covers the local position), so no chain tips needed.
+fn arm_never_covering_feed(dl: &Rc<MockDownloader>, len: u64) {
+    for k in 0..len {
+        let (p, d) = make_fallback_batch(0, 10 + k, 10 + k, GENESIS_HASH);
+        dl.on_list(k as u32, move |dl| dl.insert(p.clone(), d.clone()));
+    }
+}
+
+/// PASS: a Following node behind its observed target, fed only at-or-ahead
+/// files it can never chain onto, exits at the round bound with Retry and
+/// zero progress. FAIL: the drain barrier's late-file catches hold the
+/// invocation open for the length of the feed. Cap-exit stall classification
+/// is deliberately unpinned (owned by the orchestrator phase).
+#[test]
+fn following_never_covering_feed_exits_at_round_bound_without_progress() {
+    glommio_test!({
+        let (_tmp, dir) = test_dir();
+        let tc = TestComponents::new(&dir).await;
+
+        let dl = Rc::new(MockDownloader::new());
+        arm_never_covering_feed(&dl, 40);
+
+        let res = tc.catchup_with_target(&dl, 0, 1000).await.expect("catchup must not error");
+
+        assert!(res.rounds <= 8, "a zero-progress churning view must also exit at the round bound, rounds={}", res.rounds);
+        assert!(
+            matches!(res.completion, CatchupCompletion::Retry),
+            "an uncloseable hole must never be Caught, got {}",
+            completion_name(&res.completion)
+        );
+        assert_eq!(res.batches_applied, 0, "nothing covers the local position: no batch may apply");
+        assert_eq!(tc.wal_seq(), 0, "local wal must be untouched");
+        tc.close().await;
+    });
+}
+
+/// PASS: Boot under the same never-covering churn exits at the round bound
+/// with Retry (never a false Caught over the hole). FAIL: Boot chases the
+/// churn unbounded.
+#[test]
+fn boot_never_covering_feed_exits_at_round_bound_without_progress() {
+    glommio_test!({
+        let (_tmp, dir) = test_dir();
+        let tc = TestComponents::new(&dir).await;
+
+        let dl = Rc::new(MockDownloader::new());
+        arm_never_covering_feed(&dl, 40);
+
+        let res = tc.catchup_as_boot(&dl, 0).await.expect("boot catchup must not error");
+
+        assert!(res.rounds <= 8, "a zero-progress boot churn must also exit at the round bound, rounds={}", res.rounds);
+        assert!(
+            matches!(res.completion, CatchupCompletion::Retry),
+            "boot over an uncloseable hole must never be Caught, got {}",
+            completion_name(&res.completion)
+        );
+        assert_eq!(res.batches_applied, 0, "nothing covers the local position: no batch may apply");
+        tc.close().await;
+    });
+}
+
+/// PASS: after a Promoting bound-exit, a fresh invocation over the now-quiet
+/// fully visible backlog resumes exactly where the first stopped and reaches
+/// Caught at the full chain length, itself within the bound (the inner
+/// consume walks all visible covering files without re-listing). FAIL:
+/// batches consumed before the bound-exit are lost, visible files are
+/// skipped, or the continuation never converges.
+#[test]
+fn bound_exit_then_quiet_feed_resumes_to_caught() {
+    glommio_test!({
+        let files = chained_single_entry_files(100).await;
+        let (_tmp, dir) = test_dir();
+        let tc = TestComponents::new(&dir).await;
+
+        let dl = Rc::new(MockDownloader::new());
+        arm_drip_feed(&dl, &files);
+
+        let first = tc.catchup_as_promoting(&dl, 0).await.expect("first invocation must not error");
+        assert!(first.rounds <= 8, "premise: the first invocation must exit at the round bound, rounds={}", first.rounds);
+        assert!(
+            matches!(first.completion, CatchupCompletion::Retry),
+            "premise: a bound-exit with the feed still live must be Retry, got {}",
+            completion_name(&first.completion)
+        );
+        let wal_after_first = tc.wal_seq();
+        assert_eq!(
+            wal_after_first,
+            first.batches_applied as u64,
+            "everything consumed before the bound-exit must be durably applied"
+        );
+
+        // Stop the feed: the full backlog becomes visible at once. Leftover
+        // drip hooks re-insert already-visible files, so later lists see
+        // nothing fresh.
+        for (p, d) in &files {
+            dl.insert(p.clone(), d.clone());
+        }
+
+        let second = tc.catchup_as_promoting(&dl, 0).await.expect("second invocation must not error");
+        assert!(
+            matches!(second.completion, CatchupCompletion::Caught),
+            "quiet feed, fully visible backlog: the continuation must reach Caught, got {}",
+            completion_name(&second.completion)
+        );
+        assert!(second.rounds <= 8, "the continuation must also stay within the bound, rounds={}", second.rounds);
+        assert_eq!(tc.wal_seq(), 100, "the continuation must consume to the full chain length, wal={}", tc.wal_seq());
+        assert_eq!(
+            second.batches_applied as u64,
+            100 - wal_after_first,
+            "the continuation must pick up exactly where the first invocation left off"
+        );
+        tc.close().await;
+    });
+}
+
 // ── B3: read-cursor-present recovery regression pin ──
 
 /// PASS: the same unacked divergence at wal=6 with the read cursor still

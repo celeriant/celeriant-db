@@ -7,7 +7,9 @@ use std::{
 
 use celeriant_distributed::{lease_store::LeaseStore, node_status::NodeStatus, node_status_logic::{compute_new_ttl, decide_post_catchup_action, PostCatchupAction}, s3_lease_manager::{ElectionOutcome, S3LeaseManager}, validated_node_status::{self, ValidatedNodeStatus, set_node_status_and_metric}};
 use celeriant_msg::response::responses::HeartbeatResult;
-use celeriant_shard::{error::send_heartbeat_error::SendHeartbeatError, replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::{LeaseRenewalRequester, ShardWal, TailReconciliation}, shard_wal_s3_catchup::CatchupCompletion};
+use celeriant_shard::{error::send_heartbeat_error::SendHeartbeatError, replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::{LeaseRenewalRequester, ShardWal, TailReconciliation}};
+
+use super::catchup_attempts;
 use glommio::{
     channels::{
         channel_mesh::{Receivers, Senders},
@@ -404,38 +406,8 @@ enum CatchupRunOutcome {
     Caught,
     Shutdown,
     S3Unreachable,
+    StalledView,
 }
-
-/// True when a catchup attempt is blocked SOLELY on shards reporting a stalled
-/// S3 view with zero progress (unconsumable files at-or-ahead, or a follower
-/// behind the observed leader tip with nothing landing). Such an attempt cannot
-/// converge by retrying catchup alone: resolution needs the leader's TCP/kick
-/// path or a fresh upload. Consecutive stalled attempts are therefore bounded
-/// instead of pinning the node in catching-up forever; later kicks re-enter.
-fn attempt_is_stalled_on_s3(results: &[CatchupCompletionMsg]) -> bool {
-    let mut saw_wedged_retry = false;
-    for msg in results {
-        match &msg.result {
-            Ok(r) => match r.completion {
-                CatchupCompletion::Caught => {}
-                CatchupCompletion::Retry => {
-                    if r.stalled_awaiting_s3 && r.batches_applied == 0 {
-                        saw_wedged_retry = true;
-                    } else {
-                        return false; // real progress or a drainable retry: keep looping
-                    }
-                }
-            },
-            Err(_) => return false, // error handling owns this attempt
-        }
-    }
-    saw_wedged_retry
-}
-
-// Consecutive stalled catchup attempts (5s apart) tolerated before handing
-// recovery back to the TCP/kick path. Four attempts is 20s+ of a stable
-// unconsumable view: enough for any in-flight upload burst to have surfaced.
-const MAX_STALLED_ATTEMPTS: u32 = 4;
 
 // Catchup cycle generations, unique across all run_s3_catchup invocations.
 static CATCHUP_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -446,24 +418,19 @@ async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'stati
 ) -> CatchupRunOutcome {
     let shard_count = ctx.config.num_shards as usize;
     let mut attempt = 0u32;
-    // 4 rounds x 5s ~= 20s of confirmed S3 outage before bailing so a follower can resume via TCP.
-    const MAX_S3_UNREACHABLE_ROUNDS: u32 = 4;
-    let mut consecutive_s3_unreachable = 0u32;
-    let mut consecutive_stalled = 0u32;
-
-    // Decide the role ONCE from shard 0's authoritative status and carry it in
-    // the message: deriving per shard from ambient status races the Promoting
-    // StatusUpdate broadcast (droppable under queue pressure), and a data shard
-    // running promotion catchup as Following would fast-exit without consuming
-    // the dead peer's acked fallback data.
-    let role = match ctx.shard_wal.node_status.get().raw() {
-        s if s.is_promoting() => celeriant_shard::shard_wal_s3_catchup::CatchupRole::Promoting,
-        NodeStatus::BootCatchup => celeriant_shard::shard_wal_s3_catchup::CatchupRole::Boot,
-        _ => celeriant_shard::shard_wal_s3_catchup::CatchupRole::Following,
-    };
+    let mut tracker = catchup_attempts::AttemptTracker::new();
 
     loop {
         attempt += 1;
+        // Decide the role per ATTEMPT from shard 0's authoritative status and
+        // carry it in the message. Carried, not derived per data shard: ambient
+        // derivation races the Promoting StatusUpdate broadcast (droppable
+        // under queue pressure), and a data shard running promotion catchup as
+        // Following would fast-exit without consuming the dead peer's acked
+        // fallback data. Per attempt, not once: a status change that bypasses
+        // the between-attempts renewal block (e.g. an on-demand renewal
+        // fencing this node) must not leave later attempts on a stale role.
+        let role = catchup_attempts::role_for_status(ctx.shard_wal.node_status.get().raw());
         // Fresh generation per broadcast: catchup cycles can overlap (a shard's
         // previous catchup may still be running) and the completion channel
         // persists across cycles, so an untagged stale completion would satisfy
@@ -497,106 +464,25 @@ async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'stati
             }
         }
 
-        // Split so a pure-S3-error round (no contact) counts toward the unreachable bound, while
-        // any S3 contact (undrained) resets it. Disk-full is its own class:
-        // retried indefinitely (space gets recovered; rotation already alarms
-        // via celeriant_rotation_out_of_space_total) and never counted toward
-        // the unreachable bound; S3 is fine, the local disk isn't.
-        let mut has_undrained = false;
-        let mut has_s3_error = false;
-        let mut has_disk_full = false;
-        let mut has_fatal = false;
-
-        for msg in &results {
-            match &msg.result {
-                Ok(r) => match r.completion {
-                    CatchupCompletion::Caught => {
-                        info!(
-                            shard_id = msg.shard_id,
-                            batches_applied = r.batches_applied,
-                            bytes_downloaded = r.bytes_downloaded,
-                            rounds = r.rounds,
-                            "S3 catchup caught up for shard"
-                        );
-                    }
-                    CatchupCompletion::Retry => {
-                        warn!(
-                            shard_id = msg.shard_id,
-                            batches_applied = r.batches_applied,
-                            bytes_downloaded = r.bytes_downloaded,
-                            rounds = r.rounds,
-                            "S3 catchup did not drain for shard, will retry"
-                        );
-                        has_undrained = true;
-                    }
-                },
-                Err(e) if e.is_disk_full() => {
-                    warn!(shard_id = msg.shard_id, error = ?e, "S3 catchup blocked on full disk, will retry");
-                    has_disk_full = true;
-                }
-                Err(e) if e.is_retriable() => {
-                    warn!(shard_id = msg.shard_id, error = ?e, "S3 catchup retriable error, will retry");
-                    has_s3_error = true;
-                }
-                Err(e) => {
-                    error!(shard_id = msg.shard_id, error = ?e, "S3 catchup fatal error, shutting down");
-                    has_fatal = true;
-                }
+        match tracker.assess(attempt, role, &results) {
+            catchup_attempts::AttemptDecision::Shutdown => {
+                ctx.shutdown_requested.set(true);
+                broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::Shutdown, ctx.intrashard_sender.clone()).await;
+                return CatchupRunOutcome::Shutdown;
             }
-        }
-
-        if has_fatal {
-            ctx.shutdown_requested.set(true);
-            broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::Shutdown, ctx.intrashard_sender.clone()).await;
-            return CatchupRunOutcome::Shutdown;
-        }
-
-        if !has_undrained && !has_s3_error && !has_disk_full {
-            return CatchupRunOutcome::Caught;
-        }
-
-        // A Boot node blocks its own TCP recovery while it waits (BootCatchup
-        // rejects heartbeats and replication), and each stalled attempt already
-        // proved view stability across a full drain-settle window. One is
-        // enough evidence to hand an S3 hole to TCP; if S3 was actually still
-        // draining, a later kick or the periodic probe re-enters catchup as
-        // Following, which keeps the full patience budget.
-        let max_stalled = if role == celeriant_shard::shard_wal_s3_catchup::CatchupRole::Boot { 1 } else { MAX_STALLED_ATTEMPTS };
-        if attempt_is_stalled_on_s3(&results) {
-            consecutive_stalled += 1;
-            if consecutive_stalled >= max_stalled {
-                warn!(
-                    attempt,
-                    consecutive_stalled,
-                    "S3 catchup wedged on a stable unconsumable at-or-ahead view; bailing so TCP/kick recovery can proceed"
-                );
-                metrics::counter!("celeriant_s3_catchup_stall_bail_total").increment(1);
-                return CatchupRunOutcome::S3Unreachable;
-            }
-        } else if !has_s3_error && !has_disk_full {
-            // Only a round with real progress (or a drainable retry) clears the
-            // wedge count. An S3-error round proves nothing about the wedge;
-            // resetting on it would let a flapping S3 pin the node in catchup
-            // indefinitely.
-            consecutive_stalled = 0;
-        }
-
-        if has_s3_error && !has_undrained {
-            consecutive_s3_unreachable += 1;
-            if consecutive_s3_unreachable >= MAX_S3_UNREACHABLE_ROUNDS {
-                warn!(attempt, consecutive_s3_unreachable, "S3 unreachable across consecutive catchup rounds; bailing so a heartbeated follower can resume via TCP");
-                return CatchupRunOutcome::S3Unreachable;
-            }
-        } else {
-            consecutive_s3_unreachable = 0;
+            catchup_attempts::AttemptDecision::Caught => return CatchupRunOutcome::Caught,
+            catchup_attempts::AttemptDecision::StallBail => return CatchupRunOutcome::StalledView,
+            catchup_attempts::AttemptDecision::UnreachableBail => return CatchupRunOutcome::S3Unreachable,
+            catchup_attempts::AttemptDecision::Continue => {}
         }
 
         // A promotion that spans catchup attempts must renew its lease or it
-        // decays mid-catchup and strands the cluster leaderless. The renewal
-        // runs between attempts, so it only helps when the invocation returns;
-        // a consume-wedged invocation never reaches it. On supersession adopt
-        // the outcome and stop: the promotion flip gate sees the non-Promoting
-        // status and yields as LostRace instead of installing a zombie leader.
+        // decays mid-catchup and strands the cluster leaderless. The shard
+        // layer's round cap guarantees every invocation returns, so this
+        // renewal/supersession block runs between attempts even under a live
+        // upload feed. On supersession adopt the outcome and stop: the
+        // promotion flip gate sees the non-Promoting status and yields as
+        // LostRace instead of installing a zombie leader.
         if ctx.shard_wal.node_status.get().raw().is_promoting() {
             if let Some(lm) = ctx.lease_manager.as_ref() {
                 match lm.run_election_to_acquire_s3_lease().await {
@@ -634,8 +520,16 @@ async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'stati
             }
         }
 
-        warn!(attempt, "S3 catchup has retriable errors, retrying in 5s");
-        glommio::timer::sleep(Duration::from_secs(5)).await;
+        // Every shard racing a live feed: re-attempt immediately so a
+        // draining promotion outruns the uploader instead of handing it 5s
+        // head starts. Any shard waiting on the view (zero progress or error)
+        // keeps the sleep; its bail bound is paced in attempts-with-sleeps.
+        if catchup_attempts::attempt_racing_live_feed(&results) {
+            warn!(attempt, "S3 catchup: all shards racing a live feed, re-attempting immediately");
+        } else {
+            warn!(attempt, "S3 catchup waiting on the S3 view or retriable errors, retrying in 5s");
+            glommio::timer::sleep(Duration::from_secs(5)).await;
+        }
     }
 }
 
@@ -902,8 +796,10 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
             info!(previous_lease_epoch, new_lease_epoch, "Lost leadership / fenced — running S3 catchup before becoming follower");
         } else if became_follower_from_leader_or_fenced {
             info!("Self-fenced; culling speculative tail without catchup (lease has not changed hands yet)");
-        } else {
+        } else if needs_catchup {
             info!(previous_lease_epoch, new_lease_epoch, "Lease epoch advanced while non-leader — running S3 catchup");
+        } else {
+            info!(previous_lease_epoch, following_leader_epoch = outcome.status.raw().lease_epoch_for_logging(), "Following a peer without an observed epoch advance; reconciling durable tail only");
         }
 
         // Queues are FIFO; broadcasting cull first means any following EnterS3Catchup
@@ -928,7 +824,7 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
             // the election so it retries; never serve writes on an unverified WAL.
             match run_s3_catchup(ctx, &rx).await {
                 CatchupRunOutcome::Caught => {}
-                CatchupRunOutcome::Shutdown | CatchupRunOutcome::S3Unreachable => {
+                CatchupRunOutcome::Shutdown | CatchupRunOutcome::S3Unreachable | CatchupRunOutcome::StalledView => {
                     return Err(celeriant_distributed::lease_store::LeaseStoreError::Unavailable { message: "Could not catch up WAL via S3".to_string() });
                 }
             }
@@ -1409,6 +1305,8 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                         ).await;
                         if matches!(catchup_outcome, CatchupRunOutcome::S3Unreachable) {
                             warn!(leader_lease_epoch, "S3 unreachable during catchup but live leader heartbeating; resumed as Follower for TCP-driven recovery");
+                        } else if matches!(catchup_outcome, CatchupRunOutcome::StalledView) {
+                            warn!(leader_lease_epoch, "Catchup stalled on an unconsumable S3 view; resumed as Follower for TCP-driven recovery");
                         } else {
                             info!(leader_lease_epoch, "Post-catchup: lease alive; resumed as Follower (TCP replication re-enabled)");
                         }
@@ -2005,36 +1903,4 @@ mod tests {
         }
     }
 
-    /// The ahead-wedge bound fires only when EVERY non-Caught shard is blocked
-    /// on a stable unconsumable at-or-ahead view with zero progress; any real
-    /// progress, drainable retry, or error keeps the normal retry loop in charge.
-    #[test]
-    fn attempt_is_stalled_on_s3_truth_table() {
-        use celeriant_shard::error::s3_catchup_error::S3CatchupError;
-        use celeriant_shard::shard_wal_s3_catchup::S3CatchupResult;
-        use CatchupCompletion::{Caught, Retry};
-
-        let res = |completion: CatchupCompletion, ahead: bool, applied: u64| -> Result<S3CatchupResult, S3CatchupError> {
-            Ok(S3CatchupResult { batches_applied: applied, bytes_downloaded: 0, rounds: 1, completion, stalled_awaiting_s3: ahead })
-        };
-        let msg = |shard_id: usize, result: Result<S3CatchupResult, S3CatchupError>| CatchupCompletionMsg { shard_id, attempt: 7, result };
-
-        // all shards caught → not wedged (Caught outcome owns it)
-        assert!(!attempt_is_stalled_on_s3(&[msg(0, res(Caught, false, 0)), msg(1, res(Caught, false, 2))]));
-        // one shard wedged, rest caught → wedged
-        assert!(attempt_is_stalled_on_s3(&[msg(0, res(Caught, false, 0)), msg(1, res(Retry, true, 0))]));
-        // wedged shard that still applied batches → progress, not wedged
-        assert!(!attempt_is_stalled_on_s3(&[msg(0, res(Retry, true, 3))]));
-        // plain drainable retry (no ahead flag) → not wedged
-        assert!(!attempt_is_stalled_on_s3(&[msg(0, res(Retry, false, 0))]));
-        // mixed wedged + drainable retry → not wedged (drainable may converge)
-        assert!(!attempt_is_stalled_on_s3(&[msg(0, res(Retry, true, 0)), msg(1, res(Retry, false, 0))]));
-        // any error → error handling owns the attempt
-        assert!(!attempt_is_stalled_on_s3(&[
-            msg(0, res(Retry, true, 0)),
-            msg(1, Err(celeriant_shard::error::s3_catchup_error::S3CatchupError::SidecarUnavailable)),
-        ]));
-        // empty attempt → not wedged
-        assert!(!attempt_is_stalled_on_s3(&[]));
-    }
 }

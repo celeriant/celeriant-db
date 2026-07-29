@@ -178,10 +178,23 @@ const DRAIN_SETTLE_INTERVAL: Duration = Duration::from_millis(750);
 const DRAIN_SETTLE_INTERVAL: Duration = Duration::from_millis(1);
 
 // Max drain-settle cycles a PROMOTING catchup invocation may burn before
-// yielding Retry so the caller can renew the promotion lease. Bounds drain
-// waits only: consume rounds are unbounded, so a live upload feed can still
-// hold one invocation open indefinitely.
+// yielding Retry so the caller can renew the promotion lease. Tighter than
+// MAX_CONSUME_ROUNDS because each cycle holds the invocation through a full
+// settle window, not just a list.
 const PROMOTING_MAX_DRAIN_CONTINUES: u32 = 2;
+
+// Rounds one invocation may run before yielding Retry. A live upload feed
+// lands a fresh consumable file every round, so without this cap the feed
+// holds the invocation — and the node's rejection of TCP replication, which
+// is what sustains the feed — open indefinitely. Progress is durable and the
+// caller re-enters: a superseded promotion reaches the between-attempts
+// supersession check it was wedged away from, while a still-live promotion
+// fed by a deposed leader's in-window uploads pays a bounded re-entry cost
+// (broadcast + inter-attempt sleep) per capped cycle until that stale TTL
+// lapses, at most ~one lease window. Sized for a static backlog (consumed in
+// 1-2 rounds: the inner loop walks all visible covering files without
+// re-listing) plus truncation and drain re-lists.
+const MAX_CONSUME_ROUNDS: u32 = 8;
 
 // Visible backlog (entries between next_wal_seq and the newest visible file's
 // end) below which a beyond-target follower treats covering files as the
@@ -289,7 +302,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
     max_catchup_gap_bytes: Option<u64>,
     dict_codec: Rc<DictCodec>,
     role: CatchupRole,
-    observed_leader_wal_seq: u64,
+    catchup_target_wal_seq: u64,
     live_tail_yielded_wal_seq: &Cell<u64>,
 ) -> Result<S3CatchupResult, S3CatchupError> {
     let mut result = S3CatchupResult {
@@ -311,12 +324,26 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
     let mut processed_paths: HashSet<String> = HashSet::new();
     // A promoting leader-elect chasing a still-uploading (not-yet-fenced) peer
     // can outlive its own lease inside one invocation, stranding the cluster
-    // leaderless. Capping the settle-and-continue cycles stops drain waits
-    // from doing that; consume rounds stay unbounded, so a live upload feed
-    // can still hold the invocation open.
+    // leaderless. The drain-continue cap and MAX_CONSUME_ROUNDS together
+    // guarantee every invocation returns, so lease renewal and supersession
+    // checks between attempts always run.
     let mut drain_continues = 0u32;
 
     loop {
+        if result.rounds >= MAX_CONSUME_ROUNDS {
+            tracing::warn!(
+                shard_id,
+                rounds = result.rounds,
+                batches_applied = result.batches_applied,
+                next_wal_seq,
+                "S3 catchup round cap reached; yielding Retry to the caller"
+            );
+            metrics::counter!(
+                "celeriant_s3_catchup_round_cap_total",
+                "shard_id" => shard_id.to_string()
+            ).increment(1);
+            break;
+        }
         result.rounds += 1;
         // Count at execution, not at clean exit: a round that truncates then returns
         // early via `?` (replacement chain not yet in S3, handed to TCP) still ran.
@@ -375,7 +402,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
         // be consumed. Latched to one yield per position: a second catchup at
         // the same next_wal_seq means TCP did not deliver, so consume instead.
         // Boot is exempt: an unvalidated chain must consume before serving.
-        if role == CatchupRole::Following && next_wal_seq > observed_leader_wal_seq {
+        if role == CatchupRole::Following && next_wal_seq > catchup_target_wal_seq {
             let has_unprocessed_covering = entries
                 .values()
                 .flatten()
@@ -655,7 +682,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                 .values()
                 .flatten()
                 .any(|c| c.end_wal_seq >= next_wal_seq && !processed_paths.contains(&c.path));
-            let next_beyond_observed_leader = next_wal_seq > observed_leader_wal_seq;
+            let next_beyond_observed_leader = next_wal_seq > catchup_target_wal_seq;
             match no_progress_verdict(!seen_paths.is_empty(), unprocessed_at_or_ahead, role, next_beyond_observed_leader) {
                 NoProgressVerdict::CaughtNow => {
                     result.completion = CatchupCompletion::Caught;
@@ -689,7 +716,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                     tracing::warn!(
                         shard_id,
                         next_wal_seq,
-                        observed_leader_wal_seq,
+                        catchup_target_wal_seq,
                         unprocessed_at_or_ahead,
                         remaining_bytes,
                         "S3 catchup stalled awaiting S3 data: retrying, not caught up"

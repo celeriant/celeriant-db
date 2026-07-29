@@ -25,11 +25,11 @@ use celeriant_chaos::scenario::{
 #[derive(Parser)]
 #[command(name = "celeriant-chaos", about = "Chaos test orchestrator for the RPi cluster")]
 struct Args {
-    /// Run all scenarios in the suite. Today: same as default (only baseline exists).
+    /// Run the full suite in order. Without it, only baseline runs.
     #[arg(long)]
     full: bool,
 
-    /// Run a specific scenario by name. Today: only "baseline".
+    /// Run one scenario by name. See README for the list; a few sit outside --full.
     #[arg(long)]
     scenario: Option<String>,
 

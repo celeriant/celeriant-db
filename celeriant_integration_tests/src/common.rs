@@ -23,11 +23,18 @@ pub type R = Result<(), Box<dyn Error>>;
 /// spaced 10 apart to clear each server's trio (replication = +1, metrics = +2),
 /// and the per-run base is offset by pid so back-to-back suite runs don't reuse
 /// a port still cooling down.
+///
+/// Each test is its own subprocess, so the pid offset strides a whole 10-slot
+/// block: consecutive pids differ by 1, and a bare `pid + slot` would hand test
+/// N+1 a port test N's server or MinIO container is still holding.
 pub fn port_for(_seed: &str) -> u16 {
     let slot = NEXT_PORT_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let pid_off = (std::process::id() % 1000) as u16;
-    12000 + ((pid_off + slot) % 5000) * 10
+    debug_assert!(slot < SLOTS_PER_PROCESS, "test exceeded its {SLOTS_PER_PROCESS}-port block");
+    let pid_off = (std::process::id() % 500) as u16;
+    12000 + ((pid_off * SLOTS_PER_PROCESS + slot) % 5000) * 10
 }
+
+const SLOTS_PER_PROCESS: u16 = 10;
 
 static NEXT_PORT_SLOT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 

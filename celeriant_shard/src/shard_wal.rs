@@ -225,10 +225,11 @@ pub struct ShardWal<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
 
     /// Highest wal_seq this shard has SEEN the leader hold, learned from the
     /// last wal_seq of replication batches we rejected (WalSeqMismatch /
-    /// TipHashMismatch). Monotonic max, in-memory only (resets to 0 at boot).
-    /// S3 catchup uses it as the convergence target for a kicked follower: at
-    /// or past it, live TCP is the better channel and catchup exits.
-    pub observed_leader_wal_seq: Cell<u64>,
+    /// TipHashMismatch), tagged with the teaching lease epoch. In-memory only
+    /// (resets to 0 at boot). S3 catchup uses it as the convergence target for
+    /// a kicked follower: at or past it, live TCP is the better channel and
+    /// catchup exits.
+    pub observed_leader_target: crate::observed_leader::ObservedLeaderTarget,
 
     /// The `next_wal_seq` at which the last live-tail yield to TCP happened
     /// (0 = never). S3 catchup consults it so a kicked follower yields a small
@@ -533,7 +534,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             replication_client: Rc::new(replication_client),
             leader_client_address: RefCell::new(None),
             peer_node_id: Cell::new(None),
-            observed_leader_wal_seq: Cell::new(0),
+            observed_leader_target: crate::observed_leader::ObservedLeaderTarget::new(),
             live_tail_yielded_wal_seq: Cell::new(0),
             last_rollback_at: Rc::new(Cell::new(None)),
             last_logged_rollback_at: Cell::new(None),
@@ -2959,10 +2960,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         // wal_seq is a durable-on-leader floor and becomes the catchup target.
         let record_observed_leader = || {
             if let Some(last) = request.batches.last() {
-                let observed = last.metablock.wal_seq;
-                if observed > self.observed_leader_wal_seq.get() {
-                    self.observed_leader_wal_seq.set(observed);
-                }
+                self.observed_leader_target.teach(batch_lease_epoch, last.metablock.wal_seq);
             }
         };
         match shard_wal_s3_catchup::apply_external_batch(
@@ -4084,6 +4082,29 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             set_node_status_and_metric(&self.node_status, ValidatedNodeStatus::create_custom_status(catchup_status, 0, 0), self.config.shard_id);
         }
 
+        // A target taught by a dead lease epoch is a phantom: its tail may
+        // have been culled cluster-wide, and chasing it burns the full
+        // drain-settle budget on every kick. Validate against the epoch this
+        // follower currently knows its leader by.
+        let known_leader_epoch = match self.node_status.get().raw() {
+            NodeStatus::Follower { leader_lease_epoch }
+            | NodeStatus::FollowerCatchingUp { leader_lease_epoch } => Some(leader_lease_epoch),
+            _ => None,
+        };
+        let (taught_epoch, taught_wal_seq) = self.observed_leader_target.taught();
+        if taught_wal_seq > 0 && known_leader_epoch.is_some_and(|known| taught_epoch < known) {
+            tracing::info!(
+                shard_id = self.config.shard_id,
+                taught_epoch,
+                known_leader_epoch = known_leader_epoch.unwrap_or(0),
+                taught_wal_seq,
+                "discarding phantom catchup target taught by a dead lease epoch"
+            );
+            metrics::counter!(
+                "celeriant_s3_catchup_phantom_target_discarded_total",
+                "shard_id" => self.config.shard_id.to_string()
+            ).increment(1);
+        }
         catchup_from_s3(
             &self.log_segments_cache,
             &self.shard_mem_cache,
@@ -4096,7 +4117,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             self.config.max_catchup_gap_bytes,
             self.dict_codec.clone(),
             role,
-            self.observed_leader_wal_seq.get(),
+            self.observed_leader_target.target_for(known_leader_epoch),
             &self.live_tail_yielded_wal_seq,
         ).await
 

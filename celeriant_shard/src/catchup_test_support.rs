@@ -260,9 +260,9 @@ impl TestComponents {
         &self,
         downloader: &Rc<MockDownloader>,
         shard_id: u32,
-        observed_leader_wal_seq: u64,
+        catchup_target_wal_seq: u64,
     ) -> Result<S3CatchupResult, S3CatchupError> {
-        self.catchup_full(downloader, shard_id, None, None, CatchupRole::Following, observed_leader_wal_seq).await
+        self.catchup_full(downloader, shard_id, None, None, CatchupRole::Following, catchup_target_wal_seq).await
     }
 
     /// Promoting-role catchup (leader-elect: must consume everything, settle
@@ -282,11 +282,11 @@ impl TestComponents {
         peer_node_id: Option<u128>,
         max_catchup_gap_bytes: Option<u64>,
         role: CatchupRole,
-        observed_leader_wal_seq: u64,
+        catchup_target_wal_seq: u64,
     ) -> Result<S3CatchupResult, S3CatchupError> {
         // Fresh latch per call: single-invocation tests see first-kick semantics.
         let latch = std::cell::Cell::new(0u64);
-        self.catchup_full_with_latch(downloader, shard_id, peer_node_id, max_catchup_gap_bytes, role, observed_leader_wal_seq, &latch).await
+        self.catchup_full_with_latch(downloader, shard_id, peer_node_id, max_catchup_gap_bytes, role, catchup_target_wal_seq, &latch).await
     }
 
     /// Boot-role catchup (first catchup after process start).
@@ -308,7 +308,7 @@ impl TestComponents {
         peer_node_id: Option<u128>,
         max_catchup_gap_bytes: Option<u64>,
         role: CatchupRole,
-        observed_leader_wal_seq: u64,
+        catchup_target_wal_seq: u64,
         live_tail_yielded_wal_seq: &std::cell::Cell<u64>,
     ) -> Result<S3CatchupResult, S3CatchupError> {
         catchup_from_s3(
@@ -323,7 +323,7 @@ impl TestComponents {
             max_catchup_gap_bytes,
             test_codec(),
             role,
-            observed_leader_wal_seq,
+            catchup_target_wal_seq,
             live_tail_yielded_wal_seq,
         )
         .await

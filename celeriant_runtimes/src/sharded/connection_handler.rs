@@ -1216,8 +1216,12 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
 
     // Determine whether to accept the heartbeat and which raw_status to use.
     let raw_status = if current_status.is_any_follower_state() {
-        // Normal path: already a follower, accept heartbeat.
-        current_status.raw()
+        // Normal path: already a follower, accept heartbeat. Adopt a higher
+        // heartbeat epoch: a follower that stays in the fold across a
+        // leadership change otherwise keeps the old leader_lease_epoch
+        // forever, which validates dead-epoch phantom catchup targets and
+        // accepts a deposed equal-epoch leader's teachings.
+        follower_heartbeat_epoch_adoption(current_status.raw(), req.lease_epoch)
     } else if let NodeStatus::Promoting { lease_epoch } = current_status.raw() {
         // Raw, not effective: even a decayed (expired) promotion must refuse a
         // zombie's adoption — a heartbeat at epoch <= our won epoch is from a
@@ -1543,6 +1547,24 @@ fn promoting_heartbeat_adoption(promoting_lease_epoch: u64, req_lease_epoch: u64
     (req_lease_epoch > promoting_lease_epoch).then_some(NodeStatus::Follower { leader_lease_epoch: req_lease_epoch })
 }
 
+/// Already-follower heartbeat: keep the variant, raise the known leader epoch
+/// to the heartbeat's if higher. Heartbeats are sent only by an
+/// effective-Leader carrying its CAS-won epoch, so a higher value implies a
+/// newer election win — the same trust the fence-adopt and leader-stepdown
+/// branches extend. A lower/equal epoch leaves the status untouched (stale
+/// heartbeats still extend the TTL; deliberately unchanged).
+fn follower_heartbeat_epoch_adoption(current: NodeStatus, req_lease_epoch: u64) -> NodeStatus {
+    match current {
+        NodeStatus::Follower { leader_lease_epoch } if req_lease_epoch > leader_lease_epoch => {
+            NodeStatus::Follower { leader_lease_epoch: req_lease_epoch }
+        }
+        NodeStatus::FollowerCatchingUp { leader_lease_epoch } if req_lease_epoch > leader_lease_epoch => {
+            NodeStatus::FollowerCatchingUp { leader_lease_epoch: req_lease_epoch }
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1572,6 +1594,26 @@ mod tests {
         ];
         for &(own, req, expected) in cases {
             assert_eq!(promoting_heartbeat_adoption(own, req), expected, "own={own} req={req}");
+        }
+    }
+
+    /// An already-follower heartbeat raises the known leader epoch to a higher
+    /// heartbeat epoch (variant preserved) so dead-epoch phantom catchup
+    /// targets get discarded and a deposed equal-epoch leader cannot keep
+    /// teaching; lower/equal epochs leave the status untouched.
+    #[test]
+    fn follower_heartbeat_epoch_adoption_by_epoch() {
+        use NodeStatus::{Follower, FollowerCatchingUp};
+        // (current status, heartbeat epoch, expected)
+        let cases: &[(NodeStatus, u64, NodeStatus)] = &[
+            (Follower { leader_lease_epoch: 5 }, 6, Follower { leader_lease_epoch: 6 }),
+            (Follower { leader_lease_epoch: 5 }, 5, Follower { leader_lease_epoch: 5 }),
+            (Follower { leader_lease_epoch: 5 }, 4, Follower { leader_lease_epoch: 5 }),
+            (FollowerCatchingUp { leader_lease_epoch: 5 }, 6, FollowerCatchingUp { leader_lease_epoch: 6 }),
+            (FollowerCatchingUp { leader_lease_epoch: 5 }, 5, FollowerCatchingUp { leader_lease_epoch: 5 }),
+        ];
+        for &(current, req, expected) in cases {
+            assert_eq!(follower_heartbeat_epoch_adoption(current, req), expected, "current={current:?} req={req}");
         }
     }
 

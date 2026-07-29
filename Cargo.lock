@@ -831,6 +831,7 @@ dependencies = [
  "celeriant_distributed",
  "celeriant_ktls",
  "celeriant_msg",
+ "celeriant_rotating_log",
  "celeriant_shard",
  "celeriant_sidecar",
  "celeriant_wal",
