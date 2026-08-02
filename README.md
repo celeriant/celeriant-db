@@ -1,3 +1,19 @@
+<!-- BEGIN PROVENANCE PREAMBLE (managed by consolidation/finalise.sh, do not hand-edit) -->
+> **This repository carries 580 commits going back to 2024-05-27, across seven predecessor
+> repositories joined at their tips.** Seven root commits are GPG-signed by GitHub itself, which
+> fixes each repository's creation date independently of anything I control. Import GitHub's key and
+> check them:
+>
+> ```sh
+> curl -sL https://github.com/web-flow.gpg | gpg --import
+> git log --format='%G? %h %ad %s' --date=short --all | grep -E '^[EGU]'
+> ```
+>
+> Browsing older history needs `git log --full-history -- <path>`, and `--first-parent` will only
+> show you one lineage. See [PROVENANCE.md](PROVENANCE.md) for why, what was removed before
+> publication, and where AI tooling was used.
+<!-- END PROVENANCE PREAMBLE -->
+
 # Celeriant - An experimental event sourcing database
 
 A fast, distributed, append-only write-ahead log built specifically for event sourcing. 
