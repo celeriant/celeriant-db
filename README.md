@@ -1,32 +1,51 @@
-# Celeriant
+# Celeriant - An experimental event sourcing database
 
-A fast, distributed, append-only write-ahead log built specifically for event sourcing. It is dedicated to the write side of [CQRS](https://www.martinfowler.com/bliki/CQRS.html).
+A fast, distributed, append-only write-ahead log built specifically for event sourcing. 
 
-Not a relational database. Not a message broker. Just the write side of event sourcing, done properly.
+This is a serious, but somewhat still experimental project and is not vibe-coded. See [PROVENANCE.md](PROVENANCE.md). This readme is written by me.
 
-## Release Status
+My main interests trace back to:
 
-Celeriant is new. Really new. It's ready to experiment with, in non-production workloads. A lot might change in the next few months, and we won't be supporting backwards compatibility until 1.0. Use at your own risk.
+- at work I see clients reach to Kafka or PostgreSQL to implement event sourcing and/or distribution across microservices. Always ends badly.
+- I have an interest in offline-first apps and event sourcing is a viable alternative to CRDTs (Conflict-free Replicated Data Types)
 
-## Why Celeriant
+The goal is to build a fundamental, open source substrate that is fast, safe, correct and can linearlise events across 1 or many aggregates via OCC.
 
-PostgreSQL gives you correctness but not throughput. Kafka gives you throughput but not correctness. Celeriant gives you both.
+**fast** - up to 500k writes/sec. stable at 325k with p99 201ms. Redis speed recent write cache for catchups.
 
-**PostgreSQL** - It does all the things. You can design a single table that acts like an event store, add indexes, do conditional writes. PostgreSQL dies at scale. Every event append generates [8-10x the logical data size](docs/postgresql-event-sourcing-structural-mismatch.md) in actual I/O: heap writes, index updates, WAL, full page images, autovacuum. That continuous write pressure means vacuum can never catch up, and at 10,000 events/sec you hit [transaction ID wraparound](docs/postgresql-event-sourcing-structural-mismatch.md) every few days. Mailchimp lost 40 hours to it. The feature you need most for projections, `LISTEN/NOTIFY`, acquires a [global exclusive lock on the entire database](docs/postgresql-event-sourcing-structural-mismatch.md). Recall.ai had three outages in four days before ripping it out entirely. On Aurora I/O-Optimized the per-I/O charges go away, but storage never shrinks, MVCC dead tuple bloat compounds, and there's no lifecycle tiering. A modest 30k writes/sec workload costs [$16,000/month in month 1 and $205,000/month by month 12](docs/benchmark-summary.md).
+**safe** - write to disk before ack. No 'web scale' in-mem buffer bullshit. Doesn't blow up when you get to 100 million aggregates.
 
-**Kafka** - Claims millions of writes/sec, but that number counts records inside batches. Per-operation throughput, one write, wait for the ack, maxes out at ~24k req/s on our hardware ([benchmark](docs/benchmark-results/kafka-benchmark.md)). No conditional writes, no per-aggregate ordering. Two services read the same aggregate, both write version 6, both succeed. Silent data corruption. This has been an [open issue since 2015](https://issues.apache.org/jira/browse/KAFKA-2260). There is no way to read events for a single aggregate either. You get the whole partition firehose and filter client-side. One slow event blocks every aggregate in that partition (head-of-line blocking). The standard fix is a Dead Letter Queue, but skipping an event breaks the causal chain. [Axon's docs](https://docs.axoniq.io/axon-framework-reference/4.11/events/event-processors/dead-letter-queue/) acknowledge you have to halt the entire aggregate stream, which defeats the purpose. Re-partitioning breaks ordering permanently, so you can't scale after the fact. Teams end up with a lot of code to handle the sharp edges.
+**correct** - schema validation, exactly once events, optimistic concurrency control. All server-side.
 
-**Celeriant** - Per-aggregate ordering, optimistic concurrency control, exactly-once writes, and durable cluster replication. Scales to millions of aggregates with bounded memory regardless of cardinality. Cheap to run, predictable costs, no sharp edges or gotchas as you scale. A single Celeriant cluster writes up to 500k events/sec.
+**linearlisable** - per shard total ordering, dynamic consistency boundaries, no out of order or sequence gaps.
 
-## What Celeriant Is
+This is built by a team of 1 over ~3 years. Future self: never build a database from scratch.
 
-A distributed, append-only log organised by aggregate:
+Unlike most new-ish databases, everything is written from scrach. It doesn't sit on other embedded database. It's not a Kafka fork. Main dependencies are glommio (thread-per-core + io_uring + direct I/O) and bincode (serialisation).
+
+## Celeriant vs xxx
+
+**PostgreSQL** - performance pretty meh and can hit a wall. Use of sequences for event tables has gotchas for read catchup as sequence allocation is before commit, read catchups can miss events. Storing events in JSONB columns sucks too. `LISTEN/NOTIFY` can kill your server.
+
+**Kafka** - Not designed around aggregates. So you get a firehose of events and need DLQs. DLQ's then break aggregate causality if you are not careful. Usual pattern is outbox table + debezium -> kafka, but what happens is services have subtle shared state that creeps in over time; so services can raise events on the same aggregate in parallel, based on an outdated read model. No optimistic concurrency control means your aggregate invariants can be violated, and you only see it in prod when the system gets busy. This has been an [open issue since 2015](https://issues.apache.org/jira/browse/KAFKA-2260). No event schema validation server-side unless you go enterprise. Expensive.
+
+**KurrentDB** - Single WAL, global ordering but tops out at 15k writes/sec. Postgres does 50k. Celeriant can hit 500k. No server side schema enforcement. Not open source. Memory scales with stream cardinality, expect it to die if you keep adding new aggregates. Built on .Net, GC pauses can trigger false elections.
+
+## Should I use this
+
+Yes I know you are thinking that. Depends. Would a high performance event sourcing architecture give whatever you are building a competitive advantage? Is your boss ok with you risking it on an un-proven database, built by 1 guy out in Australia that nobody else uses?
+
+Do you need OCC+DCB over your aggregates? Are you considering event sourcing patterns over outbox+CDC+message bus?
+
+I'm keen to chat with you if you want to try it. I'll even help you build it. Reach out to me on [LinkedIn](https://www.linkedin.com/in/tyson-brown-208b88b6/) or email me tyson@celeriant.io. 
+
+## Getting into the details
+
+Celeriant is an append-only log organised by aggregate:
 
 ```
-org_id / aggregate_type_id / aggregate_id -> ordered event stream
+org_id / aggregate_type_id / aggregate_id
 ```
-
-Each aggregate is an independent, totally-ordered stream. Writes are acknowledged after durable disk write and quorum replication.
 
 **You get:**
 
@@ -38,9 +57,9 @@ Each aggregate is an independent, totally-ordered stream. Writes are acknowledge
 - Explicit offsets (you control your read position)
 - Event type filtering
 - Watch API (real-time change notifications)
-- Compression (zstd, snappy, brotli, gzip)
+- Compression (zstd)
 - In-memory read cache (recent events served from memory)
-- Per-event encryption support (AES-GCM, stored opaquely by server)
+- Per-event encryption support (for e2e encryption and crypto-shredding)
 - Blake3 hash chain linking every event to its predecessor (tamper-evident audit log)
 
 **You don't get:**
@@ -66,7 +85,6 @@ waits for the durable ack, then sends the next. This is the pattern real microse
 | System              | Peak req/s  | P99 at peak | Nodes | TLS            | Fsync      | OCC |
 | ------------------- | ----------- | ----------- | ----- | -------------- | ---------- | --- |
 | **Celeriant (64c)** | **535,292** | **210ms**   | 2     | mTLS (kTLS)    | Both nodes | Yes |
-| **Celeriant (32c)** | **389,759** | **217ms**   | 2     | mTLS (kTLS)    | Both nodes | Yes |
 | PostgreSQL/Marten   | 42,721      | 46ms        | 2     | mTLS (OpenSSL) | Both nodes | Yes |
 | Kafka               | ~24,000     | ~1,342ms    | 3     | TLS            | None       | No  |
 
@@ -79,7 +97,7 @@ Full results: [ec2-benchmark](docs/benchmark-results/ec2-benchmark.md),
 [marten-benchmark](docs/benchmark-results/marten-benchmark.md),
 [kafka-benchmark](docs/benchmark-results/kafka-benchmark.md).
 
-## Architecture
+## Technical Architecture
 
 ### Thread-Per-Core
 
@@ -211,6 +229,8 @@ Aggregates are assigned to shards by configurable routing:
 Clients connect to any shard. Requests are redirected to the owning shard automatically.
 
 The modulo is on the low bits of the routing field, so pick IDs with uniform low bits or you'll hot-shard. See [Choosing IDs so shards stay balanced](docs/guide.md#choosing-ids-so-shards-stay-balanced).
+
+You can't do DCB if aggregates in the commit group cross shard boundaries. Make sure you co-locate.
 
 ## When Not to Use Celeriant
 
