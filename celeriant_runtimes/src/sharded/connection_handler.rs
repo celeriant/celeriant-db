@@ -23,7 +23,7 @@ use celeriant_msg::read_wire_data_error::ReadWireDataError;
 use celeriant_wire::network::wire_error::WireError;
 use celeriant_wire::network::wire_header::WireHeader;
 use glommio::{channels::{channel_mesh::Senders, local_channel::LocalSender}, net::TcpStream};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::{
     intrashard_messages::{IntrashardMessages, RedirectedConnection},
@@ -280,6 +280,8 @@ pub fn handle_enter_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader +
     attempt: u64,
 ) {
     glommio::spawn_local(async move {
+        metrics::counter!("celeriant_s3_catchup_task_started_total",
+            &[("shard_id", ctx.current_shard_id.to_string())]).increment(1);
         let result = ctx.shard_wal.enter_s3_catchup(role).await;
 
         if let Err(e) = try_send_with_retry(
@@ -1418,13 +1420,16 @@ async fn broadcast_status<R: ReplicationClient + 'static, D: S3Downloader + 'sta
         if peer == ctx.current_shard_id {
             continue;
         }
-        let _ = try_send_with_retry(
+        if let Err(e) = try_send_with_retry(
             ctx.intrashard_sender.as_ref(), peer,
             // These status updates originate from follower-side events (kick, clock-drift fence,
             // heartbeat receipt). They are not CAS-confirmed leases, so cas_confirmed_at_ms=None.
             // leader_changed_hands=false: none of these are a peer-takeover promotion.
             IntrashardMessages::StatusUpdate { status, cas_confirmed_at_ms: None, leader_changed_hands: false }, 10
-        ).await;
+        ).await {
+            metrics::counter!("celeriant_intrashard_status_broadcast_dropped_total").increment(1);
+            error!(from_shard = ctx.current_shard_id, to_shard = peer, error = ?e, new_status = ?status.raw(), "Status broadcast dropped after retries — peer shard keeps a stale status");
+        }
     }
 }
 

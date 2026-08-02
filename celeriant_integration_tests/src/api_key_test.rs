@@ -19,6 +19,7 @@ use base64::Engine;
 use celeriant_client_tokio::celeriant_client::{CeleriantClient, ClientIdentityConfig};
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_crypto::{generate_api_key, hash_api_key};
+use crate::common::port_for;
 use crate::{ServerConfig, TestServer};
 use celeriant_msg::{
     process_client_requests::ClientRequest,
@@ -84,7 +85,7 @@ secondary_ro = "{}"
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== API Key Authentication Integration Tests ===\n");
 
-    let base_port = 10200 + (std::process::id() % 100) as u16;
+    let base_port = port_for("api_key_no_keys");
 
     // Generate API keys for tests
     let keys = generate_key_set();
@@ -98,8 +99,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     drop(server);
 
-    // Server WITH api_keys.toml configured
-    let enforcing_port = base_port + 2;
+    // Server WITH api_keys.toml configured. A fresh slot, not base_port + 2:
+    // that collided with the first server's metrics port.
+    let enforcing_port = port_for("api_key_enforcing");
     println!(
         "Starting test server (API keys enforced) on port {}...",
         enforcing_port

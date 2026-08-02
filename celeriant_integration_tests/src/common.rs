@@ -27,14 +27,29 @@ pub type R = Result<(), Box<dyn Error>>;
 /// Each test is its own subprocess, so the pid offset strides a whole 10-slot
 /// block: consecutive pids differ by 1, and a bare `pid + slot` would hand test
 /// N+1 a port test N's server or MinIO container is still holding.
+///
+/// Every port must land below `EPHEMERAL_FLOOR`: a listener above it races the
+/// kernel handing the same port to an outbound socket, and these tests open tens
+/// of thousands. That ceiling caps how many pid blocks fit, so blocks do recycle
+/// within a long run. A stale sibling is rarer than the ephemeral race it replaces.
 pub fn port_for(_seed: &str) -> u16 {
     let slot = NEXT_PORT_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     debug_assert!(slot < SLOTS_PER_PROCESS, "test exceeded its {SLOTS_PER_PROCESS}-port block");
-    let pid_off = (std::process::id() % 500) as u16;
-    12000 + ((pid_off * SLOTS_PER_PROCESS + slot) % 5000) * 10
+    let pid_off = (std::process::id() % PID_BLOCKS) as u16;
+    let port = PORT_BASE + (pid_off * SLOTS_PER_PROCESS + slot) * PORT_STRIDE;
+    debug_assert!(port < EPHEMERAL_FLOOR, "port {port} is in the kernel ephemeral range");
+    port
 }
 
+/// Clear of the `1xxxx + pid % 100` bases the older hand-rolled tests still use.
+const PORT_BASE: u16 = 20000;
+/// `/proc/sys/net/ipv4/ip_local_port_range` low water mark on stock Linux.
+const EPHEMERAL_FLOOR: u16 = 32768;
+const PORT_STRIDE: u16 = 10;
 const SLOTS_PER_PROCESS: u16 = 10;
+/// Largest value keeping `PORT_BASE + (PID_BLOCKS * SLOTS_PER_PROCESS) * PORT_STRIDE`
+/// under `EPHEMERAL_FLOOR`.
+const PID_BLOCKS: u32 = 127;
 
 static NEXT_PORT_SLOT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 

@@ -22,6 +22,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::sharded::{
     api_key_reloader::ApiKeyReloader,
+    catchup_barrier,
     connection_handler::{
         CatchupCompletionMsg, ConnectionContext, PortType, handle_enter_s3_catchup, handle_new_connection, handle_redirected_client_connection, handle_redirected_cluster_connection,
     },
@@ -159,8 +160,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
             self.ctx.schema_registration_pending = Some(Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())));
         }
 
-        for (_src_shard, stream) in self.intrashard_receivers.streams() {
-            spawn_intrashard_message_handler(stream, self.ctx.clone());
+        spawn_executor_heartbeat(self.ctx.current_shard_id);
+        for (src_shard, stream) in self.intrashard_receivers.streams() {
+            spawn_intrashard_message_handler(src_shard, stream, self.ctx.clone());
         }
 
         if let Some(rx) = rx {
@@ -407,10 +409,14 @@ enum CatchupRunOutcome {
     Shutdown,
     S3Unreachable,
     StalledView,
+    ShutdownRequested,
 }
 
 // Catchup cycle generations, unique across all run_s3_catchup invocations.
 static CATCHUP_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+// Total budget for one attempt's completion barrier. a liveness backstop for an unresponsive shard
+const COMPLETION_BARRIER_TIMEOUT: Duration = Duration::from_secs(90);
 
 async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     ctx: &ConnectionContext<R, D, S>,
@@ -421,6 +427,10 @@ async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'stati
     let mut tracker = catchup_attempts::AttemptTracker::new();
 
     loop {
+        if ctx.shutdown_requested.get() {
+            return CatchupRunOutcome::ShutdownRequested;
+        }
+
         attempt += 1;
         // Decide the role per ATTEMPT from shard 0's authoritative status and
         // carry it in the message. Carried, not derived per data shard: ambient
@@ -449,22 +459,22 @@ async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'stati
         let shard0_result = ctx.shard_wal.enter_s3_catchup(role).await;
         results.push(CatchupCompletionMsg { shard_id: 0, attempt: generation, result: shard0_result });
 
-        let mut remaining = shard_count - 1;
-        while remaining > 0 {
-            match rx.recv().await {
-                Some(msg) => {
-                    if msg.attempt != generation {
-                        tracing::debug!(stale_attempt = msg.attempt, generation, shard_id = msg.shard_id, "discarding stale catchup completion");
-                        continue;
-                    }
-                    results.push(msg);
-                    remaining -= 1;
-                }
-                None => break,
+        let timed_out = match catchup_barrier::await_completions(rx, generation, shard_count, COMPLETION_BARRIER_TIMEOUT).await {
+            catchup_barrier::BarrierOutcome::Complete(msgs) => {
+                results.extend(msgs);
+                Vec::new()
             }
-        }
+            catchup_barrier::BarrierOutcome::Closed(msgs) => {
+                results.extend(msgs);
+                (1..shard_count).filter(|id| !results.iter().any(|m| m.shard_id == *id)).collect()
+            }
+            catchup_barrier::BarrierOutcome::TimedOut { results: msgs, unreported } => {
+                results.extend(msgs);
+                unreported
+            }
+        };
 
-        match tracker.assess(attempt, role, &results) {
+        match tracker.assess(attempt, role, &results, &timed_out) {
             catchup_attempts::AttemptDecision::Shutdown => {
                 ctx.shutdown_requested.set(true);
                 broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::Shutdown, ctx.intrashard_sender.clone()).await;
@@ -824,7 +834,7 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
             // the election so it retries; never serve writes on an unverified WAL.
             match run_s3_catchup(ctx, &rx).await {
                 CatchupRunOutcome::Caught => {}
-                CatchupRunOutcome::Shutdown | CatchupRunOutcome::S3Unreachable | CatchupRunOutcome::StalledView => {
+                CatchupRunOutcome::Shutdown | CatchupRunOutcome::S3Unreachable | CatchupRunOutcome::StalledView | CatchupRunOutcome::ShutdownRequested => {
                     return Err(celeriant_distributed::lease_store::LeaseStoreError::Unavailable { message: "Could not catch up WAL via S3".to_string() });
                 }
             }
@@ -1245,6 +1255,9 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                 info!(node_status = ?ctx.shard_wal.node_status.get(), "Follower or fenced node detected expired lease, challenging for leadership");
 
                 if let Err(e) = set_node_role_via_s3(&lease_manager, &ctx, &rx, "challenge").await {
+                    if ctx.shutdown_requested.get() {
+                        continue;
+                    }
                     panic!("Election failed after retries: {e}");
                 }
                 last_s3_lease_write_at_ms = Some(validated_node_status::unix_epoch_now_ms());
@@ -1259,6 +1272,9 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                 let catchup_outcome = run_s3_catchup(&ctx, &rx).await;
                 if matches!(catchup_outcome, CatchupRunOutcome::Shutdown) {
                     panic!("S3 catchup failed with fatal error");
+                }
+                if matches!(catchup_outcome, CatchupRunOutcome::ShutdownRequested) {
+                    continue;
                 }
 
                 // Wait briefly only when another node's expired lease.bin is in S3, so
@@ -1327,6 +1343,9 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                         if ctx.shard_wal.node_status.get().raw().is_catching_up() {
                             info!("Boot-grace wait elapsed without heartbeat; challenging via CAS");
                             if let Err(e) = set_node_role_via_s3(&lease_manager, &ctx, &rx, "post_catchup").await {
+                                if ctx.shutdown_requested.get() {
+                                    continue;
+                                }
                                 panic!("Post-catchup election failed after retries: {e}");
                             }
                             last_s3_lease_write_at_ms = Some(validated_node_status::unix_epoch_now_ms());
@@ -1336,6 +1355,9 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                     }
                     PostCatchupAction::ChallengeViaCAS => {
                         if let Err(e) = set_node_role_via_s3(&lease_manager, &ctx, &rx, "post_catchup").await {
+                            if ctx.shutdown_requested.get() {
+                                continue;
+                            }
                             panic!("Post-catchup election failed after retries: {e}");
                         }
                         last_s3_lease_write_at_ms = Some(validated_node_status::unix_epoch_now_ms());
@@ -1349,16 +1371,47 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
     .detach();
 }
 
+/// Clears an in-flight gauge on scope exit, including an unwind.
+struct ClearGaugeOnDrop(metrics::Gauge);
+
+impl Drop for ClearGaugeOnDrop {
+    fn drop(&mut self) {
+        self.0.set(0.0);
+    }
+}
+
+/// Per-shard executor liveness. A 1s timer that only stamps the clock.
+fn spawn_executor_heartbeat(shard_id: usize) {
+    glommio::spawn_local(async move {
+        let shard_label: &'static str = Box::leak(shard_id.to_string().into_boxed_str());
+        loop {
+            metrics::gauge!("celeriant_shard_executor_heartbeat_ms", "shard_id" => shard_label)
+                .set(validated_node_status::unix_epoch_now_ms() as f64);
+            glommio::timer::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .detach();
+}
+
 fn spawn_intrashard_message_handler<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    src_shard: usize,
     stream: ConnectedReceiver<IntrashardMessages>,
     ctx: ConnectionContext<R, D, S>,
 ) {
     let shard_id = ctx.current_shard_id;
     glommio::spawn_local(async move {
+        let src_label: &'static str = Box::leak(src_shard.to_string().into_boxed_str());
+        let dst_label: &'static str = Box::leak(shard_id.to_string().into_boxed_str());
+        let dequeued = metrics::counter!("celeriant_intrashard_dequeued_total", "src_shard" => src_label, "shard_id" => dst_label);
         while let Some(msg) = stream.recv().await {
+            let kind = msg.kind();
+            dequeued.increment(1);
+            let started = metrics::gauge!("celeriant_intrashard_handler_started_at_ms", "src_shard" => src_label, "shard_id" => dst_label, "kind" => kind);
+            started.set(validated_node_status::unix_epoch_now_ms() as f64);
+            let _clear = ClearGaugeOnDrop(started);
             handle_intrashard_message(msg, &ctx).await;
         }
-        error!(shard_id, "Intrashard message handler exited — channel closed");
+        error!(shard_id, src_shard, "Intrashard message handler exited — channel closed");
     })
     .detach();
 }
@@ -1417,7 +1470,10 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
         IntrashardMessages::EnterS3Catchup { role, attempt } => handle_enter_s3_catchup(ctx.clone(), role, attempt),
         IntrashardMessages::S3CatchupComplete { shard_id, attempt, result } => {
             if let Some(tx) = &ctx.catchup_completion_tx {
-                let _ = tx.try_send(CatchupCompletionMsg { result, shard_id, attempt });
+                if tx.try_send(CatchupCompletionMsg { result, shard_id, attempt }).is_err() {
+                    metrics::counter!("celeriant_s3_catchup_completion_dropped_total").increment(1);
+                    warn!(shard_id, attempt, "S3 catchup completion dropped as receiver gone");
+                }
             }
         }
         IntrashardMessages::StatusUpdate { status, cas_confirmed_at_ms, leader_changed_hands } => {

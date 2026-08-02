@@ -1143,6 +1143,7 @@ mod tests {
             parked_commit_depth_by_shard: BTreeMap::new(),
             last_self_acked_by_shard: BTreeMap::new(),
             node_status_code_by_shard: BTreeMap::new(),
+            executor_heartbeat_ms_by_shard: BTreeMap::new(),
             writes_total: 0,
             write_errors_total: 0,
             leader_elections_total: 0,
@@ -1187,6 +1188,13 @@ mod tests {
             position_snapshot_stale_commit_total: 0,
             commit_notify_sent_total: 0,
             commit_notify_received_total: 0,
+            s3_catchup_barrier_timeout_total: 0,
+            s3_catchup_stall_bail_total: 0,
+            s3_catchup_task_started_total: 0,
+            intrashard_status_broadcast_dropped_total: 0,
+            s3_catchup_completion_dropped_total: 0,
+            stuck_handlers: Vec::new(),
+            mesh_dequeued_by_pair: std::collections::BTreeMap::new(),
             // All guarded counters "exported": these tests target the
             // read-cursor/leader-stability checks, not check_counter's
             // presence guard (covered by its own tests below).

@@ -139,6 +139,13 @@ fn register_metric_descriptions() {
     describe_counter!("celeriant_extension_redirects_total", "Cross-shard connection redirects by a PerShardExtension (e.g. the queue)");
     describe_counter!("celeriant_extension_redirect_dropped_total", "Extension redirects dropped because the target shard's inbound channel was full or closed");
     describe_counter!("celeriant_mesh_channel_full_total", "Mesh channel full events by message type");
+    describe_counter!("celeriant_intrashard_dequeued_total", "Mesh messages consumed, per (src_shard, shard_id) loop — a shard runs one loop per producer, so this is never summed");
+    describe_gauge!("celeriant_intrashard_handler_started_at_ms", "Unix ms when the in-flight mesh handler started, 0 when idle. Non-zero and stale names the handler a mesh loop is blocked in");
+    describe_gauge!("celeriant_shard_executor_heartbeat_ms", "Unix ms refreshed every 1s per shard. Stale means the executor made no progress; it cannot say whether the cause is OS starvation or a spinning handler");
+    describe_counter!("celeriant_intrashard_status_broadcast_dropped_total", "Status broadcasts abandoned after retries — the peer keeps a stale status");
+    describe_counter!("celeriant_s3_catchup_completion_dropped_total", "Catchup completions lost forwarding to shard 0 (receiver gone)");
+    describe_counter!("celeriant_s3_catchup_task_started_total", "Spawned S3 catchup tasks that began running. Data shards only — shard 0 runs its catchup inline");
+    describe_counter!("celeriant_s3_catchup_barrier_timeout_total", "Shards that missed the catchup completion barrier deadline");
     describe_gauge!("celeriant_watch_subscribers_active", "Active watch subscriptions");
 
     // Cluster

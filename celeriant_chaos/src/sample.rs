@@ -42,6 +42,11 @@ pub struct NodeSample {
     /// shard's read legitimately outruns the leader's scraped view.
     #[serde(default)]
     pub node_status_code_by_shard: BTreeMap<u32, u64>,
+    /// Per-shard unix-ms stamp from `celeriant_shard_executor_heartbeat_ms{shard_id="N"}`,
+    /// refreshed every 1s. A value that stops advancing across samples means the
+    /// executor made no progress at all, not just one mesh loop.
+    #[serde(default)]
+    pub executor_heartbeat_ms_by_shard: BTreeMap<u32, u64>,
     pub writes_total: u64,
     pub write_errors_total: u64,
     pub leader_elections_total: u64,
@@ -139,6 +144,37 @@ pub struct NodeSample {
     pub commit_notify_sent_total: u64,
     /// Guard-passing empty-batch commit-notifies accepted (follower side).
     pub commit_notify_received_total: u64,
+    /// S3 catchup abandoned the barrier wait on timeout.
+    #[serde(default)]
+    pub s3_catchup_barrier_timeout_total: u64,
+    /// S3 catchup bailed because a shard stopped making progress.
+    #[serde(default)]
+    pub s3_catchup_stall_bail_total: u64,
+    /// S3 catchup tasks spawned. Against the completion counters this separates
+    /// "never started" from "started and never finished".
+    #[serde(default)]
+    pub s3_catchup_task_started_total: u64,
+    /// StatusUpdate broadcasts dropped because the mesh channel was full — a
+    /// shard that never learns a peer's status is one of the wedge causes.
+    #[serde(default)]
+    pub intrashard_status_broadcast_dropped_total: u64,
+    /// Catchup completions dropped instead of delivered. Non-zero means a shard
+    /// finished catching up and nobody was told.
+    #[serde(default)]
+    pub s3_catchup_completion_dropped_total: u64,
+    /// `celeriant_intrashard_handler_started_at_ms` series that are NON-ZERO, as
+    /// `{labels}@value`. Filtered because the gauge is zero while idle and every
+    /// one of the 60+ series would otherwise land in every sample. Each entry
+    /// names a mesh loop currently inside a handler, which one, and since when.
+    #[serde(default)]
+    pub stuck_handlers: Vec<String>,
+    /// `celeriant_intrashard_dequeued_total` keyed by its raw `{src_shard,shard_id}`
+    /// label blob. Kept per-pair, not summed: a shard runs one mesh loop per
+    /// PRODUCER, so a total would let a busy sibling loop mask a dead one. The
+    /// mesh is FIFO per pair, so a counter that advanced past a message's send
+    /// time proves that message was consumed.
+    #[serde(default)]
+    pub mesh_dequeued_by_pair: BTreeMap<String, u64>,
     /// Prometheus counter names (from the COUNTERS whitelist) that actually
     /// appeared in this scrape. A4: `unwrap_or(0)` at parse time makes an
     /// absent (renamed/removed) metric indistinguishable from a present-but-
@@ -161,6 +197,7 @@ impl NodeSample {
             parked_commit_depth_by_shard: BTreeMap::new(),
             last_self_acked_by_shard: BTreeMap::new(),
             node_status_code_by_shard: BTreeMap::new(),
+            executor_heartbeat_ms_by_shard: BTreeMap::new(),
             writes_total: 0,
             write_errors_total: 0,
             leader_elections_total: 0,
@@ -205,6 +242,13 @@ impl NodeSample {
             position_snapshot_stale_commit_total: 0,
             commit_notify_sent_total: 0,
             commit_notify_received_total: 0,
+            s3_catchup_barrier_timeout_total: 0,
+            s3_catchup_stall_bail_total: 0,
+            s3_catchup_task_started_total: 0,
+            intrashard_status_broadcast_dropped_total: 0,
+            s3_catchup_completion_dropped_total: 0,
+            stuck_handlers: Vec::new(),
+            mesh_dequeued_by_pair: BTreeMap::new(),
             metric_keys_present: std::collections::BTreeSet::new(),
         }
     }
@@ -224,6 +268,9 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
     let mut parked_commit_depth_by_shard: BTreeMap<u32, u64> = BTreeMap::new();
     let mut last_self_acked_by_shard: BTreeMap<u32, u64> = BTreeMap::new();
     let mut node_status_code_by_shard: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut executor_heartbeat_ms_by_shard: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut stuck_handlers: Vec<String> = Vec::new();
+    let mut mesh_dequeued: BTreeMap<String, u64> = BTreeMap::new();
     let mut client_connections_active: u64 = 0;
     let mut watch_subscribers_active: u64 = 0;
 
@@ -270,6 +317,11 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         "celeriant_position_snapshot_stale_commit_total",
         "celeriant_commit_notify_sent_total",
         "celeriant_commit_notify_received_total",
+        "celeriant_s3_catchup_barrier_timeout_total",
+        "celeriant_s3_catchup_stall_bail_total",
+        "celeriant_s3_catchup_task_started_total",
+        "celeriant_intrashard_status_broadcast_dropped_total",
+        "celeriant_s3_catchup_completion_dropped_total",
     ];
 
     for line in body.lines() {
@@ -342,6 +394,32 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
             }
             continue;
         }
+        if name == "celeriant_intrashard_dequeued_total" {
+            if let Ok(v) = value_str.parse::<f64>()
+                && let Some(labels) = name_part.find('{').map(|i| &name_part[i..])
+            {
+                mesh_dequeued.insert(labels.to_string(), v as u64);
+            }
+            continue;
+        }
+        if name == "celeriant_shard_executor_heartbeat_ms" {
+            if let Ok(v) = value_str.parse::<f64>()
+                && let Some(shard_id) = extract_label(name_part, "shard_id")
+                && let Ok(id) = shard_id.parse::<u32>()
+            {
+                executor_heartbeat_ms_by_shard.insert(id, v as u64);
+            }
+            continue;
+        }
+        if name == "celeriant_intrashard_handler_started_at_ms" {
+            if let Ok(v) = value_str.parse::<f64>()
+                && v != 0.0
+            {
+                let labels = &name_part[name.len()..];
+                stuck_handlers.push(format!("{labels}@{}", v as u64));
+            }
+            continue;
+        }
         if name == "celeriant_client_connections_active" {
             if let Ok(v) = value_str.parse::<f64>() {
                 client_connections_active = client_connections_active.saturating_add(v as u64);
@@ -377,6 +455,9 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         parked_commit_depth_by_shard,
         last_self_acked_by_shard,
         node_status_code_by_shard,
+        executor_heartbeat_ms_by_shard,
+        stuck_handlers,
+        mesh_dequeued_by_pair: mesh_dequeued,
         writes_total: get("celeriant_writes_total"),
         write_errors_total: get("celeriant_write_errors_total"),
         leader_elections_total: get("celeriant_leader_elections_total"),
@@ -419,6 +500,11 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         position_snapshot_stale_commit_total: get("celeriant_position_snapshot_stale_commit_total"),
         commit_notify_sent_total: get("celeriant_commit_notify_sent_total"),
         commit_notify_received_total: get("celeriant_commit_notify_received_total"),
+        s3_catchup_barrier_timeout_total: get("celeriant_s3_catchup_barrier_timeout_total"),
+        s3_catchup_stall_bail_total: get("celeriant_s3_catchup_stall_bail_total"),
+        s3_catchup_task_started_total: get("celeriant_s3_catchup_task_started_total"),
+        intrashard_status_broadcast_dropped_total: get("celeriant_intrashard_status_broadcast_dropped_total"),
+        s3_catchup_completion_dropped_total: get("celeriant_s3_catchup_completion_dropped_total"),
         barrier_sync_fsync_total: get("celeriant_barrier_sync_fsync_total"),
         barrier_sync_fsync_failed_total: get("celeriant_barrier_sync_fsync_failed_total"),
         metric_keys_present,
@@ -468,4 +554,56 @@ pub fn elapsed_ms(start: Instant, now: Instant) -> u64 {
 /// Sleep helper that uses the chosen scrape interval.
 pub fn scrape_interval() -> Duration {
     Duration::from_millis(500)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(body: &str) -> NodeSample {
+        parse_metrics("h1".into(), 0, body)
+    }
+
+    #[test]
+    fn stuck_handlers_keeps_only_nonzero() {
+        let s = sample(
+            "celeriant_intrashard_handler_started_at_ms{src_shard=\"0\",shard_id=\"2\",kind=\"enter_s3_catchup\"} 1785377615123\n\
+             celeriant_intrashard_handler_started_at_ms{src_shard=\"1\",shard_id=\"2\",kind=\"status_update\"} 0\n",
+        );
+        assert_eq!(
+            s.stuck_handlers,
+            vec!["{src_shard=\"0\",shard_id=\"2\",kind=\"enter_s3_catchup\"}@1785377615123"]
+        );
+    }
+
+    #[test]
+    fn stuck_handlers_empty_when_all_idle() {
+        let s = sample("celeriant_intrashard_handler_started_at_ms{src_shard=\"0\",shard_id=\"1\",kind=\"probe\"} 0\n");
+        assert!(s.stuck_handlers.is_empty());
+    }
+
+    #[test]
+    fn executor_heartbeat_parsed_per_shard() {
+        let s = sample(
+            "celeriant_shard_executor_heartbeat_ms{shard_id=\"0\"} 1785377615000\n\
+             celeriant_shard_executor_heartbeat_ms{shard_id=\"3\"} 1785377614000\n",
+        );
+        assert_eq!(s.executor_heartbeat_ms_by_shard.get(&0), Some(&1785377615000));
+        assert_eq!(s.executor_heartbeat_ms_by_shard.get(&3), Some(&1785377614000));
+    }
+
+    #[test]
+    fn new_catchup_counters_summed_and_marked_present() {
+        let s = sample(
+            "celeriant_s3_catchup_barrier_timeout_total 2\n\
+             celeriant_s3_catchup_stall_bail_total 1\n\
+             celeriant_s3_catchup_task_started_total{shard_id=\"0\"} 4\n\
+             celeriant_s3_catchup_task_started_total{shard_id=\"1\"} 5\n",
+        );
+        assert_eq!(s.s3_catchup_barrier_timeout_total, 2);
+        assert_eq!(s.s3_catchup_stall_bail_total, 1);
+        assert_eq!(s.s3_catchup_task_started_total, 9);
+        assert_eq!(s.intrashard_status_broadcast_dropped_total, 0);
+        assert!(!s.metric_keys_present.contains("celeriant_s3_catchup_completion_dropped_total"));
+    }
 }

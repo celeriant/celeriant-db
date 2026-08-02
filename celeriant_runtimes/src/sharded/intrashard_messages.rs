@@ -64,6 +64,56 @@ pub enum IntrashardMessages {
     },
 }
 
+impl IntrashardMessages {
+    /// Stable metric label naming the handler
+    pub fn kind(&self) -> &'static str {
+        match self {
+            IntrashardMessages::Shutdown => "shutdown",
+            IntrashardMessages::ClientConnectionRedirect { .. } => "client_redirect",
+            IntrashardMessages::ClusterConnectionRedirect { .. } => "cluster_redirect",
+            IntrashardMessages::ExtensionConnectionRedirect { .. } => "extension_redirect",
+            IntrashardMessages::CullSpeculativeTail { .. } => "cull_speculative_tail",
+            IntrashardMessages::RenewS3LeaseNow { .. } => "renew_s3_lease",
+            IntrashardMessages::EnterS3Catchup { .. } => "enter_s3_catchup",
+            IntrashardMessages::S3CatchupComplete { .. } => "s3_catchup_complete",
+            IntrashardMessages::StatusUpdate { .. } => "status_update",
+            IntrashardMessages::UpdatePeerNodeId { .. } => "update_peer_node_id",
+            IntrashardMessages::UpdateFollower { .. } => "update_follower",
+            IntrashardMessages::FollowerReachable { .. } => "follower_reachable",
+            IntrashardMessages::PeriodicProbe => "periodic_probe",
+            IntrashardMessages::HeartbeatInFlightStarted { .. } => "heartbeat_in_flight_started",
+            IntrashardMessages::HeartbeatInFlightCleared => "heartbeat_in_flight_cleared",
+            IntrashardMessages::UpdateLeaderClientAddress { .. } => "update_leader_client_address",
+            IntrashardMessages::SchemaRegistration { .. } => "schema_registration",
+            IntrashardMessages::SchemaRegistrationComplete { .. } => "schema_registration_complete",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use celeriant_distributed::node_status::NodeStatus;
+
+    #[test]
+    fn wedge_path_kinds_are_distinct() {
+        let status = ValidatedNodeStatus::create_custom_status(NodeStatus::BootCatchup, 0, 0);
+        let kinds = [
+            IntrashardMessages::Shutdown.kind(),
+            IntrashardMessages::CullSpeculativeTail { mode: TailReconciliation::ReconcileAsFollower }.kind(),
+            IntrashardMessages::RenewS3LeaseNow { requesting_shard: 1 }.kind(),
+            IntrashardMessages::EnterS3Catchup { role: celeriant_shard::shard_wal_s3_catchup::CatchupRole::Following, attempt: 1 }.kind(),
+            IntrashardMessages::StatusUpdate { status, cas_confirmed_at_ms: None, leader_changed_hands: false }.kind(),
+            IntrashardMessages::PeriodicProbe.kind(),
+            IntrashardMessages::FollowerReachable { reachable: true, was_reachable: false }.kind(),
+        ];
+        let mut seen = kinds.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), kinds.len(), "two IntrashardMessages variants share a kind label: {kinds:?}");
+    }
+}
+
 pub struct RedirectedConnection {
     pub accepted_tcp_stream: AcceptedTcpStream,
     pub payload: Vec<u8>,
