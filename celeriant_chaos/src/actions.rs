@@ -148,6 +148,7 @@ impl<'a> ActionExecutor<'a> {
     fn run_make(&self, target: &str, vars: &[String]) -> Result<(), String> {
         let mut cmd = Command::new("make");
         cmd.arg("-s").arg(target);
+        cmd.arg("DANGEROUS=1");
         for v in vars {
             cmd.arg(v);
         }

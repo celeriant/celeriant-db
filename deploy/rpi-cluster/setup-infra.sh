@@ -18,6 +18,10 @@ case "${INFRA_MODE:-}" in
     *) printf "ERROR: INFRA_MODE must be 'remote' or 'local' (got '%s')\n" "${INFRA_MODE:-}" >&2; exit 1 ;;
 esac
 
+# INFRA_HOST is derived from INFRA_MODE by the Makefile, which is the only
+# entry point. Kept there so config.env stays the single source of truth.
+: "${INFRA_HOST:?unset — run 'make setup-infra', not this script directly}"
+
 print_remote_urls() {
     printf "\n${GREEN}Infra stack deployed on %s.${RESET}\n" "$INFRA_HOST"
     printf "  Grafana:        http://%s:3000 (admin/admin)\n" "$INFRA_HOST"
@@ -131,50 +135,10 @@ else  # local
     printf ">>> Wiping local minio-data volume...\n"
     (cd "$SCRIPT_DIR" && docker compose down -v 2>/dev/null) || true
 
-    # Template prometheus config. The compose file references ./prometheus.yml (a
-    # placeholder template); we generate the real config to prometheus.generated.yml
-    # and use docker-compose.local-override.yml to remap the bind mount.
-    printf ">>> Generating prometheus.generated.yml...\n"
-    sed -e "s|LEADER_HOST_PLACEHOLDER|$LEADER_HOST|g" \
-        -e "s|FOLLOWER_HOST_PLACEHOLDER|$FOLLOWER_HOST|g" \
-        -e "s|METRICS_PORT_PLACEHOLDER|$METRICS_PORT|g" \
-        "$SCRIPT_DIR/prometheus.yml" > "$SCRIPT_DIR/prometheus.generated.yml"
-
-    # Stage Grafana provisioning locally. The compose file's relative paths
-    # (./grafana-provisioning/, ./dashboards/) resolve to this directory.
-    GRAFANA_SRC="${PROJECT_ROOT}/deploy/local-cluster/grafana"
-    if [ -d "$GRAFANA_SRC" ]; then
-        printf ">>> Staging Grafana provisioning locally...\n"
-
-        mkdir -p "$SCRIPT_DIR/grafana-provisioning/datasources" \
-                 "$SCRIPT_DIR/grafana-provisioning/dashboards" \
-                 "$SCRIPT_DIR/dashboards"
-
-        cat > "$SCRIPT_DIR/grafana-provisioning/datasources/datasources.yml" <<'DSEOF'
-apiVersion: 1
-datasources:
-  - name: Prometheus
-    uid: celeriant-prometheus
-    type: prometheus
-    access: proxy
-    url: http://prometheus:9090
-    isDefault: true
-  - name: Loki
-    uid: celeriant-loki
-    type: loki
-    access: proxy
-    url: http://loki:3100
-DSEOF
-
-        cp "${GRAFANA_SRC}/provisioning/dashboards/dashboards.yml" \
-           "$SCRIPT_DIR/grafana-provisioning/dashboards/"
-
-        if [ -d "${GRAFANA_SRC}/dashboards" ]; then
-            cp "${GRAFANA_SRC}"/dashboards/*.json "$SCRIPT_DIR/dashboards/" 2>/dev/null || true
-        fi
-    else
-        printf ">>> No local-cluster grafana config found, skipping dashboard provisioning.\n"
-    fi
+    # Generate the bind-mount sources the local override expects. Also run by
+    # `make start-infra`, so an unseeded checkout can start without this script.
+    printf ">>> Staging local infra config...\n"
+    bash "$SCRIPT_DIR/stage-local-infra.sh"
 
     # Start the stack. The override file remaps the prometheus bind mount to the
     # generated config so we don't overwrite the placeholder prometheus.yml.

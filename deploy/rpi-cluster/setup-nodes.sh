@@ -101,6 +101,48 @@ scp /tmp/promtail.service "$HOST":/tmp/promtail.service
 ssh "$HOST" 'sudo mv /tmp/promtail.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable promtail'
 rm -f /tmp/promtail.service
 
+# --- Crash forensics ---
+# RPi OS ships journald Storage=volatile, so every reboot wipes the evidence.
+# A node that dies under load then comes back with nothing to say about why.
+printf "\n=== Crash forensics on %s ===\n" "$HOST"
+ssh "$HOST" bash -s <<'FORENSICS'
+set -euo pipefail
+
+sudo mkdir -p /etc/systemd/journald.conf.d
+cat <<'JOURNALD' | sudo tee /etc/systemd/journald.conf.d/50-persistent.conf > /dev/null
+# Overrides RPi OS 40-rpi-volatile-storage.conf so crash evidence survives a
+# reboot. Capped, since sparing the SD card is why the default is volatile.
+[Journal]
+Storage=persistent
+SystemMaxUse=200M
+JOURNALD
+
+sudo mkdir -p /var/log/journal
+sudo systemctl restart systemd-journald
+sudo journalctl --flush
+FORENSICS
+
+scp "$SCRIPT_DIR/power-trace.sh" "$HOST":/tmp/power-trace.sh
+ssh "$HOST" bash -s <<'POWERTRACE'
+set -euo pipefail
+
+sudo install -m755 /tmp/power-trace.sh /usr/local/bin/power-trace.sh
+rm -f /tmp/power-trace.sh
+cat <<'UNIT' | sudo tee /etc/systemd/system/power-trace.service > /dev/null
+[Unit]
+Description=Pi 5 PMIC power trace
+
+[Service]
+ExecStart=/usr/local/bin/power-trace.sh
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+sudo systemctl daemon-reload
+sudo systemctl enable --now power-trace.service
+POWERTRACE
+
 # --- Systemd service + promtail config (re-runnable; called again on every `make deploy`) ---
 bash "$SCRIPT_DIR/update-service.sh" "$HOST" "$INFRA_HOST" "$MEMORY_CONSUMPTION_PERCENT" "$SHARD_LOG_PREALLOCATE_BYTES" "$RESERVE_COORDINATOR_SHARD"
 

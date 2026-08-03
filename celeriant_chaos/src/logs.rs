@@ -19,8 +19,14 @@ pub fn fetch_journal(
 
     // `--since=@<unix>` / `--until=@<unix>` is the most portable, locale-free
     // form. Works on systemd 230+ which is everything since 2016.
+    //
+    // The kernel ring is appended after the unit log: when a node dies the
+    // database's own view says nothing useful, and the cause (OOM, thermal,
+    // PCIe/NVMe fault, watchdog) only ever shows up in kernel messages.
     let remote = format!(
-        "journalctl -u celeriant --no-pager --since=@{start_unix} --until=@{end_unix}"
+        "journalctl -u celeriant --no-pager --since=@{start_unix} --until=@{end_unix}; \
+         echo '===== KERNEL ====='; \
+         journalctl -k --no-pager --since=@{start_unix} --until=@{end_unix} 2>&1 || true"
     );
 
     let file = std::fs::File::create(dest)

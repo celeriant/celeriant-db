@@ -14,7 +14,13 @@ case "${INFRA_MODE:-}" in
 esac
 
 if [ "$INFRA_MODE" = "remote" ]; then
-    ssh "$INFRA_HOST" "cd ~/celeriant-infra && docker compose $*"
+    # Resolved from INFRA_MODE by the Makefile, the only entry point.
+    : "${INFRA_HOST:?unset — reach this via a make target, not directly}"
+    # Explicit -p rather than relying on the directory name for the project.
+    # cs3 also hosts the prod stacks (celeriant-prod-edge, celeriant-prod-infra),
+    # and `down -v` resolving to the wrong project would take out prod's lease
+    # store. A rename or a stray COMPOSE_PROJECT_NAME is all it would take.
+    ssh "$INFRA_HOST" "cd ~/celeriant-infra && docker compose -p celeriant-infra $*"
 else
     cd "$SCRIPT_DIR" && docker compose -f docker-compose.yml -f docker-compose.local-override.yml "$@"
 fi

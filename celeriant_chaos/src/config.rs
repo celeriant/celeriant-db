@@ -61,6 +61,22 @@ impl ClusterConfig {
             }
         };
 
+        // certs/ is gitignored, so a cleaned checkout reaches the first bench
+        // before failing with an opaque PKI error. Check up front instead.
+        let ca_cert = deploy_dir.join("certs/client-ca.crt");
+        let client_cert = deploy_dir.join("certs/client.crt");
+        let client_key = deploy_dir.join("certs/client.key");
+        for p in [&ca_cert, &client_cert, &client_key] {
+            if !p.exists() {
+                return Err(format!(
+                    "missing {} — run `make certs` in {} (then `make check-certs` to verify \
+                     they match the CA the nodes trust)",
+                    p.display(),
+                    deploy_dir.display()
+                ));
+            }
+        }
+
         Ok(Self {
             leader_host: get_required("LEADER_HOST")?,
             follower_host: get_required("FOLLOWER_HOST")?,
@@ -70,9 +86,9 @@ impl ClusterConfig {
             metrics_port: parse_port("METRICS_PORT", 9090)?,
             s3_port: parse_port("S3_PORT", 9000)?,
             deploy_dir: deploy_dir.clone(),
-            ca_cert: deploy_dir.join("certs/client-ca.crt"),
-            client_cert: deploy_dir.join("certs/client.crt"),
-            client_key: deploy_dir.join("certs/client.key"),
+            ca_cert,
+            client_cert,
+            client_key,
         })
     }
 

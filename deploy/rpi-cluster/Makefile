@@ -18,6 +18,23 @@ $(error INFRA_MODE must be 'local' or 'remote' (got '$(INFRA_MODE)'))
 endif
 export INFRA_HOST
 
+# cs1 and cs2 are shared with a 24/7 prod celeriant deployment. The isolation is
+# a parallel namespace, not a separate box: prod runs unit celeriant-prod, binary
+# /usr/local/bin/celeriant-prod, data root /var/lib/nvme/celeriant-prod, ports
+# 10100/10101/9092, and its own MinIO on cs3:9002. Nothing here should ever touch
+# those. See utilitydelta/personal/home-lab/celeriant-homelab-deploy.md.
+#
+# Two chaos scenarios are host-scoped and reach prod regardless of naming:
+# fill-disk (filesystem-wide) and skew-clock (host-wide). Stop celeriant-prod on
+# the target box only for those; the pair survives on the other node.
+PROD_DATA_ROOT := /var/lib/nvme/celeriant-prod
+CHAOS_DATA_ROOT := /var/lib/nvme/celeriant-data
+
+# Destructive and host-mutating targets refuse unless this is 1. A variable, not
+# a read -p prompt, because the chaos harness drives these targets itself and
+# would deadlock on stdin.
+DANGEROUS ?= 0
+
 # Colours
 RED    := \033[0;31m
 GREEN  := \033[0;32m
@@ -25,12 +42,77 @@ YELLOW := \033[0;33m
 BOLD   := \033[1m
 RESET  := \033[0m
 
-.PHONY: help setup-all setup-nodes setup-nvme setup-ktls setup-infra certs \
+.PHONY: help setup-all setup-nodes setup-nvme-DESTRUCTIVE setup-ktls setup-infra certs \
         deploy build ship restart stop start logs run-test teardown teardown-data \
         update-service \
         stop-cs1 stop-cs2 stop-minio kill-cs1 kill-cs2 kill-minio \
         kill-cs1-no-restart kill-cs2-no-restart \
-        start-cs1 start-cs2 start-minio status start-infra
+        start-cs1 start-cs2 start-minio status start-infra failover-test check-certs \
+        require-dangerous guard-prod guard-nvme heal-all \
+        skew-clock restore-clock fill-disk clean-disk partition-host heal-host \
+        pause-cs1 pause-cs2 resume-cs1 resume-cs2
+
+# ---------------------------------------------------------------------------
+# Guards
+#
+# Isolation that depends on remembering to be careful is not isolation. cs1 and
+# cs2 host a 24/7 prod deployment alongside this rig, and the harness calls the
+# destructive targets itself, so a cluster wipe is something an automated run
+# performs rather than only something you type.
+# ---------------------------------------------------------------------------
+
+require-dangerous:
+	@if [ "$(DANGEROUS)" != "1" ]; then \
+	  printf "$(RED)REFUSING: '$(MAKECMDGOALS)' mutates or destroys this cluster.$(RESET)\n"; \
+	  printf "If that is what this cluster is:  make DANGEROUS=1 $(MAKECMDGOALS)\n"; \
+	  exit 1; \
+	fi
+
+# teardown-data only deletes inside REMOTE_DATA_ROOT, so the question it has to
+# answer is whether that still points at chaos. Allow-list, not deny-list: an
+# earlier version had no *) arm, so an empty REMOTE_DATA_ROOT passed the case
+# and produced rm -rf /*. realpath -m also closes ../celeriant-prod traversal.
+guard-prod:
+	@[ -n "$(REMOTE_DATA_ROOT)" ] || { printf "$(RED)REFUSING: REMOTE_DATA_ROOT is empty$(RESET)\n"; exit 1; }
+	@r=$$(realpath -m "$(REMOTE_DATA_ROOT)"); \
+	 case "$$r" in \
+	   $(CHAOS_DATA_ROOT)) ;; \
+	   *) printf "$(RED)REFUSING: data root resolves to %s, not $(CHAOS_DATA_ROOT)$(RESET)\n" "$$r"; exit 1 ;; \
+	 esac
+	@printf "guard-prod: ok\n"
+
+# setup-nvme reformats the device, so the question is whether prod exists on it
+# at all. An unreachable host is not evidence of absence, so rc 0/1/other are
+# three different answers.
+guard-nvme: guard-prod
+	@for H in $(DATA_NODES); do \
+	  ssh $$H "test -e $(PROD_DATA_ROOT)"; rc=$$?; \
+	  case $$rc in \
+	    0) printf "$(RED)REFUSING: $(PROD_DATA_ROOT) exists on %s$(RESET)\n" "$$H"; exit 1 ;; \
+	    1) ;; \
+	    *) printf "$(RED)REFUSING: cannot reach %s (ssh rc=%s)$(RESET)\n" "$$H" "$$rc"; exit 1 ;; \
+	  esac; \
+	done
+	@printf "guard-nvme: ok\n"
+
+# Never gated. A run that dies mid-scenario leaves disabled NTP, a skewed clock,
+# an nftables rule and a .chaos_filler behind, and you need these precisely when
+# things have gone wrong.
+heal-all: ## Undo every chaos mutation on every node (clock, disk filler, partitions). Never gated.
+	@printf "$(GREEN)>>> Healing all nodes$(RESET)\n"
+	@for HOST in $(DATA_NODES) $(INFRA_HOST); do \
+	  printf "  %s: clock\n" "$$HOST"; \
+	  ssh $$HOST 'sudo timedatectl set-ntp true' 2>/dev/null || true; \
+	done
+	@for HOST in $(DATA_NODES); do \
+	  printf "  %s: disk filler\n" "$$HOST"; \
+	  ssh $$HOST 'sudo rm -f $(REMOTE_DATA_ROOT)/.chaos_filler' 2>/dev/null || true; \
+	done
+	@for HOST in $(DATA_NODES) $(INFRA_HOST); do \
+	  printf "  %s: nftables\n" "$$HOST"; \
+	  ssh $$HOST 'sudo nft delete table inet celeriant_chaos' 2>/dev/null || true; \
+	done
+	@printf "$(GREEN)All nodes healed.$(RESET)\n"
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -40,7 +122,7 @@ help: ## Show this help
 # Full setup (first-time)
 # ---------------------------------------------------------------------------
 
-setup-all: setup-nodes setup-nvme certs setup-infra deploy ## First-time full setup (excludes kTLS kernel — run separately)
+setup-all: setup-nodes setup-nvme-DESTRUCTIVE certs setup-infra deploy ## First-time full setup (excludes kTLS kernel — run separately)
 	@printf "$(GREEN)Setup complete.$(RESET)\n"
 	@printf "$(YELLOW)NOTE:$(RESET) Run 'make setup-ktls' separately if kTLS kernel is not yet built.\n"
 	@printf "Then 'make start' to bring up the cluster.\n"
@@ -49,7 +131,9 @@ setup-all: setup-nodes setup-nvme certs setup-infra deploy ## First-time full se
 # Node setup
 # ---------------------------------------------------------------------------
 
-setup-nodes: ## One-time OS prep on data nodes (limits, systemd, promtail) — runs in parallel
+# Gated because setup-nodes.sh runs an unattended `apt upgrade -y` on cs1 and
+# cs2, which is unscheduled package churn underneath a running prod.
+setup-nodes: require-dangerous ## One-time OS prep on data nodes (limits, systemd, promtail) — runs in parallel
 	@for HOST in $(DATA_NODES); do \
 		printf "$(BOLD)>>> Setting up $$HOST$(RESET)\n"; \
 		bash setup-nodes.sh $$HOST $(INFRA_HOST) $(MEMORY_CONSUMPTION_PERCENT) $(SHARD_LOG_PREALLOCATE_BYTES) $(RESERVE_COORDINATOR_SHARD) &\
@@ -57,7 +141,7 @@ setup-nodes: ## One-time OS prep on data nodes (limits, systemd, promtail) — r
 	wait
 	@printf "$(GREEN)All nodes configured.$(RESET)\n"
 
-setup-nvme: ## Format and mount NVMe on data nodes (DESTRUCTIVE — prompts per node, sequential)
+setup-nvme-DESTRUCTIVE: require-dangerous guard-nvme ## Format and mount NVMe on data nodes (DESTRUCTIVE — prompts per node, sequential)
 	@for HOST in $(DATA_NODES); do \
 		printf "$(BOLD)>>> NVMe setup on $$HOST$(RESET)\n"; \
 		bash setup-nvme.sh $$HOST; \
@@ -91,6 +175,9 @@ setup-infra: ## Deploy Docker + infra stack (MinIO, Prometheus, Loki, Grafana) t
 
 certs: ## Generate and distribute TLS certificates
 	@bash gen-certs.sh
+
+check-certs: ## Verify certs are present, unexpired, and match the CA the nodes trust
+	@bash check-certs.sh
 
 # ---------------------------------------------------------------------------
 # Build & deploy (recurring)
@@ -158,27 +245,27 @@ stop-minio: ## Graceful stop MinIO on infra node
 	@printf "$(BOLD)>>> Stopping MinIO on $(INFRA_HOST)$(RESET)\n"
 	@bash infra-exec.sh stop minio
 
-kill-cs1: ## Hard kill cs1 (SIGKILL). Note: systemd `Restart=on-failure` auto-restarts after RestartSec=3.
+kill-cs1: require-dangerous ## Hard kill cs1 (SIGKILL). Note: systemd `Restart=on-failure` auto-restarts after RestartSec=3.
 	@printf "$(RED)>>> Killing celeriant on $(LEADER_HOST) (cs1)$(RESET)\n"
 	@ssh $(LEADER_HOST) 'sudo systemctl kill -s KILL celeriant'
 
-kill-cs2: ## Hard kill cs2 (SIGKILL). Note: systemd `Restart=on-failure` auto-restarts after RestartSec=3.
+kill-cs2: require-dangerous ## Hard kill cs2 (SIGKILL). Note: systemd `Restart=on-failure` auto-restarts after RestartSec=3.
 	@printf "$(RED)>>> Killing celeriant on $(FOLLOWER_HOST) (cs2)$(RESET)\n"
 	@ssh $(FOLLOWER_HOST) 'sudo systemctl kill -s KILL celeriant'
 
-kill-cs1-no-restart: ## Hard kill cs1 (SIGKILL) and cancel systemd auto-restart. Pairs with start-cs1.
+kill-cs1-no-restart: require-dangerous ## Hard kill cs1 (SIGKILL) and cancel systemd auto-restart. Pairs with start-cs1.
 	@printf "$(RED)>>> Killing celeriant on $(LEADER_HOST) (cs1) [no auto-restart]$(RESET)\n"
 	@ssh $(LEADER_HOST) 'sudo systemctl kill -s KILL celeriant; sudo systemctl stop celeriant'
 
-kill-cs2-no-restart: ## Hard kill cs2 (SIGKILL) and cancel systemd auto-restart. Pairs with start-cs2.
+kill-cs2-no-restart: require-dangerous ## Hard kill cs2 (SIGKILL) and cancel systemd auto-restart. Pairs with start-cs2.
 	@printf "$(RED)>>> Killing celeriant on $(FOLLOWER_HOST) (cs2) [no auto-restart]$(RESET)\n"
 	@ssh $(FOLLOWER_HOST) 'sudo systemctl kill -s KILL celeriant; sudo systemctl stop celeriant'
 
-pause-cs1: ## SIGSTOP cs1 — freezes the process without terminating it. Pairs with resume-cs1.
+pause-cs1: require-dangerous ## SIGSTOP cs1 — freezes the process without terminating it. Pairs with resume-cs1.
 	@printf "$(RED)>>> Pausing celeriant on $(LEADER_HOST) (cs1) [SIGSTOP]$(RESET)\n"
 	@ssh $(LEADER_HOST) 'sudo systemctl kill -s STOP celeriant'
 
-pause-cs2: ## SIGSTOP cs2 — freezes the process without terminating it. Pairs with resume-cs2.
+pause-cs2: require-dangerous ## SIGSTOP cs2 — freezes the process without terminating it. Pairs with resume-cs2.
 	@printf "$(RED)>>> Pausing celeriant on $(FOLLOWER_HOST) (cs2) [SIGSTOP]$(RESET)\n"
 	@ssh $(FOLLOWER_HOST) 'sudo systemctl kill -s STOP celeriant'
 
@@ -190,7 +277,7 @@ resume-cs2: ## SIGCONT cs2 — unfreezes a previously-SIGSTOPped cs2.
 	@printf "$(GREEN)>>> Resuming celeriant on $(FOLLOWER_HOST) (cs2) [SIGCONT]$(RESET)\n"
 	@ssh $(FOLLOWER_HOST) 'sudo systemctl kill -s CONT celeriant'
 
-skew-clock: ## Shift HOST's system clock by OFFSET (e.g. OFFSET="+2 seconds" or "-2 seconds"). Disables NTP first so systemd-timesyncd doesn't immediately correct the jump. Requires HOST, OFFSET.
+skew-clock: require-dangerous ## Shift HOST's system clock by OFFSET (e.g. OFFSET="+2 seconds" or "-2 seconds"). Disables NTP first so systemd-timesyncd doesn't immediately correct the jump. Requires HOST, OFFSET.
 	@if [ -z "$(HOST)" ] || [ -z "$(OFFSET)" ]; then \
 		printf "$(RED)ERROR: skew-clock requires HOST and OFFSET$(RESET)\n"; exit 2; \
 	fi
@@ -204,7 +291,7 @@ restore-clock: ## Re-enable NTP on HOST to restore correct time. Requires HOST.
 	@printf "$(GREEN)>>> Restoring clock on $(HOST) (re-enabling NTP)$(RESET)\n"
 	@ssh $(HOST) 'sudo timedatectl set-ntp true'
 
-fill-disk: ## Fill HOST's data disk to within RESERVE_MB of full via fallocate. Requires HOST. Optional RESERVE_MB (default 50).
+fill-disk: require-dangerous ## Fill HOST's data disk to within RESERVE_MB of full via fallocate. Requires HOST. Optional RESERVE_MB (default 50).
 	@if [ -z "$(HOST)" ]; then \
 		printf "$(RED)ERROR: fill-disk requires HOST$(RESET)\n"; exit 2; \
 	fi
@@ -219,7 +306,7 @@ clean-disk: ## Remove the chaos filler file from HOST. Safe to run repeatedly. R
 	@printf "$(GREEN)>>> Removing chaos filler on $(HOST)$(RESET)\n"
 	@ssh $(HOST) 'sudo rm -f $(REMOTE_DATA_ROOT)/.chaos_filler'
 
-partition-host: ## One-way nftables drop on SRC blocking outbound TCP to DST:PORT. Requires SRC, DST, PORT.
+partition-host: require-dangerous ## One-way nftables drop on SRC blocking outbound TCP to DST:PORT. Requires SRC, DST, PORT.
 	@if [ -z "$(SRC)" ] || [ -z "$(DST)" ] || [ -z "$(PORT)" ]; then \
 		printf "$(RED)ERROR: partition-host requires SRC, DST and PORT$(RESET)\n"; exit 2; \
 	fi
@@ -239,7 +326,7 @@ heal-host: ## Remove the nftables drop rules for DST:PORT from SRC. Idempotent. 
 	             | while read h; do sudo nft delete rule inet celeriant_chaos output handle \$$h; done; \
 	             true"
 
-kill-minio: ## Hard kill MinIO on infra node
+kill-minio: require-dangerous ## Hard kill MinIO on infra node
 	@printf "$(RED)>>> Killing MinIO on $(INFRA_HOST)$(RESET)\n"
 	@bash infra-exec.sh kill minio
 
@@ -272,6 +359,7 @@ endif
 
 start-infra: ## Bring up the full infra stack and wait until MinIO is healthy
 	@printf "$(BOLD)>>> Starting infra stack on $(INFRA_HOST)$(RESET)\n"
+	@bash stage-local-infra.sh
 	@bash infra-exec.sh up -d
 	@printf "Waiting for MinIO to become healthy...\n"
 	@for i in $$(seq 1 60); do \
@@ -298,6 +386,9 @@ logs: ## Tail logs from both data nodes (Ctrl+C to stop)
 
 vitals: ## Snapshot SoC temp, throttle bitmask, CPU freq for data nodes + infra rpi
 	@bash vitals.sh $(DATA_NODES) $(INFRA_HOST)
+
+failover-test: ## Failover stress test. Override connection counts with CONNS="2000 4000"
+	@bash failover-test.sh $(CONNS)
 
 # ---------------------------------------------------------------------------
 # Integration tests
@@ -327,7 +418,7 @@ teardown: stop ## Stop all services (Celeriant + infra)
 
 # Wipes only the side INFRA_MODE currently points at. To clean both:
 #   make teardown-data; edit config.env to flip INFRA_MODE; make teardown-data.
-teardown-data: teardown ## Stop all services AND wipe all data (DESTRUCTIVE)
+teardown-data: require-dangerous guard-prod teardown ## Stop all services AND wipe all data (DESTRUCTIVE)
 	@printf "$(RED)$(BOLD)Wiping ALL Celeriant data on $(LEADER_HOST), $(FOLLOWER_HOST), and $(INFRA_HOST)$(RESET)\n"
 	@for HOST in $(DATA_NODES); do \
 		ssh $$HOST 'sudo rm -rf $(REMOTE_DATA_ROOT)/*'; \

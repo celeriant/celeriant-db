@@ -169,7 +169,7 @@ This runs four steps in sequence:
 | Step | What it does |
 |------|-------------|
 | `setup-nodes` | Updates packages, sets file descriptor and memlock limits, installs xfsprogs, deploys the `celeriant` systemd service and Promtail (log shipper) to both data nodes. Runs in parallel on both Pis. |
-| `setup-nvme` | Partitions and formats the NVMe drive as XFS, mounts it at `/var/lib/celeriant`, adds an fstab entry. **Destructive** — prompts for confirmation per node. Sequential. |
+| `setup-nvme-DESTRUCTIVE` | Partitions and formats the NVMe drive as XFS, mounts it at `/var/lib/celeriant`, adds an fstab entry. **Destructive** — prompts for confirmation per node. Sequential. |
 | `certs` | Generates two CA keypairs (client CA + intracluster CA), node certs, a client-facing server cert, and a benchmark client cert. Distributes to both data nodes. |
 | `setup-infra` | In remote mode: installs Docker on the infra node (via SSH), deploys the compose stack. In local mode: runs `docker compose` on the build machine. Provisions Grafana dashboards in both cases. |
 
@@ -301,7 +301,7 @@ Certificates are generated with SANs covering both data node IPs, `localhost`, a
 
 ## Troubleshooting
 
-**`Direct I/O verification failed`** — the NVMe is not mounted or is not formatted as XFS. Run `make setup-nvme` or check `lsblk` on the node.
+**`Direct I/O verification failed`** — the NVMe is not mounted or is not formatted as XFS. Run `make DANGEROUS=1 setup-nvme-DESTRUCTIVE` or check `lsblk` on the node.
 
 **`kTLS module already loaded. Nothing to do.`** — the kernel already has `CONFIG_TLS`. `make setup-ktls` is idempotent; it skips the build if `modprobe tls` succeeds.
 

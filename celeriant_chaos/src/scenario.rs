@@ -614,7 +614,11 @@ pub async fn tear_down_and_evaluate_with_audit(
 
     let passed = checks.iter().all(|c| c.passed);
     if !passed {
-        println!("[{scenario_name}] FAIL — journals already in run dir");
+        let failed: Vec<&str> = checks.iter().filter(|c| !c.passed).map(|c| c.name).collect();
+        println!("[{scenario_name}] FAIL — {}", failed.join(", "));
+        for c in checks.iter().filter(|c| !c.passed) {
+            println!("[{scenario_name}]   {}: {}", c.name, c.detail);
+        }
     }
 
     Ok(ScenarioReport {
@@ -946,6 +950,11 @@ pub async fn run_baseline(
         bench_result.p50_ms,
         bench_result.p99_ms,
     );
+
+    // The other three delete_trim_checks call sites settle first; baseline did
+    // not, so a follower still draining the last batch read as a false ack.
+    // Poll rather than sleep — a fault-free run converges in well under a second.
+    wait_for_wal_convergence("baseline", cfg, Duration::from_secs(60)).await;
 
     let extra_checks = delete_trim_checks("baseline", cfg, &pool, run_dir, dt_handle).await;
 

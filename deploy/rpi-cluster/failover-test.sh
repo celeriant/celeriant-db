@@ -4,9 +4,9 @@ set -euo pipefail
 # Failover stress test: teardown, redeploy, run bench with follower kill mid-test.
 # Reports whether the leader retained leadership or got usurped.
 #
-# Usage:
-#   bash failover-test.sh [connections]    # default: 8000
-#   bash failover-test.sh 2000 4000 8000   # sweep multiple values
+# Usage (via make, which resolves INFRA_HOST from INFRA_MODE):
+#   make failover-test                     # default: 8000
+#   make failover-test CONNS="2000 4000"   # sweep multiple values
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -76,19 +76,12 @@ run_one() {
     make -s teardown-data 2>&1 | tail -2
 
     log "Bringing up infra (MinIO, Prometheus, Loki, Grafana)..."
-    ssh "$INFRA_HOST" 'cd ~/celeriant-infra && docker compose up -d' 2>&1 | tail -2
-
-    log "Waiting for MinIO to become healthy..."
-    local minio_attempts=0
-    while ! ssh "$INFRA_HOST" "curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1"; do
-        minio_attempts=$((minio_attempts + 1))
-        if (( minio_attempts > 60 )); then
-            fail "MinIO failed to start after 60s"
-            return 1
-        fi
-        sleep 1
-    done
-    log "MinIO healthy (${minio_attempts}s)"
+    # start-infra brings the stack up and waits for MinIO health in both
+    # INFRA_MODEs. The inline ssh this replaced only worked in remote.
+    if ! make -s start-infra 2>&1 | tail -3; then
+        fail "infra failed to start"
+        return 1
+    fi
 
     log "Starting leader (cs1)..."
     make -s start-cs1
