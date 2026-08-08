@@ -11,6 +11,7 @@ use celeriant_distributed::node_status::NodeStatus;
 use celeriant_wal::segment_summary::{SegmentAggregateEntry, SegmentSummaryPayload};
 use celeriant_wal::metablocks::metablock_event_batch::MetablockEventBatch;
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
+use celeriant_wal::precomputed_hash::{PrecomputedBuildHasher, PrecomputedMap, PrecomputedSet};
 use celeriant_wal::schema_key::SchemaKey;
 use celeriant_wal::{
     aggregate_client_key::AggregateClientKey, aggregate_key::AggregateKey, aggregate_type_key::AggregateTypeKey,
@@ -46,7 +47,7 @@ pub struct ShardMemCache<V: Validate> {
 
     /// Cache of recent writes indexed by aggregate key.
     /// Only populated after successful durable write.
-    aggregate_recent_writes: HashMap<AggregateKey, AggregateRecentWrites>,
+    aggregate_recent_writes: PrecomputedMap<AggregateKey, AggregateRecentWrites>,
 
     /// Current size of the recent write cache in bytes
     cache_current_bytes: u64,
@@ -56,37 +57,37 @@ pub struct ShardMemCache<V: Validate> {
 
     /// LRU cache of aggregate positions committed to file (batch and event sequences)
     /// Updated after fsync - used by write path (OCC, idempotency)
-    aggregate_write_snapshots: LruCache<AggregateKey, MemSnapshotAggregate>,
+    aggregate_write_snapshots: LruCache<AggregateKey, MemSnapshotAggregate, PrecomputedBuildHasher>,
 
     /// LRU cache of aggregate positions visible to readers
     /// Updated after replication - used by read path
-    aggregate_read_snapshots: LruCache<AggregateKey, MemSnapshotAggregate>,
+    aggregate_read_snapshots: LruCache<AggregateKey, MemSnapshotAggregate, PrecomputedBuildHasher>,
 
     /// LRU cache of client event sequences committed to file
     /// Missing here does not mean client hasn't written to aggregate, just not in cache
     /// Stores (client_seq, wal_seq). wal_seq=0 means loaded from disk (always durable).
-    aggregate_write_client_snapshots: LruCache<AggregateClientKey, (u64, u64)>,
+    aggregate_write_client_snapshots: LruCache<AggregateClientKey, (u64, u64), PrecomputedBuildHasher>,
 
     /// Indexes representing the in-memory positions of the next write for each aggregate
     /// These are writes yet to be written to disk
     /// This is unbounded as we expect quick flush to disk
-    aggregate_queue_positions: HashMap<AggregateKey, QueueAggregatePositions>,
+    aggregate_queue_positions: PrecomputedMap<AggregateKey, QueueAggregatePositions>,
 
     /// Writes from clients that are pending write to disk
     /// This is unbounded as we expect quick flush to disk
     pending_append_queue: Vec<ShardLogQueueItem>,
 
     /// LRU cache of compiled schemas (Validated/CompilationFailed only).
-    schema_cache: LruCache<SchemaKey, CachedSchema<V>>,
+    schema_cache: LruCache<SchemaKey, CachedSchema<V>, PrecomputedBuildHasher>,
 
     /// LRU cache of keys confirmed to have no schema in WAL.
     /// Separated from schema_cache so large validators can't evict these tiny entries.
-    no_schema_cache: LruCache<SchemaKey, ()>,
+    no_schema_cache: LruCache<SchemaKey, (), PrecomputedBuildHasher>,
 
     /// Pending schema registrations not yet fsynced (D4)
     /// Checked alongside schema_cache to prevent concurrent duplicate registrations.
     /// Cleared on fsync rollback.
-    pending_schema_registrations: HashSet<SchemaKey>,
+    pending_schema_registrations: PrecomputedSet<SchemaKey>,
 
     /// Batches awaiting replication (post-fsync, pre-commit). Bounded indirectly
     /// by the inflight cap: writes are rejected at entry when
@@ -495,7 +496,7 @@ impl<V: Validate> ShardMemCache<V> {
         self.pending_append_bytes = 0;
 
         // Drain pending schemas — schema_cache is the primary duplicate guard from here
-        let mut pending_schema_registrations = HashSet::new();
+        let mut pending_schema_registrations = PrecomputedSet::default();
         std::mem::swap(&mut pending_schema_registrations, &mut self.pending_schema_registrations);
 
         SyncPositionsSnapshot {
@@ -890,7 +891,7 @@ impl<V: Validate> ShardMemCache<V> {
     }
 
     fn remap_snapshot_lru(
-        cache: &mut LruCache<AggregateKey, MemSnapshotAggregate>,
+        cache: &mut LruCache<AggregateKey, MemSnapshotAggregate, PrecomputedBuildHasher>,
         target_log_id: u64,
         new_tips: &HashMap<AggregateKey, u64>,
     ) {
@@ -1196,17 +1197,17 @@ impl<V: Validate> ShardMemCache<V> {
 
         Self {
             recent_write_cache_bytes,
-            aggregate_recent_writes: HashMap::new(),
+            aggregate_recent_writes: PrecomputedMap::default(),
             cache_current_bytes: 0,
             cache_eviction_queue: VecDeque::new(),
-            aggregate_queue_positions: HashMap::new(),
+            aggregate_queue_positions: PrecomputedMap::default(),
             pending_append_queue: vec![],
-            aggregate_write_snapshots: LruCache::new(aggregate_cap),
-            aggregate_read_snapshots: LruCache::new(aggregate_cap),
-            aggregate_write_client_snapshots: LruCache::new(client_cap),
-            schema_cache: LruCache::new(schema_cap),
-            no_schema_cache: LruCache::new(no_schema_cap),
-            pending_schema_registrations: HashSet::new(),
+            aggregate_write_snapshots: LruCache::with_hasher(aggregate_cap, PrecomputedBuildHasher::default()),
+            aggregate_read_snapshots: LruCache::with_hasher(aggregate_cap, PrecomputedBuildHasher::default()),
+            aggregate_write_client_snapshots: LruCache::with_hasher(client_cap, PrecomputedBuildHasher::default()),
+            schema_cache: LruCache::with_hasher(schema_cap, PrecomputedBuildHasher::default()),
+            no_schema_cache: LruCache::with_hasher(no_schema_cap, PrecomputedBuildHasher::default()),
+            pending_schema_registrations: PrecomputedSet::default(),
             pending_replication_batches: Vec::new(),
             pending_replication_bytes: 0,
             parked_commits: VecDeque::new(),
@@ -1407,9 +1408,10 @@ pub struct EventIndexes {
 /// Inserts into the cache. If `low_priority` is true, only inserts when there's
 /// spare capacity and immediately demotes the entry to LRU position.
 /// Will not change the position if the low priority key already is in the lru
-fn put_with_priority<K, V>(cache: &mut LruCache<K, V>, key: K, value: V, low_priority: bool)
+fn put_with_priority<K, V, S>(cache: &mut LruCache<K, V, S>, key: K, value: V, low_priority: bool)
 where
     K: Hash + Eq + Clone,
+    S: std::hash::BuildHasher,
 {
     if low_priority {
         if cache.contains(&key) {

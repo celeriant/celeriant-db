@@ -118,7 +118,7 @@ pub struct ServerConfig {
 
     #[arg(
         long,
-        default_value = "8192",
+        default_value = "512",
         env = "CELERIANT_MESH_CHANNEL_SIZE",
         help = "Mesh channel size for inter-shard communication"
     )]

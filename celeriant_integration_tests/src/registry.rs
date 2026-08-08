@@ -221,6 +221,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             distributed: false,
         },
         TestEntry {
+            name: "batch_replicated_cleartext",
+            description: "Plaintext replicated write throughput and latency benchmark",
+            estimated_secs: 60,
+            categories: &[Core, Performance],
+            distributed: true,
+        },
+        TestEntry {
             name: "read_list_benchmark",
             description: "Read and list performance benchmark with large WAL and concurrent ops",
             estimated_secs: 150,
@@ -664,6 +671,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             name: "edge_list_pagination_cache_eviction",
             description: "Paginated list returns correct results despite WAL sequence cache eviction",
             estimated_secs: 5,
+            categories: &[Edge],
+            distributed: false,
+        },
+        TestEntry {
+            name: "regression_list_iterator_truncation",
+            description: "Shard-listing iterators do not truncate when the discovery probe fails",
+            estimated_secs: 15,
             categories: &[Edge],
             distributed: false,
         },

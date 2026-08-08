@@ -180,9 +180,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "Orgs: {}, Types/Org: {}, Aggregates/Type: {} (Total: {})",
         NUM_ORGS, NUM_AGGREGATE_TYPES_PER_ORG, NUM_AGGREGATES_PER_TYPE, TOTAL_AGGREGATES
     );
+    let num_writers = crate::load_scale(NUM_WRITERS);
+    let num_readers = crate::load_scale(NUM_READERS);
     println!(
         "Writers: {}, Readers: {}, Duration: {}s",
-        NUM_WRITERS, NUM_READERS, TEST_DURATION_SECS
+        num_writers, num_readers, TEST_DURATION_SECS
     );
     println!("Delete probability: 1 in {} writes\n", DELETE_PROBABILITY);
 
@@ -190,13 +192,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(GlobalTrackingState::new());
 
     // Establish connections
-    let total_connections = NUM_WRITERS + NUM_READERS;
+    let total_connections = num_writers + num_readers;
     println!("Establishing {} connections...", total_connections);
 
-    let mut writer_clients = Vec::with_capacity(NUM_WRITERS);
-    let mut reader_clients = Vec::with_capacity(NUM_READERS);
+    let mut writer_clients = Vec::with_capacity(num_writers);
+    let mut reader_clients = Vec::with_capacity(num_readers);
 
-    for i in 0..NUM_WRITERS {
+    for i in 0..num_writers {
         let client = CeleriantClient::connect_with_timeout(
             server_addr,
             Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
@@ -208,7 +210,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         writer_clients.push((i, client));
     }
 
-    for i in 0..NUM_READERS {
+    for i in 0..num_readers {
         let client = CeleriantClient::connect_with_timeout(
             server_addr,
             Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
@@ -392,17 +394,38 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let agg_iter = ListAggregatesIterator::new(&mut verify_client, None, None, list_options);
     let listed_aggregates: Vec<_> = agg_iter.collect().await?;
 
-    let mut listed_existing: HashSet<AggregateKey> = HashSet::new();
-    let mut listed_deleted: HashSet<AggregateKey> = HashSet::new();
+    // Control listing. `max_shard_hint` suppresses the iterator's shard-discovery probe,
+    // which is the only path that can end the walk early. If this returns more rows than
+    // the default listing, the shortfall is the client iterator truncating rather than the
+    // database losing aggregates.
+    let max_shard = server.config().num_shards.unwrap_or(1).saturating_sub(1) as u64;
+    let hinted_iter = ListAggregatesIterator::new(
+        &mut verify_client,
+        None,
+        None,
+        ListOptions {
+            include_deleted: true,
+            max_shard_hint: Some(max_shard),
+            ..Default::default()
+        },
+    );
+    let hinted_aggregates: Vec<_> = hinted_iter.collect().await?;
+    println!(
+        "  Listed {} aggregates via shard discovery, {} with max_shard_hint={}",
+        listed_aggregates.len(),
+        hinted_aggregates.len(),
+        max_shard
+    );
 
-    for agg in &listed_aggregates {
-        let key = AggregateKey::new(agg.org_id, agg.aggregate_type_id, agg.aggregate_id);
-        if agg.is_deleted {
-            listed_deleted.insert(key);
-        } else {
-            listed_existing.insert(key);
-        }
-    }
+    let (listed_existing, listed_deleted) = split_by_deleted(&listed_aggregates);
+    let (hinted_existing, hinted_deleted) = split_by_deleted(&hinted_aggregates);
+    println!(
+        "  Against expectations — discovery: {} existing / {} deleted missing; hinted: {} existing / {} deleted missing",
+        expected_existing.difference(&listed_existing).count(),
+        expected_deleted.difference(&listed_deleted).count(),
+        expected_existing.difference(&hinted_existing).count(),
+        expected_deleted.difference(&hinted_deleted).count()
+    );
 
     // Check existing aggregates
     let missing_existing: Vec<_> = expected_existing.difference(&listed_existing).collect();
@@ -424,6 +447,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("  Existing aggregate mismatch!");
         if !missing_existing.is_empty() {
             println!("    Missing existing: {} aggregates", missing_existing.len());
+            dump_missing_keys("missing_existing", &missing_existing);
         }
         if !wrongly_deleted.is_empty() {
             println!(
@@ -469,11 +493,55 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     if has_errors {
         println!("  ISSUES DETECTED - Review output above");
-    } else {
-        println!("  All verifications passed!");
+        return Err(format!(
+            "chaos_delete verification failed: write_errors={} delete_errors={} read_errors={} \
+             missing_orgs={} missing_types={} aggregate_errors={}",
+            write_errors,
+            delete_errors,
+            read_errors,
+            missing_orgs.len(),
+            missing_types.len(),
+            aggregate_errors
+        )
+        .into());
     }
+    println!("  All verifications passed!");
 
     Ok(())
+}
+
+/// Split a listing into (existing, deleted) key sets.
+fn split_by_deleted(
+    listed: &[celeriant_client_tokio::list_operations::AggregateStats],
+) -> (HashSet<AggregateKey>, HashSet<AggregateKey>) {
+    let mut existing = HashSet::new();
+    let mut deleted = HashSet::new();
+    for agg in listed {
+        let key = AggregateKey::new(agg.org_id, agg.aggregate_type_id, agg.aggregate_id);
+        if agg.is_deleted {
+            deleted.insert(key);
+        } else {
+            existing.insert(key);
+        }
+    }
+    (existing, deleted)
+}
+
+/// Write the failing keys to `CELERIANT_TEST_MISSING_KEYS_DIR` so they can be cross-checked
+/// against disk with celeriant-wal-inspect. Silent unless the directory is set.
+fn dump_missing_keys(label: &str, keys: &[&AggregateKey]) {
+    let Some(dir) = std::env::var_os("CELERIANT_TEST_MISSING_KEYS_DIR") else {
+        return;
+    };
+    let path = std::path::Path::new(&dir).join(format!("{}.txt", label));
+    let body: String = keys
+        .iter()
+        .map(|k| format!("{} {} {}\n", k.org_id, k.aggregate_type_id, k.aggregate_id))
+        .collect();
+    match std::fs::write(&path, body) {
+        Ok(()) => println!("    Wrote {} keys to {:?}", keys.len(), path),
+        Err(e) => println!("    Could not write {:?}: {}", path, e),
+    }
 }
 
 async fn run_writer_task(

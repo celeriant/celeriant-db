@@ -25,6 +25,33 @@ pub struct ValidatedNodeStatus {
     held_leadership: bool,
 }
 
+pub fn node_status_code(status: NodeStatus) -> f64 {
+    match status {
+        NodeStatus::BootCatchup => 0.0,
+        NodeStatus::Follower { .. } => 1.0,
+        NodeStatus::FollowerCatchingUp { .. } => 2.0,
+        NodeStatus::Promoting { .. } => 3.0,
+        NodeStatus::Leader { .. } => 4.0,
+        NodeStatus::Fenced => 5.0,
+        NodeStatus::Standalone => 6.0,
+    }
+}
+
+/// Publish the EFFECTIVE status, which is what actually gates writes.
+///
+/// `celeriant_node_status_code` publishes `raw()`, so it read `Leader` while 1,042,832 writes
+/// were rejected (F-37). This publishes `effective_node_status()` instead.
+///
+/// It must be called PERIODICALLY, not only on transition: `must_fence()` is a function of the
+/// lease expiry against the current time, so a leader crosses into Fenced with no status change
+/// and no call to `set_node_status_and_metric`. Publishing only at transitions would reproduce
+/// exactly the blindness this gauge exists to remove. The leader's heartbeat loop refreshes it
+/// every `heartbeat_interval_ms`.
+pub fn publish_effective_node_status(status: ValidatedNodeStatus, shard_id: u32) {
+    metrics::gauge!("celeriant_node_status_effective_code", &[("shard_id", shard_id.to_string())])
+        .set(node_status_code(status.effective_node_status()));
+}
+
 impl ValidatedNodeStatus {
 
     pub fn is_lease_expired(&self) -> bool {
@@ -145,16 +172,9 @@ pub fn set_node_status_and_metric(
         | NodeStatus::BootCatchup => status.held_leadership || prev.held_leadership(),
     };
     cell.set(status);
-    let code = match status.raw() {
-        NodeStatus::BootCatchup => 0.0,
-        NodeStatus::Follower { .. } => 1.0,
-        NodeStatus::FollowerCatchingUp { .. } => 2.0,
-        NodeStatus::Promoting { .. } => 3.0,
-        NodeStatus::Leader { .. } => 4.0,
-        NodeStatus::Fenced => 5.0,
-        NodeStatus::Standalone => 6.0,
-    };
-    metrics::gauge!("celeriant_node_status_code", &[("shard_id", shard_id.to_string())]).set(code);
+    metrics::gauge!("celeriant_node_status_code", &[("shard_id", shard_id.to_string())])
+        .set(node_status_code(status.raw()));
+    publish_effective_node_status(status, shard_id);
     if shard_id == 0 {
         let role = if status.is_leader() || status.is_standalone() { 1.0 } else { 0.0 };
         metrics::gauge!("celeriant_node_role").set(role);

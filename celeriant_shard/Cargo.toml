@@ -50,6 +50,11 @@ tempfile.workspace = true
 uuid.workspace = true
 criterion.workspace = true
 num_cpus.workspace = true
+# Only `write_probe` uses this. Production sets `#[global_allocator] MiMalloc` in
+# celeriant/src/main.rs, so a bench without it measures glibc malloc against a server running
+# mimalloc — and the write path's leading allocation suspects would be tuned against the wrong
+# allocator. Dev-dependency: the server binary is unaffected.
+mimalloc.workspace = true
 
 [lib]
 bench = false
@@ -60,6 +65,12 @@ harness = false
 
 [[bench]]
 name = "write_benchmark"
+harness = false
+
+# Fixed-iteration append probe, measured from outside with `perf stat`.
+# A `[[bin]]` could not do this job: `tempfile` and `mimalloc` are dev-dependencies.
+[[bench]]
+name = "write_probe"
 harness = false
 
 [[bench]]

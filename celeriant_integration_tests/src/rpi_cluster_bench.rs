@@ -67,6 +67,7 @@ fn build_tls_config(
 
 struct TaskStats {
     request_count: u64,
+    failed_requests: u64,
     latencies_ms: Vec<u64>,
 }
 
@@ -155,6 +156,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 struct BenchmarkResult {
     num_connections: usize,
     total_requests: u64,
+    failed_requests: u64,
     throughput: f64,
     avg_latency_ms: f64,
     p50_ms: u64,
@@ -167,8 +169,8 @@ struct BenchmarkResult {
 
 fn print_result(r: &BenchmarkResult) {
     println!(
-        "  Connections: {} | Requests: {} | Throughput: {:.0} req/s",
-        r.num_connections, r.total_requests, r.throughput
+        "  Connections: {} | Requests: {} | Throughput: {:.0} req/s | Busy-fails: {}",
+        r.num_connections, r.total_requests, r.throughput, r.failed_requests
     );
     println!(
         "  Latency — Avg: {:.1}ms | P50: {}ms | P95: {}ms | P99: {}ms | P99.9: {}ms | Min: {}ms | Max: {}ms",
@@ -257,6 +259,7 @@ async fn run_benchmark(
 
     let total_duration = start.elapsed();
     let total_requests: u64 = all_stats.iter().map(|s| s.request_count).sum();
+    let failed_requests: u64 = all_stats.iter().map(|s| s.failed_requests).sum();
     let mut all_latencies: Vec<u64> = all_stats.into_iter().flat_map(|s| s.latencies_ms).collect();
     all_latencies.sort_unstable();
 
@@ -281,6 +284,7 @@ async fn run_benchmark(
     Ok(BenchmarkResult {
         num_connections: actual,
         total_requests,
+        failed_requests,
         throughput,
         avg_latency_ms: avg,
         p50_ms: p50,
@@ -299,6 +303,7 @@ async fn run_connection(
     barrier: Arc<Barrier>,
 ) -> Result<TaskStats, String> {
     let mut request_count = 0u64;
+    let mut failed_requests = 0u64;
     let mut latencies = Vec::new();
 
     barrier.wait().await;
@@ -346,6 +351,9 @@ async fn run_connection(
             Err(ClientError::Server(err)) => {
                 eprintln!("Connection {} server error: {}", id, err);
             }
+            Err(ClientError::ServerBusy) => {
+                failed_requests += 1;
+            }
             Err(e) => {
                 eprintln!("Connection {} error: {}", id, e);
                 break;
@@ -355,6 +363,7 @@ async fn run_connection(
 
     Ok(TaskStats {
         request_count,
+        failed_requests,
         latencies_ms: latencies,
     })
 }

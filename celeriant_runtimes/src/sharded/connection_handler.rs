@@ -596,7 +596,7 @@ async fn check_client_redirect<R: ReplicationClient + 'static, D: S3Downloader +
         };
         if let Err(e) = ctx.intrashard_sender.try_send_to(target_shard, msg) {
             metrics::counter!("celeriant_mesh_channel_full_total", "message_type" => "client_redirect").increment(1);
-            warn!("Mesh channel full, rejecting client redirect to shard {target_shard}: {e:?}");
+            debug!("Mesh channel full, rejecting client redirect to shard {target_shard}: {e:?}");
             if let Some(inner) = e.into_inner() {
                 if let IntrashardMessages::ClientConnectionRedirect { accepted_tcp_stream, .. } = inner {
                     let mut stream = accepted_tcp_stream.bind_to_executor();
@@ -646,7 +646,7 @@ async fn check_cluster_redirect<R: ReplicationClient + 'static, D: S3Downloader 
         };
         if let Err(e) = ctx.intrashard_sender.try_send_to(target_shard, msg) {
             metrics::counter!("celeriant_mesh_channel_full_total", "message_type" => "cluster_redirect").increment(1);
-            warn!("Mesh channel full, rejecting cluster redirect to shard {target_shard}: {e:?}");
+            debug!("Mesh channel full, rejecting cluster redirect to shard {target_shard}: {e:?}");
             if let Some(inner) = e.into_inner() {
                 if let IntrashardMessages::ClusterConnectionRedirect { accepted_tcp_stream, .. } = inner {
                     let mut stream = accepted_tcp_stream.bind_to_executor();

@@ -6,7 +6,11 @@ use super::sidecar_config::SidecarConfig;
 
 pub fn install_recorder() -> PrometheusHandle {
     let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
-        .set_buckets(&[0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0])
+        // These bounds are GLOBAL -- every histogram in the process gets them
+        .set_buckets(&[
+            0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03,
+            0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0,
+        ])
         .expect("invalid bucket configuration")
         .install_recorder()
         .expect("Failed to install Prometheus metrics recorder");
@@ -63,7 +67,7 @@ fn register_metric_descriptions() {
     describe_counter!("celeriant_read_bytes_total", "Total payload bytes read");
 
     // Latency
-    describe_histogram!("celeriant_write_duration_seconds", "End-to-end write latency");
+    describe_histogram!("celeriant_write_duration_seconds", "Shard-internal write latency (excludes wire read, response write and mesh redirect)");
     describe_histogram!("celeriant_read_duration_seconds", "End-to-end read latency");
     describe_histogram!("celeriant_fsync_duration_seconds", "fsync batch duration");
     describe_histogram!("celeriant_replication_duration_seconds", "Replication batch duration");
@@ -160,6 +164,8 @@ fn register_metric_descriptions() {
     describe_counter!("celeriant_s3_lease_writes_total", "S3 lease record writes (labels: shard_id, reason=preemptive|proactive|discovery|challenge|post_catchup)");
     describe_gauge!("celeriant_s3_lease_age_seconds", "Informational: seconds since last successful S3 lease write. By design this drifts unbounded while heartbeats succeed (steady-state invariant — S3 is not touched).");
     describe_gauge!("celeriant_lease_remaining_ms", "Local lease TTL remaining in ms. Goes to zero when must_fence fires (labels: shard_id, role=leader|follower)");
+    describe_gauge!("celeriant_node_status_effective_code", "Per-shard EFFECTIVE node status, same encoding as celeriant_node_status_code. That gauge publishes raw() and read Leader while every write was rejected (F-37); this one applies must_fence. Refreshed every heartbeat, because must_fence fires on the clock rather than on a status transition.");
+    describe_histogram!("celeriant_heartbeat_duration_seconds", "Leader heartbeat send->conclusion latency (labels: shard_id). The failure mode is a LATE ack, not a failed one — the attempt/ack/failure counters cannot distinguish them, so this is what a fence shows up in first.");
     describe_counter!("celeriant_leader_self_fence_total", "Times the leader observed must_fence firing while raw status was still Leader (TTL exhausted before next renewal)");
     describe_counter!("celeriant_leader_elections_total", "Leadership transitions");
     describe_counter!("celeriant_follower_auto_fence_total", "Follower self-fenced (lease ownership lost mid-flight)");

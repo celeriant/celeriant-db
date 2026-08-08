@@ -72,25 +72,26 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let server_addr = server.address();
     println!("Server started at {}\n", server_addr);
 
+    let num_aggregates = crate::load_scale(NUM_AGGREGATES);
     println!(
         "Aggregates: {}, Duration: {}s, Payload range: {} bytes - {} bytes",
-        NUM_AGGREGATES, TEST_DURATION_SECS, MIN_PAYLOAD_SIZE, MAX_PAYLOAD_SIZE
+        num_aggregates, TEST_DURATION_SECS, MIN_PAYLOAD_SIZE, MAX_PAYLOAD_SIZE
     );
 
     let connect_start = Instant::now();
 
     // Create shared state for each aggregate
-    let aggregate_states: Vec<Arc<AggregateState>> = (0..NUM_AGGREGATES)
+    let aggregate_states: Vec<Arc<AggregateState>> = (0..num_aggregates)
         .map(|_| Arc::new(AggregateState::new()))
         .collect();
 
     // Establish connections for writers and readers (2 per aggregate)
-    println!("Establishing {} connections...", NUM_AGGREGATES * 2);
+    println!("Establishing {} connections...", num_aggregates * 2);
 
-    let mut writer_clients = Vec::with_capacity(NUM_AGGREGATES);
-    let mut reader_clients = Vec::with_capacity(NUM_AGGREGATES);
+    let mut writer_clients = Vec::with_capacity(num_aggregates);
+    let mut reader_clients = Vec::with_capacity(num_aggregates);
 
-    for aggregate_id in 0..NUM_AGGREGATES {
+    for aggregate_id in 0..num_aggregates {
         // Writer connection
         let writer = CeleriantClient::connect_with_timeout(
             server_addr,
@@ -120,19 +121,19 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let connect_duration = connect_start.elapsed();
     println!(
         "Established {} connections in {:.2}s",
-        NUM_AGGREGATES * 2,
+        num_aggregates * 2,
         connect_duration.as_secs_f64()
     );
 
     // Create barrier for synchronization (writers + readers)
-    let barrier = Arc::new(Barrier::new(NUM_AGGREGATES * 2));
+    let barrier = Arc::new(Barrier::new(num_aggregates * 2));
 
     println!("Starting chaos test...\n");
     let start_time = Instant::now();
 
     // Spawn writer tasks
-    let mut writer_tasks = Vec::with_capacity(NUM_AGGREGATES);
-    let mut reader_tasks = Vec::with_capacity(NUM_AGGREGATES);
+    let mut writer_tasks = Vec::with_capacity(num_aggregates);
+    let mut reader_tasks = Vec::with_capacity(num_aggregates);
 
     for (aggregate_id, client) in writer_clients {
         let barrier = Arc::clone(&barrier);
@@ -232,9 +233,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     if total_write_errors > 0 || total_read_errors > 0 {
         println!("\n  ERRORS DETECTED - Check logs above for details");
-    } else {
-        println!("\n  No errors detected");
+        return Err(format!(
+            "chaos: {} write errors, {} read errors",
+            total_write_errors, total_read_errors
+        )
+        .into());
     }
+    if total_writes == 0 {
+        return Err("chaos: no writes succeeded".into());
+    }
+    println!("\n  No errors detected");
 
     Ok(())
 }

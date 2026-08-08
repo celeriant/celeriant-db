@@ -21,6 +21,7 @@ pub mod phase11;
 pub mod api_key_test;
 pub mod batch;
 pub mod bug_kick_after_restart;
+pub mod batch_replicated_cleartext;
 pub mod batch_standalone_cleartext;
 pub mod batch_standalone_compressed;
 pub mod chaos;
@@ -41,6 +42,7 @@ pub mod edge_empty_replication_batch;
 pub mod edge_heartbeat_lock_contention;
 pub mod edge_wal_divergence_and_recovery;
 pub mod edge_list_pagination_cache_eviction;
+pub mod regression_list_iterator_truncation;
 pub mod edge_log_eviction_before_s3;
 pub mod edge_log_rotation_mid_replication;
 pub mod edge_s3_batch_ordering;
@@ -186,7 +188,7 @@ use tokio::time::sleep;
 /// }
 /// ```
 pub struct TestServer {
-    _temp_dir: TempDir,
+    _temp_dir: Option<TempDir>,
     address: String,
     child: Child,
     config: ServerConfig,
@@ -303,7 +305,7 @@ impl TestServer {
         Self::poll_ready(&address, &mut child, &config).await?;
         println!("  Server is ready (took {:?})", ready_start.elapsed());
         Ok(Self {
-            _temp_dir: temp_dir,
+            _temp_dir: Some(temp_dir),
             address,
             child,
             config,
@@ -451,7 +453,7 @@ impl TestServer {
         Self::poll_ready(&address, &mut child, &config).await?;
         println!("  Server is ready (took {:?})", ready_start.elapsed());
         Ok(Self {
-            _temp_dir: temp_dir,
+            _temp_dir: Some(temp_dir),
             address,
             child,
             config,
@@ -506,6 +508,13 @@ impl Drop for TestServer {
         let _ = self.child.kill();
         let _ = self.child.wait();
         println!("  Test server shut down");
+        // With CELERIANT_TEST_KEEP_DATA set, leak the data root so a failed run can be
+        // cross-checked against disk with celeriant-wal-inspect.
+        if std::env::var_os("CELERIANT_TEST_KEEP_DATA").is_some() {
+            if let Some(dir) = self._temp_dir.take() {
+                println!("  KEPT DATA ROOT: {:?}", dir.keep());
+            }
+        }
     }
 }
 
@@ -1765,4 +1774,21 @@ pub async fn wait_for_leader(address: &str, timeout: Duration) -> Result<(), Box
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     Err(format!("node {address} not leader after {timeout:?} (last probe: {last_outcome})").into())
+}
+
+/// Scale a test's concurrency by `CELERIANT_TEST_LOAD_SCALE`.
+///
+/// Session 3, Phase 3. The `chaos`, `chaos_delete` and `chaos_watch` categories carry fixed
+/// concurrency constants — 10 writer/reader pairs, 6 writers, and so on. The question being
+/// asked of them is whether **data-integrity invariants degrade under load**, which cannot be
+/// answered at one fixed concurrency.
+///
+/// Unset, or set to anything unparseable or zero, returns `base` unchanged, so every existing
+/// invocation is byte-identical to before this existed.
+pub fn load_scale(base: usize) -> usize {
+    std::env::var("CELERIANT_TEST_LOAD_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|s| *s > 0)
+        .map_or(base, |s| base.saturating_mul(s))
 }

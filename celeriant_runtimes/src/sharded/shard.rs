@@ -343,6 +343,16 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
                 let _ = self.shard_wal.close().await;
                 break;
             }
+            // Every shard carries a fence-capable lease, but only shard 0 runs the heartbeat
+            // loop, so shards 1..n had NO lease or effective-status instrument at all. Publish both here,
+            // on the one periodic loop every shard runs.
+            let status = self.shard_wal.node_status.get();
+            let shard_id = self.ctx.current_shard_id as u32;
+            validated_node_status::publish_effective_node_status(status, shard_id);
+            metrics::gauge!("celeriant_lease_remaining_ms",
+                &[("shard_id", shard_id.to_string()), ("role", "shard".to_string())])
+                .set(status.lease_expires_at_ms()
+                    .saturating_sub(validated_node_status::unix_epoch_now_ms()) as f64);
             glommio::timer::sleep(Duration::from_secs(1)).await;
         }
     }
@@ -1020,6 +1030,11 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                 // Detect leader self-fence (must_fence fired but raw still says Leader)
                 let raw_status = ctx.shard_wal.node_status.get().raw();
                 let effective_status = ctx.shard_wal.node_status.get().effective_node_status();
+                // Refresh the effective-status gauge every heartbeat
+                validated_node_status::publish_effective_node_status(
+                    ctx.shard_wal.node_status.get(),
+                    ctx.current_shard_id as u32,
+                );
                 if raw_status.is_leader() && !effective_status.is_leader() {
                     metrics::counter!("celeriant_leader_self_fence_total", &[("shard_id", shard_label.clone())]).increment(1);
                     warn!(shard_id = ctx.current_shard_id, ?raw_status, ?effective_status, lease_remaining_ms, "Leader self-fenced (must_fence fired) — TTL exhausted before next renewal");
@@ -1056,6 +1071,8 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                         Err(SendHeartbeatError::UnexpectedResponse)
                     }
                 };
+                metrics::histogram!("celeriant_heartbeat_duration_seconds", &[("shard_id", shard_label.clone())])
+                    .record(hb_start.elapsed().as_secs_f64());
                 let hb_elapsed_ms = hb_start.elapsed().as_millis() as u64;
 
                 // Heartbeat path concluded (Ack/Reject/timeout/Err) — clear the

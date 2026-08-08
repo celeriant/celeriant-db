@@ -876,6 +876,7 @@ dependencies = [
  "glommio",
  "jsonschema",
  "metrics",
+ "mimalloc",
  "num_cpus",
  "prost",
  "prost-reflect",

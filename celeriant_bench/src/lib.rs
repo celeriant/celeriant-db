@@ -132,6 +132,103 @@ pub async fn run_benchmark(
     run_benchmark_ramped(pool, num_tasks, duration_secs, None).await
 }
 
+/// The primary workload, as one knob per safety layer so a run can price them
+/// one at a time (`session/session-2/goal.md` Phase 3). `None` throughout means the
+/// original opaque-payload fire-and-forget append, unchanged.
+///
+/// Deliberately absent: client-side batching and client idempotency. One event per
+/// request is a property of the workload being modelled, not a limitation here.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WorkloadOptions {
+    /// Send `expected_version` on every write, tracking each aggregate's version
+    /// client-side. Costs a round of server-side comparison plus the version bookkeeping.
+    pub occ: bool,
+    /// Added to every aggregate id. Each task owns one aggregate for the whole run, but
+    /// task ids restart at 0 on every client machine — so without distinct offsets the
+    /// two Pis would drive the *same* aggregates and every OCC write would collide with
+    /// the other machine's. Give each client its own slice.
+    pub aggregate_offset: usize,
+}
+
+/// The JSON schema the workload's events are validated against, and the event shape that
+/// satisfies it. Kept adjacent because they must agree — if they drift, the server
+/// rejects every write and the run reads as a throughput collapse rather than a bug.
+pub const WORKLOAD_SCHEMA: &str =
+    r#"{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}},"required":["a","b"],"additionalProperties":false}"#;
+
+/// Org, aggregate-type, and event-type coordinates the workload writes under. The schema
+/// is registered against exactly this tuple; `shard_wal.rs` looks validation up by
+/// `SchemaKey::new(org, aggregate_type, major, minor)` and silently skips it on a miss.
+const WORKLOAD_ORG: u128 = 1;
+const WORKLOAD_AGG_TYPE: u128 = 1;
+const WORKLOAD_MAJOR: u64 = 1;
+const WORKLOAD_MINOR: u64 = 0;
+
+fn workload_event(a: usize, b: u64) -> DatablockAggregateEvent {
+    DatablockAggregateEvent {
+        client_seq: 0,
+        event_seq: 0,
+        event_id: None,
+        event_timestamp: 0,
+        event_type_major: WORKLOAD_MAJOR,
+        event_type_minor: WORKLOAD_MINOR,
+        event_value: Arc::new(format!(r#"{{"a":{a},"b":{b}}}"#).into_bytes()),
+        // MUST stay None. The server skips schema validation entirely for any event
+        // carrying an IV (`shard_wal.rs`, "validate OR encrypt, not both"), so an IV here
+        // would silently measure an unvalidated path while reporting validation as on.
+        iv: None,
+    }
+}
+
+/// Register the workload's JSON schema. One-shot, before load starts.
+///
+/// Idempotent by design: both client machines register, and a re-run against a cluster that
+/// was not wiped will find it already there. `AlreadyExists` is therefore success, not
+/// failure — safe because the schema body is a compile-time constant, so an existing
+/// registration under this key is necessarily identical to the one being sent. If
+/// `WORKLOAD_SCHEMA` is ever edited, wipe the cluster or the old schema silently wins.
+pub async fn register_workload_schema(pool: &Arc<CeleriantPool>) -> Result<(), ClientError> {
+    match pool
+        .register_schema(RegisterSchemaRequest {
+            correlation_id: None,
+            client_id: 0,
+            user_id: None,
+            schema_key: SchemaKey::new(WORKLOAD_ORG, WORKLOAD_AGG_TYPE, WORKLOAD_MAJOR, WORKLOAD_MINOR),
+            schema_type: 0, // SchemaType::Json
+            schema: WORKLOAD_SCHEMA.to_string(),
+        })
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(ClientError::Server(ServerError::Schema { kind: SchemaError::AlreadyExists, .. })) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Prove validation is actually on the measured path before trusting a number from it.
+///
+/// Registration succeeding is not evidence that writes are validated — a schema keyed on
+/// the wrong tuple, or an event carrying an IV, makes the server skip validation and
+/// return `Ok`. So this writes a payload the schema forbids and requires it to be
+/// *rejected*. If that write lands, the run would be pricing an unvalidated path.
+pub async fn assert_schema_enforced(pool: &Arc<CeleriantPool>) -> Result<(), Box<dyn std::error::Error>> {
+    let probe_key = AggregateKey::new(WORKLOAD_ORG, WORKLOAD_AGG_TYPE, u128::MAX);
+    let mut bad = workload_event(0, 0);
+    bad.event_value = Arc::new(br#"{"a":"not-an-integer","b":2}"#.to_vec());
+
+    match pool.write_events(probe_key, vec![bad], 0).await {
+        // A schema rejection surfaces as ServerError::Schema, not ServerError::Write — the
+        // validator rejects before the write is attempted. Both are accepted here because
+        // either one means the server refused the payload, which is what is being proven.
+        Err(ClientError::Server(ServerError::Schema { .. } | ServerError::Write { .. })) => Ok(()),
+        Ok(_) => Err("schema validation is NOT active: a payload violating the registered \
+                      schema was accepted. Every number from this run would be measuring an \
+                      unvalidated write path."
+            .into()),
+        Err(e) => Err(format!("schema enforcement probe failed for an unexpected reason: {e}").into()),
+    }
+}
+
 /// `run_benchmark` with task starts spread linearly over `connect_ramp_secs`
 /// instead of released as one herd. Pool connections are created on first
 /// request, so the ramp paces the TLS/identify handshake storm — realistic
@@ -143,6 +240,61 @@ pub async fn run_benchmark_ramped(
     duration_secs: u64,
     connect_ramp_secs: Option<u64>,
 ) -> BenchmarkResult {
+    run_write_loop(std::slice::from_ref(pool), num_tasks, duration_secs, connect_ramp_secs, None).await
+}
+
+/// The talk workload: one small JSON event per request against a schema-validated event
+/// type, optionally under OCC. Shares `run_benchmark_ramped`'s connection model, aggregate
+/// pinning and retry policy exactly, so a workload run and a baseline run differ only in
+/// the payload and the write options.
+pub async fn run_benchmark_workload(
+    pool: &Arc<CeleriantPool>,
+    num_tasks: usize,
+    duration_secs: u64,
+    connect_ramp_secs: Option<u64>,
+    workload: WorkloadOptions,
+) -> BenchmarkResult {
+    run_write_loop(std::slice::from_ref(pool), num_tasks, duration_secs, connect_ramp_secs, Some(workload)).await
+}
+
+/// Spread the task population over several pools, each dialling a different destination
+/// `ip:port`.
+///
+/// This exists to get past the client's **ephemeral-port ceiling**, not to model anything.
+/// A connection is identified by (src_ip, src_port, dst_ip, dst_port), so every connection to
+/// a single destination needs its own source port and Linux only offers 28,232 of them —
+/// which is exactly why 24,000 connections work and 32,000 do not. Giving the tasks N
+/// distinct destinations multiplies the budget by N, because a source port spent on one
+/// destination may be spent again on another.
+///
+/// The pools share nothing, so a task keeps one destination for the whole run.
+pub async fn run_benchmark_workload_fanout(
+    pools: &[Arc<CeleriantPool>],
+    num_tasks: usize,
+    duration_secs: u64,
+    connect_ramp_secs: Option<u64>,
+    workload: WorkloadOptions,
+) -> BenchmarkResult {
+    run_write_loop(pools, num_tasks, duration_secs, connect_ramp_secs, Some(workload)).await
+}
+
+/// `run_benchmark_ramped` over several destinations. See [`run_benchmark_workload_fanout`].
+pub async fn run_benchmark_ramped_fanout(
+    pools: &[Arc<CeleriantPool>],
+    num_tasks: usize,
+    duration_secs: u64,
+    connect_ramp_secs: Option<u64>,
+) -> BenchmarkResult {
+    run_write_loop(pools, num_tasks, duration_secs, connect_ramp_secs, None).await
+}
+
+async fn run_write_loop(
+    pools: &[Arc<CeleriantPool>],
+    num_tasks: usize,
+    duration_secs: u64,
+    connect_ramp_secs: Option<u64>,
+    workload: Option<WorkloadOptions>,
+) -> BenchmarkResult {
     let barrier = Arc::new(Barrier::new(num_tasks));
     let total_ok = Arc::new(AtomicU64::new(0));
     let total_err = Arc::new(AtomicU64::new(0));
@@ -151,12 +303,19 @@ pub async fn run_benchmark_ramped(
     let start = Instant::now();
 
     for id in 0..num_tasks {
-        let pool = Arc::clone(pool);
+        let pool = Arc::clone(&pools[id % pools.len()]);
         let barrier = barrier.clone();
         let ok_counter = total_ok.clone();
         let err_counter = total_err.clone();
 
         tasks.push(tokio::spawn(async move {
+            // The pool dials lazily, so a task's FIRST successful request carries a TCP connect
+            // (and possibly a mesh redirect) inside its latency sample. F-35 flagged this as
+            // biasing p99 upward and contaminating proportionally more at high connection counts
+            // -- the same direction as the effect session 5 is decomposing. Held out of the
+            // reported percentiles and reported separately rather than silently discarded, so
+            // the size of the cut stays visible. Cut dated 2026-08-06 (session 5, phase 1a).
+            let mut warmup: Option<u64> = None;
             let mut latencies = Vec::new();
             barrier.wait().await;
             let deadline = Instant::now() + Duration::from_secs(duration_secs);
@@ -174,25 +333,75 @@ pub async fn run_benchmark_ramped(
             const BACKOFF_INITIAL_MS: u64 = 10;
             const BACKOFF_MAX_MS: u64 = 500;
 
+            // OCC only. A fresh aggregate is at version 0 and each single-event write
+            // advances it by one, but this is resynced from the server on any conflict
+            // rather than trusted — so a wrong assumption self-corrects instead of
+            // turning the run into a conflict storm.
+            let mut version: u64 = 0;
+            // Aggregate id is a function of the task and NOTHING else, for the task's whole
+            // lifetime. Making it a function of request count is the defect `aa22a63`
+            // fixed: almost every write then targets another shard's aggregate, and
+            // `check_client_redirect` moves the whole TCP stream across the intrashard
+            // mesh, so the benchmark measures connection handover instead of writes.
+            let aggregate_id = workload.map_or(0, |w| w.aggregate_offset) + id;
+            let key = AggregateKey::new(WORKLOAD_ORG, WORKLOAD_AGG_TYPE, aggregate_id as u128);
+
             while Instant::now() < deadline {
-                let event = DatablockAggregateEvent {
-                    client_seq: 0,
-                    event_seq: 0,
-                    event_id: None,
-                    event_timestamp: 0,
-                    event_type_major: 1,
-                    event_type_minor: 0,
-                    event_value: Arc::new(format!("[t-{id}-r-{seq}] hello").into_bytes()),
-                    iv: None,
+                let event = match workload {
+                    Some(_) => workload_event(id, seq),
+                    None => DatablockAggregateEvent {
+                        client_seq: 0,
+                        event_seq: 0,
+                        event_id: None,
+                        event_timestamp: 0,
+                        event_type_major: 1,
+                        event_type_minor: 0,
+                        event_value: Arc::new(format!("[t-{id}-r-{seq}] hello").into_bytes()),
+                        iv: None,
+                    },
                 };
 
-                let key = AggregateKey::new(1, 1, id as u128);
                 let req_start = Instant::now();
-                match pool.write_events(key, vec![event], 0).await {
+                let result = match workload {
+                    Some(w) if w.occ => {
+                        pool.write_events_with(key.clone(), vec![event], 0, WriteEventsOptions {
+                            allow_create: true,
+                            expected_version: Some(version),
+                            enforce_client_idempotency: false,
+                        })
+                        .await
+                    }
+                    _ => pool.write_events(key.clone(), vec![event], 0).await,
+                };
+
+                match result {
                     Ok(_) => {
-                        latencies.push(req_start.elapsed().as_millis() as u64);
+                        let sample = req_start.elapsed().as_millis() as u64;
+                        match warmup {
+                            None => warmup = Some(sample),
+                            Some(_) => latencies.push(sample),
+                        }
                         ok_counter.fetch_add(1, Ordering::Relaxed);
                         backoff_ms = 0;
+                        version += 1;
+                    }
+                    // A conflict means this task's idea of the version is stale. Resync from
+                    // the server and retry immediately — no backoff, since the aggregate is
+                    // available, and no error count, since the write is about to succeed.
+                    // With one writer per aggregate this should never fire; if it does, the
+                    // aggregate ranges of the two client machines are overlapping.
+                    // `current_aggregate_version` is parsed out of the error message and so
+                    // is optional; with no value to resync to there is nothing better to do
+                    // than fall through to the normal error path.
+                    Err(ClientError::Server(ServerError::Write {
+                        kind: WriteError::OptimisticConcurrencyViolation {
+                            current_aggregate_version: Some(current),
+                            ..
+                        },
+                        ..
+                    })) => {
+                        version = current;
+                        continue;
                     }
                     Err(e) => {
                         err_counter.fetch_add(1, Ordering::Relaxed);
@@ -212,14 +421,16 @@ pub async fn run_benchmark_ramped(
                 }
                 seq += 1;
             }
-            latencies
+            (latencies, warmup)
         }));
     }
 
     let mut all_latencies = Vec::new();
+    let mut warmup_latencies = Vec::new();
     for task in tasks {
-        if let Ok(lats) = task.await {
+        if let Ok((lats, first)) = task.await {
             all_latencies.extend(lats);
+            warmup_latencies.extend(first);
         }
     }
 
@@ -227,6 +438,23 @@ pub async fn run_benchmark_ramped(
     let ok = total_ok.load(Ordering::Relaxed);
     let errors = total_err.load(Ordering::Relaxed);
     all_latencies.sort_unstable();
+
+    // Multi-machine runs (several independent clients hitting the same cluster) need
+    // percentiles computed jointly across all of them, not averaged per-machine — set
+    // BENCH_RAW_DUMP_PREFIX to write this run's raw sorted latencies + ok/elapsed to
+    // <prefix>.latencies / <prefix>.summary for offline merging.
+    if let Ok(prefix) = std::env::var("BENCH_RAW_DUMP_PREFIX") {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::File::create(format!("{prefix}.latencies")) {
+            let mut buf = String::with_capacity(all_latencies.len() * 5);
+            for l in &all_latencies {
+                buf.push_str(&l.to_string());
+                buf.push('\n');
+            }
+            let _ = f.write_all(buf.as_bytes());
+        }
+        let _ = std::fs::write(format!("{prefix}.summary"), format!("ok={ok}\nerrors={errors}\nelapsed_secs={}\n", elapsed.as_secs_f64()));
+    }
 
     let throughput = ok as f64 / elapsed.as_secs_f64();
     let (avg, p50, p95, p99, p999, min, max) = if !all_latencies.is_empty() {
@@ -244,6 +472,24 @@ pub async fn run_benchmark_ramped(
     } else {
         (0.0, 0, 0, 0, 0, 0, 0)
     };
+
+    // Exact before/after for the 1a cut, from the same run -- an A/B across binaries would carry
+    // device drift (F-34) into a number whose whole purpose is to be comparable. `all_latencies`
+    // is dead after the percentiles above, so the merge reuses it instead of copying.
+    if !warmup_latencies.is_empty() {
+        warmup_latencies.sort_unstable();
+        let held = warmup_latencies.len();
+        let w_median = warmup_latencies[held / 2];
+        let w_max = warmup_latencies[held - 1];
+        all_latencies.extend_from_slice(&warmup_latencies);
+        all_latencies.sort_unstable();
+        let n = all_latencies.len();
+        println!(
+            "  Warmup — held out {held} first-request samples (one per task), median {w_median}ms, max {w_max}ms | pre-cut P99: {}ms | pre-cut P99.9: {}ms",
+            all_latencies[n * 99 / 100],
+            all_latencies[n * 999 / 1000],
+        );
+    }
 
     BenchmarkResult {
         num_tasks,
@@ -591,6 +837,23 @@ pub async fn run_benchmark_idempotent_opts(
     let ok = total_ok.load(Ordering::Relaxed);
     let errors = total_err.load(Ordering::Relaxed);
     all_latencies.sort_unstable();
+
+    // Multi-machine runs (several independent clients hitting the same cluster) need
+    // percentiles computed jointly across all of them, not averaged per-machine — set
+    // BENCH_RAW_DUMP_PREFIX to write this run's raw sorted latencies + ok/elapsed to
+    // <prefix>.latencies / <prefix>.summary for offline merging.
+    if let Ok(prefix) = std::env::var("BENCH_RAW_DUMP_PREFIX") {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::File::create(format!("{prefix}.latencies")) {
+            let mut buf = String::with_capacity(all_latencies.len() * 5);
+            for l in &all_latencies {
+                buf.push_str(&l.to_string());
+                buf.push('\n');
+            }
+            let _ = f.write_all(buf.as_bytes());
+        }
+        let _ = std::fs::write(format!("{prefix}.summary"), format!("ok={ok}\nerrors={errors}\nelapsed_secs={}\n", elapsed.as_secs_f64()));
+    }
 
     let throughput = ok as f64 / elapsed.as_secs_f64();
     let (avg, p50, p95, p99, p999, min, max) = if !all_latencies.is_empty() {

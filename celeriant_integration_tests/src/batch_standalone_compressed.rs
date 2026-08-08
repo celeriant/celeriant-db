@@ -225,7 +225,10 @@ async fn run_connection(
             event_value: Arc::clone(&payload),
             iv: None,
         };
-        let aggregate_id = (connection_id + request_count as usize) % NUM_AGGREGATES;
+        // One aggregate per connection — see batch_standalone_cleartext.rs for why.
+        // Rotating per request advanced the target shard every write, forcing a TCP
+        // stream migration across the intrashard mesh on nearly every request.
+        let aggregate_id = connection_id % NUM_AGGREGATES;
         let mut writes = HashMap::new();
         writes.insert(
             AggregateKey::new(1, 1, aggregate_id as u128),

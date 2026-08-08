@@ -517,15 +517,16 @@ pub(crate) async fn sync(
         // Keep the chain - store the previous hash in the next metablock. Done before serialisation!
         item.metablock.previous_tip_hash = log_segment_file_metadata.write.tip_hash;
 
-        let mut metablock_bytes = [0u8; FIXED_BLOCK_SIZE_BYTES];
-        serialize_versioned_message(&item.metablock, WIRE_VERSION_WAL_METABLOCK, &mut metablock_bytes)
+        // Serialise straight into the DMA buffer. `serialize_versioned_message` writes the CRC,
+        // the version and the payload and then zero-fills the rest of the slice it is given, so
+        // it leaves no byte of a FIXED_BLOCK_SIZE_BYTES destination untouched
+        let metablock_bytes = &mut buffer_metablocks_slice[position..position + FIXED_BLOCK_SIZE_BYTES];
+        serialize_versioned_message(&item.metablock, WIRE_VERSION_WAL_METABLOCK, metablock_bytes)
             .map_err(|e| ShardFsyncError::MetablockSerialisationError(e.to_string()))?;
 
         // Compute hash chain, excluding datablock_position (node-local offset that differs between nodes)
-        log_segment_file_metadata.write.tip_hash = compute_entry_hash(&log_segment_file_metadata.write.tip_hash, &metablock_bytes);
+        log_segment_file_metadata.write.tip_hash = compute_entry_hash(&log_segment_file_metadata.write.tip_hash, metablock_bytes);
 
-        //let metablock_bytes: [u8; FIXED_BLOCK_SIZE_BYTES]
-        buffer_metablocks_slice[position..position + FIXED_BLOCK_SIZE_BYTES].copy_from_slice(&metablock_bytes);
         position += FIXED_BLOCK_SIZE_BYTES;
     }
 

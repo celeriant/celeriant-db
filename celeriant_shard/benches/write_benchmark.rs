@@ -1,23 +1,19 @@
-use std::collections::HashMap;
 use std::hint::black_box;
-use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use celeriant_distributed::validated_node_status::ValidatedNodeStatus;
-use celeriant_shard::internal_shard_config::InternalShardConfig;
 use celeriant_shard::replication_client::StubReplicationClient;
 use celeriant_shard::s3_downloader::StubS3Downloader;
-use celeriant_shard::timestamp_config::TimestampConfig;
-use celeriant_msg::request::requests::{SingleAggregateWrite, WriteRequest};
 use celeriant_shard::shard_wal::ShardWal;
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use glommio::timer::sleep;
 use glommio::{LocalExecutorBuilder, Placement};
 use tempfile::tempdir;
+
+mod bench_support;
+use bench_support::{create_config, create_events, create_write_request};
 
 criterion_group!(benches, bench_write_fsync_delays, bench_write_cache_impact, bench_write_idle_latency);
 criterion_main!(benches);
@@ -40,8 +36,6 @@ const WRITES_PER_WAVE: usize = 40;
 const INTER_WAVE_DELAY: Duration = Duration::from_micros(500);
 
 const NBR_AGGREGATE_MULTI: usize = 5000;
-
-const SEGMENT_SIZE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Fsync delay configurations to test
 fn fsync_delay_configs() -> Vec<(&'static str, Duration)> {
@@ -71,50 +65,6 @@ fn cache_configs() -> Vec<(&'static str, u64)> {
 // HELPERS
 // =============================================================================
 
-fn create_config(
-    shard_dir: PathBuf,
-    fsync_delay: Duration,
-    recent_write_cache_bytes: u64,
-) -> InternalShardConfig {
-    InternalShardConfig {
-        node_id: 1,
-        max_open_files: 256,
-        shard_log_preallocate_bytes: SEGMENT_SIZE_BYTES,
-        fsync_delay,
-        replication_delay: Duration::from_millis(17),
-        s3_replication_delay: Duration::from_millis(500),
-        replication_rollback_cooldown: Duration::from_millis(500),
-        heartbeat_starve_threshold: Duration::ZERO,
-        recent_write_cache_bytes,
-        shard_dir,
-        max_response_size: 16 * 1024 * 1024,
-        max_request_size: 16 * 1024 * 1024,
-        internode_max_request_size: 64 * 1024 * 1024,
-        aggregate_snapshots_cache_bytes: 64 * 1024 * 1024,
-        aggregate_client_snapshots_cache_bytes: 32 * 1024 * 1024,
-        read_max_chunk_size: 32 * 1024,
-        chain_read_window_bytes: 1024,
-        timestamp_config: TimestampConfig::default(),
-        list_max_duration: Duration::from_millis(2000),
-        list_page_size: 20000,
-        list_max_concurrent: 16,
-        read_max_concurrent: 64,
-        schema_cache_bytes: 4 * 1024 * 1024,
-        max_schema_size_bytes: 16384,
-        max_catchup_gap_bytes: Some(104_857_600),
-        max_promotion_batch_bytes: None,
-        max_clock_drift_ms: 500,
-        shard_id: 1,
-        compaction_check_interval: Duration::from_secs(600),
-        compaction_min_reclaimable_ratio: 0.20,
-        compaction_temp_dir: std::path::PathBuf::from("/tmp/test_compaction"),
-        cache_warmup_max_duration: Duration::MAX,
-        wal_compression_level: 3,
-        dict_bytes: std::sync::Arc::from(celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES),
-        s3_lease_duration_ms: 0,
-    }
-}
-
 /// Per-write latency percentiles to stderr, once per sampling batch. Criterion
 /// reports medians of batch averages; the write-latency gate needs p50 AND p99
 /// of individual writes. Reporting only — the measured value is unchanged.
@@ -130,45 +80,6 @@ fn report_write_percentiles(label: &str, mut durations: Vec<Duration>) {
         pct(0.50),
         pct(0.99),
     );
-}
-
-fn create_events(count: usize, size: usize, base_index: u64) -> Vec<DatablockAggregateEvent> {
-    (0..count)
-        .map(|i| DatablockAggregateEvent {
-            client_seq: base_index + i as u64,
-            event_seq: 0,
-            event_id: None,
-            event_timestamp: 1_700_000_000_000 + i as u64,
-            event_type_major: 1,
-            event_type_minor: 0,
-            event_value: Arc::new(vec![0xABu8; size]),
-            iv: None,
-        })
-        .collect()
-}
-
-fn create_write_request(
-    aggregate_key: AggregateKey,
-    events: Vec<DatablockAggregateEvent>,
-    client_id: u128,
-) -> WriteRequest {
-    let mut writes = HashMap::new();
-    writes.insert(
-        aggregate_key,
-        SingleAggregateWrite {
-            events,
-            allow_create: true,
-            expected_version: None,
-            enforce_client_idempotency: false,
-        },
-    );
-
-    WriteRequest {
-        correlation_id: None,
-        client_id,
-        user_id: None,
-        writes,
-    }
 }
 
 // =============================================================================

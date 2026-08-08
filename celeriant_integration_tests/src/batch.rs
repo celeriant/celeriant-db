@@ -114,17 +114,18 @@ secondary_ro = "{}"
 
 struct TaskStats {
     request_count: u64,
+    failed_requests: u64,
     latencies_us: Vec<u64>,
 }
 
-struct ReplicatedServers {
+pub(crate) struct ReplicatedServers {
     leader: TestServer,
     follower: TestServer,
     _minio: MinioContainer,
 }
 
 impl ReplicatedServers {
-    async fn start(base_port: u16, log_level: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    pub(crate) async fn start(base_port: u16, log_level: &str) -> Result<Self, Box<dyn std::error::Error>> {
         Self::start_with_tls_and_keys(base_port, log_level, None, None).await
     }
 
@@ -259,7 +260,7 @@ impl ReplicatedServers {
         })
     }
 
-    fn address(&self) -> &str {
+    pub(crate) fn address(&self) -> &str {
         self.leader.address()
     }
 
@@ -272,6 +273,7 @@ impl ReplicatedServers {
 struct BenchmarkResult {
     num_connections: usize,
     total_requests: u64,
+    failed_requests: u64,
     throughput: f64,
     avg_latency_ms: f64,
     p50_ms: u64,
@@ -677,10 +679,10 @@ fn print_suite_report(results: &[ScenarioResult]) {
     println!("{}\n", "=".repeat(90));
 
     println!(
-        "{:<25} {:>8} {:>14} {:>10} {:>8} {:>8}",
-        "Scenario", "Conns", "Throughput", "Avg (ms)", "P99 (ms)", "Result"
+        "{:<25} {:>8} {:>14} {:>10} {:>8} {:>10} {:>8}",
+        "Scenario", "Conns", "Throughput", "Avg (ms)", "P99 (ms)", "Busy-fails", "Result"
     );
-    println!("{}", "-".repeat(83));
+    println!("{}", "-".repeat(95));
 
     for r in results {
         let status = if r.failures.is_empty() {
@@ -689,9 +691,9 @@ fn print_suite_report(results: &[ScenarioResult]) {
             "FAIL"
         };
         println!(
-            "{:<25} {:>8} {:>11.0} /s {:>10.1} {:>8} {:>8}",
+            "{:<25} {:>8} {:>11.0} /s {:>10.1} {:>8} {:>10} {:>8}",
             r.label, r.result.num_connections, r.result.throughput, r.result.avg_latency_ms,
-            r.result.p99_ms, status,
+            r.result.p99_ms, r.result.failed_requests, status,
         );
         for f in &r.failures {
             println!("  >> {}", f);
@@ -965,6 +967,7 @@ async fn run_benchmark_iteration(
     let total_duration = start_time.elapsed();
 
     let total_requests: u64 = all_stats.iter().map(|s| s.request_count).sum();
+    let failed_requests: u64 = all_stats.iter().map(|s| s.failed_requests).sum();
     let mut all_latencies: Vec<u64> = all_stats
         .into_iter()
         .flat_map(|s| s.latencies_us)
@@ -991,6 +994,7 @@ async fn run_benchmark_iteration(
     Ok(BenchmarkResult {
         num_connections: actual_connections,
         total_requests,
+        failed_requests,
         throughput,
         avg_latency_ms,
         p50_ms,
@@ -1009,6 +1013,7 @@ async fn run_connection_benchmark(
     barrier: Arc<Barrier>,
 ) -> Result<TaskStats, String> {
     let mut request_count = 0u64;
+    let mut failed_requests = 0u64;
     let mut latencies = Vec::new();
 
     barrier.wait().await;
@@ -1056,7 +1061,14 @@ async fn run_connection_benchmark(
             iv: None,
         };
 
-        let aggregate_id = (connection_id + request_count as usize) % NUM_AGGREGATES;
+        // One aggregate per connection, fixed for its lifetime. Rotating the aggregate per
+        // request made almost every request target an aggregate owned by another shard, and
+        // check_client_redirect responds to that by moving the whole TCP stream across the
+        // intrashard mesh (IntrashardMessages::ClientConnectionRedirect). The benchmark was
+        // therefore measuring connection-handover throughput, not write throughput. Real
+        // clients hold a connection and write to aggregates it owns; celeriant_bench already
+        // models it this way (AggregateKey::new(1, 1, id)).
+        let aggregate_id = connection_id % NUM_AGGREGATES;
 
         let mut writes = HashMap::new();
         writes.insert(
@@ -1094,6 +1106,9 @@ async fn run_connection_benchmark(
             Err(ClientError::Server(err)) => {
                 eprintln!("Connection {} server error: {}", connection_id, err);
             }
+            Err(ClientError::ServerBusy) => {
+                failed_requests += 1;
+            }
             Err(e) => match e {
                 ClientError::RequestTimeout => {
                     eprintln!("Connection {} Timeout: {}", connection_id, e)
@@ -1108,6 +1123,7 @@ async fn run_connection_benchmark(
 
     Ok(TaskStats {
         request_count,
+        failed_requests,
         latencies_us: latencies,
     })
 }

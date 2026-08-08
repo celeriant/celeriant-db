@@ -137,10 +137,10 @@ impl<'a> ListOrgsIterator<'a> {
                 if cursor.is_none() && self.max_shard.is_none() && is_shard_routing_error(&e) {
                     self.max_shard = Some(shard_id.saturating_sub(1));
                     self.shard_cursors.remove(&shard_id);
-                    if self.active_shards.is_empty() && self.buffer.is_empty() {
-                        return Ok(false);
-                    }
-                    return Ok(!self.buffer.is_empty());
+                    let last_shard = shard_id.saturating_sub(1);
+                    self.active_shards.retain(|s| *s <= last_shard);
+                    self.shard_cursors.retain(|s, _| *s <= last_shard);
+                    return Ok(!self.active_shards.is_empty() || !self.buffer.is_empty());
                 }
                 Err(e)
             }
@@ -275,10 +275,10 @@ impl<'a> ListAggregateTypesIterator<'a> {
                 if cursor.is_none() && self.max_shard.is_none() && is_shard_routing_error(&e) {
                     self.max_shard = Some(shard_id.saturating_sub(1));
                     self.shard_cursors.remove(&shard_id);
-                    if self.active_shards.is_empty() && self.buffer.is_empty() {
-                        return Ok(false);
-                    }
-                    return Ok(!self.buffer.is_empty());
+                    let last_shard = shard_id.saturating_sub(1);
+                    self.active_shards.retain(|s| *s <= last_shard);
+                    self.shard_cursors.retain(|s, _| *s <= last_shard);
+                    return Ok(!self.active_shards.is_empty() || !self.buffer.is_empty());
                 }
                 Err(e)
             }
@@ -531,10 +531,10 @@ impl<'a> ListAggregatesIterator<'a> {
                 if cursor.is_none() && self.max_shard.is_none() && is_shard_routing_error(&e) {
                     self.max_shard = Some(shard_id.saturating_sub(1));
                     self.shard_cursors.remove(&shard_id);
-                    if self.active_shards.is_empty() && self.buffer.is_empty() {
-                        return Ok(false);
-                    }
-                    return Ok(!self.buffer.is_empty());
+                    let last_shard = shard_id.saturating_sub(1);
+                    self.active_shards.retain(|s| *s <= last_shard);
+                    self.shard_cursors.retain(|s, _| *s <= last_shard);
+                    return Ok(!self.active_shards.is_empty() || !self.buffer.is_empty());
                 }
                 Err(e)
             }

@@ -94,10 +94,20 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let total_events_received = Arc::new(AtomicU64::new(0));
     let churn_cycles = Arc::new(AtomicU64::new(0));
 
+    let writers = crate::load_scale(WRITERS);
+    let readers = crate::load_scale(READERS);
+    let churn_watchers = crate::load_scale(CHURN_WATCHERS);
+    let abandoned_watchers = crate::load_scale(ABANDONED_WATCHERS);
+    let long_lived_watchers = crate::load_scale(LONG_LIVED_WATCHERS);
+    println!(
+        "Load: {writers} writers, {readers} readers, {churn_watchers} churn / \
+         {abandoned_watchers} abandoned / {long_lived_watchers} long-lived watchers\n"
+    );
+
     let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     // Writers — drive the events the watchers must receive.
-    for i in 0..WRITERS {
+    for i in 0..writers {
         let addr = addr.clone();
         let pool = Arc::clone(&pool);
         let running = Arc::clone(&running);
@@ -109,7 +119,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Readers — concurrent read load against the same aggregates.
-    for i in 0..READERS {
+    for i in 0..readers {
         let addr = addr.clone();
         let pool = Arc::clone(&pool);
         let running = Arc::clone(&running);
@@ -121,7 +131,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Churn — connect a watcher with a randomly chosen filter shape, read a few
     // frames, drop. The high connect/disconnect rate is the leak vector.
-    for i in 0..CHURN_WATCHERS {
+    for i in 0..churn_watchers {
         let addr = addr.clone();
         let pool = Arc::clone(&pool);
         let running = Arc::clone(&running);
@@ -132,7 +142,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Abandoned half-open — raw connect, send watch request, drop without reading.
-    for i in 0..ABANDONED_WATCHERS {
+    for i in 0..abandoned_watchers {
         let addr = addr.clone();
         let pool = Arc::clone(&pool);
         let running = Arc::clone(&running);
@@ -155,7 +165,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Long-lived watchers — watch the whole pool and keep receiving events for the
     // duration. These prove delivery survives the churn.
-    for i in 0..LONG_LIVED_WATCHERS {
+    for i in 0..long_lived_watchers {
         let addr = addr.clone();
         let pool = Arc::clone(&pool);
         let running = Arc::clone(&running);

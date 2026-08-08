@@ -258,6 +258,10 @@ pub struct ShardWal<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
     /// Cached metrics label to avoid per-request String allocation
     metrics_shard_label: [(&'static str, String); 1],
 
+    /// Cached gauge handle for `celeriant_commit_notify_obligation_seq`, set on
+    /// every successful leader write, avoids hot path lookup
+    commit_notify_obligation_gauge: metrics::Gauge,
+
     /// Unix-ms timestamp of the last successful S3 CAS (put_lease_conditional).
     /// Updated ONLY by the CAS path in shard 0, propagated to all shards via
     /// StatusUpdate{cas_confirmed_at_ms: Some(_)}. The heartbeat-ack path must
@@ -514,6 +518,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         metrics::gauge!("celeriant_read_wal_seq", &metrics_shard_label).set(recovered_read_wal_seq as f64);
         let recovered_self_acked = log_segments_cache.active().metadata.borrow().last_self_acked_wal_seq;
         metrics::gauge!("celeriant_last_self_acked_wal_seq", &metrics_shard_label).set(recovered_self_acked as f64);
+        let commit_notify_obligation_gauge = metrics::gauge!("celeriant_commit_notify_obligation_seq", &metrics_shard_label);
 
         Ok(Self {
             dict_codec,
@@ -540,6 +545,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             last_logged_rollback_at: Cell::new(None),
             last_logged_starve_at: Cell::new(None),
             metrics_shard_label,
+            commit_notify_obligation_gauge,
             s3_cas_confirmed_at_ms: Rc::new(Cell::new(0)),
             lease_renewal_requester: OnceCell::new(),
             ack_barrier_rewind_armed: Cell::new(true),
@@ -2597,9 +2603,14 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let write_target = wal_positions(&self.log_segments_cache).0;
         let confirm_deadline = Instant::now() + REPLICATION_CONFIRM_TIMEOUT;
         let mut cycle_delay = Some(delay);
+        let mut confirm_iterations: u32 = 0;
         loop {
             self.run_replication_through_coordinator(ReplicationTrigger::Write, cycle_delay).await?;
             if wal_positions(&self.log_segments_cache).1 >= write_target {
+                if confirm_iterations > 0 {
+                    metrics::histogram!("celeriant_replication_confirm_loop_iterations", &self.metrics_shard_label)
+                        .record(confirm_iterations as f64);
+                }
                 // Burst over (pending drained): register the commit obligation and
                 // arm the notify timer. Level-triggered — the timer, not this edge,
                 // decides whether a dedicated notify ever sends, so a momentary
@@ -2622,6 +2633,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             // Re-enter immediately (no amortisation delay) to attach to the
             // in-flight cycle holding our events; yield so it can commit.
             cycle_delay = None;
+            confirm_iterations += 1;
             glommio::yield_if_needed().await;
         }
     }
@@ -2739,7 +2751,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         if confirmed > self.pending_notify_seq.get() {
             self.pending_notify_seq.set(confirmed);
         }
-        metrics::gauge!("celeriant_commit_notify_obligation_seq", &self.metrics_shard_label)
+        self.commit_notify_obligation_gauge
             .set(self.pending_notify_seq.get().saturating_sub(self.pushed_to_follower_seq.get()) as f64);
         self.arm_notify_timer();
     }
@@ -2787,8 +2799,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             glommio::timer::sleep(delay).await;
             let Some(this) = weak.upgrade() else { return };
             let (pending, pushed) = (this.pending_notify_seq.get(), this.pushed_to_follower_seq.get());
-            metrics::gauge!("celeriant_commit_notify_obligation_seq", &this.metrics_shard_label)
-                .set(pending.saturating_sub(pushed) as f64);
+            this.commit_notify_obligation_gauge.set(pending.saturating_sub(pushed) as f64);
 
             // Obligation met, or leadership lost: disarm and exit (terminal). The 5s
             // probe is the carrier for the fenced/unreachable tail.
