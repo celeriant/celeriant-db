@@ -3,7 +3,10 @@
 
 use celeriant_wal::buffer_read::{read_u64_le, read_u128_le};
 use celeriant_wal::constants::{WIRE_SIZE_ENUM_DISCRIMINANT};
-use celeriant_wal::metablocks::{metablock::Metablock, metablock_event_batch::MetablockEventBatch};
+use celeriant_wal::metablocks::{
+    metablock::Metablock, metablock_event_batch::MetablockEventBatch,
+    metablock_soft_delete::MetablockSoftDelete, metablock_soft_trim::MetablockSoftTrim,
+};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::schema_key::SchemaKey;
 
@@ -130,46 +133,69 @@ pub fn is_soft_trim_for_aggregate(bytes: &[u8], target: &AggregateKey) -> bool {
 
 #[inline]
 pub fn read_soft_trim_org_id(bytes: &[u8]) -> u128 {
-    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + AggregateKey::OFFSET_ORG_ID;
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET
+        + MetablockSoftTrim::OFFSET_AGGREGATE_KEY
+        + AggregateKey::OFFSET_ORG_ID;
     read_u128_le(bytes, offset)
 }
 
 #[inline]
 pub fn read_soft_trim_aggregate_type_id(bytes: &[u8]) -> u128 {
-    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + AggregateKey::OFFSET_AGGREGATE_TYPE_ID;
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET
+        + MetablockSoftTrim::OFFSET_AGGREGATE_KEY
+        + AggregateKey::OFFSET_AGGREGATE_TYPE_ID;
     read_u128_le(bytes, offset)
 }
 
 #[inline]
 pub fn read_soft_trim_aggregate_id(bytes: &[u8]) -> u128 {
-    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + AggregateKey::OFFSET_AGGREGATE_ID;
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET
+        + MetablockSoftTrim::OFFSET_AGGREGATE_KEY
+        + AggregateKey::OFFSET_AGGREGATE_ID;
     read_u128_le(bytes, offset)
 }
 
 #[inline]
 pub fn read_soft_trim_keep_from_aggregate_version(bytes: &[u8]) -> u64 {
-    // AggregateKey is 3 x u128 = 48 bytes
-    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + AggregateKey::WIRE_SIZE_TOTAL;
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + MetablockSoftTrim::OFFSET_KEEP_FROM_AGGREGATE_VERSION;
     read_u64_le(bytes, offset)
+}
+
+#[inline]
+pub fn read_soft_trim_client_id(bytes: &[u8]) -> u128 {
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + MetablockSoftTrim::OFFSET_CLIENT_ID;
+    read_u128_le(bytes, offset)
 }
 
 // --- SoftDelete field readers ---
 
 #[inline]
 pub fn read_soft_delete_org_id(bytes: &[u8]) -> u128 {
-    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + AggregateKey::OFFSET_ORG_ID;
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET
+        + MetablockSoftDelete::OFFSET_AGGREGATE_KEY
+        + AggregateKey::OFFSET_ORG_ID;
     read_u128_le(bytes, offset)
 }
 
 #[inline]
 pub fn read_soft_delete_aggregate_type_id(bytes: &[u8]) -> u128 {
-    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + AggregateKey::OFFSET_AGGREGATE_TYPE_ID;
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET
+        + MetablockSoftDelete::OFFSET_AGGREGATE_KEY
+        + AggregateKey::OFFSET_AGGREGATE_TYPE_ID;
     read_u128_le(bytes, offset)
 }
 
 #[inline]
 pub fn read_soft_delete_aggregate_id(bytes: &[u8]) -> u128 {
-    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + AggregateKey::OFFSET_AGGREGATE_ID;
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET
+        + MetablockSoftDelete::OFFSET_AGGREGATE_KEY
+        + AggregateKey::OFFSET_AGGREGATE_ID;
+    read_u128_le(bytes, offset)
+}
+
+#[inline]
+pub fn read_soft_delete_client_id(bytes: &[u8]) -> u128 {
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + MetablockSoftDelete::OFFSET_CLIENT_ID;
     read_u128_le(bytes, offset)
 }
 
@@ -326,7 +352,7 @@ pub fn read_schema_registration_key(bytes: &[u8]) -> SchemaKey {
 
 #[cfg(test)]
 mod tests {
-    use crate::disk::versioned_block::serialize_versioned_message;
+    use crate::disk::versioned_block::{deserialise_metablock, serialize_versioned_message};
 
     use super::*;
     use celeriant_wal::constants::{FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH, WIRE_VERSION_WAL_METABLOCK};
@@ -830,6 +856,50 @@ mod tests {
         let bytes = serialize_metablock(&metablock);
 
         assert_eq!(read_soft_trim_keep_from_aggregate_version(&bytes), 0xDEAD_BEEF_CAFE_BABE);
+    }
+
+    /// Neighbours of client_id carry distinct bytes so a shifted read cannot
+    /// coincidentally produce the expected value.
+    #[test]
+    fn read_soft_delete_client_id_matches_decoded_field() {
+        let mut metablock = make_soft_delete_metablock(1, 1000, AggregateKey::new(1, 2, 3), 0, 0);
+        let MetablockKind::SoftDelete(ref mut payload) = metablock.wal_metablock_type else {
+            panic!("expected soft delete");
+        };
+        payload.aggregate_version = 0x0123_4567_89AB_CDEF;
+        payload.event_seq = 0xFEDC_BA98_7654_3210;
+        payload.client_id = u128::MAX;
+        payload.user_id = Some(0x1357_9BDF_0246_8ACE);
+
+        let bytes = serialize_metablock(&metablock);
+        let MetablockKind::SoftDelete(decoded) = deserialise_metablock(&bytes).unwrap().wal_metablock_type else {
+            panic!("expected soft delete");
+        };
+
+        assert_eq!(read_soft_delete_client_id(&bytes), decoded.client_id);
+        assert_eq!(decoded.client_id, u128::MAX);
+    }
+
+    #[test]
+    fn read_soft_trim_client_id_matches_decoded_field() {
+        let mut metablock = make_soft_trim_metablock(1, 1000, AggregateKey::new(1, 2, 3), 50, 0, 0);
+        let MetablockKind::SoftTrim(ref mut payload) = metablock.wal_metablock_type else {
+            panic!("expected soft trim");
+        };
+        payload.keep_from_aggregate_version = 0x0011_2233_4455_6677;
+        payload.aggregate_version = 0x0123_4567_89AB_CDEF;
+        payload.event_seq = 0xFEDC_BA98_7654_3210;
+        payload.client_id = u128::MAX;
+        payload.user_id = Some(0x1357_9BDF_0246_8ACE);
+
+        let bytes = serialize_metablock(&metablock);
+        let MetablockKind::SoftTrim(decoded) = deserialise_metablock(&bytes).unwrap().wal_metablock_type else {
+            panic!("expected soft trim");
+        };
+
+        assert_eq!(read_soft_trim_client_id(&bytes), decoded.client_id);
+        assert_eq!(read_soft_trim_keep_from_aggregate_version(&bytes), decoded.keep_from_aggregate_version);
+        assert_eq!(decoded.client_id, u128::MAX);
     }
 
     #[test]

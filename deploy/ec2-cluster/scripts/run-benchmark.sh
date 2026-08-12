@@ -74,6 +74,9 @@ TASKS_PER_CLIENT=$(( TOTAL_TASKS / CLIENT_COUNT ))
 CONNS_PER_CLIENT="${BENCH_CONNS:-auto}"
 [[ "$CONNS_PER_CLIENT" == "auto" ]] && CONNS_PER_CLIENT="$TASKS_PER_CLIENT"
 
+PINNED="${BENCH_PINNED:-1}"
+CONN_MODE=$([[ "$PINNED" == "0" ]] && echo "pooled" || echo "pinned")
+
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 SAFE_TYPE=$(echo "$INSTANCE_TYPE" | tr '.' '-')
 RESULT_DIR="$CDK_DIR/results"
@@ -89,6 +92,7 @@ echo "  Address 2:   $FOLLOWER_IP:10000 (seed)"
 echo "  Total tasks: $TOTAL_TASKS (${TASKS_PER_CLIENT}/client)$AUTO_NOTE"
 echo "  Connections: $CONNS_PER_CLIENT per node per client"
 echo "  Duration:    ${DURATION}s"
+echo "  Conns:       $CONN_MODE"
 echo "  Output:      $RESULT_FILE"
 echo ""
 
@@ -105,7 +109,7 @@ cat > "$RESULT_FILE" <<EOF
 # Region:      $REGION
 # Total tasks: $TOTAL_TASKS
 # Tasks/client: $TASKS_PER_CLIENT
-# Connections: $CONNS_PER_CLIENT per node per client
+# Connections: $CONNS_PER_CLIENT per node per client ($CONN_MODE)
 # Duration:    ${DURATION}s
 # ---
 
@@ -133,6 +137,7 @@ for HOST in $CLIENT_PUBS; do
      CLUSTER_TASKS=${TASKS_PER_CLIENT} \
      CLUSTER_CONNECTIONS=${CONNS_PER_CLIENT} \
      CLUSTER_DURATION=${DURATION} \
+     CLUSTER_PINNED_CONNS=${PINNED} \
      celeriant-integration-tests --test rpi_cluster_pool_bench" \
     2>&1 > "$OUTFILE" &
   PIDS+=($!)

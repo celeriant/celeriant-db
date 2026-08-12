@@ -95,6 +95,7 @@ fn test_config(dir: &std::path::Path) -> InternalShardConfig {
         internode_max_request_size: 64 * 1024 * 1024,
         aggregate_snapshots_cache_bytes: 64 * 1024 * 1024,
         aggregate_client_snapshots_cache_bytes: 32 * 1024 * 1024,
+        negative_lookup_cache_bytes: 2 * 1024 * 1024,
         read_max_chunk_size: 32 * 1024,
         chain_read_window_bytes: 1024,
         timestamp_config: TimestampConfig::default(),

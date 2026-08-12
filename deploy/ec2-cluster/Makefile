@@ -25,6 +25,9 @@ SCP := scp $(SSH_OPTS)
 BENCH_TASKS ?= auto
 BENCH_CONNS ?= auto
 BENCH_DURATION ?= 15
+# BENCH_PINNED=0 reverts the load generator to borrowing a pool connection per request,
+# which sends most writes to a shard the connection isn't on. Only for A/B measurement.
+BENCH_PINNED ?= 1
 
 # Grafana home access: `make infra` opens :3000 to your egress IP, auto-detected
 # from the machine you deploy from. Override with HOME_IP=1.2.3.4/32, or set
@@ -48,7 +51,7 @@ else ifneq ($(PROFILE),default)
 endif
 
 .PHONY: help build build-arm infra certs deploy start stop restart status logs \
-        setup-infra run-benchmark run-sweep sync-env teardown teardown-data
+        setup-infra run-benchmark run-sweep s3-fallback sync-env teardown teardown-data
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -183,16 +186,29 @@ setup-infra: ## Stand up Prometheus/Loki/Grafana on client #1 + promtail on data
 run-benchmark: ## Run benchmark on client node(s) (concurrency auto-sized to the cluster) and collect results
 	@if [[ -z "$(CLIENT_PUBS)" ]]; then printf "$(RED)No .cluster-env$(RESET)\n"; exit 1; fi
 	@BENCH_TASKS=$(BENCH_TASKS) BENCH_CONNS=$(BENCH_CONNS) BENCH_DURATION=$(BENCH_DURATION) \
-		bash scripts/run-benchmark.sh
+		BENCH_PINNED=$(BENCH_PINNED) bash scripts/run-benchmark.sh
 
 run-sweep: ## Run benchmark at increasing concurrency levels, output CSV
 	@if [[ -z "$(CLIENT_PUBS)" ]]; then printf "$(RED)No .cluster-env$(RESET)\n"; exit 1; fi
-	@BENCH_DURATION=$(BENCH_DURATION) bash scripts/run-sweep.sh
+	@BENCH_DURATION=$(BENCH_DURATION) BENCH_PINNED=$(BENCH_PINNED) bash scripts/run-sweep.sh
+
+s3-fallback: ## Report event batches offloaded to S3 (degraded mode) + fallback counters
+	@if [[ -z "$(BUCKET)" ]]; then printf "$(RED)No .cluster-env$(RESET)\n"; exit 1; fi
+	@printf "$(BOLD)>>> S3 fallback batches in s3://$(BUCKET)/cluster/fallback/$(RESET)\n"
+	@aws s3 ls "s3://$(BUCKET)/cluster/fallback/" --recursive --summarize 2>/dev/null | tail -20 || echo "  (none)"
+	@printf "$(BOLD)>>> Fallback counters (data nodes)$(RESET)\n"
+	@for HOST in $(LEADER_PUB) $(FOLLOWER_PUB); do \
+		printf "  $$HOST: "; \
+		$(SSH)@$$HOST 'curl -s localhost:9090/metrics | grep -E "^celeriant_(replication_s3_fallbacks|catchup_fallback|s3_fallback_lease_unconfirmed)_total" | awk "{s[\$$1]+=\$$2} END {for (k in s) printf \"%s=%d \", k, s[k]; print \"\"}"' 2>/dev/null || echo "unreachable"; \
+	done
 
 # ---------------------------------------------------------------------------
 # Teardown
 # ---------------------------------------------------------------------------
 
+# NOTE: the CDK bucket is removalPolicy=DESTROY + autoDeleteObjects, so teardown
+# ERASES all S3 evidence (fallback batches, lease history). Run `make s3-fallback`
+# BEFORE teardown if the run degraded and you care why.
 teardown: stop ## Stop cluster and destroy CDK stack
 	@printf "$(BOLD)>>> Destroying CDK stack$(RESET)\n"
 	npx cdk destroy --force

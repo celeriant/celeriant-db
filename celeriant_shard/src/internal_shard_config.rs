@@ -18,6 +18,7 @@ pub struct InternalShardConfig {
     pub internode_max_request_size: u64,
     pub aggregate_snapshots_cache_bytes: u64,
     pub aggregate_client_snapshots_cache_bytes: u64,
+    pub negative_lookup_cache_bytes: u64,
     pub read_max_chunk_size: u64,
     pub chain_read_window_bytes: u64,
     pub timestamp_config: TimestampConfig,

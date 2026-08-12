@@ -1698,6 +1698,7 @@ mod tests {
             recent_write_cache_bytes: 1024,
             routing_rule,
             aggregate_client_snapshots_cache_bytes: 1024,
+            negative_lookup_cache_bytes: 2 * 1024 * 1024,
             aggregate_snapshots_cache_bytes: 1024,
             timestamp_config: celeriant_shard::timestamp_config::TimestampConfig {
                 precision: TimestampPrecision::Milliseconds,

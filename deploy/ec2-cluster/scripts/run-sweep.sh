@@ -8,6 +8,9 @@
 #   BENCH_DURATION — seconds per level (default: 15)
 #   SWEEP_LEVELS   — comma-separated concurrency levels
 #                    (default: 9000,12000,...,60000)
+#   BENCH_PINNED   — 1 (default) pins one connection per task; 0 borrows from the pool
+#                    per request, which makes most writes cross-shard and measures TCP
+#                    stream handover instead. Only useful for an A/B against the fix.
 
 set -euo pipefail
 
@@ -40,11 +43,13 @@ fi
 DURATION="${BENCH_DURATION:-15}"
 DEFAULT_LEVELS="9000,12000,15000,18000,21000,24000,27000,30000,33000,36000,39000,42000,48000,54000,60000"
 LEVELS="${SWEEP_LEVELS:-$DEFAULT_LEVELS}"
+PINNED="${BENCH_PINNED:-1}"
+CONN_MODE=$([[ "$PINNED" == "0" ]] && echo "pooled" || echo "pinned")
 
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 SAFE_TYPE=$(echo "$INSTANCE_TYPE" | tr '.' '-')
 RESULT_DIR="$CDK_DIR/results"
-CSV_FILE="$RESULT_DIR/${TIMESTAMP}_celeriant-sweep_${SAFE_TYPE}_${STORAGE_TYPE}.csv"
+CSV_FILE="$RESULT_DIR/${TIMESTAMP}_celeriant-sweep_${SAFE_TYPE}_${STORAGE_TYPE}_${CONN_MODE}.csv"
 mkdir -p "$RESULT_DIR"
 
 echo "==> Celeriant Concurrency Sweep"
@@ -53,6 +58,7 @@ echo "  Clients:    $CLIENT_COUNT x ${CLIENT_INSTANCE_TYPE:-$INSTANCE_TYPE}"
 echo "  Leader:     $LEADER_IP:10000"
 echo "  Follower:   $FOLLOWER_IP:10000"
 echo "  Duration:   ${DURATION}s per level"
+echo "  Conns:      $CONN_MODE"
 echo "  Levels:     $LEVELS"
 echo "  Output:     $CSV_FILE"
 echo ""
@@ -86,6 +92,7 @@ for LEVEL in ${LEVELS//,/ }; do
        CLUSTER_TASKS=${TASKS_PER_CLIENT} \
        CLUSTER_CONNECTIONS=${TASKS_PER_CLIENT} \
        CLUSTER_DURATION=${DURATION} \
+       CLUSTER_PINNED_CONNS=${PINNED} \
        celeriant-integration-tests --test rpi_cluster_pool_bench" \
       2>&1 > "$OUTFILE" &
     PIDS+=($!)

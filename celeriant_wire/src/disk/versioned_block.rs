@@ -1,6 +1,5 @@
 use crate::codec::bincode::{fixed_serialise_stack, fixed_serialise_heap};
-use celeriant_wal::{constants::{FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK, WIRE_VERSION_WAL_SHARD_LOG_HEADER, WIRE_VERSION_S3_FALLBACK_BATCH, WIRE_VERSION_SEGMENT_SUMMARY_BLOCK}, metablocks::metablock::Metablock, s3::{fallback_batch::FallbackBatch, lease::Lease, membership::Membership}, shard_log_header::ShardLogHeader};
-use celeriant_wal::segment_summary::SegmentSummaryBlock;
+use celeriant_wal::{constants::{FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_S3_FALLBACK_BATCH, WIRE_VERSION_SEGMENT_SUMMARY_BLOCK, WIRE_VERSION_WAL_METABLOCK, WIRE_VERSION_WAL_SHARD_LOG_HEADER}, metablocks::metablock::Metablock, s3::{fallback_batch::FallbackBatch, lease::Lease, membership::Membership}, segment_summary::segment_summary_payload::SegmentSummaryPayload, shard_log_header::ShardLogHeader};
 use crate::{codec, disk::{disk_format_error::DiskFormatError}};
 
 const VERSION_SIZE: usize = 4;
@@ -90,7 +89,7 @@ pub fn deserialise_fallback_batch(
 
 pub fn deserialise_segment_summary(
     data: &[u8],
-) -> Result<SegmentSummaryBlock, DiskFormatError> {
+) -> Result<SegmentSummaryPayload, DiskFormatError> {
     let version = validate_header(data)?;
     match version {
         WIRE_VERSION_SEGMENT_SUMMARY_BLOCK => Ok(codec::bincode::fixed_deserialise(&data[HEADER_SIZE..])?),
@@ -144,7 +143,7 @@ pub fn deserialise_shard_log_header(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use celeriant_wal::{aggregate_key::AggregateKey, buffer_read::{read_option_u128_le, read_u64_le, read_u128_le}, constants::{FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES, WIRE_SIZE_ENUM_DISCRIMINANT}, metablocks::metablock_event_batch::MetablockEventBatch, shard_log_header::{HeaderCursor, ShardLogHeader}};
+    use celeriant_wal::{aggregate_key::AggregateKey, buffer_read::{read_option_u128_le, read_u64_le, read_u128_le}, constants::{FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES, WIRE_SIZE_ENUM_DISCRIMINANT}, metablocks::metablock_event_batch::MetablockEventBatch, segment_summary::{client_set::ClientSet, segment_aggregate_entry::SegmentAggregateEntry, segment_summary_payload::SegmentSummaryPayload}, shard_log_header::{HeaderCursor, ShardLogHeader}};
 
     fn indexing_metablock_event_batch() -> Metablock {
         Metablock {
@@ -244,8 +243,6 @@ mod tests {
                 wal_seq: 0x0FED_CBA9_8765_4321,
                 tip_hash: GENESIS_HASH,
             },
-            aggregate_bloom: vec![],
-            client_bloom: vec![],
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
             read: HeaderCursor::genesis(),
@@ -286,15 +283,13 @@ mod tests {
         };
         let header = ShardLogHeader {
             write: cursor.clone(),
-            aggregate_bloom: vec![],
-            client_bloom: vec![],
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
             read: cursor,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
-        serialize_versioned_message(&header, 1, &mut buffer).unwrap();
+        serialize_versioned_message(&header, WIRE_VERSION_WAL_SHARD_LOG_HEADER, &mut buffer).unwrap();
 
         let deserialized = deserialise_shard_log_header(&buffer).unwrap();
 
@@ -315,15 +310,13 @@ mod tests {
                 wal_seq: 13,
                 tip_hash: GENESIS_HASH,
             },
-            aggregate_bloom: vec![],
-            client_bloom: vec![],
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
             read: HeaderCursor::genesis(),
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
-        serialize_versioned_message(&header, 1, &mut buffer).unwrap();
+        serialize_versioned_message(&header, WIRE_VERSION_WAL_SHARD_LOG_HEADER, &mut buffer).unwrap();
 
         // Corrupt a byte in the version field (not payload - see crc_covers_payload_data test)
         buffer[VERSION_SIZE + 2] ^= 0xFF;
@@ -341,8 +334,6 @@ mod tests {
                 wal_seq: 0x3333_3333_3333_3333,
                 tip_hash: GENESIS_HASH,
             },
-            aggregate_bloom: vec![],
-            client_bloom: vec![],
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
             read: HeaderCursor::genesis(),
@@ -370,8 +361,6 @@ mod tests {
                 wal_seq: 13,
                 tip_hash: GENESIS_HASH,
             },
-            aggregate_bloom: vec![],
-            client_bloom: vec![],
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
             read: HeaderCursor::genesis(),
@@ -399,8 +388,6 @@ mod tests {
                 wal_seq: 13,
                 tip_hash: GENESIS_HASH,
             },
-            aggregate_bloom: vec![],
-            client_bloom: vec![],
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
             read: HeaderCursor::genesis(),
@@ -428,8 +415,6 @@ mod tests {
                 wal_seq: 13,
                 tip_hash: GENESIS_HASH,
             },
-            aggregate_bloom: vec![],
-            client_bloom: vec![],
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
             read: HeaderCursor::genesis(),
@@ -450,6 +435,44 @@ mod tests {
         assert!(matches!(result, Err(DiskFormatError::UnsupportedVersion(9999))));
     }
 
+    /// Pre-release clean break: a CRC-valid header stamped v1 (the bloom-carrying
+    /// format) must fail deserialization into the corrupt-segment path — no shims.
+    #[test]
+    fn v1_header_rejected_as_unsupported() {
+        let header = ShardLogHeader {
+            write: HeaderCursor::genesis(),
+            last_received_replication_wal_seq: 0,
+            last_self_acked_wal_seq: 0,
+            read: HeaderCursor::genesis(),
+        };
+
+        let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
+        serialize_versioned_message(&header, 1, &mut buffer).unwrap();
+
+        let result = deserialise_shard_log_header(&buffer);
+        assert!(matches!(result, Err(DiskFormatError::UnsupportedVersion(1))));
+    }
+
+    /// The v2 header serializes into a single 4096-byte slot with room to spare.
+    #[test]
+    fn v2_header_fits_one_write_alignment_slot() {
+        assert_eq!(HEADER_BLOCK_SIZE_BYTES, 4096);
+        let header = ShardLogHeader {
+            write: HeaderCursor {
+                metablocks_position: u64::MAX,
+                datablocks_position: u64::MAX,
+                wal_seq: u64::MAX,
+                tip_hash: [0xFF; 32],
+            },
+            last_received_replication_wal_seq: u64::MAX,
+            last_self_acked_wal_seq: u64::MAX,
+            read: HeaderCursor::genesis(),
+        };
+        let serialized = serialize_versioned_message_heap(&header, WIRE_VERSION_WAL_SHARD_LOG_HEADER).unwrap();
+        assert!(serialized.len() <= HEADER_BLOCK_SIZE_BYTES, "serialized header is {} bytes", serialized.len());
+        assert_eq!(serialized.len(), HEADER_SIZE + ShardLogHeader::WIRE_SIZE_TOTAL);
+    }
+
     #[test]
     fn version_written_as_little_endian() {
         let header = ShardLogHeader {
@@ -459,8 +482,6 @@ mod tests {
                 wal_seq: 13,
                 tip_hash: GENESIS_HASH,
             },
-            aggregate_bloom: vec![],
-            client_bloom: vec![],
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
             read: HeaderCursor::genesis(),
@@ -561,9 +582,6 @@ mod tests {
     fn segment_summary_block_roundtrip() {
         use celeriant_wal::aggregate_type_key::AggregateTypeKey;
         use celeriant_wal::constants::WIRE_VERSION_SEGMENT_SUMMARY_BLOCK;
-        use celeriant_wal::segment_summary::{
-            SegmentAggregateEntry, SegmentSummaryBlock, SegmentSummaryPayload,
-        };
 
         let payload = SegmentSummaryPayload {
             orgs: vec![1, 2],
@@ -580,19 +598,52 @@ mod tests {
                     last_server_timestamp: 999,
                     compressed_size: 512,
                     uncompressed_size: 1024,
+                    newest_metablock_pos: 398_336,
+                    client_set: ClientSet::Exact(vec![17, 42]),
                 },
             ],
+            complete: false,
+            aggregate_bloom: Some(vec![9, 9, 9, 9]),
+            client_bloom: None,
+            schema_bloom: Some(vec![3, 8, 0, 0]),
         };
 
-        let block = SegmentSummaryBlock { payload };
-        let serialized = serialize_versioned_message_heap(&block, WIRE_VERSION_SEGMENT_SUMMARY_BLOCK).unwrap();
+        let serialized = serialize_versioned_message_heap(&payload, WIRE_VERSION_SEGMENT_SUMMARY_BLOCK).unwrap();
         let deserialized = deserialise_segment_summary(&serialized).unwrap();
 
-        assert_eq!(deserialized.payload.orgs, vec![1u128, 2]);
-        assert_eq!(deserialized.payload.aggregate_types.len(), 2);
-        assert_eq!(deserialized.payload.aggregates.len(), 1);
-        assert_eq!(deserialized.payload.aggregates[0].org_id, 1);
-        assert_eq!(deserialized.payload.aggregates[0].event_batch_count, 5);
-        assert_eq!(deserialized.payload.aggregates[0].compressed_size, 512);
+        assert_eq!(deserialized.orgs, vec![1u128, 2]);
+        assert_eq!(deserialized.aggregate_types.len(), 2);
+        assert_eq!(deserialized.aggregates.len(), 1);
+        assert_eq!(deserialized.aggregates[0].org_id, 1);
+        assert_eq!(deserialized.aggregates[0].event_batch_count, 5);
+        assert_eq!(deserialized.aggregates[0].compressed_size, 512);
+        assert_eq!(deserialized.aggregates[0].newest_metablock_pos, 398_336);
+        assert_eq!(deserialized.aggregates[0].client_set, ClientSet::Exact(vec![17, 42]));
+        assert!(!deserialized.complete);
+        assert_eq!(deserialized.aggregate_bloom, Some(vec![9, 9, 9, 9]));
+        assert_eq!(deserialized.client_bloom, None);
+        assert_eq!(deserialized.schema_bloom, Some(vec![3, 8, 0, 0]));
+    }
+
+    /// Pre-v3 summary files must fail deserialization (clean break, no shims): a
+    /// CRC-valid file stamped with an older version is rejected, feeding the
+    /// callers' missing-summary degrade path.
+    #[test]
+    fn segment_summary_pre_v3_rejected_as_unsupported() {
+
+        let payload = SegmentSummaryPayload {
+            orgs: vec![1],
+            aggregate_types: vec![],
+            aggregates: vec![],
+            complete: true,
+            aggregate_bloom: None,
+            client_bloom: None,
+            schema_bloom: None,
+        };
+        for old_version in [1u32, 2] {
+            let serialized = serialize_versioned_message_heap(&payload, old_version).unwrap();
+            let result = deserialise_segment_summary(&serialized);
+            assert!(matches!(result, Err(DiskFormatError::UnsupportedVersion(v)) if v == old_version));
+        }
     }
 }

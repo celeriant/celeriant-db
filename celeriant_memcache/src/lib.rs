@@ -3,6 +3,7 @@ pub mod cache_path;
 pub mod cached_schema;
 pub mod mem_snapshot_aggregate;
 pub mod metablock_position;
+pub mod negative_lookup;
 pub mod queue_aggregate_positions;
 pub mod recent_write;
 pub mod shard_log_queue_item;

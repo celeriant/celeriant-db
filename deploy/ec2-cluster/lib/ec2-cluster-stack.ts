@@ -32,12 +32,25 @@ export class Ec2ClusterStack extends cdk.Stack {
     const keyPairName = this.node.tryGetContext('keyPair');
     const storageType = this.node.tryGetContext('storageType') ?? 'instance-store';
     const ebsDataVolumeSize = parseInt(this.node.tryGetContext('ebsDataVolumeSize') ?? '100', 10);
+    // gp3 ships at 3,000 IOPS / 125 MB/s, which makes any comparison against local NVMe a
+    // measurement of the default rather than of EBS. IOPS is settable here; THROUGHPUT IS NOT
+    // — CloudFormation's AWS::EC2::Instance block device mapping has no Throughput field, so
+    // CDK drops it with a warning and the volume launches at 125 MB/s. Raise it after deploy:
+    //   aws ec2 modify-volume --volume-id <id> --throughput 1000
+    // See the EBS section of README.md.
+    const ebsIops = parseInt(this.node.tryGetContext('ebsIops') ?? '16000', 10);
     // RAID0-stripe all instance-store NVMes into one volume. Default on: for an append-only
     // event store the main win is capacity (full aggregate of every drive — more events on
     // local NVMe before compaction/S3 offload), plus ~+32% throughput on the 16xlarge where a
     // single drive saturates. Harmless on single-NVMe instances (mounts the one drive),
     // throughput-neutral on the 8xlarge. -c raid0=false opts out.
     const raid0 = String(this.node.tryGetContext('raid0') ?? 'true') === 'true';
+    // Spot pricing for every instance. A benchmark cluster lives for under an hour and is
+    // rebuilt from scratch each time, so an interruption costs a re-run, not data — and spot
+    // is ~70% cheaper (i4i.16xlarge in ap-southeast-2: ~$1.93/hr vs $6.58 on-demand).
+    // No maxPrice: capping at anything below on-demand only adds capacity failures.
+    // -c spot=false reverts to on-demand.
+    const spot = String(this.node.tryGetContext('spot') ?? 'true') === 'true';
 
     // Detect ARM (Graviton) instance types for correct AMI selection.
     // ARM families end in 'g' or 'gn' before the dot (i4g, c7g, c7gn, im4gn, is4gen, etc.)
@@ -57,6 +70,11 @@ export class Ec2ClusterStack extends cdk.Stack {
 
     // Home IP (CIDR) allowed to reach Grafana on :3000 — e.g. -c homeIp=1.2.3.4/32
     const homeIp = this.node.tryGetContext('homeIp') ?? '';
+
+    // Pin every instance to one AZ. Same-AZ placement is part of the benchmark methodology
+    // (LAN-equivalent latency between the nodes), and spot capacity is per-AZ — when a family
+    // runs dry in the default AZ the whole stack rolls back, so the AZ has to be movable.
+    const az = this.node.tryGetContext('az');
 
     // --- VPC (default VPC) ---
     const vpc = ec2.Vpc.fromLookup(this, 'DefaultVpc', { isDefault: true });
@@ -142,14 +160,21 @@ export class Ec2ClusterStack extends cdk.Stack {
     // Storage setup for data nodes — depends on storageType
     const storageSetup = storageType === 'ebs' ? [
       '',
-      '# Mount dedicated EBS data volume',
-      '# CDK attaches it as /dev/sdb, Nitro exposes it as /dev/nvme1n1',
+      '# Mount dedicated EBS data volume.',
+      '# Pick it by device MODEL, not by name: on instances that also have instance store',
+      '# (i4i and friends) the local NVMes occupy /dev/nvme1n1 upward too, so a name-based',
+      '# guess silently benchmarks instance store while reporting EBS. The root volume is',
+      '# excluded by having a mountpoint; the data volume is bare.',
       'DATA_DEV=""',
       'for i in $(seq 1 30); do',
-      '  for dev in /dev/nvme1n1 /dev/xvdb; do',
-      '    if [[ -b "$dev" ]]; then DATA_DEV="$dev"; break 2; fi',
+      '  for dev in /dev/nvme*n1; do',
+      '    [[ -b "$dev" ]] || continue',
+      '    model=$(cat /sys/block/$(basename "$dev")/device/model 2>/dev/null || true)',
+      '    [[ "$model" == *"Elastic Block Store"* ]] || continue',
+      '    [[ -z "$(lsblk -no MOUNTPOINT "$dev" | tr -d " \\n")" ]] || continue',
+      '    DATA_DEV="$dev"; break 2',
       '  done',
-      '  sleep 1',
+      '  sleep 2',
       'done',
       '',
       'if [[ -n "$DATA_DEV" ]]; then',
@@ -244,6 +269,18 @@ export class Ec2ClusterStack extends cdk.Stack {
     ].join('\n');
     const clientUserData = [...commonSetup, '', 'mkdir -p /etc/celeriant/certs'].join('\n');
 
+    // --- Spot launch template (market options only) ---
+    // One-time request that terminates on reclaim: the cluster is rebuilt from scratch for
+    // every benchmark, so there is nothing to preserve across an interruption.
+    const spotTemplate = spot
+      ? new ec2.LaunchTemplate(this, 'SpotTemplate', {
+        spotOptions: {
+          requestType: ec2.SpotRequestType.ONE_TIME,
+          interruptionBehavior: ec2.SpotInstanceInterruption.TERMINATE,
+        },
+      })
+      : undefined;
+
     // --- Helper to create instances ---
     const createInstance = (
       name: string,
@@ -272,8 +309,18 @@ export class Ec2ClusterStack extends cdk.Stack {
         userData: ud,
         keyPair,
         blockDevices,
-        vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
+        vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC, ...(az && { availabilityZones: [az] }) },
       });
+
+      if (spotTemplate) {
+        // `AWS::EC2::Instance` has no market options in CloudFormation, so spot has to
+        // arrive via a launch template. Only the market options come from the template —
+        // everything else is set on the instance itself, which takes precedence.
+        (instance.node.defaultChild as ec2.CfnInstance).launchTemplate = {
+          launchTemplateId: spotTemplate.launchTemplateId,
+          version: spotTemplate.latestVersionNumber,
+        };
+      }
 
       cdk.Tags.of(instance).add('Name', `celeriant-${name.toLowerCase()}`);
       cdk.Tags.of(instance).add('Project', 'celeriant-ktls-test');
@@ -287,6 +334,7 @@ export class Ec2ClusterStack extends cdk.Stack {
         deviceName: '/dev/xvdb',
         volume: ec2.BlockDeviceVolume.ebs(ebsDataVolumeSize, {
           volumeType: ec2.EbsDeviceVolumeType.GP3,
+          iops: ebsIops,
         }),
       }]
       : undefined;
@@ -314,7 +362,11 @@ export class Ec2ClusterStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'ClientInstanceType', { value: clientInstanceType });
     new cdk.CfnOutput(this, 'ClientCount', { value: String(clientCount) });
     new cdk.CfnOutput(this, 'StorageType', { value: storageType });
+    if (storageType === 'ebs') {
+      new cdk.CfnOutput(this, 'EbsSpec', { value: `gp3 ${ebsDataVolumeSize}GB ${ebsIops}iops` });
+    }
     new cdk.CfnOutput(this, 'Raid0', { value: String(raid0) });
+    new cdk.CfnOutput(this, 'Spot', { value: String(spot) });
     new cdk.CfnOutput(this, 'Architecture', { value: dataIsArm ? 'arm64' : 'x86_64' });
 
     // Client outputs — backward compatible: first client uses 'ClientPublicIp'/'ClientPrivateIp'

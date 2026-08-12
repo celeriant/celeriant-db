@@ -165,6 +165,7 @@ pub fn run_executors_and_sidecar_with_extension<S: SidecarStoreTrait>(
                     max_request_size: shard_config.max_request_size,
                     internode_max_request_size: shard_config.internode_max_request_size,
                     aggregate_client_snapshots_cache_bytes: shard_config.aggregate_client_snapshots_cache_bytes,
+                    negative_lookup_cache_bytes: shard_config.negative_lookup_cache_bytes,
                     aggregate_snapshots_cache_bytes: shard_config.aggregate_snapshots_cache_bytes,
                     read_max_chunk_size: shard_config.read_max_chunk_size,
                     chain_read_window_bytes: shard_config.chain_read_window_bytes,

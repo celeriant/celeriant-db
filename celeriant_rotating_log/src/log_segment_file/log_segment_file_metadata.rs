@@ -34,8 +34,8 @@ impl LogSegmentFileMetadata {
     /// `advance_read=false` forces read=None; used during rotation for a fresh segment.
     pub fn new(log_id: u64, file_len: u64, datablocks_carry_over: Option<Vec<u8>>, shard_log_header: &ShardLogHeader, advance_read: bool) -> Self {
         let write = LogSegmentCursor::from_shard_log_header_write(log_id, shard_log_header);
-        // Read shares the write bloom (same persisted bytes; superset is valid for reads) so a
-        // segment load allocates ONE bloom pair, not two.
+        // Read shares the write bloom Rcs (write covers read, so it is a valid superset
+        // filter for reads) and so also picks up any blooms installed after load.
         let read = if advance_read && shard_log_header.read.metablocks_position >= HEADER_BLOCK_SIZE_BYTES as u64 {
             Some(write.read_snapshot_sharing_bloom(&shard_log_header.read))
         } else {
@@ -83,7 +83,6 @@ impl LogSegmentFileMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::log_segment_file::aggregate_key_bloom::AggregateKeyBloom;
     use celeriant_wal::constants::GENESIS_HASH;
 
     fn make_header(meta_pos: u64, data_pos: u64, wal_idx: u64) -> ShardLogHeader {
@@ -94,8 +93,6 @@ mod tests {
                 wal_seq: wal_idx,
                 tip_hash: [0u8; 32],
             },
-            aggregate_bloom: AggregateKeyBloom::new().to_bytes(),
-            client_bloom: AggregateKeyBloom::new().to_bytes(),
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
             // read defaults to zero sentinel (not advanced)
@@ -111,8 +108,6 @@ mod tests {
                 wal_seq: wal_idx,
                 tip_hash: [0u8; 32],
             },
-            aggregate_bloom: AggregateKeyBloom::new().to_bytes(),
-            client_bloom: AggregateKeyBloom::new().to_bytes(),
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
             read: HeaderCursor {

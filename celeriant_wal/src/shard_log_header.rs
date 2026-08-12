@@ -1,7 +1,7 @@
 use bincode::{Decode, Encode};
 use deepsize::DeepSizeOf;
 
-use crate::constants::{AGGREGATE_BLOOM_BYTES, CLIENT_BLOOM_BYTES, EntryHashBytes, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES};
+use crate::constants::{EntryHashBytes, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES};
 
 /// Position + sequence + hash snapshot for either the write cursor or the read cursor
 /// in a log segment header. Two of these are nested in [`ShardLogHeader`]; on the wire
@@ -48,24 +48,12 @@ impl HeaderCursor {
 
 /// Written at both the start and end of the fixed-size log segment, each CRC-protected,
 /// so a torn write can be recovered from whichever copy survived. Padded to
-/// HEADER_BLOCK_SIZE_BYTES (right-sized to hold the aggregate + client bloom filters).
+/// HEADER_BLOCK_SIZE_BYTES (one DMA sector per slot).
 #[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
 pub struct ShardLogHeader {
     /// Writer's tip: the most recently written metablock. Sits at or ahead of `read`
     /// (entries here may be written but not yet replicated/confirmed).
     pub write: HeaderCursor,
-
-    /// Bloom filter of aggregate keys written to this segment, for fast "aggregate absent"
-    /// checks. A negative result means no metablock for that aggregate exists here. It's
-    /// built over the write range, which always covers the read range, so it's also a
-    /// valid (superset) filter for reads.
-    pub aggregate_bloom: Vec<u64>,
-
-    /// Bloom filter of `client_id`s (global across aggregates) written to this segment.
-    /// A negative result means no metablock from that client exists here, so a brand-new
-    /// producer's negative client-seq lookup can skip the segment with no scan. One-sided
-    /// (absent = definitely-absent), so idempotency-safe.
-    pub client_bloom: Vec<u64>,
 
     /// Promotion-upload floor: the first wal_seq we'd push to S3 if we promoted. Set from
     /// each TCP batch received as follower to `leader_confirmed_wal_seq + 1` (monotonic
@@ -96,22 +84,14 @@ impl ShardLogHeader {
     // Update these if field order or types change!
 
     const WIRE_SIZE_WRITE_CURSOR: usize = HeaderCursor::WIRE_SIZE_TOTAL;
-    const WIRE_SIZE_AGGREGATE_BLOOM: usize = AGGREGATE_BLOOM_BYTES;
-    const WIRE_SIZE_CLIENT_BLOOM: usize = CLIENT_BLOOM_BYTES;
     const WIRE_SIZE_LAST_RECEIVED_REPLICATION_WAL_SEQ: usize = 8;
     const WIRE_SIZE_LAST_SELF_ACKED_WAL_SEQ: usize = 8;
     const WIRE_SIZE_READ_CURSOR: usize = HeaderCursor::WIRE_SIZE_TOTAL;
 
     pub const OFFSET_WRITE_CURSOR: usize = 0;
 
-    pub const OFFSET_AGGREGATE_BLOOM: usize =
-        Self::OFFSET_WRITE_CURSOR + Self::WIRE_SIZE_WRITE_CURSOR;
-
-    pub const OFFSET_CLIENT_BLOOM: usize =
-        Self::OFFSET_AGGREGATE_BLOOM + Self::WIRE_SIZE_AGGREGATE_BLOOM;
-
     pub const OFFSET_LAST_RECEIVED_REPLICATION_WAL_SEQ: usize =
-        Self::OFFSET_CLIENT_BLOOM + Self::WIRE_SIZE_CLIENT_BLOOM;
+        Self::OFFSET_WRITE_CURSOR + Self::WIRE_SIZE_WRITE_CURSOR;
 
     pub const OFFSET_LAST_SELF_ACKED_WAL_SEQ: usize =
         Self::OFFSET_LAST_RECEIVED_REPLICATION_WAL_SEQ + Self::WIRE_SIZE_LAST_RECEIVED_REPLICATION_WAL_SEQ;
@@ -134,8 +114,6 @@ impl ShardLogHeader {
         };
         Self {
             write: cursor.clone(),
-            aggregate_bloom: vec![],
-            client_bloom: vec![],
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
             read: cursor,
@@ -210,8 +188,6 @@ mod tests {
                 wal_seq: 0,
                 tip_hash: GENESIS_HASH,
             },
-            aggregate_bloom: vec![],
-            client_bloom: vec![],
             last_received_replication_wal_seq: 0,
             last_self_acked_wal_seq: 0,
             read: HeaderCursor::genesis(),
@@ -282,16 +258,17 @@ mod tests {
 
     #[test]
     fn test_wire_size_fits_in_header_block() {
-        // WIRE_SIZE_TOTAL omits the bincode Vec length prefixes (2 x 8) and the wire framing
-        // (4-byte version + 4-byte CRC). The real serialized header is 24 bytes larger, so the
-        // header block must clear that, not just WIRE_SIZE_TOTAL
-        const SERIALIZED_OVERHEAD: usize = 2 * 8 + 4 + 4;
+        // WIRE_SIZE_TOTAL omits the wire framing (4-byte version + 4-byte CRC). The real
+        // serialized header is 8 bytes larger, so the 4096-byte block must clear that.
+        const SERIALIZED_OVERHEAD: usize = 4 + 4;
         assert!(
             ShardLogHeader::WIRE_SIZE_TOTAL + SERIALIZED_OVERHEAD <= HEADER_BLOCK_SIZE_BYTES,
             "ShardLogHeader serialized size ({}) exceeds header block size ({})",
             ShardLogHeader::WIRE_SIZE_TOTAL + SERIALIZED_OVERHEAD,
             HEADER_BLOCK_SIZE_BYTES
         );
+        // 2 cursors (56 B each) + 2 barrier scalars: the v2 header is fixed-size.
+        assert_eq!(ShardLogHeader::WIRE_SIZE_TOTAL, 2 * HeaderCursor::WIRE_SIZE_TOTAL + 16);
     }
 
 }

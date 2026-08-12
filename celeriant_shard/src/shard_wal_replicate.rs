@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use celeriant_wal::segment_summary::segment_summary_payload::SegmentSummaryPayload;
 use tracing::{debug, error, info, warn};
 use celeriant_disk::files::rwlock_timeout::with_budget;
 
@@ -17,7 +18,6 @@ type MemCache = ShardMemCache<CompiledValidator>;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_wal::constants::FIRST_AGGREGATE_VERSION;
 use celeriant_wal::metablocks::metablock::Metablock;
-use celeriant_wal::segment_summary::SegmentSummaryPayload;
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
 
@@ -223,8 +223,9 @@ pub(crate) async fn commit_replication<R: ReplicationClient + 'static>(
         }
     };
 
-    // Sweep memcache for any rotated-and-sealed segments whose read cursor has now caught up
-    let sealed_ready = collect_eligible_sealed_summaries(&log_segments_cache, &shard_mem_cache);
+    // Sweep memcache for any rotated-and-sealed segments whose read cursor has now
+    // caught up. Payloads carry the blooms staged at rotation.
+    let sealed_ready = collect_eligible_sealed_summaries(&log_segments_cache, &shard_mem_cache).await;
     for (log_id, payload) in sealed_ready {
         if let Err(e) = write_segment_summary_sidecar_from_payload(log_segments_cache.shard_dir(), log_id, payload).await {
             error!(shard_id, log_id, error = ?e, "Failed to write segment summary sidecar");
@@ -964,8 +965,9 @@ pub(crate) fn commit_pcd(
     let mut event_collector = WatchEventCollector::new();
     let mut shard_mem_cache = shard_mem_cache.borrow_mut();
 
+    let active_log_id = log_segments_cache.active_log_id();
     for item in commit_data.pending_queue {
-        shard_mem_cache.update_segment_summary_for_log(log_id, &item.metablock);
+        shard_mem_cache.update_segment_summary_for_log(log_id, active_log_id, &item.metablock, item.metablock_absolute_pos);
         collect_watch_event(&mut event_collector, &item.metablock);
 
         match &item.metablock.wal_metablock_type {
@@ -1059,26 +1061,32 @@ pub(crate) fn collect_watch_event(event_collector: &mut WatchEventCollector, met
 
 /// Sweep the "rotated but sidecar not yet written" queue and return any whose
 /// read cursor has caught up (i.e., the segment is fully committed)
-pub(crate) fn collect_eligible_sealed_summaries(
+pub(crate) async fn collect_eligible_sealed_summaries(
     log_segments_cache: &Rc<LogSegmentsCache>,
     shard_mem_cache: &Rc<RefCell<MemCache>>,
 ) -> Vec<(u64, SegmentSummaryPayload)> {
     let active_log_id = log_segments_cache.active_log_id();
-    let mut cache = shard_mem_cache.borrow_mut();
-    let pending = cache.pending_sealed_summary_log_ids();
+    let pending = shard_mem_cache.borrow().pending_sealed_summary_log_ids();
     let mut ready = Vec::with_capacity(pending.len());
     for log_id in pending {
         if log_id == active_log_id {
             continue;
         }
-        let fully_replicated = match log_segments_cache.get_if_cached(log_id) {
-            Some(log_segment) => !log_segment.metadata.borrow().is_pending_advance(),
-            None => true,
+        // Reload the segment rather than trusting the LRU: an evicted
+        // pending-advance segment must not be read as fully replicated (its
+        // parked commits would then land after the sidecar — a subset on disk).
+        // Sweeps are rare; one file open per candidate is fine.
+        let fully_replicated = match log_segments_cache.get(log_id).await {
+            Ok(log_segment) => !log_segment.metadata.borrow().is_pending_advance(),
+            Err(e) => {
+                tracing::warn!(log_id, error = ?e, "Sealed segment unavailable for the sidecar sweep; keeping its summary staged");
+                false
+            }
         };
         if !fully_replicated {
             continue;
         }
-        if let Some(payload) = cache.take_sealed_segment_summary(log_id) {
+        if let Some(payload) = shard_mem_cache.borrow_mut().take_sealed_segment_summary(log_id) {
             ready.push((log_id, payload));
         }
     }
@@ -1152,7 +1160,7 @@ mod tests {
     }
 
     fn fresh_memcache() -> MemCache {
-        MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
+        MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 64 * 1024 * 1024)
     }
 
     /// Builds `kinds.len()` PendingCacheItems chained from `start_tip` at wal=`start_wal`.

@@ -136,6 +136,20 @@ fn register_metric_descriptions() {
     describe_counter!("celeriant_log_rotations_total", "Log file rotations");
     describe_counter!("celeriant_log_segment_close_total", "Log segment file close events");
     describe_counter!("celeriant_orphan_segment_recovered_total", "Orphaned log segments cleaned up on boot");
+    describe_gauge!("celeriant_segment_summary_last_bytes", "Serialized size of the most recently written segment summary sidecar");
+    describe_gauge!("celeriant_segment_summary_last_aggregates", "Aggregate entry count of the most recently written segment summary sidecar");
+    describe_counter!("celeriant_segment_summary_client_sets_dropped_total", "Per-aggregate client sets dropped to Unknown at seal — fires only when the 4 MiB payload cap overflows; a non-zero rate says the cap is wrong");
+    describe_counter!("celeriant_read_segment_hint_skip_total", "Sealed segments skipped by a summary hint during the client dedup scan");
+    describe_counter!("celeriant_read_segment_hint_seek_total", "Chain scans that seeked directly to a summary tip instead of reverse-hunting");
+    describe_counter!("celeriant_negative_lookup_short_circuit_total", "First writes answered scan-free by a Complete per-aggregate negative-lookup bloom");
+    describe_counter!("celeriant_negative_lookup_builds_started_total", "Negative-lookup bloom builds begun (install-empty-then-populate)");
+    describe_counter!("celeriant_negative_lookup_builds_completed_total", "Negative-lookup bloom builds that reached Complete (exhaustive history walk, incl. eager open-scan installs)");
+    describe_counter!("celeriant_negative_lookup_false_positive_total", "Complete negative-lookup bloom said maybe-present but the scan found nothing (bloom FP or delete/trim-only client)");
+    describe_counter!("celeriant_negative_lookup_evictions_total", "Negative-lookup bloom entries evicted by the byte budget (rebuilt on next miss)");
+
+    describe_counter!("celeriant_schema_scan_started_total", "Schema-absence scans begun (write-path schema cache miss)");
+    describe_counter!("celeriant_schema_scan_segments_walked_total", "Segments whose metablocks a schema-absence scan had to walk (Unknown/incomplete schema set)");
+    describe_counter!("celeriant_schema_scan_segments_skipped_total", "Segments a schema-absence scan skipped outright via the per-segment schema set");
 
     // Connections
     describe_gauge!("celeriant_client_connections_active", "Open client TCP connections");

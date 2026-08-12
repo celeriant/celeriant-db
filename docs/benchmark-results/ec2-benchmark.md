@@ -3,6 +3,13 @@
 Durable, replicated writes on x86 i4i instances. Covers the single-NVMe vs RAID0 storage
 question on the 32 and 64 vCPU boxes, plus the cheapest tier that still runs a real cluster.
 
+> **Superseded for 64-core latency.** The load generator used for this document let pool
+> connections drift between writer tasks, so a large share of writes landed on a shard the
+> connection was not on and the server migrated the TCP stream to reach it. The p99/p99.9
+> curves below are inflated by that handover. See `ec2-benchmark-64c-20260810.md`, where
+> pinning one connection per task holds p99 at ~250 ms from 24k to 132k concurrency. The
+> throughput and disk-utilisation findings here still stand.
+
 - **Date:** 2026-05-28
 - **Pipeline:** current, post the replication/durability rewrite. Not comparable to older runs.
 - **Durability:** every write is `fdatasync()` + Direct I/O on both nodes' NVMe, replicated over

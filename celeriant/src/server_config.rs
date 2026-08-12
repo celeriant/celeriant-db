@@ -218,6 +218,14 @@ pub struct ServerConfig {
 
     #[arg(
         long,
+        default_value_t = 2 * 1024 * 1024,
+        env = "CELERIANT_NEGATIVE_LOOKUP_CACHE_BYTES",
+        help = "Per-shard byte budget for the in-memory per-aggregate negative-lookup client blooms (idempotency scan short-circuit). Entries are demand-built and evicted whole; eviction only costs a rebuild scan, never correctness (2 MiB)"
+    )]
+    pub negative_lookup_cache_bytes: u64,
+
+    #[arg(
+        long,
         default_value_t = 16384,
         env = "CELERIANT_MAX_SCHEMA_SIZE_BYTES",
         help = "Maximum size of a single schema definition in bytes (16KB)"
@@ -792,6 +800,7 @@ impl ServerConfig {
             heartbeat_starve_threshold: Duration::from_millis(self.heartbeat_starve_threshold_ms),
             routing_rule: self.routing_rule,
             aggregate_client_snapshots_cache_bytes: memory_budget.aggregate_client_snapshots_cache_bytes,
+            negative_lookup_cache_bytes: self.negative_lookup_cache_bytes,
             aggregate_snapshots_cache_bytes: memory_budget.aggregate_snapshots_cache_bytes,
             timestamp_config: TimestampConfig {
                 precision: match self.timestamp_precision {
@@ -905,6 +914,7 @@ impl ServerConfig {
         check_field!(list_page_size);
         check_field!(list_max_concurrent);
         check_field!(read_max_concurrent);
+        check_field!(negative_lookup_cache_bytes);
         check_field!(max_schema_size_bytes);
         check_field!(client_connection_timeout_ms);
         check_field!(shard_log_preallocate_bytes);
@@ -1015,6 +1025,7 @@ impl Default for ServerConfig {
             list_page_size: 2000,
             list_max_concurrent: 16,
             read_max_concurrent: 64,
+            negative_lookup_cache_bytes: 2 * 1024 * 1024,
             max_schema_size_bytes: 16384,
             s3_endpoint_override: None,
             s3_skip_signature: false,

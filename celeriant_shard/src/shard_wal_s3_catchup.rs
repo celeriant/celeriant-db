@@ -295,6 +295,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
     shard_mem_cache: &Rc<RefCell<MemCache>>,
     fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
     watched_aggregates: &Rc<AggregateWatchers>,
+    summary_cache: &RefCell<crate::shard_wal::SummaryCache>,
     downloader: &Rc<D>,
     shard_id: u32,
     node_id: u128,
@@ -626,6 +627,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                     shard_mem_cache,
                     fsync_coordinator,
                     watched_aggregates,
+                    summary_cache,
                     &dict_codec,
                     shard_id,
                     ancestor_hash,
@@ -1332,6 +1334,7 @@ async fn truncate_wal(
     shard_mem_cache: &Rc<RefCell<MemCache>>,
     fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
     watched_aggregates: &Rc<AggregateWatchers>,
+    summary_cache: &RefCell<crate::shard_wal::SummaryCache>,
     dict_codec: &DictCodec,
     shard_id: u32,
     common_ancestor_hash: [u8; 32],
@@ -1394,10 +1397,11 @@ async fn truncate_wal(
         let discarded = shard_mem_cache.borrow_mut().take_all_parked_commits();
         let mut event_collector = WatchEventCollector::new();
         {
+            let active_log_id = log_segments_cache.active_log_id();
             let mut cache = shard_mem_cache.borrow_mut();
             for pcd in &discarded {
                 for item in pcd.pending_queue.iter().filter(|i| i.metablock.wal_seq < divergent_wal_seq) {
-                    cache.update_segment_summary_for_log(pcd.log_id(), &item.metablock);
+                    cache.update_segment_summary_for_log(pcd.log_id(), active_log_id, &item.metablock, item.metablock_absolute_pos);
                     crate::shard_wal_replicate::collect_watch_event(&mut event_collector, &item.metablock);
                 }
             }
@@ -1413,11 +1417,41 @@ async fn truncate_wal(
     // intermediates, swap the sealed segment back in. After this call,
     // log_segments_cache.active() returns the file that will receive the
     // header rewrite below.
+    //
+    // Summary hygiene (rotating_log stays summary-free, so it happens here):
+    // log ids are REUSED after the unwind, so a discarded id's `.summary` file
+    // would describe a future segment it never saw — delete them BEFORE the
+    // `.wal` files go (a crash in between leaves an orphan summary but never a
+    // stale one). Decoded cache entries for every affected id, including the
+    // re-activated ancestor, are popped; and the ancestor's accumulator is
+    // discarded + tainted — post-truncate it sees only post-truncate writes,
+    // so its eventual re-seal must never authorize Skips.
     if divergent_log_id != log_segments_cache.active_log_id() {
+        {
+            let mut summaries = summary_cache.borrow_mut();
+            for log_id in divergent_log_id..=log_segments_cache.active_log_id() {
+                summaries.pop(&log_id);
+            }
+        }
+        // A surviving sidecar for a reused log id would be consulted as disk
+        // truth for the WRONG segment: a real unlink failure aborts the truncate.
+        for log_id in divergent_log_id + 1..=log_segments_cache.active_log_id() {
+            let path = crate::shard_wal_sync::summary_path(log_segments_cache.shard_dir(), log_id);
+            if let Err(e) = std::fs::remove_file(&path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(ShardFsyncError::SegmentSummarySidecarWriteError(
+                        format!("failed to delete discarded sidecar log_{log_id}.summary: {e}"),
+                    ));
+                }
+            }
+        }
+
         log_segments_cache
             .unwind_active_to_sealed(divergent_log_id)
             .await
             .map_err(|e| ShardFsyncError::MetablockSerialisationError(format!("unwind_active_to_sealed failed: {e}")))?;
+
+        shard_mem_cache.borrow_mut().reset_segment_summary_after_unwind();
     }
 
     let active = log_segments_cache.active();
@@ -1472,7 +1506,7 @@ async fn truncate_wal(
     }
 
     // Rewound cursor invalidated the active segment's backlink tips; rebuild from disk.
-    crate::shard_wal::rebuild_active_segment_chain_tips(log_segments_cache, 64 * 1024)
+    crate::shard_wal::rebuild_active_segment_chain_tips(log_segments_cache, 64 * 1024, shard_mem_cache, &[("shard_id", shard_id.to_string())])
         .await
         .map_err(|e| ShardFsyncError::MetablockSerialisationError(format!("chain-tips rebuild after truncate failed: {e:?}")))?;
 
@@ -3295,6 +3329,7 @@ mod tests {
                 &tc.shard_mem_cache,
                 &tc.fsync_coordinator,
                 &tc.watched_aggregates,
+                &tc.summary_cache,
                 &test_codec(),
                 0,
                 [9u8; 32],
@@ -3333,6 +3368,79 @@ mod tests {
                 .expect("summary entry for the aggregate must exist");
             assert_eq!(entry.event_batch_count, 4, "entries 1..=4 summarised, 5..=7 not");
             assert_eq!(entry.last_aggregate_version, 104, "summary must stop at the surviving slice");
+
+            tc.close().await;
+        });
+    }
+
+    /// Truncating onto a sealed ancestor: log ids of the discarded segments are
+    /// REUSED, so their `.summary` sidecars must be deleted (a survivor would
+    /// describe a future segment it never saw and authorize false skips) and
+    /// every affected decoded-cache entry popped, including the re-activated
+    /// ancestor's. The ancestor's accumulator is discarded and tainted: its
+    /// re-seal holds only post-truncate writes and must never authorize skips.
+    #[test]
+    fn truncate_unwind_deletes_sidecars_and_taints_reactivated_summary() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            // Small preallocate so a handful of batches spans three segments.
+            let tc = TestComponents::with_preallocate(
+                &dir,
+                2 * celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES as u64 + 64 * 1024,
+            ).await;
+
+            let mut next = 1u64;
+            while tc.log_segments_cache.active_log_id() < 3 {
+                apply_deferred_live_batch(&tc, next, next + 9).await;
+                next += 10;
+            }
+
+            // Sidecar files on disk and decoded-cache entries for every id.
+            let stub = Rc::new(celeriant_wal::segment_summary::SegmentSummaryPayload {
+                orgs: vec![],
+                aggregate_types: vec![],
+                aggregates: vec![],
+                complete: true,
+                aggregate_bloom: None,
+                client_bloom: None,
+                schema_bloom: None,
+            });
+            for log_id in 1..=3u64 {
+                std::fs::write(crate::shard_wal_sync::summary_path(&dir, log_id), b"stub").unwrap();
+                tc.summary_cache.borrow_mut().put(log_id, stub.clone());
+            }
+
+            // Divergence at wal_seq 5 → the common ancestor lives in segment 1.
+            truncate_wal(
+                &tc.log_segments_cache,
+                &tc.shard_mem_cache,
+                &tc.fsync_coordinator,
+                &tc.watched_aggregates,
+                &tc.summary_cache,
+                &test_codec(),
+                0,
+                [9u8; 32],
+                1,
+                5,
+                pos_at(5),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(tc.log_segments_cache.active_log_id(), 1, "scaffolding: segment 1 must be re-activated");
+            assert!(!crate::shard_wal_sync::summary_path(&dir, 2).exists(), "discarded id 2's sidecar must be deleted");
+            assert!(!crate::shard_wal_sync::summary_path(&dir, 3).exists(), "discarded id 3's sidecar must be deleted");
+            assert!(crate::shard_wal_sync::summary_path(&dir, 1).exists(), "the ancestor keeps its file until the re-seal overwrites it");
+            for log_id in 1..=3u64 {
+                assert!(!tc.summary_cache.borrow().contains(&log_id), "decoded cache entry for {log_id} must be popped");
+            }
+
+            // Re-seal safety: post-truncate writes fold into a tainted
+            // accumulator, so the eventual sidecar never authorizes skips.
+            tc.shard_mem_cache.borrow_mut().update_segment_summary(&test_metablock(5, [9u8; 32]), pos_at(5));
+            let payload = tc.shard_mem_cache.borrow_mut().take_segment_summary();
+            assert!(!payload.is_empty(), "scaffolding: the re-seal payload must not be empty");
+            assert!(!payload.complete, "a re-sealed post-truncate segment must never authorize summary skips");
 
             tc.close().await;
         });

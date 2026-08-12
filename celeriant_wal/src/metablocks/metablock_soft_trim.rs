@@ -13,3 +13,27 @@ pub struct MetablockSoftTrim {
     pub client_id: u128,
     pub user_id: Option<u128>,
 }
+
+impl MetablockSoftTrim {
+    // Wire format layout (bincode fixed-int encoding)
+    // Update these if field order or types change!
+
+    const WIRE_SIZE_AGGREGATE_KEY: usize = AggregateKey::WIRE_SIZE_TOTAL;
+    const WIRE_SIZE_KEEP_FROM_AGGREGATE_VERSION: usize = 8;
+    const WIRE_SIZE_AGGREGATE_VERSION: usize = 8;
+    const WIRE_SIZE_EVENT_SEQ: usize = 8;
+
+    pub const OFFSET_AGGREGATE_KEY: usize = 0;
+
+    pub const OFFSET_KEEP_FROM_AGGREGATE_VERSION: usize =
+        Self::OFFSET_AGGREGATE_KEY + Self::WIRE_SIZE_AGGREGATE_KEY;
+
+    pub const OFFSET_AGGREGATE_VERSION: usize =
+        Self::OFFSET_KEEP_FROM_AGGREGATE_VERSION + Self::WIRE_SIZE_KEEP_FROM_AGGREGATE_VERSION;
+
+    pub const OFFSET_EVENT_SEQ: usize =
+        Self::OFFSET_AGGREGATE_VERSION + Self::WIRE_SIZE_AGGREGATE_VERSION;
+
+    pub const OFFSET_CLIENT_ID: usize =
+        Self::OFFSET_EVENT_SEQ + Self::WIRE_SIZE_EVENT_SEQ;
+}

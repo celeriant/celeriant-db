@@ -5,9 +5,7 @@ pub const FIXED_BLOCK_SIZE_BYTES: usize = 1024;
 #[cfg(feature = "small-metablock")]
 pub const FIXED_BLOCK_SIZE_BYTES: usize = 512;
 
-// Right-sized to the smallest 4096-multiple that holds the serialized header: 256KB aggregate
-// bloom + 128KB client bloom + 2 cursors + scalars + framing = 393,368 B -> 97*4096 = 388KB
-pub const HEADER_BLOCK_SIZE_BYTES: usize = 388 * 1024;
+pub const HEADER_BLOCK_SIZE_BYTES: usize = 4096;
 
 #[cfg(not(feature = "small-metablock"))]
 pub const MINIBATCH_SIZE_BYTES: usize = 718;
@@ -15,9 +13,9 @@ pub const MINIBATCH_SIZE_BYTES: usize = 718;
 pub const MINIBATCH_SIZE_BYTES: usize = 206;
 pub const WIRE_VERSION_WAL_METABLOCK: u32 = 1;
 pub const WIRE_VERSION_WAL_DATABLOCK: u32 = 1;
-pub const WIRE_VERSION_WAL_SHARD_LOG_HEADER: u32 = 1;
+pub const WIRE_VERSION_WAL_SHARD_LOG_HEADER: u32 = 2;
 pub const WIRE_VERSION_S3_FALLBACK_BATCH: u32 = 1;
-pub const WIRE_VERSION_SEGMENT_SUMMARY_BLOCK: u32 = 1;
+pub const WIRE_VERSION_SEGMENT_SUMMARY_BLOCK: u32 = 3;
 pub const WIRE_SIZE_ENUM_DISCRIMINANT: usize = 4;
 pub const FIRST_AGGREGATE_VERSION: u64 = 1;
 /// Per-segment aggregate-key bloom size (256KB split-block; see `celeriant_wal::sbbf`).
@@ -145,6 +143,8 @@ mod tests {
     #[test]
     fn header_block_size_is_4096_aligned() {
         assert_eq!(HEADER_BLOCK_SIZE_BYTES % 4096, 0);
+        // One DMA sector per slot: the whole point of the v2 header split.
+        assert_eq!(HEADER_BLOCK_SIZE_BYTES as u64, MIN_WRITE_ALIGNMENT);
     }
 
     #[test]

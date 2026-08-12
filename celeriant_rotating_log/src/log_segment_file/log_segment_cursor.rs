@@ -56,7 +56,7 @@ impl Default for LogSegmentCursor {
 
 impl LogSegmentCursor {
     pub fn from_shard_log_header_write(log_id: u64, header: &ShardLogHeader) -> Self {
-        Self::from_header_cursor(log_id, &header.write, &header.aggregate_bloom, &header.client_bloom)
+        Self::from_header_cursor(log_id, &header.write)
     }
 
     /// Build a read cursor but sharing the blooms
@@ -72,14 +72,14 @@ impl LogSegmentCursor {
         }
     }
 
-    fn from_header_cursor(log_id: u64, cursor: &HeaderCursor, bloom: &[u64], client_bloom: &[u64]) -> Self {
+    fn from_header_cursor(log_id: u64, cursor: &HeaderCursor) -> Self {
         Self {
             log_id,
             metablocks_position: cursor.metablocks_position,
             datablocks_position: cursor.datablocks_position,
             wal_seq: cursor.wal_seq,
-            aggregate_key_bloom: shared_bloom(AggregateKeyBloom::from_bytes(bloom)),
-            client_id_bloom: shared_bloom(AggregateKeyBloom::from_bytes(client_bloom)),
+            aggregate_key_bloom: shared_bloom(AggregateKeyBloom::absent()),
+            client_id_bloom: shared_bloom(AggregateKeyBloom::absent()),
             tip_hash: cursor.tip_hash,
         }
     }
@@ -101,8 +101,6 @@ impl LogSegmentCursor {
     ) -> ShardLogHeader {
         ShardLogHeader {
             write: self.to_header_cursor(),
-            aggregate_bloom: self.aggregate_key_bloom.borrow().to_bytes(),
-            client_bloom: self.client_id_bloom.borrow().to_bytes(),
             last_received_replication_wal_seq,
             last_self_acked_wal_seq,
             // Zero sentinel: read has not advanced to this segment yet (post-rotation).

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use celeriant_disk::files::read_fixed_records_visit_const::{ReadVisitError, read_fixed_records_visit_const};
 use celeriant_wal::constants::FIXED_BLOCK_SIZE_BYTES;
 use celeriant_wal::{aggregate_key::AggregateKey, constants::HEADER_BLOCK_SIZE_BYTES};
@@ -5,6 +7,15 @@ use celeriant_wire::disk::metablock_bytes;
 
 use crate::errors::scan_error::ScanError;
 use crate::log_segments_cache::LogSegmentsCache;
+
+/// Caller-supplied per-segment knowledge for chain scans
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SegmentHint {
+    /// The target chain has no member in this segment: skip it entirely.
+    Skip,
+    /// The target chain's newest member sits at this absolute position.
+    SeekTo(u64),
+}
 
 /// Scans metablocks in reverse order across all log files.
 /// Starts from the active log and works backwards through older logs.
@@ -28,6 +39,12 @@ pub struct ReverseMetablockScanner<'a> {
     /// metablocks (minimal bytes, best when many aggregates are interleaved); larger
     /// batches consecutive in-window hops (fewer IOs when the chain is dense).
     chain_follow_window: u64,
+    /// Optional per-segment hints for chain scans; segments absent from the map
+    /// scan exactly as without hints. Composes with (runs after) the bloom checks.
+    segment_hints: Option<&'a HashMap<u64, SegmentHint>>,
+    /// Oldest log_id to visit (default 1). Callers driving a per-segment loop set
+    /// it to the starting log_id so one scanner covers exactly one segment.
+    min_log_id: u64,
 }
 
 impl<'a> ReverseMetablockScanner<'a> {
@@ -42,7 +59,23 @@ impl<'a> ReverseMetablockScanner<'a> {
             use_write_cursor: false,
             chain_aggregate_key: None,
             chain_follow_window: FIXED_BLOCK_SIZE_BYTES as u64,
+            segment_hints: None,
+            min_log_id: 1,
         }
+    }
+
+    /// Stop after scanning down to `min_log_id` instead of log 1.
+    #[must_use]
+    pub fn with_min_log_id(mut self, min_log_id: u64) -> Self {
+        self.min_log_id = min_log_id.max(1);
+        self
+    }
+
+    /// Attach per-segment hints for chain scans (see [`SegmentHint`]).
+    #[must_use]
+    pub fn with_segment_hints(mut self, hints: &'a HashMap<u64, SegmentHint>) -> Self {
+        self.segment_hints = Some(hints);
+        self
     }
 
     #[must_use]
@@ -98,7 +131,7 @@ impl<'a> ReverseMetablockScanner<'a> {
 
         let chain_key = self.chain_aggregate_key.clone();
 
-        while self.current_log_id >= 1 {
+        while self.current_log_id >= self.min_log_id {
             let result = match &chain_key {
                 Some(key) => self.scan_chain_single_log(&mut visitor, override_end, key).await?,
                 None => self.scan_single_log(&mut visitor, override_end).await?,
@@ -109,7 +142,7 @@ impl<'a> ReverseMetablockScanner<'a> {
                 return Ok(Some(found));
             }
 
-            if self.current_log_id == 1 {
+            if self.current_log_id == self.min_log_id {
                 break;
             }
             self.current_log_id -= 1;
@@ -246,21 +279,55 @@ impl<'a> ReverseMetablockScanner<'a> {
             return Ok(None);
         }
 
+        let hint = self.segment_hints.and_then(|h| h.get(&log_id)).copied();
+        if hint == Some(SegmentHint::Skip) {
+            metrics::counter!("celeriant_read_segment_hint_skip_total").increment(1);
+            return Ok(None);
+        }
+
         let guard = log_segment_file.lock_reader("scan_chain_single_log").await?;
         let dma_file = guard.as_ref().ok_or(ScanError::NoFileHandle { log_id })?;
 
-        // Locate the aggregate's newest metablock in this segment (bloom may be a
-        // false positive, in which case there is none and we fall through to older).
-        let Some(mut pos) = self.find_first_chain_member(dma_file, log_id, start, end, key).await? else {
+        let window = self.chain_follow_window;
+        let mut win_start = 0u64;
+        let mut win: Option<glommio::io::ReadResult> = None;
+
+        // Try the hinted seek target first: verify the block belongs to this chain
+        // (a compaction may have moved blocks since the hint was computed — the
+        // block then at-or-below the old tip position can only be foreign, never an
+        // older member of the same chain, so a mismatch is detectable and safe).
+        // The verifying read seeds the follow window below, costing no extra IO.
+        let mut pos: Option<u64> = None;
+        if let Some(SegmentHint::SeekTo(hint_pos)) = hint {
+            if hint_pos >= start && hint_pos.checked_add(FIXED_BLOCK_SIZE_BYTES as u64).is_some_and(|e| e <= end) {
+                let buf = dma_file.read_at(hint_pos, FIXED_BLOCK_SIZE_BYTES).await.map_err(|e| ScanError::Io {
+                    log_id,
+                    source: e.to_string(),
+                })?;
+                let block: &[u8; FIXED_BLOCK_SIZE_BYTES] = buf[..FIXED_BLOCK_SIZE_BYTES].try_into().unwrap();
+                if metablock_bytes::read_chain_aggregate_key(block).as_ref() == Some(key) {
+                    metrics::counter!("celeriant_read_segment_hint_seek_total").increment(1);
+                    win_start = hint_pos;
+                    win = Some(buf);
+                    pos = Some(hint_pos);
+                }
+            }
+        }
+
+        // No (usable) hint: locate the aggregate's newest metablock by reverse scan
+        // (bloom may be a false positive, in which case there is none and we fall
+        // through to older segments).
+        let resolved = match pos {
+            Some(p) => Some(p),
+            None => self.find_first_chain_member(dma_file, log_id, start, end, key).await?,
+        };
+        let Some(mut pos) = resolved else {
             return Ok(None);
         };
 
         // Follow backlinks. A window covers in-range hops without re-reading (dense
         // chains); jumps beyond it read a fresh window, skipping interleaved foreign
         // metablocks. Window size trades bytes-read against IO count (see builder).
-        let window = self.chain_follow_window;
-        let mut win_start = 0u64;
-        let mut win: Option<glommio::io::ReadResult> = None;
         loop {
             let covered = matches!(&win, Some(buf)
                 if pos >= win_start && pos + FIXED_BLOCK_SIZE_BYTES as u64 <= win_start + buf.len() as u64);
@@ -802,6 +869,185 @@ mod tests {
             let seen = collect_chain(&h, &target, FIXED_BLOCK_SIZE_BYTES as u64).await;
             let versions: Vec<u64> = seen.iter().map(|(_, _, v)| *v).collect();
             assert_eq!(versions, vec![2], "out-of-range backlink stops the walk; v1 not reached");
+        });
+    }
+
+    // ── Segment hints (chain scans) ──
+
+    use super::SegmentHint;
+
+    /// A `Skip` hint suppresses the segment entirely — the segment's chain
+    /// members are not visited, older segments still are.
+    #[test]
+    fn hint_skip_suppresses_segment_but_not_older_ones() {
+        glommio_test!({
+            let mut h = Harness::new().await;
+            let target = key(1, 1, 1);
+
+            h.write_version(&target, 1).await;
+            let old_log = h.active_log_id();
+            h.rotate().await;
+            h.write_version(&target, 2).await;
+            let new_log = h.active_log_id();
+            h.commit().await;
+
+            let hints = HashMap::from([(new_log, SegmentHint::Skip)]);
+            let mut seen: Vec<(u64, u64)> = Vec::new();
+            h.scanner(None)
+                .with_aggregate_chain(target.clone(), FIXED_BLOCK_SIZE_BYTES as u64)
+                .with_segment_hints(&hints)
+                .scan::<(), ()>(|log_id, _, block| {
+                    seen.push((log_id, block_version(block)));
+                    Ok(None)
+                })
+                .await
+                .unwrap();
+            assert_eq!(seen, vec![(old_log, 1)], "hinted segment skipped, older segment still walked");
+        });
+    }
+
+    /// A valid `SeekTo` hint starts the chain walk at the hinted block: the
+    /// find-first reverse hunt over newer foreign blocks never runs, and the
+    /// visited set equals the unhinted walk's.
+    #[test]
+    fn hint_seek_to_visits_same_chain_as_full_walk() {
+        glommio_test!({
+            let mut h = Harness::new().await;
+            let target = key(1, 1, 1);
+            let foreign = key(1, 1, 999);
+
+            h.write_version(&target, 1).await;
+            for _ in 0..5 {
+                h.write_foreign(&foreign).await;
+            }
+            let tip = h.write_version(&target, 2).await;
+            for _ in 0..5 {
+                h.write_foreign(&foreign).await;
+            }
+            h.commit().await;
+
+            let unhinted = collect_chain(&h, &target, FIXED_BLOCK_SIZE_BYTES as u64).await;
+
+            let hints = HashMap::from([(h.active_log_id(), SegmentHint::SeekTo(tip))]);
+            let mut hinted: Vec<(u64, u64, u64)> = Vec::new();
+            h.scanner(None)
+                .with_aggregate_chain(target.clone(), FIXED_BLOCK_SIZE_BYTES as u64)
+                .with_segment_hints(&hints)
+                .scan::<(), ()>(|log_id, pos, block| {
+                    hinted.push((log_id, pos, block_version(block)));
+                    Ok(None)
+                })
+                .await
+                .unwrap();
+            assert_eq!(hinted, unhinted, "seek hint must visit exactly the chain the full walk visits");
+        });
+    }
+
+    /// A stale `SeekTo` pointing at a foreign block (compaction moved blocks)
+    /// must fall back to the full reverse hunt — never silently miss the chain.
+    #[test]
+    fn hint_seek_to_foreign_block_falls_back_to_full_hunt() {
+        glommio_test!({
+            let mut h = Harness::new().await;
+            let target = key(1, 1, 1);
+            let foreign = key(1, 1, 999);
+
+            h.write_version(&target, 1).await;
+            let foreign_pos = h.write_foreign(&foreign).await;
+            h.write_version(&target, 2).await;
+            h.commit().await;
+
+            let hints = HashMap::from([(h.active_log_id(), SegmentHint::SeekTo(foreign_pos))]);
+            let mut versions: Vec<u64> = Vec::new();
+            h.scanner(None)
+                .with_aggregate_chain(target.clone(), FIXED_BLOCK_SIZE_BYTES as u64)
+                .with_segment_hints(&hints)
+                .scan::<(), ()>(|_, _, block| {
+                    versions.push(block_version(block));
+                    Ok(None)
+                })
+                .await
+                .unwrap();
+            assert_eq!(versions, vec![2, 1], "stale hint must degrade to the full hunt, not a miss");
+        });
+    }
+
+    /// An out-of-range `SeekTo` (past the readable end / below the region start)
+    /// is ignored: full hunt as today.
+    #[test]
+    fn hint_seek_to_out_of_range_falls_back() {
+        glommio_test!({
+            let mut h = Harness::new().await;
+            let target = key(1, 1, 1);
+            h.write_version(&target, 1).await;
+            h.commit().await;
+
+            for bad in [7u64, u64::MAX - FIXED_BLOCK_SIZE_BYTES as u64] {
+                let hints = HashMap::from([(h.active_log_id(), SegmentHint::SeekTo(bad))]);
+                let mut versions: Vec<u64> = Vec::new();
+                h.scanner(None)
+                    .with_aggregate_chain(target.clone(), FIXED_BLOCK_SIZE_BYTES as u64)
+                    .with_segment_hints(&hints)
+                    .scan::<(), ()>(|_, _, block| {
+                        versions.push(block_version(block));
+                        Ok(None)
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(versions, vec![1], "out-of-range hint {bad} must not break the walk");
+            }
+        });
+    }
+
+    /// Segments without a hint entry scan exactly as before.
+    #[test]
+    fn absent_hint_entry_scans_normally() {
+        glommio_test!({
+            let mut h = Harness::new().await;
+            let target = key(1, 1, 1);
+            h.write_version(&target, 1).await;
+            h.write_version(&target, 2).await;
+            h.commit().await;
+
+            let hints: HashMap<u64, SegmentHint> = HashMap::new();
+            let mut versions: Vec<u64> = Vec::new();
+            h.scanner(None)
+                .with_aggregate_chain(target.clone(), FIXED_BLOCK_SIZE_BYTES as u64)
+                .with_segment_hints(&hints)
+                .scan::<(), ()>(|_, _, block| {
+                    versions.push(block_version(block));
+                    Ok(None)
+                })
+                .await
+                .unwrap();
+            assert_eq!(versions, vec![2, 1]);
+        });
+    }
+
+    /// A scanner bounded to its starting segment must not descend into older
+    /// segments (the per-segment dedup consult drives one scanner per segment).
+    #[test]
+    fn min_log_id_bounds_the_scan_to_one_segment() {
+        glommio_test!({
+            let mut h = Harness::new().await;
+            let target = key(1, 1, 1);
+            h.write_version(&target, 1).await;
+            h.rotate().await;
+            h.write_version(&target, 2).await;
+            h.commit().await;
+
+            let top = h.active_log_id();
+            let mut seen: Vec<(u64, u64)> = Vec::new();
+            h.scanner(None)
+                .with_aggregate_chain(target.clone(), FIXED_BLOCK_SIZE_BYTES as u64)
+                .with_min_log_id(top)
+                .scan::<(), ()>(|log_id, _, block| {
+                    seen.push((log_id, block_version(block)));
+                    Ok(None)
+                })
+                .await
+                .unwrap();
+            assert_eq!(seen, vec![(top, 2)], "the bounded scan must stop at its own segment");
         });
     }
 

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use celeriant_wal::segment_summary::segment_summary_payload::SegmentSummaryPayload;
 use tracing::{debug, error};
 
 use celeriant_distributed::node_status::NodeStatus;
@@ -19,7 +20,6 @@ use celeriant_rotating_log::log_segment_file::log_segment_file_metadata::LogSegm
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_wal::constants::{self, EntryHashBytes, FIRST_AGGREGATE_VERSION, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, MIN_WRITE_ALIGNMENT, WIRE_VERSION_SEGMENT_SUMMARY_BLOCK, WIRE_VERSION_WAL_METABLOCK};
 use celeriant_wire::codec::compression::DictCodec;
-use celeriant_wal::segment_summary::{SegmentSummaryBlock, SegmentSummaryPayload};
 
 use celeriant_wal::aggregate_client_key::client_id_bloom_hash;
 use celeriant_wal::aggregate_key::AggregateKey;
@@ -114,16 +114,18 @@ pub(crate) async fn commit_fsync_with_rollback(
         }
 
         if commit_target == CommitTarget::FullCommit {
-            // Full commit: summary is complete, write sidecar now.
+            // Full commit: summary is complete, write sidecar now (the active
+            // segment is still the sealing one — its cursor holds the blooms).
             write_segment_summary_sidecar(
-                log_segments_cache.shard_dir(),
+                &log_segments_cache,
                 log_segments_cache.active_log_id(),
                 &shard_mem_cache,
             ).await?;
         } else {
             // Deferred commit: the summary is incomplete until the deferred
             // read-side commit drains. Snapshot the accumulator for the sealed
-            // segment; the post-commit sweep writes the sidecar.
+            // segment; the post-commit sweep builds the right-sized segment
+            // blooms from its exact key knowledge and writes the sidecar.
             let old_log_id = log_segments_cache.active_log_id();
             shard_mem_cache.borrow_mut().store_sealed_segment_summary(old_log_id);
         }
@@ -132,6 +134,11 @@ pub(crate) async fn commit_fsync_with_rollback(
             .rotate_to_next_log()
             .await
             .map_err(ShardFsyncError::UnableToRotateToNewLogSegmentFile)?;
+        // Rotation visible: the drained accumulator now describes the new
+        // active segment, so the schema-absence consult may trust it again.
+        // (Both seal branches above drained it, which latched the consult to
+        // maybe-present for the parked-await window.)
+        shard_mem_cache.borrow_mut().note_active_segment_rotated();
     }
 
     let active_log_segment = log_segments_cache.active();
@@ -234,7 +241,7 @@ fn commit_sync(
         }
 
         if commit_target == CommitTarget::FullCommit {
-            shard_mem_cache.update_segment_summary(&queue_item.metablock);
+            shard_mem_cache.update_segment_summary(&queue_item.metablock, queue_item.metablock_absolute_pos);
         }
 
         match &queue_item.metablock.wal_metablock_type {
@@ -544,14 +551,21 @@ pub(crate) async fn sync(
                 log_segment_file_metadata.write.aggregate_key_bloom.borrow_mut().insert(&event_batch.aggregate_key);
                 log_segment_file_metadata.write.client_id_bloom.borrow_mut().insert_hash(client_id_bloom_hash(event_batch.client_id));
             }
-            MetablockKind::SchemaRegistration(schema_reg) => {
-                log_segment_file_metadata.write.aggregate_key_bloom.borrow_mut().insert_hash(schema_reg.schema_key.bloom_hash());
-            }
+            // Schema keys live in the per-segment schema set (fed at commit and
+            // by the open-time rebuild), never in the aggregate bloom: aggregate
+            // blooms answer aggregate questions only, and mixing the two hash
+            // domains is what made schema-absence checks unable to skip segments.
+            MetablockKind::SchemaRegistration(_) => {}
+            // Delete/trim carry a client_id too: every aggregate-scoped client-bearing
+            // kind lands in the client bloom, or a tombstone-only client makes it a
+            // subset (false "absent"). SchemaRegistration touches no aggregate: exempt.
             MetablockKind::SoftDelete(soft_delete) => {
                 log_segment_file_metadata.write.aggregate_key_bloom.borrow_mut().insert(&soft_delete.aggregate_key);
+                log_segment_file_metadata.write.client_id_bloom.borrow_mut().insert_hash(client_id_bloom_hash(soft_delete.client_id));
             }
             MetablockKind::SoftTrim(soft_trim) => {
                 log_segment_file_metadata.write.aggregate_key_bloom.borrow_mut().insert(&soft_trim.aggregate_key);
+                log_segment_file_metadata.write.client_id_bloom.borrow_mut().insert_hash(client_id_bloom_hash(soft_trim.client_id));
             }
         }
     }
@@ -648,15 +662,36 @@ pub(crate) fn summary_path(shard_dir: &Path, log_id: u64) -> PathBuf {
 pub(crate) async fn write_segment_summary_sidecar_from_payload(
     shard_dir: &Path,
     log_id: u64,
-    payload: SegmentSummaryPayload,
+    mut payload: SegmentSummaryPayload,
 ) -> Result<(), ShardFsyncError> {
     if payload.is_empty() {
-        return Ok(());
+        // No file for an empty segment — but a STALE file must not survive it
+        // (a truncated-then-reused id re-sealing empty would otherwise leave
+        // the old segment's complete sidecar answering for the new one).
+        let path = summary_path(shard_dir, log_id);
+        return match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(ShardFsyncError::SegmentSummarySidecarWriteError(
+                format!("failed to delete stale sidecar for empty segment: {e}"),
+            )),
+        };
     }
 
-    let block = SegmentSummaryBlock { payload };
-    let serialized = serialize_versioned_message_heap(&block, WIRE_VERSION_SEGMENT_SUMMARY_BLOCK)
+    // Cap AFTER the blooms are attached so the bound covers the real file size.
+    let dropped = payload.trim_out_client_sets();
+    if dropped > 0 {
+        metrics::counter!("celeriant_segment_summary_client_sets_dropped_total").increment(dropped as u64);
+    }
+
+    let aggregate_count = payload.aggregates.len();
+    let serialized = serialize_versioned_message_heap(&payload, WIRE_VERSION_SEGMENT_SUMMARY_BLOCK)
         .map_err(|e| ShardFsyncError::SegmentSummarySidecarWriteError(e.to_string()))?;
+
+    // Seal-time observability (gauges, deliberately not histograms — the global
+    // buckets are seconds-scaled): most recent sealed summary's size and width.
+    metrics::gauge!("celeriant_segment_summary_last_bytes").set(serialized.len() as f64);
+    metrics::gauge!("celeriant_segment_summary_last_aggregates").set(aggregate_count as f64);
 
     let path = summary_path(shard_dir, log_id);
     let file = glommio::io::BufferedFile::create(&path)
@@ -672,13 +707,22 @@ pub(crate) async fn write_segment_summary_sidecar_from_payload(
     Ok(())
 }
 
+/// FullCommit seal: the accumulator drain builds the right-sized segment blooms
+/// from its exact key knowledge — the fixed-size live cursor blooms stay
+/// in-memory only.
 async fn write_segment_summary_sidecar(
-    shard_dir: &Path,
+    log_segments_cache: &Rc<LogSegmentsCache>,
     log_id: u64,
     shard_mem_cache: &Rc<RefCell<MemCache>>,
 ) -> Result<(), ShardFsyncError> {
     let payload = shard_mem_cache.borrow_mut().take_segment_summary();
-    write_segment_summary_sidecar_from_payload(shard_dir, log_id, payload).await
+    let result = write_segment_summary_sidecar_from_payload(log_segments_cache.shard_dir(), log_id, payload).await;
+    if result.is_err() {
+        // Drained but never landed: whatever this still-active segment seals
+        // with later is a subset. Retaint so it can't authorize skips.
+        shard_mem_cache.borrow_mut().mark_segment_summary_incomplete();
+    }
+    result
 }
 
 #[cfg(test)]
@@ -884,7 +928,7 @@ mod tests {
         let (tmp, dir) = test_dir();
         let lsc = Rc::new(LogSegmentsCache::ready_up(dir, 4 * 1024 * 1024, 4, 0).await.unwrap());
         let smc = Rc::new(RefCell::new(
-            MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
+            MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 64 * 1024 * 1024)
         ));
         let watched = Rc::new(AggregateWatchers::new());
         let log_segment = lsc.active();
@@ -913,6 +957,49 @@ mod tests {
 
     fn deferred_follower_commit_sync(t: &TestShard) {
         run_commit_sync(t, NodeStatus::Follower { leader_lease_epoch: 1 }, CommitTarget::DeferToLeaderConfirmed);
+    }
+
+    /// An empty re-seal (e.g. a truncated-then-reused id whose new life holds
+    /// no aggregates) must remove the previous incarnation's sidecar, not
+    /// leave it answering for the new segment.
+    #[test]
+    fn empty_payload_deletes_stale_sidecar() {
+        glommio_test!({
+            let t = test_shard().await;
+            let k = AggregateKey::new(1, 1, 1);
+            t.smc.borrow_mut().update_segment_summary(&event_batch_metablock(k, 1, 5), HEADER_BLOCK_SIZE_BYTES as u64);
+            write_segment_summary_sidecar(&t.lsc, 1, &t.smc).await.unwrap();
+            let path = summary_path(t.lsc.shard_dir(), 1);
+            assert!(path.exists(), "scaffolding: first seal must write the sidecar");
+
+            // Accumulator drained by the write above: the next call is an empty re-seal.
+            write_segment_summary_sidecar(&t.lsc, 1, &t.smc).await.unwrap();
+            assert!(!path.exists(), "an empty re-seal must delete the stale sidecar");
+        });
+    }
+
+    /// A failed sidecar write after the accumulator drained leaves the segment
+    /// active with a hole in its summary state. If a later commit re-seals it
+    /// as complete, the sidecar is a subset and can authorize false skips.
+    #[test]
+    fn sidecar_write_failure_retaints_the_accumulator() {
+        glommio_test!({
+            let t = test_shard().await;
+            let k = AggregateKey::new(1, 1, 1);
+            t.smc.borrow_mut().update_segment_summary(&event_batch_metablock(k, 1, 5), HEADER_BLOCK_SIZE_BYTES as u64);
+
+            // Poison the sidecar path: a directory named log_1.summary makes create fail.
+            std::fs::create_dir_all(summary_path(t.lsc.shard_dir(), 1)).unwrap();
+
+            let result = write_segment_summary_sidecar(&t.lsc, 1, &t.smc).await;
+            assert!(result.is_err(), "scaffolding: the poisoned path must fail the write");
+
+            assert!(
+                !t.smc.borrow_mut().take_segment_summary().complete,
+                "a drained-but-unwritten summary must retaint the accumulator so a \
+                 later seal cannot claim completeness over the lost entries"
+            );
+        });
     }
 
     /// FullCommit (standalone / catchup) commits the read side at fsync: the
@@ -1163,18 +1250,95 @@ mod tests {
     #[test]
     fn empty_segment_no_summary_written() {
         glommio_test!({
-            let (_tmp, dir) = test_dir();
-            std::fs::create_dir_all(&dir).unwrap();
-
-            let smc = Rc::new(RefCell::new(
-                MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
-            ));
+            let t = test_shard().await;
 
             // No writes → empty segment summary → no file should be created
-            write_segment_summary_sidecar(&dir, 1, &smc).await.unwrap();
+            write_segment_summary_sidecar(&t.lsc, 1, &t.smc).await.unwrap();
 
-            let path = summary_path(&dir, 1);
+            let path = summary_path(t.lsc.shard_dir(), 1);
             assert!(!path.exists(), "empty segment should not produce a .summary file");
+
+            t.lsc.close().await;
+        });
+    }
+
+    /// The sealed sidecar must carry the segment's blooms at seal — right-sized
+    /// from the accumulator's true cardinality (one 32-byte block here), `Some`
+    /// even for a sparsely-written segment, and answering exactly like the fixed
+    /// in-memory bloom for the same keys. `None` is reserved for the degrade
+    /// path ("no bloom"), never written at a complete seal.
+    #[test]
+    fn sidecar_written_at_seal_carries_sized_segment_blooms() {
+        glommio_test!({
+            use celeriant_wal::sbbf;
+            let t = test_shard().await;
+            let k = AggregateKey::new(1, 1, 1);
+
+            t.smc.borrow_mut().add_to_pending_queue(vec![
+                queue_item(event_batch_metablock(k.clone(), 1, 5)),
+            ]);
+            let mut snapshot = t.smc.borrow_mut().take_sync_positions_snapshot();
+            let new_metadata = sync(t.log_segment.clone(), &mut snapshot, CommitTarget::FullCommit).await.unwrap();
+            *t.log_segment.metadata.borrow_mut() = new_metadata;
+            t.smc.borrow_mut().update_segment_summary(&event_batch_metablock(k.clone(), 1, 5), 4096);
+
+            write_segment_summary_sidecar(&t.lsc, t.lsc.active_log_id(), &t.smc).await.unwrap();
+
+            let payload = crate::shard_wal::read_segment_summary(t.lsc.shard_dir(), t.lsc.active_log_id()).await
+                .expect("sidecar must exist");
+            let agg_words = payload.aggregate_bloom.expect("complete seal must persist an aggregate bloom");
+            let client_words = payload.client_bloom.expect("complete seal must persist a client bloom");
+            assert_eq!(agg_words.len() * 8, 32, "one aggregate sizes to a single SBBF block, not 256 KiB");
+            assert_eq!(client_words.len() * 8, 32, "one client sizes to a single SBBF block, not 128 KiB");
+            // Answers must match the live fixed-size bloom for the same keys:
+            // member present in both, non-member absent in both.
+            let live = t.log_segment.metadata.borrow().write.aggregate_key_bloom.borrow().clone();
+            assert!(sbbf::contains(&agg_words, k.bloom_hash()) && live.may_contain(&k));
+            let other = AggregateKey::new(9, 9, 9);
+            assert!(!sbbf::contains(&agg_words, other.bloom_hash()) && !live.may_contain(&other));
+
+            t.lsc.close().await;
+        });
+    }
+
+    /// The 4 MiB cap is enforced at write time, AFTER the blooms attach: a
+    /// payload that only overflows once the ~384 KiB of segment blooms are
+    /// counted must still shed client sets so the on-disk file honors the
+    /// documented bound. Blooms and entries are never dropped.
+    #[test]
+    fn sidecar_write_caps_payload_including_bloom_bytes() {
+        glommio_test!({
+            use celeriant_wal::aggregate_type_key::AggregateTypeKey;
+            use celeriant_wal::constants::{AGGREGATE_BLOOM_BYTES, CLIENT_BLOOM_BYTES};
+            use celeriant_wal::segment_summary::{ClientSet, SegmentAggregateEntry, SegmentSummaryPayload, SUMMARY_PAYLOAD_MAX_BYTES};
+
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("shard");
+            std::fs::create_dir_all(&dir).unwrap();
+
+            let mut entry = SegmentAggregateEntry::new(1, 2, 3);
+            entry.newest_metablock_pos = 4096;
+            // Sized to fit the cap on its own; only the blooms push it over.
+            entry.client_set = ClientSet::Bloom(vec![0u64; (SUMMARY_PAYLOAD_MAX_BYTES / 8) as usize - 30_000]);
+            let payload = SegmentSummaryPayload {
+                orgs: vec![1],
+                aggregate_types: vec![AggregateTypeKey::new(1, 2)],
+                aggregates: vec![entry],
+                complete: true,
+                aggregate_bloom: Some(vec![0u64; AGGREGATE_BLOOM_BYTES / 8]),
+                client_bloom: Some(vec![0u64; CLIENT_BLOOM_BYTES / 8]),
+                schema_bloom: None,
+            };
+            let bloom_bytes = 2 * 8 + (AGGREGATE_BLOOM_BYTES + CLIENT_BLOOM_BYTES) as u64;
+            assert!(payload.wire_size() - bloom_bytes <= SUMMARY_PAYLOAD_MAX_BYTES, "scaffolding: under the cap without blooms");
+            assert!(payload.wire_size() > SUMMARY_PAYLOAD_MAX_BYTES, "scaffolding: over the cap with blooms");
+
+            write_segment_summary_sidecar_from_payload(&dir, 1, payload).await.unwrap();
+
+            let decoded = crate::shard_wal::read_segment_summary(&dir, 1).await.expect("sidecar must decode");
+            assert!(decoded.wire_size() <= SUMMARY_PAYLOAD_MAX_BYTES, "the on-disk payload must honor the cap including bloom bytes");
+            assert_eq!(decoded.aggregates[0].client_set, ClientSet::Unknown, "the client set pays for the overflow");
+            assert!(decoded.aggregate_bloom.is_some() && decoded.client_bloom.is_some(), "blooms are never dropped");
         });
     }
 }

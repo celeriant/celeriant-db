@@ -21,6 +21,7 @@ use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_wal::metablocks::metablock_soft_delete::MetablockSoftDelete;
 use celeriant_wal::metablocks::metablock_soft_trim::MetablockSoftTrim;
 use celeriant_wal::schema_key::SchemaKey;
+use celeriant_wal::segment_summary::client_set::ClientSet;
 use celeriant_wal::shard_log_header::{HeaderCursor, ShardLogHeader};
 
 // ── Helpers ──
@@ -45,6 +46,7 @@ fn cache_with(
         agg_write_snap_bytes,
         agg_client_snap_bytes,
         4 * 1024 * 1024, // schema_cache_bytes
+        2 * 1024 * 1024, // negative_lookup_cache_bytes
         internode_max_request_size,
     )
 }
@@ -127,8 +129,6 @@ fn test_pending_commit_data() -> PendingCommitData {
     };
     let header = ShardLogHeader {
         write: cursor.clone(),
-        aggregate_bloom: celeriant_rotating_log::log_segment_file::aggregate_key_bloom::AggregateKeyBloom::new().to_bytes(),
-        client_bloom: celeriant_rotating_log::log_segment_file::aggregate_key_bloom::AggregateKeyBloom::with_capacity_bytes(celeriant_wal::constants::CLIENT_BLOOM_BYTES).to_bytes(),
         last_received_replication_wal_seq: 0,
         last_self_acked_wal_seq: 0,
         read: cursor,
@@ -1582,7 +1582,7 @@ fn sealed_slot_stored_when_empty_routes_late_commits_to_sealed_segment() {
 
     // A deferred commit for segment 1 drains after the rotation.
     let mb = test_metablock(agg(1, 1, 1), 1, 5, 100, 1);
-    c.update_segment_summary_for_log(1, &mb);
+    c.update_segment_summary_for_log(1, 2, &mb, 0);
 
     assert!(
         c.peek_segment_summary().is_empty(),
@@ -1918,6 +1918,70 @@ fn fsync_rollback_clears_all_schema_state() {
     assert!(!c.schema_is_pending(&sk(3, 0)));
 }
 
+/// Tiny schema caps (2 entries each) so LRU eviction is drivable in a test.
+fn cache_tiny_schema() -> ShardMemCache<StubValidator> {
+    ShardMemCache::new(64 * 1024, 64 * 1024, 64 * 1024, 400, 2 * 1024 * 1024, 1024 * 1024)
+}
+
+/// Register-then-scan race: the absence scan's no_schema conclusion arrives
+/// AFTER a concurrent registration already populated schema_cache (the scan's
+/// WAL snapshot predates the registration's blocks). The no_schema insert must
+/// yield — otherwise it outlives the Validated entry's LRU eviction and
+/// `schema_cache_contains` silently skips validation forever.
+#[test]
+fn no_schema_insert_yields_to_existing_schema_entry() {
+    let mut c = cache_tiny_schema();
+    let key = sk(1, 0);
+    c.schema_cache_insert(key.clone(), stub_cached_schema());
+    c.no_schema_cache_insert(key.clone());
+
+    assert!(c.schema_cache_has_schema(&key), "the registration is authoritative");
+
+    // LRU-evict the Validated entry; a shadowed no_schema entry would now answer.
+    c.schema_cache_insert(sk(2, 0), stub_cached_schema());
+    c.schema_cache_insert(sk(3, 0), stub_cached_schema());
+    assert!(!c.schema_cache_has_schema(&key), "scaffolding: eviction happened");
+    assert!(
+        !c.schema_cache_contains(&key),
+        "stale no_schema shadowed the evicted registration — validation would be silently skipped"
+    );
+}
+
+/// Scan-then-register: the absence conclusion lands first, the registration
+/// commits after. The registration pops the stale no_schema entry, and no
+/// later eviction may resurrect it.
+#[test]
+fn schema_insert_pops_stale_no_schema_entry() {
+    let mut c = cache_tiny_schema();
+    let key = sk(1, 0);
+    c.no_schema_cache_insert(key.clone());
+    assert!(c.schema_cache_contains(&key) && !c.schema_cache_has_schema(&key), "scaffolding: absence cached");
+
+    c.schema_cache_insert(key.clone(), stub_cached_schema());
+    assert!(c.schema_cache_has_schema(&key));
+
+    c.schema_cache_insert(sk(2, 0), stub_cached_schema());
+    c.schema_cache_insert(sk(3, 0), stub_cached_schema());
+    assert!(!c.schema_cache_has_schema(&key), "scaffolding: eviction happened");
+    assert!(
+        !c.schema_cache_contains(&key),
+        "evicting the registration resurrected the pre-registration no_schema conclusion"
+    );
+}
+
+/// A NotYetLoaded warmup placeholder is still proof a registration block
+/// exists on disk — the absence insert must yield to it too.
+#[test]
+fn no_schema_insert_yields_to_not_yet_loaded_placeholder() {
+    let mut c = cache_tiny_schema();
+    let key = sk(1, 0);
+    c.schema_cache_insert(key.clone(), CachedSchema::NotYetLoaded);
+    c.no_schema_cache_insert(key.clone());
+    c.schema_cache_insert(sk(2, 0), stub_cached_schema());
+    c.schema_cache_insert(sk(3, 0), stub_cached_schema());
+    assert!(!c.schema_cache_contains(&key), "no_schema must not shadow a placeholder for an on-disk registration");
+}
+
 #[test]
 fn schema_compilation_failed_counts_as_has_schema() {
     let mut c = cache();
@@ -2101,8 +2165,8 @@ fn st_metablock(key: AggregateKey, keep_from: u64) -> Metablock {
 fn segment_summary_tracks_event_batch() {
     let mut c = cache();
     let key = agg(1, 2, 3);
-    c.update_segment_summary(&eb_metablock(key.clone(), 1, 1000));
-    c.update_segment_summary(&eb_metablock(key.clone(), 2, 2000));
+    c.update_segment_summary(&eb_metablock(key.clone(), 1, 1000), 0);
+    c.update_segment_summary(&eb_metablock(key.clone(), 2, 2000), 0);
 
     let summary = c.peek_segment_summary();
     let entry = summary.get(&key).unwrap();
@@ -2118,8 +2182,8 @@ fn segment_summary_tracks_event_batch() {
 fn segment_summary_soft_delete_resets_counts() {
     let mut c = cache();
     let key = agg(1, 2, 3);
-    c.update_segment_summary(&eb_metablock(key.clone(), 1, 1000));
-    c.update_segment_summary(&sd_metablock(key.clone()));
+    c.update_segment_summary(&eb_metablock(key.clone(), 1, 1000), 0);
+    c.update_segment_summary(&sd_metablock(key.clone()), 0);
 
     let summary = c.peek_segment_summary();
     let entry = summary.get(&key).unwrap();
@@ -2133,8 +2197,8 @@ fn segment_summary_soft_delete_resets_counts() {
 fn segment_summary_soft_trim_updates_trimmed_below_version() {
     let mut c = cache();
     let key = agg(1, 2, 3);
-    c.update_segment_summary(&eb_metablock(key.clone(), 1, 1000));
-    c.update_segment_summary(&st_metablock(key.clone(), 5));
+    c.update_segment_summary(&eb_metablock(key.clone(), 1, 1000), 0);
+    c.update_segment_summary(&st_metablock(key.clone(), 5), 0);
 
     let entry = c.peek_segment_summary().get(&key).unwrap();
     assert_eq!(entry.min_aggregate_version, 5);
@@ -2144,7 +2208,7 @@ fn segment_summary_soft_trim_updates_trimmed_below_version() {
 fn segment_summary_soft_trim_ignored_for_unknown_aggregate() {
     let mut c = cache();
     let key = agg(1, 2, 3);
-    c.update_segment_summary(&st_metablock(key.clone(), 5));
+    c.update_segment_summary(&st_metablock(key.clone(), 5), 0);
     assert!(c.peek_segment_summary().is_empty());
 }
 
@@ -2153,8 +2217,8 @@ fn take_segment_summary_returns_and_clears() {
     let mut c = cache();
     let k1 = agg(1, 2, 3);
     let k2 = agg(1, 4, 5);
-    c.update_segment_summary(&eb_metablock(k1, 1, 1000));
-    c.update_segment_summary(&eb_metablock(k2, 1, 1000));
+    c.update_segment_summary(&eb_metablock(k1, 1, 1000), 0);
+    c.update_segment_summary(&eb_metablock(k2, 1, 1000), 0);
 
     let payload = c.take_segment_summary();
     assert_eq!(payload.orgs.len(), 1);
@@ -2170,7 +2234,7 @@ fn take_segment_summary_returns_and_clears() {
 #[test]
 fn segment_summary_preserved_on_fsync_rollback() {
     let mut c = cache();
-    c.update_segment_summary(&eb_metablock(agg(1, 2, 3), 1, 1000));
+    c.update_segment_summary(&eb_metablock(agg(1, 2, 3), 1, 1000), 0);
     assert!(!c.peek_segment_summary().is_empty());
     c.execute_fsync_rollback();
     assert!(!c.peek_segment_summary().is_empty());
@@ -2179,9 +2243,9 @@ fn segment_summary_preserved_on_fsync_rollback() {
 #[test]
 fn peek_segment_summary_orgs_returns_unique_orgs() {
     let mut c = cache();
-    c.update_segment_summary(&eb_metablock(agg(1, 2, 3), 1, 1000));
-    c.update_segment_summary(&eb_metablock(agg(1, 4, 5), 1, 1000));
-    c.update_segment_summary(&eb_metablock(agg(7, 8, 9), 1, 1000));
+    c.update_segment_summary(&eb_metablock(agg(1, 2, 3), 1, 1000), 0);
+    c.update_segment_summary(&eb_metablock(agg(1, 4, 5), 1, 1000), 0);
+    c.update_segment_summary(&eb_metablock(agg(7, 8, 9), 1, 1000), 0);
 
     let orgs = c.peek_segment_summary_orgs();
     assert_eq!(orgs.len(), 2);
@@ -2192,9 +2256,9 @@ fn peek_segment_summary_orgs_returns_unique_orgs() {
 #[test]
 fn peek_segment_summary_types_returns_unique_types() {
     let mut c = cache();
-    c.update_segment_summary(&eb_metablock(agg(1, 2, 3), 1, 1000));
-    c.update_segment_summary(&eb_metablock(agg(1, 2, 4), 1, 1000));
-    c.update_segment_summary(&eb_metablock(agg(1, 5, 6), 1, 1000));
+    c.update_segment_summary(&eb_metablock(agg(1, 2, 3), 1, 1000), 0);
+    c.update_segment_summary(&eb_metablock(agg(1, 2, 4), 1, 1000), 0);
+    c.update_segment_summary(&eb_metablock(agg(1, 5, 6), 1, 1000), 0);
 
     let types = c.peek_segment_summary_types();
     assert_eq!(types.len(), 2);
@@ -2205,8 +2269,8 @@ fn peek_segment_summary_types_returns_unique_types() {
 #[test]
 fn take_segment_summary_clears_segment_state() {
     let mut c = cache();
-    c.update_segment_summary(&eb_metablock(agg(1, 2, 3), 1, 1000));
-    c.update_segment_summary(&eb_metablock(agg(4, 5, 6), 1, 1000));
+    c.update_segment_summary(&eb_metablock(agg(1, 2, 3), 1, 1000), 0);
+    c.update_segment_summary(&eb_metablock(agg(4, 5, 6), 1, 1000), 0);
 
     let _payload = c.take_segment_summary();
 
@@ -2218,14 +2282,376 @@ fn take_segment_summary_clears_segment_state() {
 #[test]
 fn fsync_rollback_preserves_segment_summary() {
     let mut c = cache();
-    c.update_segment_summary(&eb_metablock(agg(1, 2, 3), 1, 1000));
-    c.update_segment_summary(&eb_metablock(agg(4, 5, 6), 1, 1000));
+    c.update_segment_summary(&eb_metablock(agg(1, 2, 3), 1, 1000), 0);
+    c.update_segment_summary(&eb_metablock(agg(4, 5, 6), 1, 1000), 0);
 
     c.execute_fsync_rollback();
 
     assert_eq!(c.peek_segment_summary_orgs().len(), 2);
     assert_eq!(c.peek_segment_summary_types().len(), 2);
     assert_eq!(c.peek_segment_summary().len(), 2);
+}
+
+// ── Segment summary v3: per-segment schema set ──
+
+fn schema_metablock(major: u64, minor: u64) -> Metablock {
+    Metablock {
+        wal_seq: 0,
+        server_timestamp: 0,
+        lease_epoch: 1,
+        node_id: 1,
+        uncompressed_size: 0,
+        compressed_size: 0,
+        datablock_version: 0,
+        datablock_compression_type: 0,
+        previous_tip_hash: GENESIS_HASH,
+        datablock_position: 0,
+        previous_aggregate_metablock_pos: 0,
+        wal_metablock_type: MetablockKind::SchemaRegistration(
+            celeriant_wal::metablocks::metablock_schema_registration::MetablockSchemaRegistration {
+                schema_key: SchemaKey::new(1, 2, major, minor),
+                client_id: 1,
+                user_id: None,
+            },
+        ),
+        datablock: DatablockStorageKind::None,
+    }
+}
+
+/// A schema registration must land in the payload's schema set — and ONLY
+/// there: it carries no aggregate, so no aggregate entry may appear.
+#[test]
+fn take_segment_summary_collects_schema_hashes() {
+    let mut c = cache();
+    c.update_segment_summary(&schema_metablock(3, 4), 0);
+    c.update_segment_summary(&eb_metablock(agg(1, 2, 3), 1, 1000), 0);
+
+    let payload = c.take_segment_summary();
+    assert_eq!(payload.aggregates.len(), 1, "the registration must not create an aggregate entry");
+    let hash = SchemaKey::new(1, 2, 3, 4).bloom_hash();
+    assert!(payload.schema_may_contain_hash(hash));
+    assert!(!payload.schema_may_contain_hash(hash ^ 1), "the bloom answers definite absence for a non-member");
+
+    // Drained: the next segment starts schema-less — an empty bloom, not None.
+    let next = c.take_segment_summary();
+    assert!(next.schema_bloom.as_ref().is_some_and(|w| w.iter().all(|b| *b == 0)));
+    assert!(!next.schema_may_contain_hash(hash));
+}
+
+/// The FullCommit seal window: `take_segment_summary` drains the accumulator
+/// while `active_log_id` still names the sealing segment (the fiber parks at
+/// the sidecar and rotation awaits). Until the rotation is reported complete,
+/// the consult must answer maybe-present — a drained, untainted accumulator
+/// claiming absence would hide the sealing segment's committed registrations.
+#[test]
+fn seal_drain_latches_active_consult_until_rotation_completes() {
+    let mut c = cache();
+    let hash = SchemaKey::new(1, 2, 3, 4).bloom_hash();
+    c.update_segment_summary(&schema_metablock(3, 4), 0);
+
+    let _seal_payload = c.take_segment_summary();
+    assert!(c.active_segment_may_contain_schema(hash), "mid-seal window must not answer absence");
+    assert!(c.active_segment_may_contain_schema(hash ^ 1), "for ANY hash, not just drained ones");
+
+    c.note_active_segment_rotated();
+    assert!(!c.active_segment_may_contain_schema(hash), "post-rotation the fresh accumulator answers absence");
+}
+
+/// An incomplete accumulator is a subset; its schema bloom must persist as
+/// None — a bloom would claim absences it cannot prove.
+#[test]
+fn incomplete_accumulator_persists_no_schema_bloom() {
+    let mut c = cache();
+    c.update_segment_summary(&schema_metablock(3, 4), 0);
+    c.mark_segment_summary_incomplete();
+    let payload = c.take_segment_summary();
+    assert_eq!(payload.schema_bloom, None);
+}
+
+/// Schemas ride the sealed slot like the rest of the accumulator: staged at
+/// rotation, still fed by late deferred commits, drained into the sidecar payload.
+#[test]
+fn sealed_slot_carries_schema_hashes_including_late_commits() {
+    let mut c = cache();
+    c.update_segment_summary(&schema_metablock(3, 4), 0);
+    c.store_sealed_segment_summary(1);
+
+    // Deferred commit for the sealed segment after rotation.
+    c.update_segment_summary_for_log(1, 2, &schema_metablock(5, 6), 0);
+
+    let payload = c.take_sealed_segment_summary(1).unwrap();
+    assert!(payload.schema_may_contain_hash(SchemaKey::new(1, 2, 3, 4).bloom_hash()));
+    assert!(payload.schema_may_contain_hash(SchemaKey::new(1, 2, 5, 6).bloom_hash()));
+    // Drained but rotation not yet reported: the seal window must not answer
+    // absence (active_log_id still names the sealing segment).
+    assert!(c.active_segment_may_contain_schema(SchemaKey::new(1, 2, 3, 4).bloom_hash()));
+    c.note_active_segment_rotated();
+    assert!(!c.active_segment_may_contain_schema(SchemaKey::new(1, 2, 3, 4).bloom_hash()),
+        "after rotation the drained set answers for the new segment");
+}
+
+/// The active-segment consult: absence is answerable only while the
+/// accumulator is taint-free.
+#[test]
+fn active_segment_schema_consult_respects_taint() {
+    let mut c = cache();
+    let hash = SchemaKey::new(1, 2, 3, 4).bloom_hash();
+    assert!(!c.active_segment_may_contain_schema(hash), "fresh accumulator proves absence");
+
+    c.update_segment_summary(&schema_metablock(3, 4), 0);
+    assert!(c.active_segment_may_contain_schema(hash));
+    assert!(!c.active_segment_may_contain_schema(hash ^ 1));
+
+    c.mark_segment_summary_incomplete();
+    assert!(c.active_segment_may_contain_schema(hash ^ 1), "a tainted accumulator must not prove absence");
+}
+
+/// The unwind reset discards the schema hashes with the rest of the accumulator
+/// and taints it: the re-activated file may hold registrations it never saw.
+#[test]
+fn unwind_reset_clears_schema_hashes_and_taints() {
+    let mut c = cache();
+    c.update_segment_summary(&schema_metablock(3, 4), 0);
+    c.reset_segment_summary_after_unwind();
+    assert!(c.active_segment_may_contain_schema(0xABCD), "post-unwind consult must degrade to walk");
+    assert_eq!(c.take_segment_summary().schema_bloom, None);
+}
+
+// ── Segment summary v2: client sets + tip index ──
+
+fn with_client(mut mb: Metablock, client_id: u128) -> Metablock {
+    match &mut mb.wal_metablock_type {
+        MetablockKind::EventBatchMetadata(eb) => eb.client_id = client_id,
+        MetablockKind::SoftDelete(sd) => sd.client_id = client_id,
+        MetablockKind::SoftTrim(st) => st.client_id = client_id,
+        MetablockKind::SchemaRegistration(sr) => sr.client_id = client_id,
+    }
+    mb
+}
+
+fn client_hash(client_id: u128) -> u64 {
+    celeriant_wal::aggregate_client_key::client_id_bloom_hash(client_id)
+}
+
+/// Every aggregate-scoped client-bearing kind must feed the client set: a
+/// delete-only or trim-only client left out makes the set a subset — a false
+/// "absent" and a possible replay.
+#[test]
+fn take_segment_summary_client_set_includes_delete_and_trim_clients() {
+    let mut c = cache();
+    let key = agg(1, 2, 3);
+    c.update_segment_summary(&with_client(eb_metablock(key.clone(), 1, 1000), 7), 0);
+    c.update_segment_summary(&with_client(st_metablock(key.clone(), 1), 13), 0);
+    c.update_segment_summary(&with_client(sd_metablock(key.clone()), 11), 0);
+
+    let payload = c.take_segment_summary();
+    let entry = payload.aggregates.iter().find(|e| e.aggregate_id == 3).unwrap();
+    let set = &entry.client_set;
+    assert_eq!(set.cardinality(), Some(3), "expected Exact set of writer+trimmer+deleter, got {set:?}");
+    assert!(set.may_contain_hash(client_hash(7)), "writer must be present");
+    assert!(set.may_contain_hash(client_hash(13)), "trim-only client must be present");
+    assert!(set.may_contain_hash(client_hash(11)), "delete-only client must be present");
+    assert!(!set.may_contain_hash(client_hash(99)), "never-seen client must be definitely absent");
+}
+
+#[test]
+fn take_segment_summary_converts_to_bloom_above_exact_threshold() {
+    let mut c = cache();
+    let key = agg(1, 2, 3);
+    for client in 1..=33u128 {
+        c.update_segment_summary(&with_client(eb_metablock(key.clone(), client as u64, 1000), client), 0);
+    }
+
+    let payload = c.take_segment_summary();
+    let entry = payload.aggregates.iter().find(|e| e.aggregate_id == 3).unwrap();
+    assert!(
+        matches!(entry.client_set, ClientSet::Bloom(_)),
+        "33 distinct clients must convert to a bloom, got {:?}", entry.client_set
+    );
+    for client in 1..=33u128 {
+        assert!(entry.client_set.may_contain_hash(client_hash(client)), "no false absent for client {client}");
+    }
+}
+
+/// The fold runs in write order, so the newest position wins — including
+/// tombstone kinds, which are chain members and valid seek targets.
+#[test]
+fn segment_summary_newest_metablock_pos_last_wins() {
+    let mut c = cache();
+    let key = agg(1, 2, 3);
+    c.update_segment_summary(&eb_metablock(key.clone(), 1, 1000), 397_312);
+    c.update_segment_summary(&eb_metablock(key.clone(), 2, 2000), 398_336);
+    assert_eq!(c.peek_segment_summary().get(&key).unwrap().newest_metablock_pos, 398_336);
+
+    c.update_segment_summary(&st_metablock(key.clone(), 2), 399_360);
+    assert_eq!(c.peek_segment_summary().get(&key).unwrap().newest_metablock_pos, 399_360, "trim is the newest chain member");
+
+    c.update_segment_summary(&sd_metablock(key.clone()), 400_384);
+    assert_eq!(c.peek_segment_summary().get(&key).unwrap().newest_metablock_pos, 400_384, "delete is the newest chain member");
+}
+
+/// Trim on an aggregate with no other record in the segment stays entry-less:
+/// consumers then skip the segment, which matches today's scan (client seqs are
+/// only read from EventBatch blocks).
+#[test]
+fn segment_summary_trim_only_aggregate_stays_absent() {
+    let mut c = cache();
+    let key = agg(1, 2, 3);
+    c.update_segment_summary(&with_client(st_metablock(key.clone(), 5), 13), 4096);
+    assert!(c.peek_segment_summary().is_empty());
+    assert!(c.take_segment_summary().is_empty());
+}
+
+/// The sealed-slot fold must collect the same client/tip data as the active fold.
+#[test]
+fn sealed_segment_summary_collects_clients_and_positions() {
+    let mut c = cache();
+    let key = agg(1, 2, 3);
+    c.update_segment_summary(&with_client(eb_metablock(key.clone(), 1, 1000), 7), 397_312);
+    c.store_sealed_segment_summary(1);
+
+    // Late deferred commits for the sealed segment: a delete by another client.
+    c.update_segment_summary_for_log(1, 2, &with_client(sd_metablock(key.clone()), 11), 398_336);
+
+    let payload = c.take_sealed_segment_summary(1).unwrap();
+    let entry = payload.aggregates.iter().find(|e| e.aggregate_id == 3).unwrap();
+    assert_eq!(entry.newest_metablock_pos, 398_336);
+    assert!(entry.client_set.may_contain_hash(client_hash(7)));
+    assert!(entry.client_set.may_contain_hash(client_hash(11)));
+    assert!(!entry.client_set.may_contain_hash(client_hash(99)));
+    assert_eq!(entry.client_set.cardinality(), Some(2));
+}
+
+/// Rotation must move the active accumulator's client hashes into the sealed
+/// slot — losing them would seal Unknown sets and forfeit the skip.
+#[test]
+fn store_sealed_segment_summary_moves_client_hashes() {
+    let mut c = cache();
+    let key = agg(1, 2, 3);
+    c.update_segment_summary(&with_client(eb_metablock(key.clone(), 1, 1000), 7), 4096);
+    c.store_sealed_segment_summary(1);
+
+    let payload = c.take_sealed_segment_summary(1).unwrap();
+    assert_eq!(payload.aggregates[0].client_set.cardinality(), Some(1));
+
+    // And the next active segment starts clean.
+    c.update_segment_summary(&with_client(eb_metablock(key.clone(), 2, 2000), 8), 8192);
+    let next = c.take_segment_summary();
+    let set = &next.aggregates[0].client_set;
+    assert!(!set.may_contain_hash(client_hash(7)), "previous segment's client must not leak into the next");
+    assert!(set.may_contain_hash(client_hash(8)));
+}
+
+/// The sealed slot's payload carries right-sized segment blooms built from the
+/// slot's exact key knowledge: one 32-byte block for one key, containing the
+/// key/client and answering absence for a non-member.
+#[test]
+fn take_sealed_segment_summary_builds_sized_blooms() {
+    use celeriant_wal::sbbf;
+    let mut c = cache();
+    let key = agg(1, 2, 3);
+    c.update_segment_summary(&with_client(eb_metablock(key.clone(), 1, 1000), 7), 4096);
+    c.store_sealed_segment_summary(1);
+
+    let payload = c.take_sealed_segment_summary(1).unwrap();
+    let agg_words = payload.aggregate_bloom.expect("complete slot must persist an aggregate bloom");
+    let client_words = payload.client_bloom.expect("complete slot must persist a client bloom");
+    assert_eq!(agg_words.len() * 8, 32, "one key sizes to a single SBBF block, not 256 KiB");
+    assert_eq!(client_words.len() * 8, 32, "one client sizes to a single SBBF block, not 128 KiB");
+    assert!(sbbf::contains(&agg_words, key.bloom_hash()));
+    assert!(!sbbf::contains(&agg_words, agg(9, 9, 9).bloom_hash()), "sized bloom answers definite absence");
+    assert!(sbbf::contains(&client_words, client_hash(7)));
+    assert!(!sbbf::contains(&client_words, client_hash(99)));
+}
+
+/// A trim-only aggregate gets no summary entry, but its key and client MUST
+/// land in the segment blooms: the aggregate-load scan reads the trim floor,
+/// and a bloom skip would hand out a stale one.
+#[test]
+fn sized_blooms_cover_trim_only_keys_and_clients() {
+    use celeriant_wal::sbbf;
+    let mut c = cache();
+    let trimmed = agg(1, 2, 42);
+    // SoftTrim with no other block for this aggregate in the segment.
+    c.update_segment_summary(&with_client(st_metablock(trimmed.clone(), 5), 13), 4096);
+    c.update_segment_summary(&with_client(eb_metablock(agg(1, 2, 3), 1, 1000), 7), 4096);
+
+    let payload = c.take_segment_summary();
+    assert!(payload.aggregates.iter().all(|e| e.aggregate_id != 42), "trim-only aggregate stays out of the summary");
+    let agg_words = payload.aggregate_bloom.unwrap();
+    let client_words = payload.client_bloom.unwrap();
+    assert!(sbbf::contains(&agg_words, trimmed.bloom_hash()), "trim-only key must not be bloom-skippable");
+    assert!(sbbf::contains(&client_words, client_hash(13)), "trim-only client must not be bloom-skippable");
+}
+
+/// An incomplete accumulator persists NO segment blooms — any bloom built from
+/// a subset could answer a false "absent".
+#[test]
+fn incomplete_accumulator_persists_no_segment_blooms() {
+    let mut c = cache();
+    c.update_segment_summary(&with_client(eb_metablock(agg(1, 2, 3), 1, 1000), 7), 4096);
+    c.mark_segment_summary_incomplete();
+    let payload = c.take_segment_summary();
+    assert_eq!(payload.aggregate_bloom, None);
+    assert_eq!(payload.client_bloom, None);
+}
+
+// ── Segment summary completeness taint ──
+
+/// The taint propagates into every drained payload and resets at rotation: an
+/// incomplete accumulator seals `complete: false` (its aggregate list is a
+/// subset — consumers must never Skip on it), while the next segment's fold
+/// sees every commit from birth and seals complete again.
+#[test]
+fn segment_summary_incomplete_taint_propagates_and_resets_at_rotation() {
+    let key = agg(1, 2, 3);
+
+    // Direct seal (FullCommit path): taint carried, then reset.
+    let mut c = cache();
+    c.update_segment_summary(&eb_metablock(key.clone(), 1, 1000), 4096);
+    c.mark_segment_summary_incomplete();
+    assert!(!c.take_segment_summary().complete, "taint must reach the sealed payload");
+    c.update_segment_summary(&eb_metablock(key.clone(), 2, 2000), 4096);
+    assert!(c.take_segment_summary().complete, "a fresh segment's fold seals complete");
+
+    // Deferred seal (rotation path): taint carried through the sealed slot,
+    // the next active accumulator starts complete.
+    let mut c = cache();
+    c.update_segment_summary(&eb_metablock(key.clone(), 1, 1000), 4096);
+    c.mark_segment_summary_incomplete();
+    c.store_sealed_segment_summary(1);
+    c.update_segment_summary(&eb_metablock(key.clone(), 2, 2000), 4096);
+    assert!(!c.take_sealed_segment_summary(1).unwrap().complete, "sealed slot must preserve the taint");
+    assert!(c.take_segment_summary().complete, "rotation resets the active accumulator to complete");
+}
+
+/// After a truncate unwinds onto a re-activated sealed segment, the active
+/// accumulator is discarded (it described the deleted segment) and tainted:
+/// the re-activated file holds commits the accumulator never saw.
+#[test]
+fn reset_after_unwind_discards_accumulator_and_taints() {
+    let mut c = cache();
+    c.update_segment_summary(&with_client(eb_metablock(agg(1, 2, 3), 1, 1000), 7), 4096);
+
+    c.reset_segment_summary_after_unwind();
+
+    // Post-truncate surviving commits fold into the tainted accumulator.
+    c.update_segment_summary(&with_client(eb_metablock(agg(1, 2, 4), 1, 1000), 8), 8192);
+    let payload = c.take_segment_summary();
+    assert!(!payload.complete, "a re-activated segment's summary must never authorize skips");
+    assert!(payload.aggregates.iter().all(|e| e.aggregate_id != 3), "discarded segment's folds must not survive the unwind");
+    assert!(payload.aggregates.iter().any(|e| e.aggregate_id == 4));
+}
+
+/// A commit for a sealed segment whose slot is gone must be dropped, never
+/// folded into the active accumulator: its positions are cross-file and would
+/// break the SeekTo same-file proof.
+#[test]
+fn update_for_non_active_log_without_slot_is_dropped() {
+    let mut c = cache();
+    c.update_segment_summary_for_log(1, 2, &eb_metablock(agg(1, 2, 3), 1, 1000), 4096);
+    assert!(c.peek_segment_summary().is_empty(), "cross-segment commit must not pollute the active accumulator");
+    assert!(c.take_sealed_segment_summary(1).is_none());
 }
 
 // ── Compaction position remap ──
@@ -2266,3 +2692,278 @@ fn remap_compacted_positions_remaps_evicts_and_guards_log_id() {
     }
 }
 
+
+// ── Negative-lookup per-aggregate client blooms ──
+
+use crate::shard_mem_cache::NegativeLookupAnswer;
+
+fn cache_with_negative_budget(budget: u64) -> ShardMemCache<StubValidator> {
+    ShardMemCache::new(64 * 1024, 64 * 1024, 64 * 1024, 4 * 1024 * 1024, budget, 1024 * 1024)
+}
+
+fn complete_bloom_for(c: &mut ShardMemCache<StubValidator>, key: &AggregateKey) {
+    let generation = c.negative_lookup_try_begin_build(key).expect("begin build");
+    assert!(c.negative_lookup_finish_build(key, generation, true));
+}
+
+/// AUDIT SURFACE: every commit route funnels through the segment-summary fold,
+/// which must insert every client-bearing kind into the resident bloom —
+/// including a SoftTrim for an aggregate with no summary entry in the segment
+/// (the fold skips its client map, the bloom must not).
+#[test]
+fn commit_fold_inserts_all_client_bearing_kinds_into_resident_bloom() {
+    let mut c = cache();
+    let key = agg(1, 2, 3);
+    complete_bloom_for(&mut c, &key);
+    assert_eq!(c.negative_lookup_check(&key, client_hash(7)), NegativeLookupAnswer::DefinitelyAbsent);
+
+    // Trim FIRST, while the aggregate has no entry in the segment accumulator.
+    c.update_segment_summary(&with_client(st_metablock(key.clone(), 1), 13), 4096);
+    assert_eq!(
+        c.negative_lookup_check(&key, client_hash(13)),
+        NegativeLookupAnswer::MaybePresent,
+        "trim-only client with no summary entry must still land in the bloom",
+    );
+
+    c.update_segment_summary(&with_client(eb_metablock(key.clone(), 1, 1000), 7), 4096);
+    c.update_segment_summary(&with_client(sd_metablock(key.clone()), 11), 4096);
+    assert_eq!(c.negative_lookup_check(&key, client_hash(7)), NegativeLookupAnswer::MaybePresent);
+    assert_eq!(c.negative_lookup_check(&key, client_hash(11)), NegativeLookupAnswer::MaybePresent);
+    assert_eq!(c.negative_lookup_check(&key, client_hash(99)), NegativeLookupAnswer::DefinitelyAbsent);
+}
+
+/// The sealed-slot and slotless commit routes insert too — a late deferred
+/// commit is durable data whether or not its summary slot survived.
+#[test]
+fn commit_fold_for_sealed_and_slotless_routes_inserts_into_bloom() {
+    let mut c = cache();
+    let key = agg(1, 2, 3);
+    complete_bloom_for(&mut c, &key);
+
+    c.store_sealed_segment_summary(1);
+    c.update_segment_summary_for_log(1, 2, &with_client(eb_metablock(key.clone(), 1, 1000), 21), 4096);
+    assert_eq!(c.negative_lookup_check(&key, client_hash(21)), NegativeLookupAnswer::MaybePresent, "sealed-slot route");
+
+    c.update_segment_summary_for_log(7, 9, &with_client(eb_metablock(key.clone(), 2, 2000), 22), 4096);
+    assert_eq!(c.negative_lookup_check(&key, client_hash(22)), NegativeLookupAnswer::MaybePresent, "slotless route");
+}
+
+/// Install-empty-then-populate: from the instant `try_begin_build` returns,
+/// commit-side inserts land in the Building entry, and it never answers absent.
+#[test]
+fn building_entry_absorbs_commits_and_never_answers_absent() {
+    let mut c = cache();
+    let key = agg(1, 2, 3);
+    assert_eq!(c.negative_lookup_check(&key, client_hash(1)), NegativeLookupAnswer::NoEntry);
+    let generation = c.negative_lookup_try_begin_build(&key).expect("begin build");
+    assert!(c.negative_lookup_try_begin_build(&key).is_none(), "one build in flight per aggregate");
+    assert_eq!(c.negative_lookup_check(&key, client_hash(1)), NegativeLookupAnswer::Building);
+
+    c.update_segment_summary(&with_client(eb_metablock(key.clone(), 1, 1000), 42), 4096);
+    assert!(c.negative_lookup_finish_build(&key, generation, true));
+    assert_eq!(c.negative_lookup_check(&key, client_hash(42)), NegativeLookupAnswer::MaybePresent, "concurrent commit must survive completion");
+    assert_eq!(c.negative_lookup_check(&key, client_hash(1)), NegativeLookupAnswer::DefinitelyAbsent);
+}
+
+/// A parked (incomplete) build stays Building, keeps its members, and can be
+/// resumed by a later miss.
+#[test]
+fn incomplete_build_parks_and_resumes() {
+    let mut c = cache();
+    let key = agg(1, 2, 3);
+    let generation = c.negative_lookup_try_begin_build(&key).expect("begin build");
+    c.negative_lookup_insert(&key, client_hash(5));
+    assert!(!c.negative_lookup_finish_build(&key, generation, false), "truncated walk must not complete");
+    assert_eq!(c.negative_lookup_check(&key, client_hash(9)), NegativeLookupAnswer::Building);
+
+    let resumed = c.negative_lookup_try_begin_build(&key).expect("parked build must be resumable");
+    assert!(c.negative_lookup_finish_build(&key, resumed, true));
+    assert_eq!(c.negative_lookup_check(&key, client_hash(5)), NegativeLookupAnswer::MaybePresent, "members collected before the park survive");
+    assert_eq!(c.negative_lookup_check(&key, client_hash(9)), NegativeLookupAnswer::DefinitelyAbsent);
+}
+
+/// The byte budget bounds the cache at all times; eviction drops whole entries
+/// (LRU first) and a dropped aggregate simply rebuilds on its next miss.
+#[test]
+fn negative_lookup_byte_budget_is_respected() {
+    let budget = 2048;
+    let mut c = cache_with_negative_budget(budget);
+    for i in 0..100u128 {
+        let key = agg(1, 2, i);
+        let generation = c.negative_lookup_try_begin_build(&key).expect("begin build");
+        for client in 0..10u128 {
+            c.negative_lookup_insert(&key, client_hash(client));
+        }
+        c.negative_lookup_finish_build(&key, generation, true);
+        assert!(c.negative_lookup_bytes() <= budget, "budget exceeded at aggregate {i}: {}", c.negative_lookup_bytes());
+    }
+    assert!(c.negative_lookup_len() < 100, "eviction must have fired");
+    assert_eq!(c.negative_lookup_check(&agg(1, 2, 0), client_hash(0)), NegativeLookupAnswer::NoEntry, "evicted LRU entry rebuilds on next miss");
+}
+
+/// Eager seed: installs Complete only when told the history is confined,
+/// merges into existing entries without changing their state, and stops
+/// installing new entries past the budget.
+#[test]
+fn negative_lookup_seed_semantics() {
+    let mut c = cache();
+    let key = agg(1, 2, 3);
+    let hashes: std::collections::HashSet<u64> = [client_hash(1), client_hash(2)].into();
+    assert!(c.negative_lookup_seed(&key, &hashes, true));
+    assert_eq!(c.negative_lookup_check(&key, client_hash(1)), NegativeLookupAnswer::MaybePresent);
+    assert_eq!(c.negative_lookup_check(&key, client_hash(9)), NegativeLookupAnswer::DefinitelyAbsent);
+
+    // Merge into existing Complete entry: no state change, hashes inserted.
+    let more: std::collections::HashSet<u64> = [client_hash(3)].into();
+    assert!(!c.negative_lookup_seed(&key, &more, false));
+    assert_eq!(c.negative_lookup_check(&key, client_hash(3)), NegativeLookupAnswer::MaybePresent);
+
+    // Building seed stays Building.
+    let key2 = agg(1, 2, 4);
+    assert!(!c.negative_lookup_seed(&key2, &hashes, false));
+    assert_eq!(c.negative_lookup_check(&key2, client_hash(1)), NegativeLookupAnswer::Building);
+
+    // Budget stop: a tiny budget refuses new installs but keeps merging.
+    let mut small = cache_with_negative_budget(200);
+    assert!(small.negative_lookup_seed(&agg(9, 9, 1), &hashes, true));
+    assert!(!small.negative_lookup_seed(&agg(9, 9, 2), &hashes, true), "past the budget no new entries install");
+    assert_eq!(small.negative_lookup_check(&agg(9, 9, 2), client_hash(1)), NegativeLookupAnswer::NoEntry);
+}
+
+/// Sidecar-union soundness at the cache level: Exact hashes insert into the
+/// main bloom; Bloom words are carried and OR-ed; refusal parks completeness
+/// decisions with the caller.
+#[test]
+fn negative_lookup_sidecar_unions() {
+    let mut c = cache();
+    let key = agg(1, 2, 3);
+    let generation = c.negative_lookup_try_begin_build(&key).expect("begin build");
+    c.negative_lookup_union_exact(&key, &[client_hash(7), client_hash(8)]);
+    let mut words = vec![0u64; 8];
+    celeriant_wal::sbbf::insert(&mut words, client_hash(9));
+    assert!(c.negative_lookup_union_bloom(&key, &words));
+    assert!(!c.negative_lookup_union_bloom(&key, &[0u64; 3]), "malformed sidecar words prove nothing");
+    assert!(c.negative_lookup_finish_build(&key, generation, true));
+    for client in [7u128, 8, 9] {
+        assert_eq!(c.negative_lookup_check(&key, client_hash(client)), NegativeLookupAnswer::MaybePresent, "client {client}");
+    }
+    assert_eq!(c.negative_lookup_check(&key, client_hash(99)), NegativeLookupAnswer::DefinitelyAbsent);
+}
+
+/// An entry with an active builder is pinned: eviction pressure must never drop
+/// it mid-build (the begin-latch rides on residency), and a competing install is
+/// refused when nothing evictable remains. Completion unpins.
+#[test]
+fn building_entries_are_pinned_against_eviction() {
+    // Budget fits one base entry (ENTRY_BASE_BYTES), not two.
+    let mut c = cache_with_negative_budget(300);
+    let k1 = agg(1, 2, 1);
+    let generation = c.negative_lookup_try_begin_build(&k1).expect("begin build");
+    assert!(
+        c.negative_lookup_try_begin_build(&agg(1, 2, 2)).is_none(),
+        "install over budget must be refused while the only evictable entry is pinned",
+    );
+    assert!(c.negative_lookup_try_begin_build(&agg(1, 2, 3)).is_none());
+    assert_eq!(
+        c.negative_lookup_check(&k1, client_hash(1)),
+        NegativeLookupAnswer::Building,
+        "the in-flight build must survive eviction pressure",
+    );
+    assert!(c.negative_lookup_try_begin_build(&k1).is_none(), "the surviving entry must still hold the one-builder latch");
+
+    // Completion unpins: the entry is evictable again for later installs.
+    assert!(c.negative_lookup_finish_build(&k1, generation, true));
+    assert!(c.negative_lookup_try_begin_build(&agg(1, 2, 2)).is_some(), "an unpinned Complete entry must be evictable for new installs");
+    assert!(c.negative_lookup_bytes() <= 300, "budget must hold throughout");
+}
+
+/// The finish/park mutators are builder-identity-sensitive: a dead builder's
+/// late finish (either flavor) must never complete, park, or unlatch an entry
+/// it no longer owns. Member/aux inserts stay identity-blind on purpose —
+/// inserting into any resident entry is superset-safe.
+#[test]
+fn stale_builder_finish_never_completes_foreign_entry() {
+    let mut c = cache();
+    let k = agg(1, 2, 3);
+    // Builder A begins, collects a member, parks (the guard-drop path).
+    let gen_a = c.negative_lookup_try_begin_build(&k).expect("begin build A");
+    c.negative_lookup_insert(&k, client_hash(1));
+    assert!(!c.negative_lookup_finish_build(&k, gen_a, false));
+
+    // Builder B resumes and unions a sidecar bloom before finishing.
+    let gen_b = c.negative_lookup_try_begin_build(&k).expect("resume as B");
+    assert_ne!(gen_a, gen_b, "each builder gets its own generation");
+    let mut words = vec![0u64; 8];
+    celeriant_wal::sbbf::insert(&mut words, client_hash(2));
+    assert!(c.negative_lookup_union_bloom(&k, &words));
+
+    // Dead builder A's guard fires late: the park must no-op — B stays latched
+    // (an unlatch would let a resume wipe B's unioned aux via reset_aux) …
+    c.negative_lookup_finish_build(&k, gen_a, false);
+    assert!(c.negative_lookup_try_begin_build(&k).is_none(), "stale park unlatched the active builder");
+
+    // … and a stale complete must never mark B's half-built entry Complete.
+    assert!(!c.negative_lookup_finish_build(&k, gen_a, true), "stale finish completed a foreign half-built entry");
+    assert_eq!(
+        c.negative_lookup_check(&k, client_hash(9)),
+        NegativeLookupAnswer::Building,
+        "entry must stay Building until ITS builder finishes",
+    );
+
+    // B (the live builder) completes; members and aux from both eras answer.
+    assert!(c.negative_lookup_finish_build(&k, gen_b, true));
+    assert_eq!(c.negative_lookup_check(&k, client_hash(1)), NegativeLookupAnswer::MaybePresent);
+    assert_eq!(
+        c.negative_lookup_check(&k, client_hash(2)),
+        NegativeLookupAnswer::MaybePresent,
+        "the stale park wiped the live builder's unioned aux",
+    );
+    assert_eq!(c.negative_lookup_check(&k, client_hash(9)), NegativeLookupAnswer::DefinitelyAbsent);
+}
+
+// ADVERSARIAL EVIDENCE — a seal-retry double-store must merge, not replace.
+//
+// Reachable trace: on the deferred seal branch, `commit_fsync_with_rollback`
+// calls `store_sealed_segment_summary(old_log_id)`, then awaits
+// `rotate_to_next_log()`. If rotation fails (ENOSPC/IO — the disk-full
+// moment IS when segments seal), the error propagates WITHOUT clearing the
+// staged slot or re-activating the segment. The next write's sync_durable
+// cycle re-enters, space is still low, and the seal branch runs AGAIN for
+// the same still-active old_log_id. A plain `insert` at the second store
+// would REPLACE the staged slot — which held every commit folded before the
+// first store — with the now-empty accumulator whose `complete` is TRUE
+// (the first store reset segment_summary_incomplete). Late deferred commits
+// would then fold into the empty slot, the sweep would write a complete=true
+// SUBSET sidecar, and every consult it feeds (summary_hint Skip, the
+// seal-sized aggregate/client blooms, the schema bloom) could answer a false
+// "definitely absent" for durable, ACKed data — with ALL blooms derived from
+// the slot, the false absence reaches every consult, not just the entry map.
+// `store_sealed_segment_summary` therefore MERGES colliding stores
+// (SealedSegmentSummary::merge, era-aware); this test drives the exact trace
+// and asserts nothing previously folded is lost.
+#[test]
+fn adversarial_seal_retry_overwrites_staged_slot_with_empty_complete() {
+    let mut c = cache();
+    let k_early = agg(1, 2, 3);
+    // A commit folded into the active accumulator before the first seal attempt.
+    c.update_segment_summary(&eb_metablock(k_early.clone(), 1, 1000), 4096);
+
+    // First seal attempt stages the slot; rotate_to_next_log then FAILS.
+    c.store_sealed_segment_summary(7);
+
+    // Retry cycle: segment 7 is still active, seal branch runs again.
+    c.store_sealed_segment_summary(7);
+
+    // A late deferred commit for segment 7 lands in the staged slot.
+    let k_late = agg(1, 2, 4);
+    c.update_segment_summary_for_log(7, 7, &eb_metablock(k_late.clone(), 1, 2000), 8192);
+
+    let payload = c.take_sealed_segment_summary(7).expect("slot staged");
+    assert!(payload.complete, "scaffolding: the subset payload claims completeness");
+    let has_early = payload.aggregates.iter().any(|e| e.aggregate_id == 3);
+    assert!(
+        has_early,
+        "false absence: the seal-retry overwrite dropped a folded commit from the staged slot; \
+         a complete=true sidecar (and P2's blooms sized from it) will deny aggregate 3 exists in segment 7"
+    );
+}

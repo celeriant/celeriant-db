@@ -7,12 +7,18 @@ use crate::{
     aggregate_recent_write::AggregateRecentWrites, mem_snapshot_aggregate::MemSnapshotAggregate, queue_aggregate_positions::QueueAggregatePositions,
     recent_write::RecentWrite, shard_log_queue_item::ShardLogQueueItem, sync_positions_snapshot::{SyncPositionsSnapshot},
 };
+use crate::negative_lookup::NegativeClientBloom;
 use celeriant_distributed::node_status::NodeStatus;
-use celeriant_wal::segment_summary::{SegmentAggregateEntry, SegmentSummaryPayload};
+use celeriant_wal::aggregate_client_key::client_id_bloom_hash;
+use celeriant_wal::constants::{AGGREGATE_BLOOM_BYTES, CLIENT_BLOOM_BYTES};
 use celeriant_wal::metablocks::metablock_event_batch::MetablockEventBatch;
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_wal::precomputed_hash::{PrecomputedBuildHasher, PrecomputedMap, PrecomputedSet};
 use celeriant_wal::schema_key::SchemaKey;
+use celeriant_wal::segment_summary::client_set::{ClientSet, sized_bloom_from_hashes};
+use celeriant_wal::segment_summary::schema_hash_accumulator::SchemaHashAccumulator;
+use celeriant_wal::segment_summary::segment_aggregate_entry::SegmentAggregateEntry;
+use celeriant_wal::segment_summary::segment_summary_payload::SegmentSummaryPayload;
 use celeriant_wal::{
     aggregate_client_key::AggregateClientKey, aggregate_key::AggregateKey, aggregate_type_key::AggregateTypeKey,
     constants::FIXED_BLOCK_SIZE_BYTES, datablocks::datablock::Datablock,
@@ -136,19 +142,121 @@ pub struct ShardMemCache<V: Validate> {
     segment_summary: HashMap<AggregateKey, SegmentAggregateEntry>,
     segment_summary_orgs: HashSet<u128>,
     segment_summary_types: HashSet<AggregateTypeKey>,
+    /// Per-aggregate distinct client hashes for the active segment. 8 bytes per
+    /// distinct (aggregate, client) per segment; drained at seal with the rest
+    /// of the accumulator. Converted to the wire ClientSet at take time.
+    segment_summary_clients: HashMap<AggregateKey, HashSet<u64>>,
+    /// Schema hashes registered in the active segment (bounded; volume
+    /// overflow degrades to a saturating max-size bloom). Fed at commit and by
+    /// the open-time rebuild scan; converted to the schema bloom at take time.
+    segment_summary_schemas: SchemaHashAccumulator,
+    /// Chain hashes the summary map deliberately drops but the seal-time
+    /// segment blooms must still cover: a SoftTrim landing in a segment where
+    /// its aggregate has no other block gets no summary entry (dedup-scan
+    /// semantics), yet the aggregate-load scan reads that trim's floor — a
+    /// bloom missing the key would skip the segment and hand out a STALE trim
+    /// floor. Same for its client in the segment client bloom.
+    segment_summary_loose: LooseChainHashes,
+    /// True when the active accumulator provably missed commits (truncated
+    /// pre-warm replay, post-truncate re-activation). Carried into the payload
+    /// as `!complete` at drain time; drains reset it — a fresh segment's fold
+    /// sees every commit from birth.
+    segment_summary_incomplete: bool,
+    /// True from a seal's accumulator drain until the shard layer reports the
+    /// rotation complete. In that window `active_log_id` still names the
+    /// SEALING segment while the drained accumulator describes no segment at
+    /// all, so the active-segment schema consult must not answer definite
+    /// absence from it (a committed registration in the sealing segment would
+    /// read as absent — false no_schema, cached).
+    segment_summary_draining: bool,
 
     /// Sealed segment summaries waiting for the deferred read-side commit
     /// (leader: replication ACK; follower: leader confirmation) before sidecar
     /// write. Stored at rotation time, keyed by sealed log_id.
     sealed_segment_summaries: HashMap<u64, SealedSegmentSummary>,
+
+    /// Per-aggregate negative-lookup client blooms (idempotency-negative-lookup.md).
+    /// Demand/eager-built, in-memory only; bounded by `negative_lookup_cache_bytes`
+    /// via manual byte-tracked eviction (entries are variable-size). Eviction just
+    /// drops the entry — superset safety means no invalidation obligations anywhere.
+    negative_lookup: LruCache<AggregateKey, NegativeClientBloom, PrecomputedBuildHasher>,
+    negative_lookup_bytes: u64,
+    negative_lookup_cache_bytes: u64,
+    /// Monotonic builder-identity counter; each begin-build stamps its entry
+    /// with the next value (see `NegativeClientBloom::build_generation`).
+    negative_lookup_build_generation: u64,
+}
+
+/// Answer for the produce path's negative lookup (see `negative_lookup_check`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NegativeLookupAnswer {
+    /// No bloom resident: today's full negative scan, which should build one.
+    NoEntry,
+    /// A bloom exists but is not complete: fall back to scan, trust nothing.
+    Building,
+    /// Complete bloom says the client never wrote here: scan-free first write.
+    DefinitelyAbsent,
+    /// Complete bloom says maybe (real member or false positive): scan.
+    MaybePresent,
+}
+
+/// Trim-only chain hashes for the seal-time segment blooms (see the field doc
+/// on `segment_summary_loose`). Bounded by distinct trim-only (key, client)
+/// pairs per segment — same 8-bytes-per-distinct scale the client map accepts.
+#[derive(Debug, Default)]
+pub struct LooseChainHashes {
+    keys: HashSet<u64>,
+    clients: HashSet<u64>,
+}
+
+impl LooseChainHashes {
+    fn merge(&mut self, other: LooseChainHashes) {
+        self.keys.extend(other.keys);
+        self.clients.extend(other.clients);
+    }
 }
 
 /// In-memory accumulator for a sealed segment's summary, mirroring the active segment fields.
-/// Converted to SegmentSummaryPayload when the segment becomes fully replicated.
+/// Converted to SegmentSummaryPayload (with seal-time right-sized blooms built from the
+/// exact key knowledge here) when the segment becomes fully replicated. Outside the
+/// DeepSizeOf-accounted caps — bounded by the count of sealed segments awaiting
+/// replication confirmation.
 pub struct SealedSegmentSummary {
     aggregates: HashMap<AggregateKey, SegmentAggregateEntry>,
     orgs: HashSet<u128>,
     aggregate_types: HashSet<AggregateTypeKey>,
+    clients: HashMap<AggregateKey, HashSet<u64>>,
+    schemas: SchemaHashAccumulator,
+    loose: LooseChainHashes,
+    complete: bool,
+}
+
+impl SealedSegmentSummary {
+    /// Fold a colliding store for the same log_id into this slot. Reachable
+    /// only via the seal-retry trace (rotation failed after the drain; the
+    /// re-entered seal branch drains again for the SAME still-active segment
+    /// — truncation clears slots, so no other flow collides). Everything in
+    /// `other` was folded strictly AFTER this slot's contents, so unions and
+    /// last-wins temporal fields are faithful; replacing the slot instead
+    /// would persist a complete=true SUBSET — false absence for ACKed data.
+    fn merge(&mut self, other: SealedSegmentSummary) {
+        for (key, entry) in other.aggregates {
+            match self.aggregates.entry(key) {
+                std::collections::hash_map::Entry::Occupied(mut o) => merge_entry_later_era(o.get_mut(), entry),
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(entry);
+                }
+            }
+        }
+        self.orgs.extend(other.orgs);
+        self.aggregate_types.extend(other.aggregate_types);
+        for (key, hashes) in other.clients {
+            self.clients.entry(key).or_default().extend(hashes);
+        }
+        self.schemas.merge(other.schemas);
+        self.loose.merge(other.loose);
+        self.complete &= other.complete;
+    }
 }
 
 impl<V: Validate> ShardMemCache<V> {
@@ -951,15 +1059,30 @@ impl<V: Validate> ShardMemCache<V> {
         self.schema_cache.get(key)
     }
 
-    /// Insert a Validated/CompilationFailed schema. Removes from no_schema_cache
-    /// since a schema was just registered for a previously-empty key.
+    // INVARIANT: schema_cache and no_schema_cache are mutually exclusive per
+    // key. A schema_cache entry (any state — Validated is inserted at write
+    // time, NotYetLoaded means a registration block exists on disk) always
+    // outranks an absence conclusion: an absence scan racing that
+    // registration necessarily snapshotted the WAL before its blocks landed.
+    // Both writers enforce it — insert pops the opposite cache's entry, and
+    // the absence insert yields to an existing schema entry — so the caches
+    // converge to schema-wins under either interleaving. Without this, a
+    // stale no_schema entry could outlive the schema entry's LRU eviction and
+    // `schema_cache_contains` would silently skip validation.
+
+    /// Insert a Validated/CompilationFailed schema. Pops any no_schema entry
+    /// (see the mutual-exclusion invariant above).
     pub fn schema_cache_insert(&mut self, key: SchemaKey, value: CachedSchema<V>) {
         self.no_schema_cache.pop(&key);
         self.schema_cache.put(key, value);
     }
 
-    /// Insert a key into the no-schema cache.
+    /// Record "no registration found by the absence scan" — a no-op when a
+    /// schema entry exists (see the mutual-exclusion invariant above).
     pub fn no_schema_cache_insert(&mut self, key: SchemaKey) {
+        if self.schema_cache.contains(&key) {
+            return;
+        }
         self.no_schema_cache.put(key, ());
     }
 
@@ -1185,6 +1308,7 @@ impl<V: Validate> ShardMemCache<V> {
         aggregate_write_snapshots_cache_bytes: u64,
         aggregate_client_snapshots_cache_bytes: u64,
         schema_cache_bytes: u64,
+        negative_lookup_cache_bytes: u64,
         internode_max_request_size: u64,
     ) -> Self {
         let aggregate_cap = NonZeroUsize::new((aggregate_write_snapshots_cache_bytes / 112) as usize).unwrap_or(NonZeroUsize::new(10_000).unwrap());
@@ -1220,60 +1344,264 @@ impl<V: Validate> ShardMemCache<V> {
             segment_summary: HashMap::new(),
             segment_summary_orgs: HashSet::new(),
             segment_summary_types: HashSet::new(),
+            segment_summary_clients: HashMap::new(),
+            segment_summary_schemas: SchemaHashAccumulator::default(),
+            segment_summary_loose: LooseChainHashes::default(),
+            segment_summary_incomplete: false,
+            segment_summary_draining: false,
             sealed_segment_summaries: HashMap::new(),
+            negative_lookup: LruCache::unbounded_with_hasher(PrecomputedBuildHasher::default()),
+            negative_lookup_bytes: 0,
+            negative_lookup_cache_bytes,
+            negative_lookup_build_generation: 0,
         }
     }
 
-    pub fn update_segment_summary(&mut self, metablock: &Metablock) {
-        match &metablock.wal_metablock_type {
-            MetablockKind::EventBatchMetadata(eb) => {
-                let key = &eb.aggregate_key;
-                self.segment_summary_orgs.insert(key.org_id);
-                self.segment_summary_types.insert(AggregateTypeKey::new(key.org_id, key.aggregate_type_id));
-                let entry = self.segment_summary.entry(key.clone()).or_insert_with(|| {
-                    let mut e = SegmentAggregateEntry::new(key.org_id, key.aggregate_type_id, key.aggregate_id);
-                    e.min_aggregate_version = eb.trimmed_below_version;
-                    e
-                });
-                entry.is_deleted = false;
-                entry.event_batch_count += 1;
-                if eb.aggregate_version > entry.last_aggregate_version {
-                    entry.last_aggregate_version = eb.aggregate_version;
-                }
-                if metablock.server_timestamp > entry.last_server_timestamp {
-                    entry.last_server_timestamp = metablock.server_timestamp;
-                }
-                entry.compressed_size += metablock.compressed_size;
-                entry.uncompressed_size += metablock.uncompressed_size;
-            }
-            MetablockKind::SoftDelete(sd) => {
-                let key = &sd.aggregate_key;
-                self.segment_summary_orgs.insert(key.org_id);
-                self.segment_summary_types.insert(AggregateTypeKey::new(key.org_id, key.aggregate_type_id));
-                let entry = self.segment_summary.entry(key.clone())
-                    .or_insert_with(|| SegmentAggregateEntry::new(key.org_id, key.aggregate_type_id, key.aggregate_id));
-                entry.is_deleted = true;
-                entry.event_batch_count = 0;
-                entry.compressed_size = 0;
-                entry.uncompressed_size = 0;
-            }
-            MetablockKind::SoftTrim(st) => {
-                let key = &st.aggregate_key;
-                if let Some(entry) = self.segment_summary.get_mut(key) {
-                    if st.keep_from_aggregate_version > entry.min_aggregate_version {
-                        entry.min_aggregate_version = st.keep_from_aggregate_version;
-                    }
-                }
-            }
-            MetablockKind::SchemaRegistration(_) => {}
+    // ── Negative-lookup client blooms ──────────────────────────────────────
+    //
+    // AUDIT SURFACE (insert-on-write exhaustiveness): every path that makes a
+    // client-bearing metablock durable routes its commit through
+    // `update_segment_summary` / `update_segment_summary_for_log`, which call
+    // `negative_lookup_note_commit` first:
+    //   - leader/standalone fsync FullCommit  (shard_wal_sync.rs commit fold)
+    //   - follower confirmation drain + promotion drain (commit_pcd,
+    //     shard_wal_replicate.rs)
+    //   - S3-catchup commit                  (shard_wal_s3_catchup.rs)
+    //   - open-time pre-warm replay          (shard_wal.rs pre_warm_cache)
+    // A follower's fsync defers the fold until confirmation; in that window the
+    // follower serves no writes, and every promotion path drains parked PCDs
+    // through commit_pcd before the role flip, so the bloom catches up before
+    // any lookup can consult it. Insert-before-replication is fine: a rolled
+    // back write leaves a phantom, which is a superset, which is safe.
+
+    /// The commit-side insert. No-op when no bloom is resident for the
+    /// aggregate. Unlike the summary fold, SoftTrim is NOT gated on an existing
+    /// per-segment entry — the bloom spans the aggregate's whole history.
+    fn negative_lookup_note_commit(&mut self, metablock: &Metablock) {
+        let (key, client_id) = match &metablock.wal_metablock_type {
+            MetablockKind::EventBatchMetadata(eb) => (&eb.aggregate_key, eb.client_id),
+            MetablockKind::SoftDelete(sd) => (&sd.aggregate_key, sd.client_id),
+            MetablockKind::SoftTrim(st) => (&st.aggregate_key, st.client_id),
+            MetablockKind::SchemaRegistration(_) => return, // touches no aggregate
+        };
+        // Residency check first: skip the hash when no bloom is resident.
+        if !self.negative_lookup.contains(key) {
+            return;
         }
+        self.negative_lookup_insert(key, client_id_bloom_hash(client_id));
+    }
+
+    /// Insert a client hash into the resident bloom for `key`; no-op when
+    /// absent. Does not promote the entry (commit traffic is background).
+    pub fn negative_lookup_insert(&mut self, key: &AggregateKey, client_hash: u64) {
+        let Some(entry) = self.negative_lookup.peek_mut(key) else { return };
+        let old = entry.byte_cost();
+        entry.insert_hash(client_hash);
+        let new = entry.byte_cost();
+        self.negative_lookup_bytes = self.negative_lookup_bytes + new - old;
+        self.negative_lookup_evict_to_budget();
+    }
+
+    /// The produce path's negative lookup. Promotes the entry on hit.
+    pub fn negative_lookup_check(&mut self, key: &AggregateKey, client_hash: u64) -> NegativeLookupAnswer {
+        match self.negative_lookup.get(key) {
+            None => NegativeLookupAnswer::NoEntry,
+            Some(entry) if !entry.is_complete() => NegativeLookupAnswer::Building,
+            Some(entry) if entry.may_contain_hash(client_hash) => NegativeLookupAnswer::MaybePresent,
+            Some(_) => NegativeLookupAnswer::DefinitelyAbsent,
+        }
+    }
+
+    /// Become the builder for `key`, installing an EMPTY Building entry first
+    /// (install-empty-then-populate: from this instant insert-on-write lands in
+    /// it, so commits during the build scan's awaits are never lost). Returns
+    /// the builder's generation token, or None when a build is already in
+    /// flight, the entry is Complete, or the byte budget is exhausted with
+    /// nothing evictable — callers then scan without building. Synchronous, so
+    /// the check-and-set is atomic on the single-threaded executor.
+    pub fn negative_lookup_try_begin_build(&mut self, key: &AggregateKey) -> Option<u64> {
+        if let Some(entry) = self.negative_lookup.peek_mut(key) {
+            if entry.is_complete() || entry.is_builder_active() {
+                return None;
+            }
+            // Resume a parked build: keep collected members, re-union sidecars.
+            self.negative_lookup_build_generation += 1;
+            entry.set_builder(self.negative_lookup_build_generation);
+            let old = entry.byte_cost();
+            entry.reset_aux();
+            let new = entry.byte_cost();
+            self.negative_lookup_bytes = self.negative_lookup_bytes - (old - new);
+            return Some(self.negative_lookup_build_generation);
+        }
+        let mut entry = NegativeClientBloom::new_building();
+        self.negative_lookup_build_generation += 1;
+        entry.set_builder(self.negative_lookup_build_generation);
+        let cost = entry.byte_cost();
+        // Make room first (pinned in-flight builds are never displaced); if the
+        // budget still can't fit the entry, refuse — the caller falls back to a
+        // plain scan and no entry is installed.
+        self.negative_lookup_evict_until(self.negative_lookup_cache_bytes.saturating_sub(cost));
+        if self.negative_lookup_bytes + cost > self.negative_lookup_cache_bytes {
+            metrics::counter!("celeriant_negative_lookup_build_refused_no_budget_total").increment(1);
+            return None;
+        }
+        self.negative_lookup_bytes += cost;
+        self.negative_lookup.put(key.clone(), entry);
+        Some(self.negative_lookup_build_generation)
+    }
+
+    /// Union a sealed sidecar's Exact client hashes into the building entry.
+    pub fn negative_lookup_union_exact(&mut self, key: &AggregateKey, hashes: &[u64]) {
+        let Some(entry) = self.negative_lookup.peek_mut(key) else { return };
+        let old = entry.byte_cost();
+        for h in hashes {
+            entry.insert_hash(*h);
+        }
+        let new = entry.byte_cost();
+        self.negative_lookup_bytes = self.negative_lookup_bytes + new - old;
+        self.negative_lookup_evict_to_budget();
+    }
+
+    /// Union a sealed sidecar's bloom words. `false` = refused (aux cap or
+    /// malformed, or the entry was evicted mid-build): the build is then not
+    /// exhaustive and must not complete.
+    pub fn negative_lookup_union_bloom(&mut self, key: &AggregateKey, words: &[u64]) -> bool {
+        let Some(entry) = self.negative_lookup.peek_mut(key) else { return false };
+        let old = entry.byte_cost();
+        let ok = entry.try_union_bloom_words(words);
+        let new = entry.byte_cost();
+        self.negative_lookup_bytes = self.negative_lookup_bytes + new - old;
+        self.negative_lookup_evict_to_budget();
+        ok
+    }
+
+    /// Finish a build. `complete=true` only when the scan provably reached the
+    /// start of the aggregate's history. `generation` must be the token
+    /// `try_begin_build` handed this builder: a mismatch means the resident
+    /// entry belongs to a successor builder, and finishing (either flavor)
+    /// would corrupt it — no-op instead. Returns whether the entry is now
+    /// Complete (false when it was evicted mid-build — safe, rebuilt on the
+    /// next miss).
+    pub fn negative_lookup_finish_build(&mut self, key: &AggregateKey, generation: u64, complete: bool) -> bool {
+        let Some(entry) = self.negative_lookup.peek_mut(key) else { return false };
+        if entry.build_generation() != generation {
+            metrics::counter!("celeriant_negative_lookup_stale_finish_total").increment(1);
+            return false;
+        }
+        let old = entry.byte_cost();
+        entry.finish_build(complete);
+        let done = entry.is_complete();
+        let new = entry.byte_cost();
+        self.negative_lookup_bytes = self.negative_lookup_bytes + new - old;
+        self.negative_lookup_evict_to_budget();
+        done
+    }
+
+    /// Eager population from the open-time forward scan. Merges into an
+    /// existing entry without changing its state; installs a new entry only
+    /// while the byte budget has room (the scan feeds aggregates in arbitrary
+    /// order, so past the budget it just stops installing). `complete` may only
+    /// be true when the scanned segment provably holds the aggregate's ENTIRE
+    /// history (the caller's check: no sealed segments exist at all).
+    /// Returns true when a NEW entry was installed as Complete.
+    pub fn negative_lookup_seed(&mut self, key: &AggregateKey, hashes: &HashSet<u64>, complete: bool) -> bool {
+        if let Some(entry) = self.negative_lookup.peek_mut(key) {
+            let old = entry.byte_cost();
+            for h in hashes {
+                entry.insert_hash(*h);
+            }
+            let new = entry.byte_cost();
+            self.negative_lookup_bytes = self.negative_lookup_bytes + new - old;
+            self.negative_lookup_evict_to_budget();
+            return false;
+        }
+        let mut entry = NegativeClientBloom::new_building();
+        for h in hashes {
+            entry.insert_hash(*h);
+        }
+        if complete {
+            entry.finish_build(true);
+        }
+        // Refuse rather than evict: the eager scan feeds aggregates in
+        // arbitrary order, so displacing earlier installs would just churn.
+        if self.negative_lookup_bytes + entry.byte_cost() > self.negative_lookup_cache_bytes {
+            return false;
+        }
+        self.negative_lookup_bytes += entry.byte_cost();
+        self.negative_lookup.put(key.clone(), entry);
+        complete
+    }
+
+    fn negative_lookup_evict_to_budget(&mut self) {
+        self.negative_lookup_evict_until(self.negative_lookup_cache_bytes);
+    }
+
+    /// Evict LRU entries until the cache holds at most `target_bytes`. Entries
+    /// with an active builder are pinned — evicting one would break the
+    /// one-builder latch (a fresh same-key entry admits a second builder) —
+    /// so they rotate to MRU instead. The rotation budget bounds the loop:
+    /// once only pinned entries remain the cache may stay over target (bounded
+    /// by the number of concurrent build scans).
+    fn negative_lookup_evict_until(&mut self, target_bytes: u64) {
+        let mut rotations = self.negative_lookup.len();
+        while self.negative_lookup_bytes > target_bytes {
+            let Some((key, entry)) = self.negative_lookup.pop_lru() else { break };
+            if entry.is_builder_active() {
+                self.negative_lookup.put(key, entry);
+                if rotations == 0 {
+                    break;
+                }
+                rotations -= 1;
+                continue;
+            }
+            self.negative_lookup_bytes -= entry.byte_cost();
+            metrics::counter!("celeriant_negative_lookup_evictions_total").increment(1);
+        }
+    }
+
+    pub fn negative_lookup_len(&self) -> usize {
+        self.negative_lookup.len()
+    }
+
+    pub fn negative_lookup_bytes(&self) -> u64 {
+        self.negative_lookup_bytes
+    }
+
+    pub fn update_segment_summary(&mut self, metablock: &Metablock, metablock_absolute_pos: u64) {
+        self.negative_lookup_note_commit(metablock);
+        fold_segment_summary(
+            &mut self.segment_summary,
+            &mut self.segment_summary_orgs,
+            &mut self.segment_summary_types,
+            &mut self.segment_summary_clients,
+            &mut self.segment_summary_schemas,
+            &mut self.segment_summary_loose,
+            metablock,
+            metablock_absolute_pos,
+        );
     }
 
     pub fn take_segment_summary(&mut self) -> SegmentSummaryPayload {
         let orgs: Vec<u128> = self.segment_summary_orgs.drain().collect();
         let aggregate_types: Vec<AggregateTypeKey> = self.segment_summary_types.drain().collect();
-        let aggregates: Vec<SegmentAggregateEntry> = self.segment_summary.drain().map(|(_, v)| v).collect();
-        SegmentSummaryPayload { orgs, aggregate_types, aggregates }
+        let mut clients = std::mem::take(&mut self.segment_summary_clients);
+        let schema_bloom = std::mem::take(&mut self.segment_summary_schemas).to_schema_bloom(!self.segment_summary_incomplete);
+        let complete = !self.segment_summary_incomplete;
+        // Seal-time right-sizing: the persisted segment blooms are built from
+        // the accumulator's exact key knowledge, not the fixed-size live words.
+        let loose = std::mem::take(&mut self.segment_summary_loose);
+        let (aggregate_bloom, client_bloom) = seal_segment_blooms(&self.segment_summary, &clients, &loose, complete);
+        self.segment_summary_incomplete = false;
+        self.segment_summary_draining = true;
+        let aggregates: Vec<SegmentAggregateEntry> = self
+            .segment_summary
+            .drain()
+            .map(|(key, mut entry)| {
+                entry.client_set = clients.remove(&key).map_or(ClientSet::Unknown, |h| ClientSet::from_client_hashes(&h));
+                entry
+            })
+            .collect();
+        SegmentSummaryPayload { orgs, aggregate_types, aggregates, complete, aggregate_bloom, client_bloom, schema_bloom }
     }
 
     pub fn peek_segment_summary(&self) -> &HashMap<AggregateKey, SegmentAggregateEntry> {
@@ -1288,78 +1616,119 @@ impl<V: Validate> ShardMemCache<V> {
         &self.segment_summary_types
     }
 
-    /// Store the current active segment summary for a sealed segment.
+    /// Store the current active segment summary for a sealed segment. The slot's
+    /// exact key knowledge (still fed by late deferred commits) is what the
+    /// sidecar sweep builds the right-sized segment blooms from.
     /// Called at rotation time on the leader to defer sidecar write until replication confirms.
     pub fn store_sealed_segment_summary(&mut self, log_id: u64) {
         let sealed = SealedSegmentSummary {
             aggregates: std::mem::take(&mut self.segment_summary),
             orgs: std::mem::take(&mut self.segment_summary_orgs),
             aggregate_types: std::mem::take(&mut self.segment_summary_types),
+            clients: std::mem::take(&mut self.segment_summary_clients),
+            schemas: std::mem::take(&mut self.segment_summary_schemas),
+            loose: std::mem::take(&mut self.segment_summary_loose),
+            complete: !self.segment_summary_incomplete,
         };
+        // Rotation resets the taint: the new segment's fold sees every commit from birth.
+        self.segment_summary_incomplete = false;
+        self.segment_summary_draining = true;
         // Store even when empty: deferred commits for this segment may still be
         // in flight, and update_segment_summary_for_log must route them here,
         // not into the next segment's active accumulator. An empty payload is
-        // dropped at sidecar-write time.
-        self.sealed_segment_summaries.insert(log_id, sealed);
+        // dropped at sidecar-write time. A colliding slot (seal retried after
+        // a failed rotation) MERGES — see SealedSegmentSummary::merge.
+        match self.sealed_segment_summaries.entry(log_id) {
+            std::collections::hash_map::Entry::Occupied(mut o) => o.get_mut().merge(sealed),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(sealed);
+            }
+        }
     }
 
     /// Update the segment summary for a specific log segment.
     /// Routes to the sealed snapshot if one exists for this log_id,
-    /// otherwise updates the active segment accumulator.
-    pub fn update_segment_summary_for_log(&mut self, log_id: u64, metablock: &Metablock) {
+    /// otherwise updates the active segment accumulator — but only when the
+    /// commit actually belongs to the active segment.
+    pub fn update_segment_summary_for_log(&mut self, log_id: u64, active_log_id: u64, metablock: &Metablock, metablock_absolute_pos: u64) {
         if self.sealed_segment_summaries.contains_key(&log_id) {
-            self.update_sealed_segment_summary(log_id, metablock);
+            self.negative_lookup_note_commit(metablock);
+            self.update_sealed_segment_summary(log_id, metablock, metablock_absolute_pos);
+        } else if log_id == active_log_id {
+            self.update_segment_summary(metablock, metablock_absolute_pos);
         } else {
-            self.update_segment_summary(metablock);
+            // Still a durable client-bearing commit even though its summary
+            // slot is gone — the bloom insert must not be dropped with it.
+            self.negative_lookup_note_commit(metablock);
+            // Defensive only: the sidecar sweep gate reloads evicted segments, so
+            // a sealed segment's late commit always finds its slot above. Folding
+            // it here would plant cross-file positions in the active accumulator,
+            // breaking the SeekTo same-file proof — drop it instead.
+            tracing::debug!(log_id, active_log_id, "dropping segment-summary update for a sealed segment with no staged slot");
         }
+    }
+
+    /// Discard the active accumulator and mark it incomplete. For the truncate
+    /// path that unwinds onto a re-activated sealed segment: the accumulator's
+    /// contents describe the discarded segment, and the re-activated file
+    /// already holds commits the accumulator never saw.
+    pub fn reset_segment_summary_after_unwind(&mut self) {
+        self.segment_summary.clear();
+        self.segment_summary_orgs.clear();
+        self.segment_summary_types.clear();
+        self.segment_summary_clients.clear();
+        self.segment_summary_schemas = SchemaHashAccumulator::default();
+        self.segment_summary_loose = LooseChainHashes::default();
+        self.segment_summary_incomplete = true;
+        // Re-activation replaces rotation as the window's end; the taint set
+        // above already forces maybe-present, so the latch can drop.
+        self.segment_summary_draining = false;
+    }
+
+    /// Taint the active accumulator: it provably missed commits (e.g. the
+    /// pre-warm replay stopped before covering the whole active segment).
+    pub fn mark_segment_summary_incomplete(&mut self) {
+        self.segment_summary_incomplete = true;
+    }
+
+    /// Active-segment consult for the schema-absence proof: `false` = the
+    /// segment definitely holds no registration for this hash. Only a
+    /// taint-free, non-overflowed accumulator may answer absence.
+    pub fn active_segment_may_contain_schema(&self, hash: u64) -> bool {
+        self.segment_summary_draining
+            || self.segment_summary_incomplete
+            || self.segment_summary_schemas.may_contain(hash)
+    }
+
+    /// Rotation completed: `active_log_id` now names the new segment the
+    /// (drained, empty) accumulator legitimately describes, and absence
+    /// answers are sound again. Called by the seal path AFTER
+    /// `rotate_to_next_log` returns.
+    pub fn note_active_segment_rotated(&mut self) {
+        self.segment_summary_draining = false;
+    }
+
+    /// Open-time rebuild feed: the full forward scan of the active segment
+    /// inserts every schema-registration hash it sees (idempotent superset of
+    /// the pre-warm replay's commit-fed inserts).
+    pub fn segment_summary_insert_schema_hash(&mut self, hash: u64) {
+        self.segment_summary_schemas.insert(hash);
     }
 
     /// Update a sealed segment's summary with a metablock that was replicated for that segment.
     /// Mirrors update_segment_summary but targets the stored sealed snapshot.
-    pub fn update_sealed_segment_summary(&mut self, log_id: u64, metablock: &Metablock) {
+    pub fn update_sealed_segment_summary(&mut self, log_id: u64, metablock: &Metablock, metablock_absolute_pos: u64) {
         let Some(sealed) = self.sealed_segment_summaries.get_mut(&log_id) else { return };
-        match &metablock.wal_metablock_type {
-            MetablockKind::EventBatchMetadata(eb) => {
-                let key = &eb.aggregate_key;
-                sealed.orgs.insert(key.org_id);
-                sealed.aggregate_types.insert(AggregateTypeKey::new(key.org_id, key.aggregate_type_id));
-                let entry = sealed.aggregates.entry(key.clone()).or_insert_with(|| {
-                    let mut e = SegmentAggregateEntry::new(key.org_id, key.aggregate_type_id, key.aggregate_id);
-                    e.min_aggregate_version = eb.trimmed_below_version;
-                    e
-                });
-                entry.is_deleted = false;
-                entry.event_batch_count += 1;
-                if eb.aggregate_version > entry.last_aggregate_version {
-                    entry.last_aggregate_version = eb.aggregate_version;
-                }
-                if metablock.server_timestamp > entry.last_server_timestamp {
-                    entry.last_server_timestamp = metablock.server_timestamp;
-                }
-                entry.compressed_size += metablock.compressed_size;
-                entry.uncompressed_size += metablock.uncompressed_size;
-            }
-            MetablockKind::SoftDelete(sd) => {
-                let key = &sd.aggregate_key;
-                sealed.orgs.insert(key.org_id);
-                sealed.aggregate_types.insert(AggregateTypeKey::new(key.org_id, key.aggregate_type_id));
-                let entry = sealed.aggregates.entry(key.clone())
-                    .or_insert_with(|| SegmentAggregateEntry::new(key.org_id, key.aggregate_type_id, key.aggregate_id));
-                entry.is_deleted = true;
-                entry.event_batch_count = 0;
-                entry.compressed_size = 0;
-                entry.uncompressed_size = 0;
-            }
-            MetablockKind::SoftTrim(st) => {
-                let key = &st.aggregate_key;
-                if let Some(entry) = sealed.aggregates.get_mut(key) {
-                    if st.keep_from_aggregate_version > entry.min_aggregate_version {
-                        entry.min_aggregate_version = st.keep_from_aggregate_version;
-                    }
-                }
-            }
-            MetablockKind::SchemaRegistration(_) => {}
-        }
+        fold_segment_summary(
+            &mut sealed.aggregates,
+            &mut sealed.orgs,
+            &mut sealed.aggregate_types,
+            &mut sealed.clients,
+            &mut sealed.schemas,
+            &mut sealed.loose,
+            metablock,
+            metablock_absolute_pos,
+        );
     }
 
     /// Snapshot the log_ids of sealed segments whose summary is staged in memcache and
@@ -1369,13 +1738,29 @@ impl<V: Validate> ShardMemCache<V> {
         self.sealed_segment_summaries.keys().copied().collect()
     }
 
-    /// Take the sealed segment summary, converting to SegmentSummaryPayload for sidecar write.
+    /// Take the sealed segment summary, converting to SegmentSummaryPayload
+    /// (seal-time right-sized blooms included) for sidecar write.
     pub fn take_sealed_segment_summary(&mut self, log_id: u64) -> Option<SegmentSummaryPayload> {
         let sealed = self.sealed_segment_summaries.remove(&log_id)?;
+        let (aggregate_bloom, client_bloom) =
+            seal_segment_blooms(&sealed.aggregates, &sealed.clients, &sealed.loose, sealed.complete);
+        let mut clients = sealed.clients;
+        let aggregates: Vec<SegmentAggregateEntry> = sealed
+            .aggregates
+            .into_iter()
+            .map(|(key, mut entry)| {
+                entry.client_set = clients.remove(&key).map_or(ClientSet::Unknown, |h| ClientSet::from_client_hashes(&h));
+                entry
+            })
+            .collect();
         Some(SegmentSummaryPayload {
             orgs: sealed.orgs.into_iter().collect(),
             aggregate_types: sealed.aggregate_types.into_iter().collect(),
-            aggregates: sealed.aggregates.into_values().collect(),
+            aggregates,
+            complete: sealed.complete,
+            aggregate_bloom,
+            client_bloom,
+            schema_bloom: sealed.schemas.to_schema_bloom(sealed.complete),
         })
     }
 
@@ -1403,6 +1788,137 @@ pub struct EventIndexes {
     pub aggregate_version: u64,
     pub min_aggregate_version: u64,
     pub event_seq: u64,
+}
+
+/// Merge a colliding slot's aggregate entry, where `later` was folded strictly
+/// after `entry` (same segment, forward time): temporal fields take the later
+/// era, monotone fields max, additive fields sum. A later-era delete stands
+/// wholesale — the fold zeroes counts at delete, and nothing newer exists.
+fn merge_entry_later_era(entry: &mut SegmentAggregateEntry, later: SegmentAggregateEntry) {
+    if later.is_deleted {
+        *entry = later;
+        return;
+    }
+    entry.is_deleted = false;
+    entry.event_batch_count += later.event_batch_count;
+    entry.last_aggregate_version = entry.last_aggregate_version.max(later.last_aggregate_version);
+    entry.min_aggregate_version = entry.min_aggregate_version.max(later.min_aggregate_version);
+    entry.last_server_timestamp = entry.last_server_timestamp.max(later.last_server_timestamp);
+    entry.compressed_size += later.compressed_size;
+    entry.uncompressed_size += later.uncompressed_size;
+    if later.newest_metablock_pos != 0 {
+        entry.newest_metablock_pos = later.newest_metablock_pos;
+    }
+}
+
+/// Seal-time right-sized segment blooms from an accumulator's exact key
+/// knowledge (all three blooms share one sizing formula). Sound
+/// only for a COMPLETE accumulator — an incomplete one is a subset and any
+/// bloom built from it could answer a false "absent", so both persist as None
+/// (maybe-present everywhere). The per-aggregate client sets are exact in
+/// memory (no cap), so the client union is exact; trim-only keys/clients ride
+/// in via `loose`.
+fn seal_segment_blooms(
+    aggregates: &HashMap<AggregateKey, SegmentAggregateEntry>,
+    clients: &HashMap<AggregateKey, HashSet<u64>>,
+    loose: &LooseChainHashes,
+    complete: bool,
+) -> (Option<Vec<u64>>, Option<Vec<u64>>) {
+    if !complete {
+        return (None, None);
+    }
+    let aggregate_bloom = sized_bloom_from_hashes(
+        aggregates.len() + loose.keys.len(),
+        aggregates.keys().map(AggregateKey::bloom_hash).chain(loose.keys.iter().copied()),
+        AGGREGATE_BLOOM_BYTES,
+    );
+    let client_union: HashSet<u64> =
+        clients.values().flatten().chain(loose.clients.iter()).copied().collect();
+    let client_bloom = sized_bloom_from_hashes(
+        client_union.len(),
+        client_union.iter().copied(),
+        CLIENT_BLOOM_BYTES,
+    );
+    (Some(aggregate_bloom), Some(client_bloom))
+}
+
+/// One metablock's contribution to a segment summary accumulator (active or sealed
+/// slot). Every aggregate-scoped client-bearing kind (EventBatch, SoftDelete,
+/// SoftTrim) feeds the per-aggregate client-hash set — a tombstone-only client
+/// missing from it would be a subset, answering a false "absent". Positions are
+/// last-wins: the fold runs in write order, so the last position is the newest.
+fn fold_segment_summary(
+    aggregates: &mut HashMap<AggregateKey, SegmentAggregateEntry>,
+    orgs: &mut HashSet<u128>,
+    aggregate_types: &mut HashSet<AggregateTypeKey>,
+    clients: &mut HashMap<AggregateKey, HashSet<u64>>,
+    schemas: &mut SchemaHashAccumulator,
+    loose: &mut LooseChainHashes,
+    metablock: &Metablock,
+    metablock_absolute_pos: u64,
+) {
+    match &metablock.wal_metablock_type {
+        MetablockKind::EventBatchMetadata(eb) => {
+            let key = &eb.aggregate_key;
+            orgs.insert(key.org_id);
+            aggregate_types.insert(AggregateTypeKey::new(key.org_id, key.aggregate_type_id));
+            let entry = aggregates.entry(key.clone()).or_insert_with(|| {
+                let mut e = SegmentAggregateEntry::new(key.org_id, key.aggregate_type_id, key.aggregate_id);
+                e.min_aggregate_version = eb.trimmed_below_version;
+                e
+            });
+            entry.is_deleted = false;
+            entry.event_batch_count += 1;
+            if eb.aggregate_version > entry.last_aggregate_version {
+                entry.last_aggregate_version = eb.aggregate_version;
+            }
+            if metablock.server_timestamp > entry.last_server_timestamp {
+                entry.last_server_timestamp = metablock.server_timestamp;
+            }
+            entry.compressed_size += metablock.compressed_size;
+            entry.uncompressed_size += metablock.uncompressed_size;
+            entry.newest_metablock_pos = metablock_absolute_pos;
+            clients.entry(key.clone()).or_default().insert(client_id_bloom_hash(eb.client_id));
+        }
+        MetablockKind::SoftDelete(sd) => {
+            let key = &sd.aggregate_key;
+            orgs.insert(key.org_id);
+            aggregate_types.insert(AggregateTypeKey::new(key.org_id, key.aggregate_type_id));
+            let entry = aggregates.entry(key.clone())
+                .or_insert_with(|| SegmentAggregateEntry::new(key.org_id, key.aggregate_type_id, key.aggregate_id));
+            entry.is_deleted = true;
+            entry.event_batch_count = 0;
+            entry.compressed_size = 0;
+            entry.uncompressed_size = 0;
+            entry.newest_metablock_pos = metablock_absolute_pos;
+            clients.entry(key.clone()).or_default().insert(client_id_bloom_hash(sd.client_id));
+        }
+        MetablockKind::SoftTrim(st) => {
+            // No entry means the aggregate has nothing else in this segment; the
+            // summary then reports it absent and consumers skip the segment, which
+            // matches today's scan (client seqs are read from EventBatch blocks only).
+            let key = &st.aggregate_key;
+            if let Some(entry) = aggregates.get_mut(key) {
+                if st.keep_from_aggregate_version > entry.min_aggregate_version {
+                    entry.min_aggregate_version = st.keep_from_aggregate_version;
+                }
+                entry.newest_metablock_pos = metablock_absolute_pos;
+                clients.entry(key.clone()).or_default().insert(client_id_bloom_hash(st.client_id));
+            } else {
+                // No summary entry (see above) — but the segment blooms must
+                // stay supersets of every chain key and client in the file:
+                // the aggregate-load scan reads this trim's floor, and a bloom
+                // skip here would hand out a stale one.
+                loose.keys.insert(key.bloom_hash());
+                loose.clients.insert(client_id_bloom_hash(st.client_id));
+            }
+        }
+        // No aggregate entry (registrations carry none); the segment's schema
+        // set is what the absence proof consults.
+        MetablockKind::SchemaRegistration(sr) => {
+            schemas.insert(sr.schema_key.bloom_hash());
+        }
+    }
 }
 
 /// Inserts into the cache. If `low_priority` is true, only inserts when there's

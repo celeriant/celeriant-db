@@ -2,6 +2,8 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use celeriant_wal::segment_summary::client_set::ClientSet;
+use celeriant_wal::segment_summary::segment_summary_payload::SegmentSummaryPayload;
 use glommio::sync::Semaphore;
 use tracing::{debug, info, trace, warn};
 
@@ -20,7 +22,7 @@ use celeriant_memcache::cache_path::CachePath;
 use celeriant_memcache::mem_snapshot_aggregate::{AggregateStatus, MemSnapshotAggregate};
 use celeriant_memcache::metablock_position::MetablockPosition;
 use celeriant_memcache::shard_log_queue_item::ShardLogQueueItem;
-use celeriant_memcache::shard_mem_cache::{ClientSeqStatus, ShardMemCache};
+use celeriant_memcache::shard_mem_cache::{ClientSeqStatus, NegativeLookupAnswer, ShardMemCache};
 use crate::schema_validator::CompiledValidator;
 
 type MemCache = ShardMemCache<CompiledValidator>;
@@ -31,7 +33,9 @@ use celeriant_msg::request::requests::{DeleteRequest, AggregateDetailsRequest, L
 use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
 use celeriant_msg::response::responses::{AggregateListItem, AggregateTypeListItem, AggregateDetailsResponse, DeleteResponse, FollowerRejection, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, OrgListItem, ReadResponse, RegisterSchemaResponse, ReplicationBatchResponse, ReplicationResult, TrimStartResponse, WriteResponse};
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
-use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
+use celeriant_rotating_log::reverse_metablock_scanner::{ReverseMetablockScanner, SegmentHint};
+use lru::LruCache;
+use std::num::NonZeroUsize;
 use celeriant_wal::aggregate_client_key::{client_id_bloom_hash, AggregateClientKey};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::aggregate_type_key::AggregateTypeKey;
@@ -39,7 +43,6 @@ use celeriant_wal::schema_key::SchemaKey;
 use celeriant_wal::constants::{FIRST_AGGREGATE_VERSION, FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH};
 use celeriant_wal::datablocks::datablock::Datablock;
 use celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
-use celeriant_wal::segment_summary::SegmentSummaryPayload;
 use celeriant_wal::datablocks::datablock_kind::DatablockKind;
 use celeriant_wal::datablocks::datablock_schema_registration::DatablockSchemaRegistration;
 use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
@@ -96,6 +99,17 @@ const REPLICATION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 /// (measured ~198 vs ~4809 with the mis-sized 2× window). Pacing knob, not a
 /// correctness gate — too small fires under load, too large only staler idle tails.
 const RECENCY_WINDOW_BATCHES: u32 = 16;
+
+/// Decoded sealed-segment summary cache capacity (segments).
+// Left at 16 even though typical sealed sidecars are ~KB: the worst-case payload is
+// still SUMMARY_PAYLOAD_MAX_BYTES (4 MiB), so this constant — not typical sidecar
+// size — bounds the cache's memory (16 × 4 MiB); a miss now costs one tiny read
+// + decode, so raising it should follow consult-miss metrics, not sidecar size.
+const SUMMARY_CACHE_SEGMENTS: usize = 16;
+
+/// Decoded sealed-segment summary cache. Owned by `ShardWal`; the S3-catchup
+/// truncate path borrows it to invalidate entries for unwound log ids.
+pub(crate) type SummaryCache = LruCache<u64, Rc<SegmentSummaryPayload>>;
 
 /// Compile a schema datablock and insert into the cache.
 /// Shared by pre_warm_cache, ensure_schema_cached, and follower replication.
@@ -189,6 +203,13 @@ pub struct ShardWal<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
 
     /// Cache for bloom filter construction to avoid repeated allocations, uses interior mutability
     bloom_filter_cache: Rc<BloomFilterCache>,
+
+    /// Bounded cache of decoded sealed-segment summaries, shared by the dedup
+    /// consult and the listing paths. Sealed summaries are immutable EXCEPT
+    /// compaction rewrites and S3-catchup truncates, which pop the affected
+    /// entries (compaction after the swap, truncate for every unwound id).
+    /// Worst case 16 × 4 MiB = 64 MiB; realistic summaries are ~10-100 KiB.
+    summary_cache: RefCell<SummaryCache>,
 
     // Are we the leader? Follower? Single node mode? Note this can change at runtime.
     pub node_status: Rc<Cell<ValidatedNodeStatus>>,
@@ -330,21 +351,41 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> AggregateReader 
     }
 }
 
-/// Rebuild the active segment's in-memory per-aggregate backlink tips by scanning
-/// it once (newest position per aggregate). The map is not persisted, so the next
-/// append after open or a truncation would otherwise back-link to 0 and the reverse
-/// scan would stop short of older same-segment metablocks. Active segment only.
+/// Rebuild the active segment's in-memory state by scanning it forward once:
+/// (a) per-aggregate backlink tips (newest position per aggregate — not persisted, so
+/// the next append would otherwise back-link to 0 and the reverse scan would stop
+/// short of older same-segment metablocks), and (b) the segment's aggregate + client
+/// blooms (v2 headers carry none; the loaded cursors hold ABSENT blooms until here).
+/// Every client-bearing kind feeds the client bloom — EventBatch, SoftDelete, SoftTrim
+/// — a tombstone-only client left out would make the bloom a subset (false "absent").
+/// SchemaRegistration feeds the segment-summary schema accumulator (NOT the aggregate
+/// bloom — aggregate blooms answer aggregate questions only); the full scan makes the
+/// accumulator's schema set a superset even when the pre-warm replay stopped short.
+/// Deserialization-free: kind + keys + client_id read straight from block bytes.
+/// Active segment only; this same sequential pass is the recovery warm-up that keeps
+/// post-crash idempotency lookups off the random-read path.
 pub(crate) async fn rebuild_active_segment_chain_tips(
     log_segments_cache: &LogSegmentsCache,
     scan_chunk_size: u64,
+    shard_mem_cache: &Rc<RefCell<MemCache>>,
+    metrics_shard_label: &[(&'static str, String); 1],
 ) -> Result<usize, std::io::Error> {
     use celeriant_disk::files::read_fixed_records_visit_const::{read_fixed_records_visit_const, ReadVisitError};
+    use celeriant_rotating_log::log_segment_file::aggregate_key_bloom::AggregateKeyBloom;
 
     let active = log_segments_cache.active();
+    let active_log_id = active.metadata.borrow().log_id;
     let metablocks_start = celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES as u64;
     let metablocks_end = active.metadata.borrow().write.metablocks_position;
 
     let mut tips: HashMap<AggregateKey, u64> = HashMap::new();
+    let mut aggregate_bloom = AggregateKeyBloom::new();
+    let mut client_bloom = AggregateKeyBloom::with_capacity_bytes(celeriant_wal::constants::CLIENT_BLOOM_BYTES);
+    // Eager negative-lookup feed: the scan already reads every metablock's key
+    // and client_id, so collecting per-aggregate client hashes adds no IO.
+    // Transient, same scale as the seal accumulator's client map.
+    let mut clients: HashMap<AggregateKey, std::collections::HashSet<u64>> = HashMap::new();
+    let mut schema_hashes: Vec<u64> = Vec::new();
     if metablocks_end > metablocks_start {
         let guard = active.lock_reader("rebuild_chain_tips").await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, e.to_string()))?;
@@ -355,24 +396,110 @@ pub(crate) async fn rebuild_active_segment_chain_tips(
             dma_file, false, metablocks_start, metablocks_end, scan_chunk_size,
             |pos, block| {
                 if let Some(key) = metablock_bytes::read_chain_aggregate_key(block) {
+                    aggregate_bloom.insert(&key);
+                    let client_id = if metablock_bytes::is_metablock_kind_event_batch_metadata(block) {
+                        metablock_bytes::read_event_batch_client_id(block)
+                    } else if metablock_bytes::is_metablock_kind_soft_delete(block) {
+                        metablock_bytes::read_soft_delete_client_id(block)
+                    } else {
+                        metablock_bytes::read_soft_trim_client_id(block)
+                    };
+                    client_bloom.insert_hash(client_id_bloom_hash(client_id));
+                    clients.entry(key.clone()).or_default().insert(client_id_bloom_hash(client_id));
                     tips.insert(key, pos); // forward scan: last (newest) write wins
+                } else if metablock_bytes::is_metablock_kind_schema_registration(block) {
+                    schema_hashes.push(metablock_bytes::read_schema_registration_key(block).bloom_hash());
                 }
                 Ok(false)
             },
         ).await;
-        if let Err(ReadVisitError::Io(e)) = result {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()));
+        // Exhaustive on purpose: ANY scan error must abort before install, or a
+        // partially-populated precise bloom (a subset) replaces the safe absent one.
+        match result {
+            Ok(_) => {}
+            Err(ReadVisitError::Io(e)) => {
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()));
+            }
+            Err(ReadVisitError::Visitor(())) => {
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, "rebuild visitor aborted"));
+            }
         }
     }
 
+    // Writes must be FENCED while this runs: the scan snapshots [start, end) above,
+    // awaits on disk, then replaces tips and blooms wholesale — a commit landing
+    // mid-scan would be clobbered (stale-LOW tip, subset bloom, both correctness
+    // bugs now that the blooms gate dedup scans). All callers (open, S3-catchup
+    // truncate, tail cull) hold the write path quiescent; these tripwires catch a
+    // future unfenced caller.
+    debug_assert_eq!(
+        log_segments_cache.active_log_id(), active_log_id,
+        "active segment rotated during the open-time rebuild scan"
+    );
+    debug_assert_eq!(
+        active.metadata.borrow().write.metablocks_position, metablocks_end,
+        "write cursor moved during the open-time rebuild scan — writes are not fenced"
+    );
+
     let count = tips.len();
     *active.aggregate_chain_tips.borrow_mut() = tips;
+    active.install_blooms(aggregate_bloom, client_bloom);
+
+    // Eager negative-lookup population (bounded by the cache's byte budget,
+    // enforced inside `negative_lookup_seed`). Entries built here cover ONLY
+    // the active segment, so they may be Complete only when the aggregate's
+    // whole history is provably confined to it — which is knowable without
+    // extra IO exactly when no sealed segments exist. Otherwise they install
+    // as Building and the first miss finishes the build from sidecars + scan.
+    // This pass is what turns post-recovery fan-in into no-scan first writes.
+    {
+        let eager_complete = active_log_id == 1;
+        let mut mc = shard_mem_cache.borrow_mut();
+        // Schema hashes land in the active summary accumulator, next to where
+        // commits insert them; the sidecar picks them up at seal.
+        for hash in &schema_hashes {
+            mc.segment_summary_insert_schema_hash(*hash);
+        }
+        let mut completed = 0u64;
+        for (key, hashes) in &clients {
+            if mc.negative_lookup_seed(key, hashes, eager_complete) {
+                completed += 1;
+            }
+        }
+        if completed > 0 {
+            metrics::counter!("celeriant_negative_lookup_builds_completed_total", metrics_shard_label).increment(completed);
+        }
+    }
     Ok(count)
 }
 
+/// Where the client dedup scan starts. The aggregate snapshot LRU gives an exact
+/// cross-segment position; failing that, the active segment's chain tips give the
+/// aggregate's newest in-segment block, skipping the O(distance-to-tip) reverse hunt.
+/// Both misses mean an unbounded reverse scan from the active write tip, relying on
+/// the segment blooms to short-circuit.
+fn client_scan_start(
+    last_known: &MetablockPosition,
+    active_log_id: u64,
+    active_tip: Option<u64>,
+) -> (u64, Option<u64>) {
+    if last_known.log_id != 0 {
+        (
+            last_known.log_id,
+            Some(last_known.metablock_absolute_pos.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64)), //Include SELF
+        )
+    } else {
+        (
+            active_log_id,
+            active_tip.map(|pos| pos.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64)),
+        )
+    }
+}
+
 /// Read the segment summary from a closed log segment's sidecar `.summary` file.
-/// Returns `None` for legacy segments that don't have a summary, or if the file is corrupt.
-/// Opens and closes the file each time — no LRU involvement, OS page cache handles repeats.
+/// Returns `None` for legacy/v1 segments without a usable summary, or if the file
+/// is corrupt. Opens and closes the file each time; repeat consumers go through
+/// `read_segment_summary_cached` (bounded decoded LRU).
 pub(crate) async fn read_segment_summary(
     shard_dir: &std::path::Path,
     log_id: u64,
@@ -405,9 +532,33 @@ pub(crate) async fn read_segment_summary(
     };
 
     match deserialise_segment_summary(&buf) {
-        Ok(block) => Some(block.payload),
+        Ok(block) => Some(block),
         Err(_) => None,
     }
+}
+
+/// Per-segment dedup hint from a decoded summary (aggregates sorted by ids —
+/// see `read_segment_summary_cached`). `None` = no usable information, walk the
+/// segment exactly as without a summary. Skip fires when the aggregate has no
+/// entry in the segment, or its client set answers "definitely absent" — the
+/// safe direction is superset, so a skip can never hide a real record. Skips
+/// therefore require a COMPLETE summary: an incomplete one (subset) may still
+/// serve tips — positions from a newest-first replay are true-newest for the
+/// aggregates it has — but its absences prove nothing.
+fn summary_hint(payload: &SegmentSummaryPayload, key: &AggregateKey, client_hash: u64) -> Option<SegmentHint> {
+    let found = payload.aggregates.binary_search_by_key(
+        &(key.org_id, key.aggregate_type_id, key.aggregate_id),
+        |e| (e.org_id, e.aggregate_type_id, e.aggregate_id),
+    );
+    let entry = match found {
+        Err(_) => return payload.complete.then_some(SegmentHint::Skip),
+        Ok(i) => &payload.aggregates[i],
+    };
+    if payload.complete && !entry.client_set.may_contain_hash(client_hash) {
+        return Some(SegmentHint::Skip);
+    }
+    // 0 = no tip recorded (compaction dropped the aggregate's blocks): full walk.
+    (entry.newest_metablock_pos != 0).then_some(SegmentHint::SeekTo(entry.newest_metablock_pos))
 }
 
 impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
@@ -477,6 +628,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             config.aggregate_snapshots_cache_bytes,
             config.aggregate_client_snapshots_cache_bytes,
             config.schema_cache_bytes,
+            config.negative_lookup_cache_bytes,
             config.internode_max_request_size,
         );
 
@@ -498,6 +650,23 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let shard_mem_cache = Rc::new(RefCell::new(shard_mem_cache));
         let log_segments_cache = Rc::new(log_segments_cache);
 
+        // Sealed segments reloaded after LRU eviction get their blooms from the
+        // .summary sidecar (v2 headers carry none). Layering: rotating_log must not
+        // read summaries, so the shard injects the loader. No/torn sidecar -> None
+        // -> the segment keeps ABSENT blooms (maybe-present, never a false skip).
+        {
+            let shard_dir = config.shard_dir.clone();
+            log_segments_cache.set_sealed_bloom_loader(Rc::new(move |log_id| {
+                let shard_dir = shard_dir.clone();
+                Box::pin(async move {
+                    match read_segment_summary(&shard_dir, log_id).await {
+                        Some(payload) => (payload.aggregate_bloom, payload.client_bloom),
+                        None => (None, None),
+                    }
+                })
+            }));
+        }
+
         let dict_codec = Rc::new(
             DictCodec::new(&config.dict_bytes, config.wal_compression_level)
                 .map_err(|e| ReadyUpError::DictCodecBuildFailed(e.to_string()))?,
@@ -505,7 +674,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         Self::pre_warm_cache(&log_segments_cache, &shard_mem_cache, &config, &dict_codec).await?;
 
-        rebuild_active_segment_chain_tips(&log_segments_cache, config.read_max_chunk_size)
+        rebuild_active_segment_chain_tips(&log_segments_cache, config.read_max_chunk_size, &shard_mem_cache, &metrics_shard_label)
             .await
             .map_err(|source| ReadyUpError::UnableToAccessDirectory {
                 directory: "active-segment backlink rebuild".to_string(),
@@ -529,6 +698,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             replication_coordinator: Rc::new(Coordinator::new()),
             watched_aggregates: Rc::new(AggregateWatchers::new()),
             bloom_filter_cache: Rc::new(BloomFilterCache::new()),
+            summary_cache: RefCell::new(LruCache::new(NonZeroUsize::new(SUMMARY_CACHE_SEGMENTS).unwrap())),
             node_status: Rc::new(Cell::new(node_status)),
             config,
             aggregate_loading: LoadingCoordinator::new(),
@@ -591,9 +761,12 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let mut agg_cache_full = false;
         let mut client_cache_full = false;
         let mut timed_out = false;
+        // Set when the scan stops while still inside the active segment: the
+        // summary replay below then covers only a newest-prefix of it.
+        let mut partial_active_replay = false;
 
         let starting_log_id = log_segments_cache.active_log_id();
-        let mut active_segment_metablocks: Vec<Metablock> = Vec::new();
+        let mut active_segment_metablocks: Vec<(u64, Metablock)> = Vec::new();
 
         // Warm to the write tip so the cache can serve the write path; culls
         // clear these caches when dropping an un-acked tip anyway.
@@ -610,10 +783,12 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         scanner
             .scan::<(), ReadyUpError>(|log_id, metablock_absolute_pos, metablock_bytes| {
                 if agg_cache_full && client_cache_full {
+                    partial_active_replay |= log_id == starting_log_id;
                     return Ok(Some(()));
                 }
                 if warmup_start.elapsed() >= warmup_deadline {
                     timed_out = true;
+                    partial_active_replay |= log_id == starting_log_id;
                     return Ok(Some(()));
                 }
 
@@ -624,7 +799,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                             source: std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")),
                         })?;
                     if log_id == starting_log_id {
-                        active_segment_metablocks.push(metablock.clone());
+                        active_segment_metablocks.push((metablock_absolute_pos, metablock.clone()));
                     }
                     if let MetablockKind::SoftDelete(soft_delete) = metablock.wal_metablock_type {
                         let mut cache = shard_mem_cache.borrow_mut();
@@ -653,7 +828,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                             source: std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")),
                         })?;
                     if log_id == starting_log_id {
-                        active_segment_metablocks.push(metablock.clone());
+                        active_segment_metablocks.push((metablock_absolute_pos, metablock.clone()));
                     }
                     if let MetablockKind::SoftTrim(soft_trim) = metablock.wal_metablock_type {
                         let mut cache = shard_mem_cache.borrow_mut();
@@ -676,7 +851,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 if metablock_bytes::is_metablock_kind_schema_registration(metablock_bytes) {
                     if let Ok(metablock) = deserialise_metablock(metablock_bytes) {
                         if log_id == starting_log_id {
-                            active_segment_metablocks.push(metablock.clone());
+                            active_segment_metablocks.push((metablock_absolute_pos, metablock.clone()));
                         }
                         if let MetablockKind::SchemaRegistration(ref schema_reg) = metablock.wal_metablock_type {
                             let mut cache = shard_mem_cache.borrow_mut();
@@ -695,7 +870,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
                 if log_id == starting_log_id {
                     if let Ok(metablock) = deserialise_metablock(metablock_bytes) {
-                        active_segment_metablocks.push(metablock);
+                        active_segment_metablocks.push((metablock_absolute_pos, metablock));
                     }
                 }
 
@@ -773,10 +948,16 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         // Replay active segment metablocks in forward (write) order for correct summary state.
         // The reverse scan collected them newest-first; reversing gives chronological order.
+        // A replay that stopped inside the active segment seeds a SUBSET: taint the
+        // accumulator so the eventual seal never authorizes Skip decisions (the tips
+        // it does hold are true-newest and stay usable as SeekTo targets).
         {
             let mut cache = shard_mem_cache.borrow_mut();
-            for metablock in active_segment_metablocks.into_iter().rev() {
-                cache.update_segment_summary(&metablock);
+            for (metablock_absolute_pos, metablock) in active_segment_metablocks.into_iter().rev() {
+                cache.update_segment_summary(&metablock, metablock_absolute_pos);
+            }
+            if partial_active_replay {
+                cache.mark_segment_summary_incomplete();
             }
         }
 
@@ -790,6 +971,23 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         );
 
         Ok(())
+    }
+
+    /// Read-through cache over `read_segment_summary`, shared by the dedup
+    /// consult and the listing paths. Aggregates are sorted by ids at decode so
+    /// `summary_hint` can binary-search; the order is deterministic, so listing
+    /// cursors (offsets into the Vec) stay stable across evictions and restarts.
+    /// Misses (no/v1/torn sidecar) are NOT cached — the deferred sweep may write
+    /// the sidecar later. Concurrent misses may decode twice: bounded and rare.
+    async fn read_segment_summary_cached(&self, log_id: u64) -> Option<Rc<SegmentSummaryPayload>> {
+        if let Some(payload) = self.summary_cache.borrow_mut().get(&log_id) {
+            return Some(payload.clone());
+        }
+        let mut payload = read_segment_summary(self.log_segments_cache.shard_dir(), log_id).await?;
+        payload.aggregates.sort_unstable_by_key(|e| (e.org_id, e.aggregate_type_id, e.aggregate_id));
+        let payload = Rc::new(payload);
+        self.summary_cache.borrow_mut().put(log_id, payload.clone());
+        Some(payload)
     }
 
     /// List all unique organizations that have data in this shard.
@@ -835,9 +1033,12 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 });
             }
 
-            match read_segment_summary(self.log_segments_cache.shard_dir(), log_id).await {
+            // Incomplete summaries (partial-warmup / post-truncate taint) are a
+            // subset: listing from them would omit silently and permanently.
+            // All three listing paths fall back to the legacy scan instead.
+            match self.read_segment_summary_cached(log_id).await.filter(|p| p.complete) {
                 Some(payload) => {
-                    for org_id in payload.orgs {
+                    for &org_id in &payload.orgs {
                         if seen.insert(org_id) {
                             results.push(OrgListItem { org_id });
                         }
@@ -920,9 +1121,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 });
             }
 
-            match read_segment_summary(self.log_segments_cache.shard_dir(), log_id).await {
+            match self.read_segment_summary_cached(log_id).await.filter(|p| p.complete) {
                 Some(payload) => {
-                    for atk in payload.aggregate_types {
+                    for atk in &payload.aggregate_types {
                         if let Some(filter) = filter_org_id {
                             if atk.org_id != filter { continue; }
                         }
@@ -1122,7 +1323,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 return Ok(build_response(request.correlation_id, result_order, &seen, Some(next)));
             }
 
-            match read_segment_summary(self.log_segments_cache.shard_dir(), log_id).await {
+            match self.read_segment_summary_cached(log_id).await.filter(|p| p.complete) {
                 Some(payload) => {
                     let mut i = offset as usize;
                     while i < payload.aggregates.len() {
@@ -1790,7 +1991,12 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
             match result {
                 // Segment compacted — return immediately (one per cycle).
-                Ok(Some(r)) => return Ok(Some(r)),
+                Ok(Some(r)) => {
+                    // Compaction rewrote the segment and its sidecar; drop any
+                    // stale decoded summary so the next consult re-reads it.
+                    self.summary_cache.borrow_mut().pop(&r.log_id);
+                    return Ok(Some(r));
+                }
                 // Below threshold or pending advance — yield then try next segment.
                 Ok(None) => {
                     segments_checked += 1;
@@ -1843,6 +2049,57 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             return Ok(());
         }
 
+        // ── Negative-lookup bloom (idempotency-negative-lookup.md) ──────────
+        let client_hash = client_id_bloom_hash(aggregate_client_key.client_id);
+        let negative_answer = self.shard_mem_cache.borrow_mut().negative_lookup_check(aggregate_key, client_hash);
+        if negative_answer == NegativeLookupAnswer::DefinitelyAbsent {
+            // A Complete bloom proves this client never wrote here: scan-free
+            // first write. Insert it now (it is about to write; a rolled-back
+            // write leaves a phantom, which is a superset, which is safe) and
+            // seed the per-client LRU sentinel exactly as the not-found scan
+            // path would.
+            let mut mc = self.shard_mem_cache.borrow_mut();
+            mc.negative_lookup_insert(aggregate_key, client_hash);
+            mc.put_aggregate_client_into_cache(aggregate_client_key.clone(), 0, false);
+            drop(mc);
+            metrics::counter!("celeriant_negative_lookup_short_circuit_total", &self.metrics_shard_label).increment(1);
+            return Ok(());
+        }
+        // No usable bloom: become the builder unless one is Complete
+        // (MaybePresent: scan for the member/FP) or a build is already in
+        // flight (Building latch: falls back to a plain scan, per the doc).
+        // Install-empty-then-populate ordering: `try_begin_build` installs the
+        // Building entry synchronously — BEFORE any await below — so every
+        // concurrent commit from here on lands in it via insert-on-write.
+        let complete_bloom = negative_answer == NegativeLookupAnswer::MaybePresent;
+        let build_generation = if complete_bloom {
+            None
+        } else {
+            self.shard_mem_cache.borrow_mut().negative_lookup_try_begin_build(aggregate_key)
+        };
+        let building = build_generation.is_some();
+        // Parks the build on ANY exit (scan error, lock/semaphore timeout,
+        // task cancellation): the entry stays Building — never answering
+        // absent — and a later miss resumes it. Disarmed by finish below.
+        // Carries this builder's generation so a late drop can never park a
+        // successor builder's entry.
+        struct NegativeBuildGuard<'a> {
+            mem: &'a RefCell<MemCache>,
+            key: &'a AggregateKey,
+            generation: Option<u64>,
+        }
+        impl Drop for NegativeBuildGuard<'_> {
+            fn drop(&mut self) {
+                if let Some(generation) = self.generation {
+                    self.mem.borrow_mut().negative_lookup_finish_build(self.key, generation, false);
+                }
+            }
+        }
+        let mut build_guard = NegativeBuildGuard { mem: &self.shard_mem_cache, key: aggregate_key, generation: build_generation };
+        if building {
+            metrics::counter!("celeriant_negative_lookup_builds_started_total", &self.metrics_shard_label).increment(1);
+        }
+
         // Limit concurrent disk scans across different aggregates (NVMe starvation)
         let sem_wait_start = std::time::Instant::now();
         let _cache_permit = self.cache_load_semaphore.acquire_permit(1).await
@@ -1852,59 +2109,157 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         let last_known_metablock = self.shard_mem_cache.borrow_mut().get_aggregate_last_metablock_pos(aggregate_key, CachePath::Write);
 
-        // Guard against cache miss, aggregate can still have blocks present
-        // No cache means we need to do the full reverse scan
-        let (start_log_id, start_from_position) = if last_known_metablock.log_id == 0 {
-            (self.log_segments_cache.active_log_id(), None)
+        // Snapshot miss doesn't mean the aggregate has no blocks: fall back to the
+        // active segment's chain tips (rebuilt at open and on every cursor rewind,
+        // updated at commit — same freshness the appender relies on at sync time).
+        let active_tip = if last_known_metablock.log_id == 0 {
+            self.log_segments_cache.active().aggregate_chain_tips.borrow().get(aggregate_key).copied()
         } else {
-            (
-                last_known_metablock.log_id,
-                Some(last_known_metablock.metablock_absolute_pos.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64)), //Include SELF
-            )
+            None
         };
+        if active_tip.is_some() {
+            metrics::counter!(
+                "celeriant_cache_aggregate_client_tip_hint_total",
+                &self.metrics_shard_label,
+            ).increment(1);
+        }
+        let active_log_id = self.log_segments_cache.active_log_id();
+        let (start_log_id, start_from_position) =
+            client_scan_start(&last_known_metablock, active_log_id, active_tip);
 
-        // Begin the search from the chosen start, moving backwards. Chain-follow: this
-        // walks several of THIS aggregate's per-client versions, so skipping interleaved
-        // foreign metablocks via backlinks beats reading every block.
-        let mut scanner = ReverseMetablockScanner::new(
-            &self.log_segments_cache,
-            start_log_id,
-            start_from_position,
-            self.config.read_max_chunk_size,
-        )
-        .with_aggregate_chain(aggregate_key.clone(), self.config.chain_read_window_bytes)
-        .with_client_bloom_filter_hash(client_id_bloom_hash(aggregate_client_key.client_id))
-        .with_write_cursor_upper_bound();
-
-        let find_result = scanner
-            .scan::<bool, ()>(|_log_id, _metablock_absolute_pos, metablock_bytes| {
-                if !metablock_bytes::is_matches_aggregate_key(metablock_bytes, aggregate_key) {
-                    return Ok(None);
+        // Walk segments newest-to-oldest, consulting each sealed segment's summary
+        // only when the scan is about to enter it (lazy: a hit in a newer segment
+        // never touches older sidecars, and each sidecar decodes at most once per
+        // miss — no LRU thrash when segments outnumber the cache). An absent
+        // aggregate entry or a definitely-absent per-aggregate client set skips
+        // the segment outright; otherwise seek straight to the aggregate's newest
+        // metablock (the scanner self-verifies the target, so a stale
+        // post-compaction hint degrades to the full hunt). Segments with
+        // no/old-version/incomplete summary keep the full walk; the active
+        // segment keeps the chain-tip start-hint path untouched. The segment
+        // blooms still run first inside the scanner and stay authoritative.
+        let mut find_result: Option<bool> = None;
+        let mut hint: HashMap<u64, SegmentHint> = HashMap::with_capacity(1);
+        // Build completeness tracking: stays true only while every sealed
+        // segment is either walked or has its client set fully unioned in.
+        let mut build_exhaustive = true;
+        for log_id in (1..=start_log_id).rev() {
+            hint.clear();
+            if log_id != active_log_id {
+                let summary = self.read_segment_summary_cached(log_id).await;
+                if let Some(summary) = &summary {
+                    if let Some(h) = summary_hint(summary, aggregate_key, client_hash) {
+                        hint.insert(log_id, h);
+                    }
                 }
-
-                let client_id = metablock_bytes::read_event_batch_client_id(metablock_bytes);
-                let low_priority = client_id != aggregate_client_key.client_id;
-                let target_aggregate_client_key = AggregateClientKey::new(aggregate_key.clone(), client_id);
-
-                let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
-
-                // Not the aggregate we are searching for. Can we eager cache it? If not, skip it.
-                if low_priority && shard_mem_cache.is_aggregate_client_cache_full_or_contains(&target_aggregate_client_key) {
-                    return Ok(None);
+                if building {
+                    // Union the sealed segment's client set into the building
+                    // bloom BEFORE the scan can Skip on it: a Skip below then
+                    // never hides clients from the build. Only a complete
+                    // summary's set covers every client in the segment; an
+                    // Unknown set (or incomplete/missing summary) never
+                    // authorizes a Skip, so the chain walk covers the segment.
+                    if let Some(summary) = &summary {
+                        if summary.complete {
+                            let found_entry = summary.aggregates.binary_search_by_key(
+                                &(aggregate_key.org_id, aggregate_key.aggregate_type_id, aggregate_key.aggregate_id),
+                                |e| (e.org_id, e.aggregate_type_id, e.aggregate_id),
+                            );
+                            if let Ok(i) = found_entry {
+                                match &summary.aggregates[i].client_set {
+                                    ClientSet::Exact(hashes) => {
+                                        self.shard_mem_cache.borrow_mut().negative_lookup_union_exact(aggregate_key, hashes);
+                                    }
+                                    ClientSet::Bloom(words) => {
+                                        // Sidecar blooms share client_id_bloom_hash + SBBF math but are
+                                        // sized per segment, so the words are carried verbatim (aux) and
+                                        // OR-ed at lookup. Refusal (aux cap/malformed) = not exhaustive.
+                                        if !self.shard_mem_cache.borrow_mut().negative_lookup_union_bloom(aggregate_key, words) {
+                                            build_exhaustive = false;
+                                        }
+                                    }
+                                    ClientSet::Unknown => {}
+                                }
+                            }
+                        }
+                    }
                 }
+            }
 
-                let last_client_seq = metablock_bytes::read_event_batch_max_client_seq(metablock_bytes);
+            // Chain-follow within the segment: this walks several of THIS aggregate's
+            // per-client versions, so skipping interleaved foreign metablocks via
+            // backlinks beats reading every block.
+            let mut scanner = ReverseMetablockScanner::new(
+                &self.log_segments_cache,
+                log_id,
+                if log_id == start_log_id { start_from_position } else { None },
+                self.config.read_max_chunk_size,
+            )
+            .with_aggregate_chain(aggregate_key.clone(), self.config.chain_read_window_bytes)
+            .with_segment_hints(&hint)
+            .with_write_cursor_upper_bound()
+            .with_min_log_id(log_id);
+            if !building {
+                // The segment-level client bloom skips segments where the TARGET
+                // client is absent — sound for the lookup, but it would hide the
+                // aggregate's OTHER clients from a build (subset). Disabled while
+                // building; the sidecar unions above replace it where trustworthy.
+                scanner = scanner.with_client_bloom_filter_hash(client_hash);
+            }
 
-                shard_mem_cache.put_aggregate_client_into_cache(target_aggregate_client_key, last_client_seq, low_priority);
+            find_result = scanner
+                .scan::<bool, ()>(|_log_id, _metablock_absolute_pos, metablock_bytes| {
+                    // Build collection: every client-bearing chain member the walk
+                    // visits (EventBatch/SoftDelete/SoftTrim — every client-bearing kind) feeds
+                    // the building bloom, not just the EventBatch blocks the
+                    // client-seq lookup below cares about.
+                    if building {
+                        let commit_client_id = if metablock_bytes::is_metablock_kind_event_batch_metadata(metablock_bytes) {
+                            Some(metablock_bytes::read_event_batch_client_id(metablock_bytes))
+                        } else if metablock_bytes::is_metablock_kind_soft_delete(metablock_bytes) {
+                            Some(metablock_bytes::read_soft_delete_client_id(metablock_bytes))
+                        } else if metablock_bytes::is_metablock_kind_soft_trim(metablock_bytes) {
+                            Some(metablock_bytes::read_soft_trim_client_id(metablock_bytes))
+                        } else {
+                            None
+                        };
+                        if let Some(cid) = commit_client_id {
+                            self.shard_mem_cache.borrow_mut().negative_lookup_insert(aggregate_key, client_id_bloom_hash(cid));
+                        }
+                    }
 
-                if low_priority {
-                    Ok(None) //Haven't found aggregate client yet
-                } else {
-                    Ok(Some(true)) //Done searching
-                }
-            })
-            .await
-            .map_err(ShardCacheLoadError::FileScanningError)?;
+                    if !metablock_bytes::is_matches_aggregate_key(metablock_bytes, aggregate_key) {
+                        return Ok(None);
+                    }
+
+                    let client_id = metablock_bytes::read_event_batch_client_id(metablock_bytes);
+                    let low_priority = client_id != aggregate_client_key.client_id;
+                    let target_aggregate_client_key = AggregateClientKey::new(aggregate_key.clone(), client_id);
+
+                    let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
+
+                    // Not the aggregate we are searching for. Can we eager cache it? If not, skip it.
+                    if low_priority && shard_mem_cache.is_aggregate_client_cache_full_or_contains(&target_aggregate_client_key) {
+                        return Ok(None);
+                    }
+
+                    let last_client_seq = metablock_bytes::read_event_batch_max_client_seq(metablock_bytes);
+
+                    shard_mem_cache.put_aggregate_client_into_cache(target_aggregate_client_key, last_client_seq, low_priority);
+
+                    if low_priority {
+                        Ok(None) //Haven't found aggregate client yet
+                    } else {
+                        Ok(Some(true)) //Done searching
+                    }
+                })
+                .await
+                .map_err(ShardCacheLoadError::FileScanningError)?;
+
+            if find_result.is_some() {
+                break;
+            }
+        }
 
         let found = find_result.unwrap_or(false);
         if !found {
@@ -1912,15 +2267,43 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             // Sentinel 0 prevents subsequent idempotent writes from this never-before-seen
             // client from re-triggering the WAL scan above. get_client_seq() treats 0 as None.
             shard_mem_cache.put_aggregate_client_into_cache(aggregate_client_key.clone(), 0, false);
+            // The client is about to perform its first write: insert it so a
+            // resident bloom stays a superset (its commit re-inserts anyway).
+            shard_mem_cache.negative_lookup_insert(aggregate_key, client_hash);
+            drop(shard_mem_cache);
             metrics::counter!(
                 "celeriant_cache_aggregate_client_scan_not_found_total",
                 &self.metrics_shard_label,
             ).increment(1);
+            if complete_bloom {
+                // A Complete bloom said maybe-present but the scan proved
+                // absence: a false positive (or a delete/trim-only client,
+                // which carries no client_seq to find). Option-B's failure
+                // signal in reverse — this must stay rare in steady state.
+                metrics::counter!("celeriant_negative_lookup_false_positive_total", &self.metrics_shard_label).increment(1);
+            }
         } else {
             metrics::counter!(
                 "celeriant_cache_aggregate_client_scan_found_total",
                 &self.metrics_shard_label,
             ).increment(1);
+        }
+
+        if let Some(generation) = build_generation {
+            // Build completeness invariant ("did I walk all of it"): not-found
+            // means the loop covered every segment from the aggregate's newest
+            // block down to log 1 — each one either chain-walked in full,
+            // skipped with its complete client set unioned in, or skipped
+            // because the aggregate provably has no blocks there. A found stop
+            // leaves older history unvisited, and any union refusal breaks
+            // coverage: in both cases the entry parks as Building (still
+            // absorbing insert-on-write) and a later miss resumes the build.
+            let complete = !found && build_exhaustive;
+            let completed = self.shard_mem_cache.borrow_mut().negative_lookup_finish_build(aggregate_key, generation, complete);
+            build_guard.generation = None;
+            if completed {
+                metrics::counter!("celeriant_negative_lookup_builds_completed_total", &self.metrics_shard_label).increment(1);
+            }
         }
 
         Ok(())
@@ -1972,32 +2355,65 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         metrics::histogram!("celeriant_read_semaphore_wait_seconds", &self.metrics_shard_label)
             .record(sem_wait_start.elapsed().as_secs_f64());
 
-        let starting_log_id = self.log_segments_cache.active_log_id();
-        let mut scanner = ReverseMetablockScanner::new(
-            &self.log_segments_cache,
-            starting_log_id,
-            None,
-            self.config.read_max_chunk_size,
-        )
-        .with_bloom_filter_hash(schema_key.bloom_hash());
+        metrics::counter!("celeriant_schema_scan_started_total", &self.metrics_shard_label).increment(1);
 
-        let found_metablock = scanner
-            .scan::<(u64, Metablock), ()>(|log_id, _metablock_absolute_pos, metablock_bytes| {
-                if !metablock_bytes::is_schema_registration_for_key(metablock_bytes, schema_key) {
-                    return Ok(None);
+        // Walk segments newest-to-oldest, consulting each segment's schema
+        // bloom before touching its blocks: the active segment via the
+        // in-memory accumulator, sealed segments via the sidecar (lazy, like
+        // the dedup consult). Definite absence — the common case, an empty
+        // bloom under a complete summary — skips the segment without reading
+        // it; a missing bloom or an incomplete summary walks it exactly as
+        // before. The aggregate bloom is never consulted: schema hashes no
+        // longer live there.
+        let schema_hash = schema_key.bloom_hash();
+        let active_log_id = self.log_segments_cache.active_log_id();
+        let mut found_metablock: Option<(u64, Metablock)> = None;
+        for log_id in (1..=active_log_id).rev() {
+            let may_contain = if log_id == active_log_id {
+                self.shard_mem_cache.borrow().active_segment_may_contain_schema(schema_hash)
+            } else {
+                match self.read_segment_summary_cached(log_id).await {
+                    // Absence requires a COMPLETE summary: an incomplete bloom is a subset.
+                    Some(summary) => summary.schema_may_contain_hash(schema_hash),
+                    None => true,
                 }
+            };
+            if !may_contain {
+                metrics::counter!("celeriant_schema_scan_segments_skipped_total", &self.metrics_shard_label).increment(1);
+                continue;
+            }
+            metrics::counter!("celeriant_schema_scan_segments_walked_total", &self.metrics_shard_label).increment(1);
 
-                let metablock = deserialise_metablock(metablock_bytes)
-                    .map_err(|_| ())?;
+            let mut scanner = ReverseMetablockScanner::new(
+                &self.log_segments_cache,
+                log_id,
+                None,
+                self.config.read_max_chunk_size,
+            )
+            .with_min_log_id(log_id);
 
-                if let MetablockKind::SchemaRegistration(_) = metablock.wal_metablock_type {
-                    return Ok(Some((log_id, metablock)));
-                }
+            found_metablock = scanner
+                .scan::<(u64, Metablock), ()>(|log_id, _metablock_absolute_pos, metablock_bytes| {
+                    if !metablock_bytes::is_schema_registration_for_key(metablock_bytes, schema_key) {
+                        return Ok(None);
+                    }
 
-                Ok(None)
-            })
-            .await
-            .map_err(ShardCacheLoadError::FileScanningError)?;
+                    let metablock = deserialise_metablock(metablock_bytes)
+                        .map_err(|_| ())?;
+
+                    if let MetablockKind::SchemaRegistration(_) = metablock.wal_metablock_type {
+                        return Ok(Some((log_id, metablock)));
+                    }
+
+                    Ok(None)
+                })
+                .await
+                .map_err(ShardCacheLoadError::FileScanningError)?;
+
+            if found_metablock.is_some() {
+                break;
+            }
+        }
 
         match found_metablock {
             Some((log_id, metablock)) => {
@@ -3170,8 +3586,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     }
 
     /// Write sidecars for sealed segments whose read cursor caught up after a drain.
+    /// The payload carries the blooms staged at rotation — no header to reload them from.
     async fn sweep_sealed_summaries(&self) {
-        let sealed_ready = shard_wal_replicate::collect_eligible_sealed_summaries(&self.log_segments_cache, &self.shard_mem_cache);
+        let sealed_ready = shard_wal_replicate::collect_eligible_sealed_summaries(&self.log_segments_cache, &self.shard_mem_cache).await;
         for (log_id, payload) in sealed_ready {
             if let Err(e) = crate::shard_wal_sync::write_segment_summary_sidecar_from_payload(
                 self.log_segments_cache.shard_dir(), log_id, payload,
@@ -3485,7 +3902,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         // The rewind orphaned the in-segment backlink tips (still pointing into the culled
         // tail); rebuild so the next append back-links to a live committed block, not a culled one.
-        rebuild_active_segment_chain_tips(&self.log_segments_cache, self.config.read_max_chunk_size)
+        rebuild_active_segment_chain_tips(&self.log_segments_cache, self.config.read_max_chunk_size, &self.shard_mem_cache, &self.metrics_shard_label)
             .await
             .map_err(|e| ShardFsyncError::MetablockSerialisationError(format!("chain-tips rebuild after cull failed: {e:?}")))?;
 
@@ -4121,6 +4538,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             &self.shard_mem_cache,
             &self.fsync_coordinator,
             &self.watched_aggregates,
+            &self.summary_cache,
             &self.s3_downloader,
             self.config.shard_id,
             self.config.node_id,
@@ -4339,6 +4757,7 @@ mod tests {
             internode_max_request_size: 64 * 1024 * 1024,
             aggregate_snapshots_cache_bytes: 64 * 1024 * 1024,
             aggregate_client_snapshots_cache_bytes: 32 * 1024 * 1024,
+            negative_lookup_cache_bytes: 2 * 1024 * 1024,
             read_max_chunk_size: 32 * 1024,
             chain_read_window_bytes: 1024,
             timestamp_config: TimestampConfig::default(),
@@ -6304,6 +6723,342 @@ mod tests {
                 shard.shard_mem_cache.borrow_mut().get_client_seq(&agg, client_b),
                 Some(3),
                 "co-resident client's seq must be eager-cached during the same scan"
+            );
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn client_scan_start_prefers_snapshot_then_active_tip() {
+        // (snap_log_id, snap_pos, active_tip, expected_log_id, expected_start)
+        let cases = [
+            // Snapshot hint wins even when a tip exists: it can point at a sealed segment.
+            (3u64, 500_000u64, Some(700_000u64), 3u64, Some(501_024u64)),
+            // Cold aggregate snapshot, aggregate present in the active segment: seek to its tip.
+            (0, 0, Some(700_000), 9, Some(701_024)),
+            // Both cold: unbounded reverse scan from the active write tip.
+            (0, 0, None, 9, None),
+        ];
+        for (snap_log_id, snap_pos, tip, want_log, want_start) in cases {
+            let last_known = MetablockPosition {
+                log_id: snap_log_id,
+                metablock_absolute_pos: snap_pos,
+                event_seq: 0,
+                aggregate_version: 0,
+                min_aggregate_version: 0,
+            };
+            let got = client_scan_start(&last_known, 9, tip);
+            assert_eq!(
+                got,
+                (want_log, want_start),
+                "snap_log_id={snap_log_id} snap_pos={snap_pos} tip={tip:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_dedup_scan_cold_aggregate_in_sealed_segment_only_still_found() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let mut cfg = test_config(&dir);
+            cfg.shard_log_preallocate_bytes = 1024 * 1024; // small segment -> rotates quickly
+            let shard = ShardWal::open(cfg, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader)
+                .await
+                .unwrap();
+            let cold = key(1, 1, 1);
+            let filler = key(1, 1, 2);
+            let client_id = 7u128;
+
+            for n in 1u64..=5 {
+                let evt = DatablockAggregateEvent {
+                    client_seq: n,
+                    event_type_major: 1,
+                    event_value: Arc::new(vec![n as u8]),
+                    ..Default::default()
+                };
+                write_ok(&shard, write_req_full(cold.clone(), vec![evt], true, None, client_id, true)).await;
+            }
+
+            // Fill with a foreign aggregate until the segment rotates: the cold
+            // aggregate now lives only in the sealed segment, so the active tips
+            // map has no entry for it and the scan must fall back to the walk.
+            let mut rotated = false;
+            for n in 1u64..=1200 {
+                let evt = DatablockAggregateEvent {
+                    client_seq: n,
+                    event_type_major: 1,
+                    event_value: Arc::new(vec![0u8; 4096]),
+                    ..Default::default()
+                };
+                write_ok(&shard, write_req_full(filler.clone(), vec![evt], n == 1, None, 8u128, true)).await;
+                if shard.log_segments_cache.active_log_id() > 1 {
+                    rotated = true;
+                    break;
+                }
+            }
+            assert!(rotated, "scaffolding: 1MB preallocate must rotate within 1200 writes");
+            assert!(
+                !shard.log_segments_cache.active().aggregate_chain_tips.borrow().contains_key(&cold),
+                "scaffolding: cold aggregate must be absent from the active tips map"
+            );
+
+            {
+                let mut mc = shard.shard_mem_cache.borrow_mut();
+                mc.clear_aggregate_write_snapshots_for_test();
+                mc.clear_aggregate_write_client_snapshots_for_test();
+            }
+
+            let client_key = AggregateClientKey::new(cold.clone(), client_id);
+            shard.cache_aggregate_client(&cold, &client_key).await.expect("dedup scan should succeed");
+
+            assert_eq!(
+                shard.shard_mem_cache.borrow_mut().get_client_seq(&cold, client_id),
+                Some(5),
+                "a cold aggregate with no active-tip entry must still be found in the sealed segment"
+            );
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn delete_and_trim_insert_client_into_segment_client_bloom() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg_a = key(1, 1, 1);
+            let agg_b = key(1, 1, 2);
+            let writer = 7u128;
+            let deleter = 11u128;
+            let trimmer = 13u128;
+
+            write_ok(&shard, write_req_full(agg_a.clone(), events(3), true, None, writer, false)).await;
+            // Two batches so B is at version 2 and the trim floor below is a valid range.
+            write_ok(&shard, write_req_full(agg_b.clone(), events(3), true, None, writer, false)).await;
+            write_ok(&shard, write_req_full(agg_b.clone(), events(3), false, None, writer, false)).await;
+
+            let mut deletes = HashMap::new();
+            deletes.insert(agg_a.clone(), SingleAggregateDelete {
+                allow_recreate: false,
+                allow_sequence_continuation: false,
+                expected_version: None,
+            });
+            let del = process(&shard, ClientRequest::Delete(DeleteRequest {
+                correlation_id: None,
+                client_id: deleter,
+                user_id: None,
+                deletes,
+            })).await;
+            assert!(matches!(del, Ok(ClientResponse::Delete(_))));
+
+            let trim = process(&shard, ClientRequest::TrimStart(TrimStartRequest {
+                correlation_id: None,
+                aggregate_key: agg_b.clone(),
+                keep_from_aggregate_version: 2,
+                client_id: trimmer,
+                user_id: None,
+            })).await;
+            assert!(matches!(trim, Ok(ClientResponse::TrimStart(_))));
+
+            // Every aggregate-scoped client-bearing metablock kind must land in the
+            // client bloom: a delete-only or trim-only client missing from it is a
+            // subset, and a subset bloom answers a false "absent" once a consumer
+            // trusts it. (SchemaRegistration also carries a client_id but touches no
+            // aggregate, so it stays out.)
+            let active = shard.log_segments_cache.active();
+            let metadata = active.metadata.borrow();
+            let bloom = metadata.write.client_id_bloom.borrow();
+            assert!(bloom.may_contain_hash(client_id_bloom_hash(writer)), "writer must be in the client bloom");
+            assert!(bloom.may_contain_hash(client_id_bloom_hash(deleter)), "delete-only client must be in the client bloom");
+            assert!(bloom.may_contain_hash(client_id_bloom_hash(trimmer)), "trim-only client must be in the client bloom");
+            assert!(!bloom.may_contain_hash(client_id_bloom_hash(99u128)), "tripwire: a never-seen client must not be claimed present");
+            drop(bloom);
+            drop(metadata);
+
+            shard.close().await;
+        });
+    }
+
+    // ── Blooms out of the header: open-time rebuild + sidecar-fed sealed loads ──
+
+    /// Writes one of every client-bearing kind plus a schema registration and returns
+    /// the live active-segment bloom words (the ground truth a rebuild must reproduce).
+    async fn write_all_kinds_and_snapshot_blooms(
+        shard: &ShardWal<StubReplicationClient, StubS3Downloader>,
+    ) -> (Vec<u64>, Vec<u64>) {
+        let agg_a = key(1, 1, 1);
+        let agg_b = key(1, 1, 2);
+
+        write_ok(shard, write_req_full(agg_a.clone(), events(3), true, None, 7u128, false)).await;
+        write_ok(shard, write_req_full(agg_b.clone(), events(3), true, None, 7u128, false)).await;
+        write_ok(shard, write_req_full(agg_b.clone(), events(3), false, None, 7u128, false)).await;
+
+        let mut deletes = HashMap::new();
+        deletes.insert(agg_a, SingleAggregateDelete {
+            allow_recreate: false,
+            allow_sequence_continuation: false,
+            expected_version: None,
+        });
+        let del = process(shard, ClientRequest::Delete(DeleteRequest {
+            correlation_id: None, client_id: 11u128, user_id: None, deletes,
+        })).await;
+        assert!(matches!(del, Ok(ClientResponse::Delete(_))));
+
+        let trim = process(shard, ClientRequest::TrimStart(TrimStartRequest {
+            correlation_id: None,
+            aggregate_key: agg_b,
+            keep_from_aggregate_version: 2,
+            client_id: 13u128,
+            user_id: None,
+        })).await;
+        assert!(matches!(trim, Ok(ClientResponse::TrimStart(_))));
+
+        let schema = process(shard, schema_req(2, 2, 1, 0, NAME_AGE_SCHEMA)).await;
+        assert!(matches!(schema, Ok(ClientResponse::RegisterSchema(_))));
+
+        let active = shard.log_segments_cache.active();
+        let metadata = active.metadata.borrow();
+        let agg_words = metadata.write.aggregate_key_bloom.borrow().to_bytes();
+        let client_words = metadata.write.client_id_bloom.borrow().to_bytes();
+        (agg_words, client_words)
+    }
+
+    /// The reopened shard's active-segment blooms, asserted against the pre-restart
+    /// live words: the open-time forward scan must reproduce them exactly (same
+    /// inserts, same sizes -> byte-identical SBBF), covering every client-bearing
+    /// kind (tombstone-only and trim-only clients included). The schema hash lands
+    /// in the summary accumulator's schema set, never the aggregate bloom.
+    async fn assert_reopened_blooms_match(dir: &std::path::Path, expected_agg: &[u64], expected_client: &[u64]) {
+        let shard = open_shard(dir).await;
+        {
+            let active = shard.log_segments_cache.active();
+            let metadata = active.metadata.borrow();
+            let agg = metadata.write.aggregate_key_bloom.borrow();
+            let client = metadata.write.client_id_bloom.borrow();
+            assert!(!agg.is_absent() && !client.is_absent(), "open must rebuild PRECISE blooms, not leave them absent");
+            assert_eq!(agg.to_bytes(), expected_agg, "rebuilt aggregate bloom must equal the live pre-restart words");
+            assert_eq!(client.to_bytes(), expected_client, "rebuilt client bloom must equal the live pre-restart words");
+
+            assert!(agg.may_contain(&key(1, 1, 1)) && agg.may_contain(&key(1, 1, 2)));
+            assert!(!agg.may_contain_hash(SchemaKey::new(2, 2, 1, 0).bloom_hash()), "schema hashes must stay out of the aggregate bloom");
+            assert!(!agg.may_contain(&key(9, 9, 9)), "tripwire: never-seen aggregate must stay absent");
+            for client_id in [7u128, 11, 13] {
+                assert!(client.may_contain_hash(client_id_bloom_hash(client_id)), "client {client_id} must be rebuilt");
+            }
+            assert!(!client.may_contain_hash(client_id_bloom_hash(99u128)), "tripwire: never-seen client must stay absent");
+        }
+        assert!(
+            shard.shard_mem_cache.borrow().active_segment_may_contain_schema(SchemaKey::new(2, 2, 1, 0).bloom_hash()),
+            "open must rebuild the schema hash into the active schema set"
+        );
+        shard.close().await;
+    }
+
+    #[test]
+    fn open_rebuilds_active_segment_blooms_after_clean_close() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let (agg_words, client_words) = {
+                let shard = open_shard(&dir).await;
+                let words = write_all_kinds_and_snapshot_blooms(&shard).await;
+                shard.close().await;
+                words
+            };
+            assert_reopened_blooms_match(&dir, &agg_words, &client_words).await;
+        });
+    }
+
+    /// Crash-shaped: the shard is dropped without close mid-life (the
+    /// warmup_must_not_seed_stale_state_below_fsynced_tail pattern). Everything acked
+    /// is fsynced, so the rebuild over the durable prefix must still be exact.
+    #[test]
+    fn open_rebuilds_active_segment_blooms_after_kill_style_drop() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let (agg_words, client_words) = {
+                let shard = open_shard(&dir).await;
+                let words = write_all_kinds_and_snapshot_blooms(&shard).await;
+                drop(shard); // SIGKILL: no graceful close
+                words
+            };
+            assert_reopened_blooms_match(&dir, &agg_words, &client_words).await;
+        });
+    }
+
+    /// A sealed segment evicted from the LRU reloads with its blooms from the
+    /// .summary sidecar — the sidecar words are right-sized at seal
+    /// (smaller than the live fixed-size bloom) but must answer identically:
+    /// members present, never-seen keys short-circuited.
+    #[test]
+    fn sealed_reload_installs_sidecar_blooms() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+            let agg = key(1, 10, 100);
+            write_ok(&shard, write_req_full(agg.clone(), fat_event(1), true, None, 7u128, false)).await;
+            trigger_rotation(&shard).await;
+
+            shard.log_segments_cache.evict_from_lru(1);
+            let seg = shard.log_segments_cache.get(1).await.unwrap();
+            let meta = seg.metadata.borrow();
+            let agg_bloom = meta.write.aggregate_key_bloom.borrow();
+            assert!(!agg_bloom.is_absent(), "reload must install the sidecar blooms");
+            assert_eq!(agg_bloom.to_bytes().len() * 8, 32, "installed words must be the seal-time right-sized bloom");
+            assert!(agg_bloom.may_contain(&agg));
+            assert!(!agg_bloom.may_contain(&key(9, 9, 9)), "tripwire: the reloaded bloom must short-circuit never-seen keys");
+            let client_bloom = meta.write.client_id_bloom.borrow();
+            assert!(client_bloom.may_contain_hash(client_id_bloom_hash(7u128)));
+            assert!(!client_bloom.may_contain_hash(client_id_bloom_hash(99u128)));
+            // The scanner's read-cursor path consults the same installed words.
+            if let Some(read) = meta.read.as_ref() {
+                assert!(!read.aggregate_key_bloom.borrow().may_contain(&key(9, 9, 9)));
+            }
+            drop(client_bloom);
+            drop(agg_bloom);
+            drop(meta);
+
+            shard.close().await;
+        });
+    }
+
+    /// Missing sidecar: the reload keeps ABSENT blooms — maybe-present for every key,
+    /// so the scanner cannot unsoundly skip — and lookups still return correct results
+    /// via the full walk.
+    #[test]
+    fn sealed_reload_missing_sidecar_no_short_circuit_but_correct() {
+        glommio_test!({
+            use crate::shard_wal_sync::summary_path;
+
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+            let agg = key(1, 10, 100);
+            let client_id = 7u128;
+            write_ok(&shard, write_req_full(agg.clone(), events(3), true, None, client_id, true)).await;
+            trigger_rotation(&shard).await;
+
+            std::fs::remove_file(summary_path(shard.log_segments_cache.shard_dir(), 1)).unwrap();
+            shard.log_segments_cache.evict_from_lru(1);
+
+            {
+                let seg = shard.log_segments_cache.get(1).await.unwrap();
+                let meta = seg.metadata.borrow();
+                assert!(meta.write.aggregate_key_bloom.borrow().is_absent(), "no sidecar -> no bloom");
+                assert!(meta.write.aggregate_key_bloom.borrow().may_contain(&key(9, 9, 9)),
+                    "an absent bloom must answer maybe-present, never claim universal absence");
+            }
+
+            {
+                let mut mc = shard.shard_mem_cache.borrow_mut();
+                mc.clear_aggregate_write_snapshots_for_test();
+                mc.clear_aggregate_write_client_snapshots_for_test();
+            }
+            let client_key = AggregateClientKey::new(agg.clone(), client_id);
+            shard.cache_aggregate_client(&agg, &client_key).await.expect("dedup scan should succeed");
+            assert_eq!(
+                shard.shard_mem_cache.borrow_mut().get_client_seq(&agg, client_id),
+                Some(3),
+                "bloomless segment must degrade to the full walk, not lose the client"
             );
 
             shard.close().await;
@@ -8821,6 +9576,129 @@ mod tests {
         });
     }
 
+    /// The sidecar sweep must not trust LRU absence: an evicted pending-advance
+    /// segment reloads from disk, whose header still shows the unconfirmed
+    /// range, so its sidecar stays deferred — writing it before the parked
+    /// commits drain would seal a subset. Only reloaded state that shows the
+    /// advance releases the write.
+    #[test]
+    fn evicted_pending_advance_segment_defers_sidecar_until_reload_shows_advanced() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let client = CapturingReplicationClient::new();
+            let mut cfg = test_config(&dir);
+            cfg.shard_log_preallocate_bytes = 1024 * 1024;
+            let shard = ShardWal::open(
+                cfg,
+                ValidatedNodeStatus::create_custom_status(NodeStatus::Follower { leader_lease_epoch: 0 }, 500, now_ms() + 10_000),
+                client,
+                StubS3Downloader,
+            ).await.unwrap();
+
+            // Rotate with every batch unconfirmed: segment 1 seals pending-advance.
+            let mut next_seq = 1u64;
+            while shard.log_segments_cache.active_log_id() == 1 {
+                let tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
+                let items: Vec<_> = (0..100u64)
+                    .map(|i| replication_item_no_datablock(next_seq + i, if i == 0 { tip } else { GENESIS_HASH }))
+                    .collect();
+                let resp = unwrap_replication(
+                    shard.handle_replication_batch(replication_batch_req_with_leader_confirmed(items, 0)).await,
+                );
+                assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+                next_seq += 100;
+            }
+            assert!(shard.shard_mem_cache.borrow().parked_commit_count() > 0, "scaffolding: unconfirmed batches must be parked");
+
+            // Evict the sealed segment, then sweep: the gate must reload it and
+            // read pending-advance from the header, not "advanced" from absence.
+            shard.log_segments_cache.evict_from_lru(1);
+            shard.sweep_sealed_summaries().await;
+            assert!(
+                !crate::shard_wal_sync::summary_path(&dir, 1).exists(),
+                "an evicted pending-advance segment must not get a sidecar"
+            );
+
+            // A covering commit-notify drains the parked commits into the (now
+            // resident again) segment, advancing its cursor — only then may the
+            // sweep release the sidecar.
+            let tip_seq = next_seq - 1;
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(replication_batch_req_with_leader_confirmed(vec![], tip_seq)).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+            assert!(
+                crate::shard_wal_sync::summary_path(&dir, 1).exists(),
+                "the sweep must write the sidecar once the drained segment shows advanced"
+            );
+
+            shard.close().await;
+        });
+    }
+
+    /// Deferred-path bloom staging: a follower rotation stages the sealed segment's
+    /// bloom words in the SealedSegmentSummary snapshot. The segment is then EVICTED
+    /// (its bloomless v2 header is all a reload can offer, and no sidecar exists yet),
+    /// so when the covering notify releases the sweep, the sidecar's blooms can only
+    /// have come from the staged snapshot — the header-reload fallback is dead.
+    #[test]
+    fn deferred_sweep_writes_sidecar_with_staged_blooms() {
+        glommio_test!({
+            use celeriant_rotating_log::log_segment_file::aggregate_key_bloom::AggregateKeyBloom;
+
+            let (_tmp, dir) = test_dir();
+            let client = CapturingReplicationClient::new();
+            let mut cfg = test_config(&dir);
+            cfg.shard_log_preallocate_bytes = 1024 * 1024;
+            let shard = ShardWal::open(
+                cfg,
+                ValidatedNodeStatus::create_custom_status(NodeStatus::Follower { leader_lease_epoch: 0 }, 500, now_ms() + 10_000),
+                client,
+                StubS3Downloader,
+            ).await.unwrap();
+
+            // Rotate with every batch unconfirmed (DeferToLeaderConfirmed path).
+            let mut next_seq = 1u64;
+            while shard.log_segments_cache.active_log_id() == 1 {
+                let tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
+                let items: Vec<_> = (0..100u64)
+                    .map(|i| replication_item_no_datablock(next_seq + i, if i == 0 { tip } else { GENESIS_HASH }))
+                    .collect();
+                let resp = unwrap_replication(
+                    shard.handle_replication_batch(replication_batch_req_with_leader_confirmed(items, 0)).await,
+                );
+                assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+                next_seq += 100;
+            }
+
+            shard.log_segments_cache.evict_from_lru(1);
+            {
+                let seg = shard.log_segments_cache.get(1).await.unwrap();
+                assert!(
+                    seg.metadata.borrow().write.aggregate_key_bloom.borrow().is_absent(),
+                    "scaffolding: the reloaded segment must be bloomless (no sidecar, bloomless header)"
+                );
+            }
+
+            // Covering commit-notify drains the parked commits; the sweep writes the sidecar.
+            let tip_seq = next_seq - 1;
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(replication_batch_req_with_leader_confirmed(vec![], tip_seq)).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+
+            let payload = read_segment_summary(shard.log_segments_cache.shard_dir(), 1).await
+                .expect("the sweep must have written the sidecar");
+            let agg_words = payload.aggregate_bloom.expect("sidecar must carry the staged aggregate bloom");
+            let agg_bloom = AggregateKeyBloom::from_bytes(&agg_words);
+            assert!(agg_bloom.may_contain(&key(1, 1, 1)), "the replicated aggregate must be in the staged bloom");
+            assert!(!agg_bloom.may_contain(&key(9, 9, 9)), "tripwire: staged bloom must stay precise");
+            assert!(payload.client_bloom.is_some(), "sidecar must carry the staged client bloom");
+
+            shard.close().await;
+        });
+    }
+
     /// The upload's reconcile prefix COMMITS an unconfirmed peer tail before
     /// scanning the promotion range, so the upload covers entries no carrier
     /// ever confirmed (they may be acked on the dead leader's side).
@@ -9504,6 +10382,56 @@ mod tests {
         });
     }
 
+    // ADVERSARIAL EVIDENCE — the seal window must not prove schema absence.
+    //
+    // The FullCommit seal path drains the active accumulator BEFORE rotation:
+    // `take_segment_summary` (inside `write_segment_summary_sidecar`) runs,
+    // then the fiber parks at awaits (sidecar create/write/fdatasync, then
+    // `rotate_to_next_log().await`). Throughout that window `active_log_id()`
+    // still names the sealing segment while the drained accumulator is fresh
+    // AND untainted (`take_segment_summary` resets
+    // `segment_summary_incomplete`). Unguarded, `active_segment_may_contain_schema`
+    // would answer "definitely absent" for every hash the sealing segment
+    // actually holds, a concurrent `ensure_schema_cached` would consult
+    // exactly that and SKIP the segment, and the false `no_schema` conclusion
+    // would be CACHED. The deferred seal path has the same window
+    // (`store_sealed_segment_summary` drains, rotation awaits after). The
+    // guard is the draining latch: both drains set `segment_summary_draining`,
+    // the consult answers maybe-present while it is up, and
+    // `note_active_segment_rotated` drops it only after rotation returns.
+    // This test reproduces the mid-await state directly (single-threaded
+    // executor: state between awaits IS this state) and asserts the lookup
+    // still finds the committed registration.
+    #[test]
+    fn adversarial_seal_window_hides_committed_schema_registration() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+
+            // A committed, durable registration in the active segment.
+            process(&shard, schema_req(1, 1, 1, 0, NAME_AGE_SCHEMA)).await.unwrap();
+            let schema_key = SchemaKey::new(1, 1, 1, 0);
+
+            // Cold cache (LRU-eviction stand-in) so the next lookup must scan.
+            shard.schema_cache_clear();
+
+            // The exact state held while write_segment_summary_sidecar /
+            // rotate_to_next_log are parked at an await: accumulator drained,
+            // rotation not yet visible.
+            let _seal_payload = shard.shard_mem_cache.borrow_mut().take_segment_summary();
+
+            // A concurrent write's schema lookup during that window.
+            shard.ensure_schema_cached(&schema_key).await.unwrap();
+
+            assert!(
+                shard.schema_cache_has_schema(&schema_key),
+                "false absence: ensure_schema_cached skipped the sealing segment via the drained accumulator and cached no_schema"
+            );
+
+            shard.close().await;
+        });
+    }
+
     #[test]
     fn schema_multiple_event_types_independent() {
         glommio_test!({
@@ -9685,6 +10613,221 @@ mod tests {
             // A is deleted.
             let result = process(&shard, read_req(agg_a.clone())).await;
             assert!(matches!(result, Err(ShardError::Read(ShardReadError::AggregateNotExists))));
+
+            shard.close().await;
+        });
+    }
+
+    /// Compaction rewrites the sidecar: tips remapped onto the compacted layout,
+    /// client sets AND segment blooms carried forward VERBATIM (the carry-forward
+    /// rule: never regenerated from survivors; supersets are safe).
+    #[test]
+    fn compaction_rewrites_sidecar_remapped_tips_verbatim_sets_and_blooms() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+            let agg_a = key(1, 1, 1);
+            let agg_b = key(1, 1, 2);
+            let writer = 7u128;
+            let deleter = 11u128;
+
+            for i in 1..=50u64 {
+                write_ok(&shard, write_req_full(agg_a.clone(), fat_event(i), i == 1, None, writer, false)).await;
+            }
+            write_ok(&shard, write_req_full(agg_b.clone(), events(3), true, None, writer, false)).await;
+
+            let mut deletes = HashMap::new();
+            deletes.insert(agg_a.clone(), SingleAggregateDelete {
+                allow_recreate: false,
+                allow_sequence_continuation: false,
+                expected_version: None,
+            });
+            let del = process(&shard, ClientRequest::Delete(DeleteRequest {
+                correlation_id: None,
+                client_id: deleter,
+                user_id: None,
+                deletes,
+            })).await;
+            assert!(matches!(del, Ok(ClientResponse::Delete(_))));
+
+            trigger_rotation(&shard).await;
+            let pre = read_segment_summary(shard.log_segments_cache.shard_dir(), 1).await.expect("pre-compaction sidecar");
+            // Prime the decoded cache so the post-compaction invalidation is exercised too.
+            let _ = shard.read_segment_summary_cached(1).await.expect("decodes");
+
+            let result = shard.compact_oldest_eligible_segment().await.unwrap();
+            assert!(result.is_some(), "expected compaction to run");
+
+            let post = read_segment_summary(shard.log_segments_cache.shard_dir(), 1).await.expect("rewritten sidecar");
+
+            // Blooms verbatim.
+            assert_eq!(post.aggregate_bloom, pre.aggregate_bloom, "aggregate bloom must be carried forward verbatim");
+            assert_eq!(post.client_bloom, pre.client_bloom, "client bloom must be carried forward verbatim");
+
+            // A's client set verbatim: the deleter's batches are gone, only the
+            // tombstone remains, yet the carried set still names both clients.
+            let entry_a = post.aggregates.iter().find(|e| e.aggregate_id == 1).expect("A's entry survives");
+            assert!(entry_a.client_set.may_contain_hash(client_id_bloom_hash(writer)));
+            assert!(entry_a.client_set.may_contain_hash(client_id_bloom_hash(deleter)));
+            let pre_a = pre.aggregates.iter().find(|e| e.aggregate_id == 1).unwrap();
+            assert_eq!(entry_a.client_set, pre_a.client_set, "client set must be byte-identical to pre-compaction");
+
+            // Tips remapped: each entry's seek target lands on its own chain in
+            // the COMPACTED file (A's tip is its surviving tombstone).
+            for (agg, entry) in [(&agg_a, entry_a), (&agg_b, post.aggregates.iter().find(|e| e.aggregate_id == 2).unwrap())] {
+                assert_ne!(entry.newest_metablock_pos, 0, "tip must be recorded for {agg:?}");
+                let block = read_block_at(&shard, 1, entry.newest_metablock_pos).await;
+                assert_eq!(
+                    metablock_bytes::read_chain_aggregate_key(&block).as_ref(), Some(agg),
+                    "remapped tip must land on the aggregate's own chain in the compacted layout"
+                );
+            }
+
+            // The decoded cache was invalidated: a fresh read reflects the rewrite.
+            let cached = shard.read_segment_summary_cached(1).await.expect("re-decodes the rewritten file");
+            let cached_a = cached.aggregates.iter().find(|e| e.aggregate_id == 1).unwrap();
+            assert_eq!(cached_a.newest_metablock_pos, entry_a.newest_metablock_pos, "cache must serve the rewritten sidecar");
+
+            shard.close().await;
+        });
+    }
+
+    /// Missing (or torn → None) pre-compaction sidecar: compaction writes
+    /// tips-only entries — Unknown client sets, no blooms — never regenerating
+    /// client knowledge from survivors.
+    #[test]
+    fn compaction_missing_sidecar_writes_tips_only_fallback() {
+        glommio_test!({
+            use crate::shard_wal_sync::summary_path;
+
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+            let agg_a = key(1, 1, 1);
+            let agg_b = key(1, 1, 2);
+
+            for i in 1..=50u64 {
+                write_ok(&shard, write_req_full(agg_a.clone(), fat_event(i), i == 1, None, 7u128, false)).await;
+            }
+            write_ok(&shard, write_req(agg_b.clone(), events(3))).await;
+            let del = process(&shard, delete_req(agg_a.clone())).await;
+            assert!(matches!(del, Ok(ClientResponse::Delete(_))));
+
+            trigger_rotation(&shard).await;
+            std::fs::remove_file(summary_path(shard.log_segments_cache.shard_dir(), 1)).unwrap();
+
+            let result = shard.compact_oldest_eligible_segment().await.unwrap();
+            assert!(result.is_some(), "expected compaction to run");
+
+            let post = read_segment_summary(shard.log_segments_cache.shard_dir(), 1).await
+                .expect("tips-only sidecar must be written");
+            assert_eq!(post.aggregate_bloom, None, "fallback must not fabricate blooms");
+            assert_eq!(post.client_bloom, None);
+
+            let entry_a = post.aggregates.iter().find(|e| e.aggregate_id == 1).expect("tombstoned A still listed");
+            assert!(entry_a.is_deleted, "A's fallback entry must reflect its deleted state");
+            assert_eq!(entry_a.client_set, celeriant_wal::segment_summary::ClientSet::Unknown,
+                "fallback must not regenerate client sets from survivors");
+            let entry_b = post.aggregates.iter().find(|e| e.aggregate_id == 2).expect("B survives");
+            assert_eq!(entry_b.client_set, celeriant_wal::segment_summary::ClientSet::Unknown);
+
+            for (agg, entry) in [(&agg_a, entry_a), (&agg_b, entry_b)] {
+                assert_ne!(entry.newest_metablock_pos, 0);
+                let block = read_block_at(&shard, 1, entry.newest_metablock_pos).await;
+                assert_eq!(metablock_bytes::read_chain_aggregate_key(&block).as_ref(), Some(agg));
+            }
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn compact_rebuilt_client_bloom_keeps_tombstone_only_clients() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+            let agg_a = key(1, 1, 1);
+            let agg_b = key(1, 1, 2);
+            let writer = 7u128;
+            let deleter = 11u128;
+
+            // A dominates the segment (deleted below -> dead ratio above threshold);
+            // B's writes survive so the segment isn't 100% dead.
+            for i in 1..=50u64 {
+                write_ok(&shard, write_req_full(agg_a.clone(), fat_event(i), i == 1, None, writer, false)).await;
+            }
+            write_ok(&shard, write_req_full(agg_b.clone(), events(3), true, None, writer, false)).await;
+
+            let mut deletes = HashMap::new();
+            deletes.insert(agg_a.clone(), SingleAggregateDelete {
+                allow_recreate: false,
+                allow_sequence_continuation: false,
+                expected_version: None,
+            });
+            let del = process(&shard, ClientRequest::Delete(DeleteRequest {
+                correlation_id: None,
+                client_id: deleter,
+                user_id: None,
+                deletes,
+            })).await;
+            assert!(matches!(del, Ok(ClientResponse::Delete(_))));
+
+            trigger_rotation(&shard).await;
+            let result = shard.compact_oldest_eligible_segment().await.unwrap();
+            assert!(result.is_some(), "expected compaction to run (A's fat data dominates dead ratio)");
+
+            // After compaction, the deleter's event batches are gone and only the
+            // SoftDelete tombstone carries their client_id. The rebuilt bloom must
+            // still contain them: tombstones always survive, and dropping the client
+            // would make the bloom a subset of the segment's true client set.
+            let seg1 = shard.log_segments_cache.get(1).await.unwrap();
+            let metadata = seg1.metadata.borrow();
+            let bloom = metadata.write.client_id_bloom.borrow();
+            assert!(bloom.may_contain_hash(client_id_bloom_hash(writer)), "surviving writer must be in the rebuilt client bloom");
+            assert!(bloom.may_contain_hash(client_id_bloom_hash(deleter)), "tombstone-only client must be in the rebuilt client bloom");
+            assert!(!bloom.may_contain_hash(client_id_bloom_hash(99u128)), "tripwire: a never-seen client must not be claimed present");
+            drop(bloom);
+            drop(metadata);
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn compact_rebuilt_client_bloom_keeps_trim_only_clients() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+            let agg = key(1, 1, 1);
+            let writer = 7u128;
+            let trimmer = 13u128;
+
+            for i in 1..=50u64 {
+                write_ok(&shard, write_req_full(agg.clone(), fat_event(i), i == 1, None, writer, false)).await;
+            }
+
+            // Trim by a client that never wrote: post-compaction the SoftTrim block is
+            // their only surviving record (batches below the floor are dropped).
+            let trim = process(&shard, ClientRequest::TrimStart(TrimStartRequest {
+                correlation_id: None,
+                aggregate_key: agg.clone(),
+                keep_from_aggregate_version: 31,
+                client_id: trimmer,
+                user_id: None,
+            })).await;
+            assert!(matches!(trim, Ok(ClientResponse::TrimStart(_))));
+
+            trigger_rotation(&shard).await;
+            let result = shard.compact_oldest_eligible_segment().await.unwrap();
+            assert!(result.is_some(), "expected compaction to run (30/50 batches trimmed = 60% dead)");
+
+            let seg1 = shard.log_segments_cache.get(1).await.unwrap();
+            let metadata = seg1.metadata.borrow();
+            let bloom = metadata.write.client_id_bloom.borrow();
+            assert!(bloom.may_contain_hash(client_id_bloom_hash(writer)), "surviving writer must be in the rebuilt client bloom");
+            assert!(bloom.may_contain_hash(client_id_bloom_hash(trimmer)), "trim-only client must be in the rebuilt client bloom");
+            assert!(!bloom.may_contain_hash(client_id_bloom_hash(99u128)), "tripwire: a never-seen client must not be claimed present");
+            drop(bloom);
+            drop(metadata);
 
             shard.close().await;
         });
@@ -11277,6 +12420,424 @@ mod tests {
         });
     }
 
+    /// A v1-stamped sidecar (CRC-valid) must fail deserialization into the
+    /// missing-summary degrade path — the clean break has no shims.
+    #[test]
+    fn v1_summary_degrades_to_none() {
+        glommio_test!({
+            use crate::shard_wal_sync::summary_path;
+            use celeriant_wal::segment_summary::{SegmentSummaryBlock, SegmentSummaryPayload};
+            use celeriant_wire::disk::versioned_block::serialize_versioned_message_heap;
+
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+
+            write_ok(&shard, write_req(key(1, 10, 100), fat_event(1))).await;
+            trigger_rotation(&shard).await;
+
+            // Overwrite the sealed segment's sidecar with a v1-stamped file.
+            let block = SegmentSummaryBlock {
+                payload: SegmentSummaryPayload {
+                    orgs: vec![1],
+                    aggregate_types: vec![],
+                    aggregates: vec![],
+                    complete: true,
+                    aggregate_bloom: None,
+                    client_bloom: None,
+                    schema_bloom: None,
+                },
+            };
+            let bytes = serialize_versioned_message_heap(&block, 1).unwrap();
+            std::fs::write(summary_path(shard.log_segments_cache.shard_dir(), 1), &bytes).unwrap();
+
+            assert!(read_segment_summary(shard.log_segments_cache.shard_dir(), 1).await.is_none(),
+                "v1 summary must degrade to None");
+            assert!(shard.read_segment_summary_cached(1).await.is_none(),
+                "the cached reader must not cache or surface a v1 summary");
+
+            shard.close().await;
+        });
+    }
+
+    /// The sealed sidecar carries the v2 fields end-to-end: per-aggregate client
+    /// sets fed by every client-bearing kind, a valid newest-metablock seek
+    /// target, and the segment blooms.
+    #[test]
+    fn sealed_sidecar_carries_client_sets_tip_and_blooms() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+            let agg = key(1, 10, 100);
+            let writer = 7u128;
+            let trimmer = 13u128;
+
+            write_ok(&shard, write_req_full(agg.clone(), fat_event(1), true, None, writer, false)).await;
+            write_ok(&shard, write_req_full(agg.clone(), fat_event(2), false, None, writer, false)).await;
+            let trim = process(&shard, ClientRequest::TrimStart(TrimStartRequest {
+                correlation_id: None,
+                aggregate_key: agg.clone(),
+                keep_from_aggregate_version: 2,
+                client_id: trimmer,
+                user_id: None,
+            })).await;
+            assert!(matches!(trim, Ok(ClientResponse::TrimStart(_))));
+
+            trigger_rotation(&shard).await;
+
+            let payload = read_segment_summary(shard.log_segments_cache.shard_dir(), 1).await.expect("sidecar must exist");
+            let entry = payload.aggregates.iter().find(|e| e.aggregate_id == 100).expect("entry for the aggregate");
+
+            let set = &entry.client_set;
+            assert!(set.may_contain_hash(client_id_bloom_hash(writer)), "writer must be in the client set");
+            assert!(set.may_contain_hash(client_id_bloom_hash(trimmer)), "trim-only client must be in the client set");
+            assert!(!set.may_contain_hash(client_id_bloom_hash(99u128)), "never-seen client must be definitely absent");
+
+            // The seek target must point at this aggregate's chain (the trim is its newest member).
+            assert_ne!(entry.newest_metablock_pos, 0);
+            let block = read_block_at(&shard, 1, entry.newest_metablock_pos).await;
+            assert_eq!(
+                metablock_bytes::read_chain_aggregate_key(&block).as_ref(), Some(&agg),
+                "newest_metablock_pos must land on the aggregate's own chain"
+            );
+
+            // Blooms: right-sized at seal from true cardinality, answering
+            // exactly like the fixed live bloom for the same keys.
+            use celeriant_rotating_log::log_segment_file::aggregate_key_bloom::AggregateKeyBloom;
+            let agg_words = payload.aggregate_bloom.as_deref().expect("complete seal must persist an aggregate bloom");
+            let client_words = payload.client_bloom.as_deref().expect("complete seal must persist a client bloom");
+            assert_eq!(agg_words.len() * 8, 32, "one aggregate sizes to a single SBBF block");
+            assert_eq!(client_words.len() * 8, 32, "two clients size to a single SBBF block");
+            let agg_bloom = AggregateKeyBloom::from_bytes(agg_words);
+            assert!(agg_bloom.may_contain(&agg));
+            assert!(!agg_bloom.may_contain(&key(9, 9, 9)), "sized bloom answers definite absence");
+            let client_bloom = AggregateKeyBloom::from_bytes(client_words);
+            assert!(client_bloom.may_contain_hash(client_id_bloom_hash(writer)));
+            assert!(client_bloom.may_contain_hash(client_id_bloom_hash(trimmer)), "trim client must be in the segment bloom");
+            assert!(!client_bloom.may_contain_hash(client_id_bloom_hash(99u128)));
+
+            shard.close().await;
+        });
+    }
+
+    async fn read_block_at<R: ReplicationClient, D: S3Downloader>(
+        shard: &ShardWal<R, D>,
+        log_id: u64,
+        pos: u64,
+    ) -> [u8; FIXED_BLOCK_SIZE_BYTES] {
+        let f = shard.log_segments_cache.get(log_id).await.unwrap();
+        let guard = f.lock_reader("test_read_block").await.unwrap();
+        let dma = guard.as_ref().unwrap();
+        let buf = dma.read_at(pos, FIXED_BLOCK_SIZE_BYTES).await.unwrap();
+        buf[..FIXED_BLOCK_SIZE_BYTES].try_into().unwrap()
+    }
+
+    // ── Decoded summary reader cache ──
+
+    #[test]
+    fn summary_cache_hit_survives_sidecar_deletion_until_invalidated() {
+        glommio_test!({
+            use crate::shard_wal_sync::summary_path;
+
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+
+            write_ok(&shard, write_req(key(1, 10, 100), fat_event(1))).await;
+            trigger_rotation(&shard).await;
+
+            let first = shard.read_segment_summary_cached(1).await.expect("summary must decode");
+            assert!(first.aggregates.iter().any(|e| e.aggregate_id == 100));
+
+            // Remove the file: a hit must come from the decoded cache, no re-read.
+            std::fs::remove_file(summary_path(shard.log_segments_cache.shard_dir(), 1)).unwrap();
+            let second = shard.read_segment_summary_cached(1).await.expect("must be served from cache");
+            assert!(Rc::ptr_eq(&first, &second), "hit must return the cached decode");
+
+            // Invalidate (what the compaction path does) — the miss now sees the deletion.
+            shard.summary_cache.borrow_mut().pop(&1);
+            assert!(shard.read_segment_summary_cached(1).await.is_none(), "post-invalidation read must hit disk");
+
+            shard.close().await;
+        });
+    }
+
+    // ── Dedup consult (summary_hint decision) ──
+
+    #[test]
+    fn summary_hint_decision_table() {
+        use celeriant_wal::segment_summary::{ClientSet, SegmentAggregateEntry, SegmentSummaryPayload};
+
+        let agg = key(1, 1, 1);
+        let present = client_id_bloom_hash(7);
+        let absent = client_id_bloom_hash(9);
+
+        let mut entry = SegmentAggregateEntry::new(1, 1, 1);
+        entry.newest_metablock_pos = 400_384;
+        entry.client_set = ClientSet::Exact(vec![present]);
+        let mut payload = SegmentSummaryPayload {
+            orgs: vec![1],
+            aggregate_types: vec![AggregateTypeKey::new(1, 1)],
+            aggregates: vec![entry],
+            complete: true,
+            aggregate_bloom: None,
+            client_bloom: None,
+            schema_bloom: None,
+        };
+
+        // Aggregate entry absent → the aggregate is not in the segment → skip.
+        assert_eq!(summary_hint(&payload, &key(1, 1, 2), present), Some(SegmentHint::Skip));
+        // Client definitely absent from this aggregate → skip.
+        assert_eq!(summary_hint(&payload, &agg, absent), Some(SegmentHint::Skip));
+        // Maybe present → seek to the newest metablock.
+        assert_eq!(summary_hint(&payload, &agg, present), Some(SegmentHint::SeekTo(400_384)));
+        // Unknown client set cannot skip, but the tip is still a valid seek target.
+        payload.aggregates[0].client_set = ClientSet::Unknown;
+        assert_eq!(summary_hint(&payload, &agg, absent), Some(SegmentHint::SeekTo(400_384)));
+        // No tip recorded (compaction dropped the blocks) → no hint → full walk.
+        payload.aggregates[0].newest_metablock_pos = 0;
+        assert_eq!(summary_hint(&payload, &agg, absent), None);
+
+        // Incomplete summary: a subset proves nothing by absence. Entry absent →
+        // full walk; a client set claiming "definitely absent" → still a full
+        // walk of the entry's tip; only the tip (true-newest) stays usable.
+        payload.complete = false;
+        payload.aggregates[0].newest_metablock_pos = 400_384;
+        payload.aggregates[0].client_set = ClientSet::Exact(vec![present]);
+        assert_eq!(summary_hint(&payload, &key(1, 1, 2), present), None, "incomplete summary must never skip on a missing entry");
+        assert_eq!(summary_hint(&payload, &agg, absent), Some(SegmentHint::SeekTo(400_384)), "incomplete client set must degrade to the seek, not skip");
+        assert_eq!(summary_hint(&payload, &agg, present), Some(SegmentHint::SeekTo(400_384)), "tips from an incomplete summary stay usable");
+    }
+
+    /// Per-aggregate client sets are finer than the segment-level client bloom:
+    /// a client that wrote OTHER aggregates in the segment (so the segment bloom
+    /// says "present") is skipped when this aggregate's set says absent. The
+    /// observable: a skipped segment never eager-caches co-resident clients,
+    /// while the no-summary full walk does.
+    #[test]
+    fn dedup_consult_skips_segment_on_client_absent_from_aggregate() {
+        glommio_test!({
+            use crate::shard_wal_sync::summary_path;
+
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+            let agg_a = key(1, 1, 1);
+            let agg_b = key(1, 1, 2);
+            let writer_a = 7u128;
+            let writer_b = 9u128;
+
+            // Segment 1: A written by 7, B written by 9. The segment client bloom
+            // contains BOTH clients; only the per-aggregate set can separate them.
+            write_ok(&shard, write_req_full(agg_a.clone(), fat_event(1), true, None, writer_a, true)).await;
+            write_ok(&shard, write_req_full(agg_b.clone(), fat_event(1), true, None, writer_b, true)).await;
+            trigger_rotation(&shard).await;
+
+            let cold_lookup = |shard: &ShardWal<StubReplicationClient, StubS3Downloader>| {
+                let mut mc = shard.shard_mem_cache.borrow_mut();
+                mc.clear_aggregate_write_snapshots_for_test();
+                mc.clear_aggregate_write_client_snapshots_for_test();
+            };
+
+            // Consult path: (A, 9) — A's client set says 9 is absent → segment skipped.
+            cold_lookup(&shard);
+            let key_a9 = AggregateClientKey::new(agg_a.clone(), writer_b);
+            shard.cache_aggregate_client(&agg_a, &key_a9).await.unwrap();
+            assert_eq!(shard.shard_mem_cache.borrow_mut().get_client_seq(&agg_a, writer_b), None,
+                "client 9 never wrote A");
+            let key_a7 = AggregateClientKey::new(agg_a.clone(), writer_a);
+            let (a7_loaded, _) = shard.shard_mem_cache.borrow_mut().aggregate_client_load_status(&agg_a, &key_a7);
+            assert!(!a7_loaded,
+                "a summary-skipped segment must not be walked — co-resident client 7 stays uncached");
+
+            // Control: no summary → today's full walk, which eager-caches client 7.
+            std::fs::remove_file(summary_path(shard.log_segments_cache.shard_dir(), 1)).unwrap();
+            shard.summary_cache.borrow_mut().pop(&1);
+            cold_lookup(&shard);
+            shard.cache_aggregate_client(&agg_a, &key_a9).await.unwrap();
+            assert_eq!(shard.shard_mem_cache.borrow_mut().get_client_seq(&agg_a, writer_b), None);
+            let (a7_loaded, a7_seq) = shard.shard_mem_cache.borrow_mut().aggregate_client_load_status(&agg_a, &key_a7);
+            assert!(a7_loaded, "the no-summary full walk must visit A's chain and eager-cache client 7");
+            assert_eq!(a7_seq, Some(1));
+
+            shard.close().await;
+        });
+    }
+
+    /// Maybe-present consult: the seek path must find the true client_seq in a
+    /// sealed segment (correctness of the SeekTo integration end-to-end).
+    #[test]
+    fn dedup_consult_seek_finds_client_seq_in_sealed_segment() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+            let agg = key(1, 1, 1);
+            let client_id = 7u128;
+
+            for n in 1u64..=5 {
+                let evt = DatablockAggregateEvent {
+                    client_seq: n,
+                    event_type_major: 1,
+                    event_value: Arc::new(vec![n as u8]),
+                    ..Default::default()
+                };
+                write_ok(&shard, write_req_full(agg.clone(), vec![evt], n == 1, None, client_id, true)).await;
+            }
+            trigger_rotation(&shard).await;
+
+            {
+                let mut mc = shard.shard_mem_cache.borrow_mut();
+                mc.clear_aggregate_write_snapshots_for_test();
+                mc.clear_aggregate_write_client_snapshots_for_test();
+            }
+
+            // Sanity: the consult has a seek hint for this lookup.
+            let summary = shard.read_segment_summary_cached(1).await.expect("sealed summary must exist");
+            assert!(matches!(
+                summary_hint(&summary, &agg, client_id_bloom_hash(client_id)),
+                Some(SegmentHint::SeekTo(_))
+            ));
+
+            let client_key = AggregateClientKey::new(agg.clone(), client_id);
+            shard.cache_aggregate_client(&agg, &client_key).await.unwrap();
+            assert_eq!(
+                shard.shard_mem_cache.borrow_mut().get_client_seq(&agg, client_id),
+                Some(5),
+                "seek path must recover the true client_seq from the sealed segment"
+            );
+
+            shard.close().await;
+        });
+    }
+
+    /// The consult is lazy: sidecars decode only when the scan is about to
+    /// enter their segment, so a hit in a newer segment never touches older
+    /// sidecars (the eager pre-load thrashed the 16-entry LRU per miss once
+    /// segments outnumbered it).
+    #[test]
+    fn dedup_consult_loads_sidecars_lazily() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+            let agg = key(1, 1, 1);
+            let client_id = 7u128;
+
+            // The client writes in segments 1 AND 2; segment 3 is active.
+            write_ok(&shard, write_req_full(agg.clone(), fat_event(1), true, None, client_id, true)).await;
+            trigger_rotation(&shard).await;
+            write_ok(&shard, write_req_full(agg.clone(), fat_event(2), false, None, client_id, true)).await;
+            trigger_rotation(&shard).await;
+            assert_eq!(shard.log_segments_cache.active_log_id(), 3, "scaffolding: two sealed segments expected");
+
+            {
+                let mut mc = shard.shard_mem_cache.borrow_mut();
+                mc.clear_aggregate_write_snapshots_for_test();
+                mc.clear_aggregate_write_client_snapshots_for_test();
+            }
+            shard.summary_cache.borrow_mut().pop(&1);
+            shard.summary_cache.borrow_mut().pop(&2);
+
+            let client_key = AggregateClientKey::new(agg.clone(), client_id);
+            shard.cache_aggregate_client(&agg, &client_key).await.unwrap();
+            assert_eq!(shard.shard_mem_cache.borrow_mut().get_client_seq(&agg, client_id), Some(2));
+
+            assert!(shard.summary_cache.borrow().contains(&2), "the entered segment's sidecar decodes");
+            assert!(!shard.summary_cache.borrow().contains(&1), "a hit in segment 2 must not touch segment 1's sidecar");
+
+            shard.close().await;
+        });
+    }
+
+    /// A pre-warm replay that stops early (cache full or warmup deadline) seeds
+    /// the active accumulator from a newest-prefix SUBSET. The next seal must
+    /// taint the sidecar (`complete: false`) so its absences never authorize a
+    /// summary Skip — otherwise a pre-restart client's idempotency seq is lost.
+    #[test]
+    fn partial_warmup_must_not_authorize_summary_skips() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let agg_a = key(1, 1, 1);
+            let writer = 7u128;
+
+            // Segment 1, pre-restart: client 7 writes A with idempotency.
+            {
+                let shard = open_compact_shard(&dir).await;
+                write_ok(&shard, write_req_full(agg_a.clone(), fat_event(1), true, None, writer, true)).await;
+                shard.close().await;
+            }
+
+            // Restart with a zero warmup budget: the replay stops inside the
+            // still-active segment 1, so the accumulator never learns about A.
+            let mut cfg = compact_config(&dir);
+            cfg.cache_warmup_max_duration = Duration::ZERO;
+            let shard = ShardWal::open(cfg, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader)
+                .await
+                .unwrap();
+
+            // Post-restart commits DO reach the accumulator; the rotation seals
+            // segment 1 with a sidecar that knows them but not A.
+            write_ok(&shard, write_req(key(2, 2, 2), fat_event(1))).await;
+            trigger_rotation(&shard).await;
+
+            let payload = read_segment_summary(shard.log_segments_cache.shard_dir(), 1).await.expect("sidecar must exist");
+            assert!(!payload.complete, "a subset sidecar must carry the incomplete taint");
+            assert!(payload.aggregates.iter().all(|e| e.aggregate_id != 1), "scaffolding: the sidecar must not know about A");
+
+            // Cold dedup consult for (A, 7): the incomplete summary must not
+            // skip segment 1 — the full walk recovers the true client_seq.
+            {
+                let mut mc = shard.shard_mem_cache.borrow_mut();
+                mc.clear_aggregate_write_snapshots_for_test();
+                mc.clear_aggregate_write_client_snapshots_for_test();
+            }
+            let client_key = AggregateClientKey::new(agg_a.clone(), writer);
+            shard.cache_aggregate_client(&agg_a, &client_key).await.unwrap();
+            assert_eq!(
+                shard.shard_mem_cache.borrow_mut().get_client_seq(&agg_a, writer),
+                Some(1),
+                "the client_seq must survive a partial-warmup restart plus rotation"
+            );
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn incomplete_sidecar_routes_listings_to_legacy_scan() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let agg_a = key(1, 1, 1);
+
+            {
+                let shard = open_compact_shard(&dir).await;
+                write_ok(&shard, write_req(agg_a.clone(), fat_event(1))).await;
+                shard.close().await;
+            }
+
+            // Same staging as the dedup twin above: zero warmup budget taints the
+            // accumulator, the rotation seals segment 1 with a subset sidecar.
+            let mut cfg = compact_config(&dir);
+            cfg.cache_warmup_max_duration = Duration::ZERO;
+            let shard = ShardWal::open(cfg, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader)
+                .await
+                .unwrap();
+            write_ok(&shard, write_req(key(2, 2, 2), fat_event(1))).await;
+            trigger_rotation(&shard).await;
+
+            let payload = read_segment_summary(shard.log_segments_cache.shard_dir(), 1).await.expect("sidecar must exist");
+            assert!(!payload.complete && payload.aggregates.iter().all(|e| e.aggregate_id != 1),
+                "scaffolding: sidecar must be a tainted subset that does not know A");
+
+            // An incomplete sidecar must not be listing-authoritative: the legacy
+            // segment scan must surface A, not silently omit it forever.
+            let orgs = unwrap_list_orgs(process(&shard, list_orgs_req()).await);
+            assert!(orgs.orgs.iter().any(|o| o.org_id == 1), "org 1 must be listed via the legacy scan");
+            let aggs = unwrap_list_aggs(process(&shard, list_aggs_req(None, None)).await);
+            assert!(aggs.aggregates.iter().any(|a| a.aggregate_id == 1), "aggregate A must be listed via the legacy scan");
+            let types = unwrap_list_types(process(&shard, list_types_req(None)).await);
+            assert!(types.aggregate_types.iter().any(|t| t.org_id == 1), "org 1's type must be listed via the legacy scan");
+
+            shard.close().await;
+        });
+    }
+
     // ── Summary-based list operations ──
 
     #[test]
@@ -11869,5 +13430,461 @@ mod tests {
         });
     }
 
-}
 
+    // ── Negative-lookup per-aggregate client bloom ──
+
+    /// Events with explicit client_seq values, for non-duplicate follow-up writes.
+    fn events_from(start: u64, count: u64) -> Vec<DatablockAggregateEvent> {
+        (start..start + count)
+            .map(|i| DatablockAggregateEvent {
+                client_seq: i,
+                event_type_major: 1,
+                event_value: Arc::new(vec![i as u8; 8]),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn negative_check<R: ReplicationClient, D: S3Downloader>(
+        shard: &ShardWal<R, D>,
+        agg: &AggregateKey,
+        client_id: u128,
+    ) -> NegativeLookupAnswer {
+        shard.shard_mem_cache.borrow_mut().negative_lookup_check(agg, client_id_bloom_hash(client_id))
+    }
+
+    /// Minimal thread-local metrics recorder: counts counters, ignores the rest.
+    #[derive(Clone, Default)]
+    struct CountingRecorder {
+        counters: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::atomic::AtomicU64>>>>,
+    }
+
+    impl CountingRecorder {
+        fn get(&self, name: &str) -> u64 {
+            self.counters.lock().unwrap().get(name).map_or(0, |c| c.load(std::sync::atomic::Ordering::Relaxed))
+        }
+    }
+
+    impl metrics::Recorder for CountingRecorder {
+        fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+        fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+        fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+        fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+            let arc = self.counters.lock().unwrap().entry(key.name().to_string()).or_default().clone();
+            metrics::Counter::from_arc(arc)
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    /// The one hard part (build/write race): the EMPTY Building bloom must be
+    /// installed BEFORE the historical scan starts, so a client committing
+    /// during the scan's awaits lands in it via insert-on-write. Choreography
+    /// mirrors delete-trim-durability.md's repro notes: the builder is parked
+    /// deterministically on the scan semaphore, the racing write commits fully
+    /// inside the window, then the build resumes and completes.
+    #[test]
+    fn negative_build_write_race_concurrent_commit_lands_in_bloom() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let config = InternalShardConfig { read_max_concurrent: 1, ..test_config(&dir) };
+            let shard = ShardWal::open(config, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader)
+                .await
+                .unwrap();
+            let agg = key(1, 1, 1);
+
+            // History from client 1; idempotency off, so no bloom is resident yet.
+            write_ok(&shard, write_req_full(agg.clone(), events(3), true, None, 1, false)).await;
+            assert_eq!(negative_check(&shard, &agg, 2), NegativeLookupAnswer::NoEntry, "precondition: no bloom before the first idempotent write");
+
+            // Hold the single scan permit so the builder parks AFTER install.
+            let permit = shard.cache_load_semaphore.acquire_permit(1).await.unwrap();
+
+            // First idempotent write from NEW client 2 becomes the builder.
+            let build_fut = process(&shard, write_req_full(agg.clone(), events(1), false, None, 2, true));
+            futures_lite::pin!(build_fut);
+            let mut installed = false;
+            for _ in 0..50 {
+                assert!(
+                    futures_lite::future::poll_once(build_fut.as_mut()).await.is_none(),
+                    "build must park on the scan semaphore",
+                );
+                if negative_check(&shard, &agg, 2) == NegativeLookupAnswer::Building {
+                    installed = true;
+                    break;
+                }
+                glommio::timer::Timer::new(Duration::from_millis(1)).await;
+            }
+            assert!(installed, "the EMPTY bloom must be installed before the historical scan starts");
+
+            // The race: client 3's first write commits fully inside the window.
+            // Above the parked scan's upper bound, so only insert-on-write can
+            // catch it.
+            write_ok(&shard, write_req_full(agg.clone(), events(1), false, None, 3, false)).await;
+
+            drop(permit);
+            let build_result = build_fut.await;
+            assert!(matches!(build_result, Ok(ClientResponse::Write(_))), "builder write failed: {build_result:?}");
+
+            // Superset after the race: the concurrent commit is in the bloom,
+            // and the build still completed.
+            assert_eq!(negative_check(&shard, &agg, 3), NegativeLookupAnswer::MaybePresent, "raced commit missing from the bloom — subset, unsound");
+            assert_eq!(negative_check(&shard, &agg, 999), NegativeLookupAnswer::DefinitelyAbsent, "build must have completed");
+
+            // End-to-end: with the per-client LRU cold, a replay from client 3
+            // must be rejected through the maybe-present -> scan -> found path.
+            shard.shard_mem_cache.borrow_mut().clear_aggregate_write_client_snapshots_for_test();
+            let dup = process(&shard, write_req_full(agg.clone(), events(1), false, None, 3, true)).await;
+            assert!(
+                matches!(dup, Err(ShardError::Write(ShardWriteError::ClientIdempotencyViolation { .. }))),
+                "replay from the raced client must be rejected, got {dup:?}",
+            );
+
+            shard.close().await;
+        });
+    }
+
+    /// A found-early scan is a truncated walk: the entry must park as Building
+    /// (never Complete), and a later miss resumes and completes the build.
+    #[test]
+    fn negative_incomplete_build_parks_then_resume_completes() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            // History for client 1 without a bloom, then cold per-client LRU.
+            write_ok(&shard, write_req_full(agg.clone(), events(3), true, None, 1, false)).await;
+            shard.shard_mem_cache.borrow_mut().clear_aggregate_write_client_snapshots_for_test();
+
+            // Returning client 1 (fresh seqs): the build scan finds it at the
+            // tip and stops early — older history unwalked, must not complete.
+            write_ok(&shard, write_req_full(agg.clone(), events_from(4, 2), false, None, 1, true)).await;
+            assert_eq!(negative_check(&shard, &agg, 77), NegativeLookupAnswer::Building, "a truncated build walk must never mark Complete");
+
+            // A genuinely new client resumes the parked build; its negative
+            // scan walks all history, so the build completes.
+            write_ok(&shard, write_req_full(agg.clone(), events(1), false, None, 2, true)).await;
+            assert_eq!(negative_check(&shard, &agg, 77), NegativeLookupAnswer::DefinitelyAbsent);
+            assert_eq!(negative_check(&shard, &agg, 1), NegativeLookupAnswer::MaybePresent);
+            assert_eq!(negative_check(&shard, &agg, 2), NegativeLookupAnswer::MaybePresent);
+
+            shard.close().await;
+        });
+    }
+
+    /// Trim-then-new-client + the false-positive path: a trim-only client lands
+    /// in the bloom via insert-on-write (the rule: every aggregate-scoped
+    /// client-bearing kind), a new client short-circuits scan-free, and the
+    /// trim-only client's own first produce takes maybe-present -> scan ->
+    /// not-found -> proceed.
+    #[test]
+    fn negative_trim_then_new_client_and_false_positive_path() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            // Three batches -> aggregate_version 3, so keep_from=2 is in range.
+            for seq in 1..=3u64 {
+                write_ok(&shard, write_req_full(agg.clone(), events_from(seq, 1), true, None, 1, true)).await;
+            }
+            assert_eq!(negative_check(&shard, &agg, 5), NegativeLookupAnswer::DefinitelyAbsent, "first idempotent write must have built a Complete bloom");
+
+            // Trim by client 7 (trim-only client, no client_seq anywhere).
+            let trim = ClientRequest::TrimStart(TrimStartRequest {
+                correlation_id: None,
+                aggregate_key: agg.clone(),
+                keep_from_aggregate_version: 2,
+                client_id: 7,
+                user_id: None,
+            });
+            assert!(matches!(process(&shard, trim).await, Ok(ClientResponse::TrimStart(_))));
+            assert_eq!(negative_check(&shard, &agg, 7), NegativeLookupAnswer::MaybePresent, "trim client must land via insert-on-write");
+
+            // New client after trim: scan-free first write.
+            write_ok(&shard, write_req_full(agg.clone(), events(1), false, None, 2, true)).await;
+            assert_eq!(negative_check(&shard, &agg, 2), NegativeLookupAnswer::MaybePresent);
+
+            // The trim-only client produces: maybe-present, scan finds no
+            // EventBatch for it, proceed as first write. Never an error.
+            write_ok(&shard, write_req_full(agg.clone(), events(1), false, None, 7, true)).await;
+
+            shard.close().await;
+        });
+    }
+
+    /// Delete-recreate-new-client: the bloom keeps pre-delete clients as
+    /// phantoms (superset, safe), the deleting client lands via insert-on-write,
+    /// and a new client after recreate short-circuits.
+    #[test]
+    fn negative_delete_recreate_then_new_client() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            write_ok(&shard, write_req_full(agg.clone(), events(3), true, None, 1, true)).await;
+
+            let delete = ClientRequest::Delete(DeleteRequest {
+                correlation_id: None,
+                client_id: 5,
+                user_id: None,
+                deletes: HashMap::from([(agg.clone(), SingleAggregateDelete {
+                    allow_recreate: true,
+                    allow_sequence_continuation: false,
+                    expected_version: None,
+                })]),
+            });
+            assert!(matches!(process(&shard, delete).await, Ok(ClientResponse::Delete(_))));
+            assert_eq!(negative_check(&shard, &agg, 5), NegativeLookupAnswer::MaybePresent, "delete client must land via insert-on-write");
+
+            // Recreate by the original writer (floors survive delete: fresh seqs).
+            write_ok(&shard, write_req_full(agg.clone(), events_from(4, 1), true, None, 1, true)).await;
+
+            // New client post-recreate: scan-free, and the bloom still answers.
+            write_ok(&shard, write_req_full(agg.clone(), events(1), true, None, 2, true)).await;
+            assert_eq!(negative_check(&shard, &agg, 2), NegativeLookupAnswer::MaybePresent);
+            assert_eq!(negative_check(&shard, &agg, 99), NegativeLookupAnswer::DefinitelyAbsent);
+
+            shard.close().await;
+        });
+    }
+
+    /// Eviction is just "drop the entry, rebuild on next miss" — and the rebuild
+    /// path must still reject replays (no correctness rides on residency).
+    #[test]
+    fn negative_eviction_then_rebuild_preserves_idempotency() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            // Budget fits one Complete entry (~192B), not two.
+            let config = InternalShardConfig { negative_lookup_cache_bytes: 256, ..test_config(&dir) };
+            let shard = ShardWal::open(config, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader)
+                .await
+                .unwrap();
+            let agg1 = key(1, 1, 1);
+            let agg2 = key(1, 1, 2);
+
+            write_ok(&shard, write_req_full(agg1.clone(), events(1), true, None, 1, true)).await;
+            write_ok(&shard, write_req_full(agg2.clone(), events(1), true, None, 1, true)).await;
+            assert_eq!(negative_check(&shard, &agg1, 1), NegativeLookupAnswer::NoEntry, "agg1's entry must have been evicted by the byte budget");
+
+            // Replay against the evicted aggregate: rebuild scan finds the
+            // client and rejects — eviction cost a scan, not correctness.
+            shard.shard_mem_cache.borrow_mut().clear_aggregate_write_client_snapshots_for_test();
+            let dup = process(&shard, write_req_full(agg1.clone(), events(1), false, None, 1, true)).await;
+            assert!(
+                matches!(dup, Err(ShardError::Write(ShardWriteError::ClientIdempotencyViolation { .. }))),
+                "replay after eviction must be rejected, got {dup:?}",
+            );
+
+            shard.close().await;
+        });
+    }
+
+    /// Mid-build eviction: eviction pressure landing DURING a parked build must
+    /// not drop the pinned Building entry (pre-fix it did, admitting a second
+    /// builder whose half-built entry the first builder then marked Complete —
+    /// a subset, i.e. false absents and duplicate writes). Competing installs
+    /// are refused instead, the resumed build completes, and replays are still
+    /// rejected. Reuses the race test's semaphore choreography to park the
+    /// builder deterministically.
+    #[test]
+    fn negative_parked_build_survives_eviction_pressure() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            // Budget fits one entry; a single scan permit parks the builder.
+            let config = InternalShardConfig {
+                negative_lookup_cache_bytes: 256,
+                read_max_concurrent: 1,
+                ..test_config(&dir)
+            };
+            let shard = ShardWal::open(config, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader)
+                .await
+                .unwrap();
+            let agg1 = key(1, 1, 1);
+
+            // History from client 1; idempotency off, so no bloom is resident yet.
+            write_ok(&shard, write_req_full(agg1.clone(), events(3), true, None, 1, false)).await;
+
+            // Hold the single scan permit so the builder parks AFTER install.
+            let permit = shard.cache_load_semaphore.acquire_permit(1).await.unwrap();
+            let build_fut = process(&shard, write_req_full(agg1.clone(), events(1), false, None, 2, true));
+            futures_lite::pin!(build_fut);
+            let mut installed = false;
+            for _ in 0..50 {
+                assert!(
+                    futures_lite::future::poll_once(build_fut.as_mut()).await.is_none(),
+                    "build must park on the scan semaphore",
+                );
+                if negative_check(&shard, &agg1, 2) == NegativeLookupAnswer::Building {
+                    installed = true;
+                    break;
+                }
+                glommio::timer::Timer::new(Duration::from_millis(1)).await;
+            }
+            assert!(installed, "the EMPTY bloom must be installed before the historical scan starts");
+
+            // Eviction pressure inside the window: installs on other aggregates
+            // would exceed the budget, and the only resident entry is pinned.
+            {
+                let mut mc = shard.shard_mem_cache.borrow_mut();
+                assert!(
+                    mc.negative_lookup_try_begin_build(&key(1, 1, 2)).is_none(),
+                    "competing install must be refused while the only evictable entry is a pinned build",
+                );
+                assert!(mc.negative_lookup_try_begin_build(&key(1, 1, 3)).is_none());
+            }
+            assert_eq!(
+                negative_check(&shard, &agg1, 2),
+                NegativeLookupAnswer::Building,
+                "eviction pressure dropped the pinned mid-build entry",
+            );
+
+            drop(permit);
+            let build_result = build_fut.await;
+            assert!(matches!(build_result, Ok(ClientResponse::Write(_))), "builder write failed: {build_result:?}");
+            assert_eq!(negative_check(&shard, &agg1, 999), NegativeLookupAnswer::DefinitelyAbsent, "resumed build must complete");
+            assert_eq!(negative_check(&shard, &agg1, 1), NegativeLookupAnswer::MaybePresent);
+
+            // Replay from client 1 with a cold per-client LRU must be rejected.
+            shard.shard_mem_cache.borrow_mut().clear_aggregate_write_client_snapshots_for_test();
+            let dup = process(&shard, write_req_full(agg1.clone(), events(1), false, None, 1, true)).await;
+            assert!(
+                matches!(dup, Err(ShardError::Write(ShardWriteError::ClientIdempotencyViolation { .. }))),
+                "replay during/after mid-build eviction pressure must be rejected, got {dup:?}",
+            );
+
+            shard.close().await;
+        });
+    }
+
+    /// Restart-then-immediate-fan-in (the EBS storm killer): the open-time scan
+    /// eagerly rebuilds Complete blooms for a single-segment history, so the
+    /// first write per (aggregate, client) after recovery is scan-free —
+    /// asserted through the scan counters, not just the answers.
+    #[test]
+    fn negative_restart_then_immediate_fan_in_is_scan_free() {
+        let (_tmp, dir) = test_dir();
+        {
+            let dir = dir.clone();
+            LocalExecutorBuilder::new(Placement::Fixed(0))
+                .spawn(move || async move {
+                    let shard = open_shard(&dir).await;
+                    for client in 1..=3u128 {
+                        write_ok(&shard, write_req_full(key(1, 1, 1), events(1), true, None, client, true)).await;
+                    }
+                    shard.close().await;
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+        }
+
+        let recorder = CountingRecorder::default();
+        let ex = LocalExecutorBuilder::new(Placement::Fixed(0)).make().unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            ex.run(async {
+                let shard = open_shard(&dir).await;
+                let agg = key(1, 1, 1);
+
+                // Eager open-scan install: Complete, since all history is in log 1.
+                assert_eq!(negative_check(&shard, &agg, 1), NegativeLookupAnswer::MaybePresent, "recovered client must be in the eager bloom");
+                assert_eq!(negative_check(&shard, &agg, 10), NegativeLookupAnswer::DefinitelyAbsent, "eager bloom must be Complete for single-segment history");
+
+                for client in 10..=13u128 {
+                    write_ok(&shard, write_req_full(agg.clone(), events(1), false, None, client, true)).await;
+                }
+                shard.close().await;
+            })
+        });
+
+        assert_eq!(recorder.get("celeriant_cache_aggregate_client_scan_not_found_total"), 0, "post-restart first writes must not scan");
+        assert_eq!(recorder.get("celeriant_cache_aggregate_client_scan_found_total"), 0, "post-restart first writes must not scan");
+        assert_eq!(recorder.get("celeriant_negative_lookup_short_circuit_total"), 4, "every fan-in first write must short-circuit");
+    }
+
+    /// Cross-seal build soundness: the build unions sealed sidecar client sets
+    /// (Exact hashes directly, Bloom words as carried aux — sized per segment,
+    /// so they cannot be OR-merged) instead of scanning skipped segments, and a
+    /// complete-summary Unknown set forces the walk. All three variants must
+    /// leave the bloom a superset and still complete the build.
+    #[test]
+    fn negative_build_unions_sealed_sidecar_client_sets() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+            let agg_bloom = key(1, 1, 1); // 34 clients -> ClientSet::Bloom at seal
+            let agg_exact = key(1, 1, 2); // 3 clients -> ClientSet::Exact
+            let agg_unknown = key(1, 1, 3); // sidecar rewritten to Unknown below
+
+            for client in 100..134u128 {
+                write_ok(&shard, write_req_full(agg_bloom.clone(), events(1), true, None, client, false)).await;
+            }
+            for client in 200..203u128 {
+                write_ok(&shard, write_req_full(agg_exact.clone(), events(1), true, None, client, false)).await;
+            }
+            for client in 300..302u128 {
+                write_ok(&shard, write_req_full(agg_unknown.clone(), events(1), true, None, client, false)).await;
+            }
+            trigger_rotation(&shard).await;
+            assert!(shard.log_segments_cache.active_log_id() > 1);
+
+            // Rewrite the sealed sidecar: agg_unknown's client set -> Unknown
+            // (still complete). The build then may not skip that segment.
+            {
+                use crate::shard_wal_sync::summary_path;
+                use celeriant_wal::constants::WIRE_VERSION_SEGMENT_SUMMARY_BLOCK;
+                use celeriant_wal::segment_summary::SegmentSummaryBlock;
+                use celeriant_wire::disk::versioned_block::serialize_versioned_message_heap;
+
+                let mut payload = read_segment_summary(shard.log_segments_cache.shard_dir(), 1).await.expect("sealed sidecar must exist");
+                assert!(payload.complete, "precondition: the sealed summary must be complete");
+                for e in payload.aggregates.iter_mut() {
+                    if e.aggregate_id == agg_unknown.aggregate_id {
+                        assert!(e.client_set != ClientSet::Unknown, "precondition: set recorded at seal");
+                        e.client_set = ClientSet::Unknown;
+                    }
+                }
+                let bytes = serialize_versioned_message_heap(&SegmentSummaryBlock { payload }, WIRE_VERSION_SEGMENT_SUMMARY_BLOCK).unwrap();
+                std::fs::write(summary_path(shard.log_segments_cache.shard_dir(), 1), &bytes).unwrap();
+                shard.summary_cache.borrow_mut().pop(&1);
+            }
+
+            for (agg, sealed_client) in [(&agg_bloom, 100u128), (&agg_exact, 200), (&agg_unknown, 300)] {
+                // A new client's first idempotent write rides the build.
+                write_ok(&shard, write_req_full(agg.clone(), events(1), false, None, 999, true)).await;
+                assert_eq!(
+                    negative_check(&shard, agg, sealed_client),
+                    NegativeLookupAnswer::MaybePresent,
+                    "sealed-segment client {sealed_client} missing — subset, unsound",
+                );
+                assert_eq!(
+                    negative_check(&shard, agg, 555),
+                    NegativeLookupAnswer::DefinitelyAbsent,
+                    "build must complete across the seal for {agg:?}",
+                );
+
+                // And the next new client is scan-free.
+                write_ok(&shard, write_req_full(agg.clone(), events(1), false, None, 1000, true)).await;
+                assert_eq!(negative_check(&shard, agg, 1000), NegativeLookupAnswer::MaybePresent);
+
+                // Replay guard across the seal: the sealed client's duplicate is
+                // still rejected (maybe-present -> scan -> found in sealed segment).
+                shard.shard_mem_cache.borrow_mut().clear_aggregate_write_client_snapshots_for_test();
+                let dup = process(&shard, write_req_full(agg.clone(), events(1), false, None, sealed_client, true)).await;
+                assert!(
+                    matches!(dup, Err(ShardError::Write(ShardWriteError::ClientIdempotencyViolation { .. }))),
+                    "sealed-segment replay must be rejected, got {dup:?}",
+                );
+            }
+
+            shard.close().await;
+        });
+    }
+
+}

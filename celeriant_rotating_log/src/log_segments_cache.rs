@@ -16,6 +16,16 @@ use crate::{
     },
 };
 
+/// Supplies a sealed segment's `(aggregate_bloom, client_bloom)` words at reload time.
+/// The blooms live in the `.summary` sidecar — a shard-level concept this crate must not
+/// read — so the shard layer injects a loader. `None` per side means no bloom: the
+/// segment's cursors keep their ABSENT blooms (maybe-present for every key, sound).
+/// Boxed future is justified: reloading an evicted segment is a cold path whose file
+/// open + header read already dominate, and a generic would infect every user of this
+/// concrete type.
+pub type SealedBloomFuture = std::pin::Pin<Box<dyn std::future::Future<Output = (Option<Vec<u64>>, Option<Vec<u64>>)>>>;
+pub type SealedBloomLoader = Rc<dyn Fn(u64) -> SealedBloomFuture>;
+
 /// Manages DmaFile handles for a shard with LRU caching.
 /// "Active File" file is the current log being written to
 /// Older logs are opened on-demand and cached with LRU eviction
@@ -31,6 +41,9 @@ pub struct LogSegmentsCache {
     shard_dir: PathBuf,
 
     pub preallocate_bytes: u64,
+
+    /// See [`SealedBloomLoader`]. None (tests, pre-wiring) leaves reloads bloomless.
+    sealed_bloom_loader: RefCell<Option<SealedBloomLoader>>,
 
     shard_label: [(&'static str, String); 1],
 }
@@ -219,11 +232,9 @@ impl LogSegmentsCache {
 
     /// Called when starting up a shard, ensures we always have an active log file to write to
     pub async fn ready_up(shard_dir: PathBuf, preallocate_bytes: u64, max_cached_files: usize, shard_id: u32) -> Result<Self, ReadyUpError> {
-        // Segment needs room for the two header copies plus a metablock+datablock region, and
-        // must be DMA-aligned. It does NOT need to be a multiple of the header block: the tail
-        // header sits at `file_len - HEADER_BLOCK_SIZE_BYTES`, datablocks align to
-        // MIN_WRITE_ALIGNMENT independently, so 4096-alignment of both is sufficient. (Relaxed
-        // from `% HEADER_BLOCK_SIZE_BYTES == 0` so the header can be right-sized below 512KB.)
+        // Segment needs room for the two header copies plus a metablock+datablock region,
+        // and must be DMA-aligned (the tail header sits at `file_len - HEADER_BLOCK_SIZE_BYTES`,
+        // which is one MIN_WRITE_ALIGNMENT sector).
         if preallocate_bytes <= HEADER_BLOCK_SIZE_BYTES as u64 * 2 || preallocate_bytes % MIN_WRITE_ALIGNMENT != 0 {
             return Err(ReadyUpError::InvalidPreallocatedBytes(preallocate_bytes));
         }
@@ -299,8 +310,15 @@ impl LogSegmentsCache {
             lru_cache: RefCell::new(LruCache::new(cache_cap)),
             shard_dir,
             preallocate_bytes,
+            sealed_bloom_loader: RefCell::new(None),
             shard_label,
         })
+    }
+
+    /// Wire the sealed-segment bloom source (called once at shard open, before any
+    /// sealed segment can be reloaded).
+    pub fn set_sealed_bloom_loader(&self, loader: SealedBloomLoader) {
+        *self.sealed_bloom_loader.borrow_mut() = Some(loader);
     }
 
     pub fn active_log_id(&self) -> u64 {
@@ -352,6 +370,20 @@ impl LogSegmentsCache {
         // Open existing file - this is async
         let log_segment_file = LogSegmentFile::open_existing(&self.shard_dir, log_id).await?;
         let rc_file = Rc::new(log_segment_file);
+
+        // The v2 header carries no blooms; a sealed reload gets them from the sidecar
+        // via the injected loader. A missing loader/sidecar leaves them ABSENT
+        let loader = self.sealed_bloom_loader.borrow().clone();
+        if let Some(loader) = loader {
+            let (aggregate, client) = loader(log_id).await;
+            let metadata = rc_file.metadata.borrow();
+            if let Some(words) = aggregate {
+                *metadata.write.aggregate_key_bloom.borrow_mut() = AggregateKeyBloom::from_bytes(&words);
+            }
+            if let Some(words) = client {
+                *metadata.write.client_id_bloom.borrow_mut() = AggregateKeyBloom::from_bytes(&words);
+            }
+        }
 
         // Cache it
         self.lru_cache.borrow_mut().put(log_id, rc_file.clone());
@@ -568,13 +600,11 @@ mod tests {
     }
 
     #[test]
-    fn ready_up_accepts_4096_aligned_non_header_multiple() {
+    fn ready_up_accepts_smallest_valid_preallocate() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
-            // 4096-aligned but NOT a multiple of the (non-power-of-two) header block — the
-            // relaxed invariant must accept it. Mirrors the 1GB prod segment / 388KB header.
-            let size = HEADER_BLOCK_SIZE_BYTES as u64 * 3 + MIN_WRITE_ALIGNMENT;
-            assert_ne!(size % HEADER_BLOCK_SIZE_BYTES as u64, 0);
+            // Smallest valid segment: strictly more than the two header sectors, aligned.
+            let size = HEADER_BLOCK_SIZE_BYTES as u64 * 2 + MIN_WRITE_ALIGNMENT;
             assert_eq!(size % MIN_WRITE_ALIGNMENT, 0);
             let cache = LogSegmentsCache::ready_up(dir, size, 2, 0).await.unwrap();
             cache.close().await;

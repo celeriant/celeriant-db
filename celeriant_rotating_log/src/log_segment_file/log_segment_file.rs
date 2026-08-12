@@ -11,7 +11,7 @@ use celeriant_disk::files::{
 };
 use celeriant_wal::{
     aggregate_key::AggregateKey,
-    constants::{AGGREGATE_BLOOM_BYTES, CLIENT_BLOOM_BYTES, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_SHARD_LOG_HEADER},
+    constants::{CLIENT_BLOOM_BYTES, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_SHARD_LOG_HEADER},
     shard_log_header::{HeaderCursor, ShardLogHeader},
 };
 use celeriant_wire::disk::versioned_block::{deserialise_shard_log_header, serialize_versioned_message};
@@ -23,7 +23,7 @@ use glommio::{
 
 use crate::{
     errors::{open_or_create_error::OpenOrCreateError, write_dual_header_error::WriteDualHeaderError},
-    log_segment_file::log_segment_file_metadata::LogSegmentFileMetadata,
+    log_segment_file::{aggregate_key_bloom::AggregateKeyBloom, log_segment_file_metadata::LogSegmentFileMetadata},
 };
 
 /// Represents a physical log file on disk, with its associated metadata.
@@ -72,6 +72,12 @@ impl LogSegmentFile {
     /// segment's tips are read; re-activation rebuilds them, so dropping is safe.
     pub fn seal_aggregate_chain_tips(&self) {
         *self.aggregate_chain_tips.borrow_mut() = HashMap::new();
+    }
+
+    pub fn install_blooms(&self, aggregate: AggregateKeyBloom, client: AggregateKeyBloom) {
+        let metadata = self.metadata.borrow();
+        *metadata.write.aggregate_key_bloom.borrow_mut() = aggregate;
+        *metadata.write.client_id_bloom.borrow_mut() = client;
     }
 
     pub async fn lock_reader(&self, location: &'static str) -> Result<RwLockReadGuard<'_, Option<Rc<DmaFile>>>, LockTimeoutError> {
@@ -354,7 +360,9 @@ async fn create_new_file(
         advance_read,
     )
     .await?;
-    build_log_segment(log_id, log_path, writer, file_len, &header, advance_read).await
+    let file = build_log_segment(log_id, log_path, writer, file_len, &header, advance_read).await?;
+    file.install_blooms(AggregateKeyBloom::new(), AggregateKeyBloom::with_capacity_bytes(CLIENT_BLOOM_BYTES));
+    Ok(file)
 }
 
 pub(crate) fn log_file_name(log_id: u64) -> String {
@@ -456,8 +464,6 @@ async fn setup_new_file(
     };
     let header = ShardLogHeader {
         write,
-        aggregate_bloom: vec![0u64; AGGREGATE_BLOOM_BYTES / 8],
-        client_bloom: vec![0u64; CLIENT_BLOOM_BYTES / 8],
         last_received_replication_wal_seq,
         last_self_acked_wal_seq,
         read,
@@ -840,6 +846,82 @@ mod tests {
                 assert!(target.exists());
                 file.close().await;
             }
+        });
+    }
+
+    /// v2 blooms never ride the header: a created segment owns precise (empty) blooms,
+    /// a LOADED one starts absent — maybe-present for every key — until the open-time
+    /// scan (active) or the sidecar loader (sealed) installs real content.
+    #[test]
+    fn created_blooms_precise_loaded_blooms_absent() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let key = AggregateKey::new(1, 2, 3);
+
+            {
+                let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true)
+                    .await
+                    .unwrap();
+                let meta = file.metadata.borrow();
+                let bloom = meta.write.aggregate_key_bloom.borrow();
+                assert!(!bloom.is_absent(), "created segment must own a precise bloom");
+                assert!(!bloom.may_contain(&key), "a fresh precise bloom claims absence");
+                drop(bloom);
+                drop(meta);
+                file.close().await;
+            }
+
+            let file = LogSegmentFile::open_existing(&dir, 1).await.unwrap();
+            {
+                let meta = file.metadata.borrow();
+                assert!(meta.write.aggregate_key_bloom.borrow().is_absent(), "loaded blooms must be absent");
+                assert!(meta.write.client_id_bloom.borrow().is_absent());
+                assert!(
+                    meta.write.aggregate_key_bloom.borrow().may_contain(&key),
+                    "absent bloom must never short-circuit"
+                );
+            }
+
+            // install_blooms replaces both cursors' view (shared Rcs).
+            let mut agg = AggregateKeyBloom::new();
+            agg.insert(&key);
+            file.install_blooms(agg, AggregateKeyBloom::with_capacity_bytes(CLIENT_BLOOM_BYTES));
+            {
+                let meta = file.metadata.borrow();
+                assert!(meta.write.aggregate_key_bloom.borrow().may_contain(&key));
+                assert!(!meta.write.aggregate_key_bloom.borrow().may_contain(&AggregateKey::new(9, 9, 9)));
+                if let Some(read) = meta.read.as_ref() {
+                    assert!(read.aggregate_key_bloom.borrow().may_contain(&key), "read shares the installed bloom");
+                }
+            }
+            file.close().await;
+        });
+    }
+
+    /// The v2 dual header is 2 x 4096 bytes per flush (vs 2 x 388 KiB pre-split): each
+    /// slot deserializes from EXACTLY one MIN_WRITE_ALIGNMENT sector, and a slot read at
+    /// any other size is rejected.
+    #[test]
+    fn dual_header_slots_are_one_sector_each() {
+        glommio_test!({
+            use celeriant_wire::disk::versioned_block::deserialise_shard_log_header;
+
+            assert_eq!(HEADER_BLOCK_SIZE_BYTES, 4096);
+            let (_tmp, dir) = test_dir();
+            LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true)
+                .await
+                .unwrap()
+                .close()
+                .await;
+
+            let contents = std::fs::read(dir.join("log_1.wal")).unwrap();
+            let front = &contents[..HEADER_BLOCK_SIZE_BYTES];
+            let rear = &contents[contents.len() - HEADER_BLOCK_SIZE_BYTES..];
+            assert!(deserialise_shard_log_header(front).is_ok(), "front slot must be one valid sector");
+            assert!(deserialise_shard_log_header(rear).is_ok(), "rear slot must be one valid sector");
+            assert_eq!(front, rear, "dual-slot discipline: identical bytes");
+            assert!(deserialise_shard_log_header(&contents[..2 * HEADER_BLOCK_SIZE_BYTES]).is_err(),
+                "a non-sector-sized slot must be rejected by the exact-size check");
         });
     }
 

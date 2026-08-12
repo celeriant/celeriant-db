@@ -44,12 +44,28 @@ graph TB
     Follower -.->|"promtail → :3100"| OBS
 ```
 
+## Spot by default
+
+Every instance is a one-time spot request that terminates on reclaim. A benchmark cluster
+lives for well under an hour and is rebuilt from scratch each run, so an interruption costs
+a re-run and nothing else — and spot is roughly 70% cheaper (`i4i.16xlarge` in
+`ap-southeast-2`: ~$1.93/hr vs $6.58 on-demand). No max price is set; capping below
+on-demand only trades money for capacity failures. Use `-c spot=false` for on-demand.
+
+Spot arrives via a launch template — `AWS::EC2::Instance` has no market options in
+CloudFormation — that carries the market options and nothing else.
+
+> **Quota:** spot has its own vCPU limit, separate from on-demand ("All Standard Spot
+> Instance Requests"). `PROFILE=i4i-64c` needs exactly 192 (2×64 + 4×16), so the common
+> 192 default leaves no headroom. Check with
+> `aws service-quotas get-service-quota --service-code ec2 --quota-code L-34B43A08`.
+
 ## Instance type flexibility
 
 Use `-c instanceType=...` for data nodes and `-c clientInstanceType=...` for the benchmark
-client(s). **Instance store (NVMe) is required for data nodes** — Glommio's io_uring does not
-work reliably with EBS volumes (WAL open hangs). Client nodes only need CPU (no disk I/O),
-so compute-optimized instances work well.
+client(s). Data nodes default to local **instance store (NVMe)**, which is what every
+published benchmark uses. Client nodes only need CPU (no disk I/O), so compute-optimized
+instances work well.
 
 Architecture (x86_64 vs ARM64) is auto-detected from the instance type family. ARM families
 (i4g, c7g, etc.) get an ARM AMI; all others get x86_64. Data and client nodes must match
@@ -91,10 +107,11 @@ bottlenecks at high concurrency — tasks are split evenly across clients.
 | Compute-optimized ARM | `c7g.4xlarge` | 16 | ~$0.78 |
 | Compute-optimized ARM (large) | `c7g.8xlarge` | 32 | ~$1.56 |
 
-> **Warning:** Do not use EBS-only instance types (t3, m5, c5) for data nodes or `-c storageType=ebs`.
-> Glommio's io_uring poll ring fails on EBS, causing the server to start but never
-> accept connections. The CDK stack still supports EBS config for potential future fixes,
-> but it is not currently functional.
+> **EBS:** `-c storageType=ebs` works. The WAL-open hang that used to wedge EBS data nodes
+> was a `SchemaKey`/`AggregateKey` bloom-hash collision, fixed and validated on EBS
+> 2026-08-09 — not an io_uring/Glommio limitation as previously recorded here. Instance
+> store is still the default and the basis of the published numbers; EBS has not been
+> swept for throughput.
 
 ## Prerequisites
 
@@ -218,6 +235,13 @@ make teardown-data     # Wipe data on data nodes
 The benchmark runs `rpi_cluster_pool_bench` — a pool-based write benchmark with
 automatic leader failover, connecting to both nodes (same test the RPi cluster uses).
 
+Each task owns one aggregate **and one connection**, both fixed for the run. That pairing
+is what makes the numbers mean anything: the server answers a request for an aggregate
+owned by another shard by moving the whole TCP stream across the intrashard mesh
+(`check_client_redirect`), so a load generator that lets connections drift between tasks
+measures connection handover instead of writes. `BENCH_PINNED=0` restores the drifting
+behaviour if you want to price it — see `docs/benchmark-results/ec2-benchmark.md`.
+
 With multiple clients (`-c clientCount=N`), total tasks are split evenly across clients
 and run in parallel. Results are aggregated (requests summed, per-client stats shown).
 
@@ -256,9 +280,10 @@ metadata headers for easy comparison across instance types.
 | `instanceType` | `c6id.2xlarge` | `-c instanceType=i4i.8xlarge` |
 | `clientInstanceType` | *(same as instanceType)* | `-c clientInstanceType=c7i.4xlarge` |
 | `clientCount` | `1` | `-c clientCount=3` (max 4) |
-| `storageType` | `instance-store` | ⚠️ `ebs` exists but is broken (see above) |
+| `storageType` | `instance-store` | `-c storageType=ebs` works (see EBS note above); instance store is the published baseline |
 | `ebsDataVolumeSize` | `100` (GB) | `-c ebsDataVolumeSize=200` (EBS only) |
 | `raid0` | *(true)* | RAID0-stripes all instance-store NVMes by default; `-c raid0=false` uses only the first drive |
+| `spot` | *(true)* | All instances are one-time spot requests; `-c spot=false` uses on-demand |
 | `homeIp` | *(auto)* | `make infra` auto-detects your public IP and opens Grafana :3000 to it; override with `HOME_IP=1.2.3.4/32` or skip with `HOME_IP=` |
 | `keyPair` | *(none, use SSM)* | `-c keyPair=my-key` |
 

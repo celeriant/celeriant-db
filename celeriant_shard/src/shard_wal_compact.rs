@@ -3,6 +3,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use celeriant_wal::segment_summary::segment_aggregate_entry::SegmentAggregateEntry;
+use celeriant_wal::segment_summary::segment_summary_payload::SegmentSummaryPayload;
 use tracing::{info, warn};
 
 use celeriant_disk::files::open_dma_files::create_file_dma;
@@ -11,12 +13,11 @@ use celeriant_memcache::cache_path::CachePath;
 use celeriant_memcache::mem_snapshot_aggregate::AggregateStatus;
 use celeriant_memcache::shard_mem_cache::ShardMemCache;
 use celeriant_rotating_log::errors::scan_error::ScanError;
-use celeriant_rotating_log::log_segment_file::aggregate_key_bloom::AggregateKeyBloom;
 use celeriant_rotating_log::log_segment_file::log_segment_file::write_dual_shard_log_header;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
-use celeriant_wal::aggregate_client_key::client_id_bloom_hash;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::constants::{self, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, MIN_WRITE_ALIGNMENT, WIRE_VERSION_WAL_METABLOCK};
+use celeriant_wal::aggregate_type_key::AggregateTypeKey;
 use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_wal::shard_log_header::{HeaderCursor, ShardLogHeader};
@@ -535,8 +536,6 @@ async fn build_compacted_file(
     //    - Record lightweight DatablockRef entries for datablocks that need copying.
     // -------------------------------------------------------------------------
     let mut datablock_refs: Vec<DatablockRef> = Vec::with_capacity(estimate.kept_metablock_count as usize);
-    let mut bloom = AggregateKeyBloom::new();
-    let mut client_bloom = AggregateKeyBloom::with_capacity_bytes(constants::CLIENT_BLOOM_BYTES);
     // Per-aggregate backlink tips for the COMPACTED layout; dropped metablocks shift
     // positions, so recompute the chain against the new offsets.
     let mut compact_tips: HashMap<AggregateKey, u64> = HashMap::new();
@@ -595,18 +594,6 @@ async fn build_compacted_file(
 
                 serialize_versioned_message(&metablock, WIRE_VERSION_WAL_METABLOCK, slot)
                     .map_err(|e| CompactionError::MetablockSerialise(e.to_string()))?;
-
-                match &metablock.wal_metablock_type {
-                    MetablockKind::EventBatchMetadata(eb) => {
-                        bloom.insert(&eb.aggregate_key);
-                        client_bloom.insert_hash(client_id_bloom_hash(eb.client_id));
-                    }
-                    MetablockKind::SoftDelete(sd) => bloom.insert(&sd.aggregate_key),
-                    MetablockKind::SoftTrim(st) => bloom.insert(&st.aggregate_key),
-                    MetablockKind::SchemaRegistration(sr) => {
-                        bloom.insert_hash(sr.schema_key.bloom_hash())
-                    }
-                }
 
                 mb_offset += FIXED_BLOCK_SIZE_BYTES;
                 Ok(false)
@@ -696,6 +683,9 @@ async fn build_compacted_file(
     // the hash chain and wal_seq represent already-verified state. The compacted content
     // no longer chains to this tip_hash — correctness is maintained by metablocks_position.
     // Compaction only runs on fully-replicated segments, so read == write.
+    // v2 header: bloomless. The compacted segment's blooms live ONLY in the rewritten
+    // sidecar (pre-compaction words carried forward verbatim, never rebuilt); the next
+    // reload installs them from there.
     let cursor = HeaderCursor {
         metablocks_position: final_metablocks_position,
         datablocks_position: final_datablocks_position,
@@ -704,8 +694,6 @@ async fn build_compacted_file(
     };
     let header = ShardLogHeader {
         write: cursor.clone(),
-        aggregate_bloom: bloom.to_bytes(),
-        client_bloom: client_bloom.to_bytes(),
         last_received_replication_wal_seq: original_last_received_replication_wal_seq,
         last_self_acked_wal_seq: original_last_self_acked_wal_seq,
         read: cursor,
@@ -830,11 +818,80 @@ pub async fn compact_segment(
         .borrow_mut()
         .remap_compacted_positions(target_log_id, &compact_tips);
 
+    rewrite_summary_sidecar(target_log_id, log_segments_cache, &compact_tips, &state_map).await;
+
     Ok(Some(CompactionResult {
         log_id: target_log_id,
         original_size,
         compacted_size,
     }))
+}
+
+/// Rewrite the compacted segment's `.summary` sidecar: tip positions remapped
+/// via `compact_tips` (0 = no hint when every block of an aggregate was dropped
+/// — its tombstone lives in a later segment), client sets AND segment blooms
+/// carried forward VERBATIM from the pre-compaction sidecar. Never regenerate
+/// them from survivors: supersets are safe, a rebuilt set could be a subset and
+/// answer a false "absent". Missing/torn sidecar: tips-only entries with
+/// Unknown client sets and no blooms.
+///
+/// Best-effort: a failed write leaves the old sidecar, whose stale seek targets
+/// self-verify in the scanner (a moved tip position can only hold a foreign
+/// block, which triggers the full-hunt fallback), so this never blocks a
+/// completed compaction.
+async fn rewrite_summary_sidecar(
+    target_log_id: u64,
+    log_segments_cache: &Rc<LogSegmentsCache>,
+    compact_tips: &HashMap<AggregateKey, u64>,
+    state_map: &HashMap<AggregateKey, AggregateCompactionState>,
+) {
+    let payload = match crate::shard_wal::read_segment_summary(log_segments_cache.shard_dir(), target_log_id).await {
+        Some(mut payload) => {
+            for entry in &mut payload.aggregates {
+                let key = AggregateKey::new(entry.org_id, entry.aggregate_type_id, entry.aggregate_id);
+                entry.newest_metablock_pos = compact_tips.get(&key).copied().unwrap_or(0);
+            }
+            payload
+        }
+        None => {
+            let mut orgs: HashSet<u128> = HashSet::new();
+            let mut aggregate_types: HashSet<AggregateTypeKey> = HashSet::new();
+            let mut aggregates = Vec::with_capacity(compact_tips.len());
+            for (key, &pos) in compact_tips {
+                orgs.insert(key.org_id);
+                aggregate_types.insert(AggregateTypeKey::new(key.org_id, key.aggregate_type_id));
+                let mut entry = SegmentAggregateEntry::new(key.org_id, key.aggregate_type_id, key.aggregate_id);
+                entry.newest_metablock_pos = pos;
+                entry.is_deleted = matches!(state_map.get(key), Some(AggregateCompactionState::Deleted));
+                aggregates.push(entry);
+            }
+            SegmentSummaryPayload {
+                orgs: orgs.into_iter().collect(),
+                aggregate_types: aggregate_types.into_iter().collect(),
+                aggregates,
+                // Complete: every surviving aggregate has a compact tip, and an
+                // absent one truly has no blocks left in the segment — Skip
+                // matches what a full walk would find.
+                complete: true,
+                aggregate_bloom: None,
+                client_bloom: None,
+                // Compaction always keeps schema registrations, but without the
+                // old sidecar their bloom is unknowable here — None walks,
+                // never a false absent.
+                schema_bloom: None,
+            }
+        }
+    };
+
+    if let Err(e) = crate::shard_wal_sync::write_segment_summary_sidecar_from_payload(
+        log_segments_cache.shard_dir(),
+        target_log_id,
+        payload,
+    )
+    .await
+    {
+        warn!(log_id = target_log_id, error = ?e, "Failed to rewrite segment summary sidecar after compaction");
+    }
 }
 
 /// Delete any orphaned `.compacting` temp files left by a previous crashed compaction.

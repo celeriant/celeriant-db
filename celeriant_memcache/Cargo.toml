@@ -16,3 +16,4 @@ celeriant_rotating_log = { path = "../celeriant_rotating_log" }
 lru.workspace = true
 deepsize.workspace = true
 metrics.workspace = true
+tracing.workspace = true

@@ -197,11 +197,16 @@ pub(crate) struct TestComponents {
     pub(crate) shard_mem_cache: Rc<RefCell<MemCache>>,
     pub(crate) fsync_coordinator: Rc<Coordinator<ShardFsyncError>>,
     pub(crate) watched_aggregates: Rc<AggregateWatchers>,
+    pub(crate) summary_cache: RefCell<crate::shard_wal::SummaryCache>,
 }
 
 impl TestComponents {
     pub(crate) async fn new(dir: &std::path::Path) -> Self {
-        let log_segments_cache = LogSegmentsCache::ready_up(dir.to_path_buf(), PREALLOCATE, 4, 0).await.unwrap();
+        Self::with_preallocate(dir, PREALLOCATE).await
+    }
+
+    pub(crate) async fn with_preallocate(dir: &std::path::Path, preallocate: u64) -> Self {
+        let log_segments_cache = LogSegmentsCache::ready_up(dir.to_path_buf(), preallocate, 4, 0).await.unwrap();
         Self {
             log_segments_cache: Rc::new(log_segments_cache),
             shard_mem_cache: Rc::new(RefCell::new(MemCache::new(
@@ -209,10 +214,12 @@ impl TestComponents {
                 64 * 1024 * 1024,
                 32 * 1024 * 1024,
                 4 * 1024 * 1024,
+                2 * 1024 * 1024,
                 64 * 1024 * 1024,
             ))),
             fsync_coordinator: Rc::new(Coordinator::new()),
             watched_aggregates: Rc::new(AggregateWatchers::new()),
+            summary_cache: RefCell::new(lru::LruCache::new(std::num::NonZeroUsize::new(16).unwrap())),
         }
     }
 
@@ -316,6 +323,7 @@ impl TestComponents {
             &self.shard_mem_cache,
             &self.fsync_coordinator,
             &self.watched_aggregates,
+            &self.summary_cache,
             downloader,
             shard_id,
             99,

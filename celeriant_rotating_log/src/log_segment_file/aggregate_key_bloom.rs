@@ -4,7 +4,9 @@ use celeriant_wal::sbbf;
 
 const WORDS: usize = AGGREGATE_BLOOM_BYTES / 8;
 
-/// Persisted bloom of aggregate (and schema) keys in log segment headers.
+/// Bloom of aggregate (and schema) keys for one log segment. Lives in memory for the
+/// active segment (rebuilt by the open-time forward scan) and in the `.summary` sidecar
+/// for sealed segments.
 #[derive(Clone)]
 pub struct AggregateKeyBloom {
     words: Vec<u64>,
@@ -30,13 +32,27 @@ impl AggregateKeyBloom {
         Self { words: vec![0u64; bytes / 8] }
     }
 
-    /// Create from existing bloom bytes (e.g., loaded from disk). Length is whatever was
-    /// persisted (256KB aggregate or 128KB client), only required to be a whole number of
+    /// Create from existing bloom bytes (e.g., loaded from a sidecar). Length is whatever
+    /// was persisted (seal-time right-sized), only required to be a whole number of
     /// 32-byte SBBF blocks.
     #[must_use]
     pub fn from_bytes(bytes: &[u64]) -> Self {
-        debug_assert_eq!(bytes.len() % 4, 0, "persisted bloom is not a whole number of SBBF blocks");
+        if bytes.len() % 4 != 0 {
+            return Self::absent();
+        }
         Self { words: bytes.to_vec() }
+    }
+
+    /// No-information bloom: `may_contain*` answers true for every key. Used for segments
+    /// loaded without sidecar blooms (v2 headers carry none).
+    #[must_use]
+    pub fn absent() -> Self {
+        Self { words: Vec::new() }
+    }
+
+    #[must_use]
+    pub fn is_absent(&self) -> bool {
+        self.words.is_empty()
     }
 
     /// Clear the bloom filter for reuse.
@@ -46,13 +62,13 @@ impl AggregateKeyBloom {
 
     /// Insert an aggregate key into the bloom filter.
     pub fn insert(&mut self, aggregate_key: &AggregateKey) {
-        sbbf::insert(&mut self.words, aggregate_key.bloom_hash());
+        self.insert_hash(aggregate_key.bloom_hash());
     }
 
     /// Insert multiple aggregate keys.
     pub fn insert_all(&mut self, aggregate_keys: &[AggregateKey]) {
         for key in aggregate_keys {
-            sbbf::insert(&mut self.words, key.bloom_hash());
+            self.insert_hash(key.bloom_hash());
         }
     }
 
@@ -60,17 +76,24 @@ impl AggregateKeyBloom {
     /// Returns `false` if definitely not in set, `true` if possibly in set.
     #[must_use]
     pub fn may_contain(&self, aggregate_key: &AggregateKey) -> bool {
-        sbbf::contains(&self.words, aggregate_key.bloom_hash())
+        self.may_contain_hash(aggregate_key.bloom_hash())
     }
 
-    /// Insert a precomputed key hash directly (e.g. `SchemaKey::bloom_hash`).
+    /// Insert a precomputed key hash directly (e.g. `client_id_bloom_hash`).
+    /// No-op on an absent bloom: it stays "everything maybe-present" (a superset).
     pub fn insert_hash(&mut self, hash: u64) {
+        if self.is_absent() {
+            return;
+        }
         sbbf::insert(&mut self.words, hash);
     }
 
     /// Check if a precomputed key hash might be in the set.
     #[must_use]
     pub fn may_contain_hash(&self, hash: u64) -> bool {
+        if self.is_absent() {
+            return true;
+        }
         sbbf::contains(&self.words, hash)
     }
 
@@ -83,7 +106,9 @@ impl AggregateKeyBloom {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use celeriant_wal::segment_summary::client_set::sized_bloom_from_hashes;
+
+use super::*;
 
     #[test]
     fn test_insert_and_check() {
@@ -101,6 +126,49 @@ mod tests {
         // key3 was not inserted - might still return true (false positive) but unlikely
     }
 
+    /// Seal-time sized bloom words, round-tripped: loaded via
+    /// `from_bytes`, a right-sized bloom must answer exactly like the fixed
+    /// 256 KiB bloom for the same key set — every inserted key maybe-present,
+    /// across cardinalities from one key up past the cap (saturation), where
+    /// only false POSITIVES may increase, never false absences.
+    #[test]
+    fn sized_bloom_answers_like_fixed_bloom_after_from_bytes() {
+        for n in [0usize, 1, 100, 300, 40_000] {
+            let keys: Vec<AggregateKey> =
+                (0..n).map(|i| AggregateKey::new(1, 2, i as u128)).collect();
+            // Small cap (8 KiB) so n=40_000 exercises saturation.
+            let words = sized_bloom_from_hashes(n, keys.iter().map(AggregateKey::bloom_hash), 8 * 1024);
+            let sized = AggregateKeyBloom::from_bytes(&words);
+            let mut fixed = AggregateKeyBloom::new();
+            for key in &keys {
+                fixed.insert(key);
+            }
+            for key in &keys {
+                assert!(sized.may_contain(key), "n={n}: no false absent allowed in the sized bloom");
+                assert!(fixed.may_contain(key));
+            }
+            if n <= 300 {
+                let outsider = AggregateKey::new(9, 9, 9_999_999);
+                assert_eq!(
+                    sized.may_contain(&outsider),
+                    fixed.may_contain(&outsider),
+                    "n={n}: sized and fixed blooms must agree on this non-member"
+                );
+            }
+        }
+    }
+
+    /// A hostile/torn sidecar with a non-block-multiple word count must degrade
+    /// to absent (maybe-present), not panic in the sbbf block math.
+    #[test]
+    fn from_bytes_malformed_length_degrades_to_absent() {
+        for words in [vec![0u64; 1], vec![0u64; 3], vec![u64::MAX; 7]] {
+            let bloom = AggregateKeyBloom::from_bytes(&words);
+            assert!(bloom.is_absent());
+            assert!(bloom.may_contain(&AggregateKey::new(1, 2, 3)), "absent bloom must never claim absence");
+        }
+    }
+
     #[test]
     fn test_from_bytes_roundtrip() {
         let mut bloom = AggregateKeyBloom::new();
@@ -111,6 +179,20 @@ mod tests {
         let restored = AggregateKeyBloom::from_bytes(&bytes);
 
         assert!(restored.may_contain(&key));
+    }
+
+    /// The absent bloom is "no information": every query answers maybe-present, and
+    /// inserts must not accidentally give it real (subset) content.
+    #[test]
+    fn absent_bloom_answers_maybe_present_and_ignores_inserts() {
+        let mut bloom = AggregateKeyBloom::absent();
+        assert!(bloom.is_absent());
+        assert!(bloom.may_contain(&AggregateKey::new(1, 2, 3)));
+        assert!(bloom.may_contain_hash(0));
+
+        bloom.insert(&AggregateKey::new(1, 2, 3));
+        assert!(bloom.is_absent(), "insert must not turn an absent bloom into a subset");
+        assert!(bloom.may_contain(&AggregateKey::new(9, 9, 9)));
     }
 
     #[test]
