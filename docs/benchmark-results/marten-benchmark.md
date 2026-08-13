@@ -1,8 +1,8 @@
-# Marten/PostgreSQL vs Celeriant Benchmark — 2026-03-27
+# Marten/PostgreSQL Benchmark — 2026-03-27
 
-Per-operation comparison on identical hardware. Both benchmarks use the same pattern:
-N concurrent tasks, each appending one event and waiting for the ack before sending
-the next. No batching, no pipelining — true per-request throughput.
+Per-operation throughput for Marten on PostgreSQL 17.8, i4i.8xlarge. N concurrent tasks,
+each appending one event and waiting for the ack before sending the next. No batching, no
+pipelining — true per-request throughput.
 
 ## Test setup
 
@@ -15,46 +15,32 @@ the next. No batching, no pipelining — true per-request throughput.
 - **Durability:** `synchronous_commit = on`, `synchronous_standby_names = 'FIRST 1 (standby1)'` — primary + standby both fsync WAL before ack
 - **Config:** `shared_buffers = 64GB`, `max_connections = 10000`, `wal_compression = lz4`
 
-### Celeriant
-- **Data nodes:** 2x i4i.8xlarge (32 vCPU, NVMe instance store, XFS, Direct I/O)
-- **Clients:** 3x c7i.4xlarge (16 vCPU each)
-- **Config:** `fdatasync()` + replication before ack
-- **Benchmark:** `rpi_cluster_pool_bench` (Rust, tokio)
-- **TLS:** mTLS with kTLS offload (TLS 1.3)
-- **Durability:** Full — fsync to WAL on both leader and follower before ack
-
-### Hardware parity
-Both use i4i.8xlarge with NVMe instance store. Both use 2 data nodes with synchronous
-replication (fsync on both nodes before ack). Both use mTLS. Same durability guarantees,
-same hardware, same client topology.
-
 ## Results
 
-| Concurrency | Marten req/s | Marten avg ms | Marten p99 ms | Celeriant req/s | Ratio |
-|---|---|---|---|---|---|
-| 500 | **42,721** | 11 | 46 | ~80,000* | **~1.9x** |
-| 1,000 | 39,784 | 25 | 93 | ~105,000* | **~2.6x** |
-| 2,000 | 34,104 | 58 | 209 | ~120,000* | **~3.5x** |
-| 3,000 | 29,226 | 102 | 344 | ~130,000* | **~4.5x** |
-| 4,500 | 19,714 | 472 | 19,490 | ~140,000* | **~7.1x** |
-| 6,000 | 19,618 | 306 | 2,011 | ~150,000* | **~7.7x** |
-| 9,000 | 12,666 | 712 | 6,497 | 144,655 | **11.4x** |
-| 12,000 | 901 | 19,651 | 26,096 | 190,647 | **212x** |
-| 15,000 | 1,053 | 23,131 | 29,161 | 226,015 | **215x** |
-| 18,000 | 1,237 | 27,597 | 35,429 | 264,051 | **213x** |
-| 21,000 | 1,457 | 32,990 | 41,896 | 292,946 | **201x** |
-| 24,000 | 1,651 | 37,964 | 47,183 | 318,768 | **193x** |
-
-*\* Celeriant values below 9,000 concurrency are interpolated from the full sweep curve*
+| Concurrency | Marten req/s | Marten avg ms | Marten p99 ms |
+|---|---|---|---|
+| 500 | **42,721** | 11 | 46 |
+| 1,000 | 39,784 | 25 | 93 |
+| 2,000 | 34,104 | 58 | 209 |
+| 3,000 | 29,226 | 102 | 344 |
+| 4,500 | 19,714 | 472 | 19,490 |
+| 6,000 | 19,618 | 306 | 2,011 |
+| 9,000 | 12,666 | 712 | 6,497 |
+| 12,000 | 901 | 19,651 | 26,096 |
+| 15,000 | 1,053 | 23,131 | 29,161 |
+| 18,000 | 1,237 | 27,597 | 35,429 |
+| 21,000 | 1,457 | 32,990 | 41,896 |
+| 24,000 | 1,651 | 37,964 | 47,183 |
 
 ## Key findings
 
 ### Throughput
 
-- **Celeriant peak: 389,759 req/s** at 39,000 concurrency
-- **PostgreSQL peak: 42,721 req/s** at 500 concurrency — **9.1x lower**
-- PostgreSQL throughput **decreases monotonically** as connections increase
+- **PostgreSQL peak: 42,721 req/s** at 500 concurrency
+- Throughput **decreases monotonically** as connections increase
 - At 12,000 connections PostgreSQL falls off a cliff: throughput drops 97% from 12.7k to <1k req/s
+- For reference, Celeriant on the same hardware peaks at **419,132 req/s** at 39,000 concurrency
+  (2 data nodes, fsync on both before ack). See `ec2-benchmark-metal-20260813.md`.
 
 ### Connection scaling
 
@@ -70,9 +56,6 @@ PostgreSQL exhibits the classic process-per-connection scaling wall:
 
 Between 9,000 and 12,000 connections, throughput collapses from 12.7k to <1k req/s.
 This is not a gradual degradation — it's a hard cliff.
-
-Celeriant, by contrast, scales linearly to 39,000 concurrent connections with increasing
-throughput at every level.
 
 ### Why PostgreSQL hits a wall
 
@@ -99,30 +82,24 @@ At high concurrency, multiple bottlenecks compound:
 
 7. **mTLS overhead.** TLS handshakes and per-record encryption in userspace (OpenSSL) add CPU cost per connection and per byte.
 
-Celeriant avoids all of these: single-threaded async I/O via io_uring with Direct I/O, memory-mapped WAL with a single `fdatasync()`, no SQL parsing, no MVCC, no process forking, and kTLS offloads encryption to the kernel.
+### Durability
 
-### Durability comparison
-
-| | PostgreSQL | Celeriant |
-|---|---|---|
-| Write to disk | WAL fsync before ack | `fdatasync()` before ack |
-| Replication | Synchronous standby (fsync before ack) | Leader + follower both fsync |
-| Data loss on power failure | None | None |
-| Nodes | 2 (primary + standby) | 2 (leader + follower) |
-| TLS | mTLS (OpenSSL, userspace) | mTLS with kTLS (TLS 1.3, kernel offload) |
-
-Both systems provide identical durability guarantees: fsync on two nodes before ack,
-with mTLS in transit. Celeriant is 9-200x faster depending on concurrency.
+| | PostgreSQL |
+|---|---|
+| Write to disk | WAL fsync before ack |
+| Replication | Synchronous standby (fsync before ack) |
+| Data loss on power failure | None |
+| Nodes | 2 (primary + standby) |
+| TLS | mTLS (OpenSSL, userspace) |
 
 ### Comparison with Kafka
 
-All three systems on i4i.8xlarge, per-operation (no batching), with TLS and replication:
+Both on i4i.8xlarge, per-operation (no batching), with TLS and replication:
 
 | System | Peak req/s | Nodes | TLS | Fsync | Connection scaling |
 |---|---|---|---|---|---|
-| **Celeriant** | **389,759** | 2 | mTLS (kTLS) | Both nodes | Linear to 42k |
 | PostgreSQL/Marten | 42,721 | 2 | mTLS (OpenSSL) | Both nodes | Cliff at 12k |
-| Kafka | ~24,000 | 3 | TLS | None | Flat (throughput-limited) |
+| Kafka | 24,162 | 3 | TLS | None | Flat (throughput-limited) |
 
 PostgreSQL has 1.8x Kafka's peak throughput while providing stronger durability (fsync
 vs page cache) and richer functionality (SQL, JSONB, transactions). Kafka maintains

@@ -1,0 +1,14 @@
+# Exact-hardware re-measurement of Celeriant for the Kafka/Marten comparison.
+#
+# The published comparison (docs/benchmark-results/{kafka,marten}-benchmark.md, 2026-03) ran
+# Celeriant at 389,759 req/s peak on 2x i4i.8xlarge + 3x c7i.4xlarge. That figure is from an
+# OLD BUILD. This re-runs the identical hardware and client shape on current main so the
+# comparison is like-for-like again. Kafka and Marten are unchanged and are not re-run.
+#
+# Concurrency points chosen to line up with the published Marten ladder:
+#   500    Marten's own peak (42,721) — the point most favourable to Postgres
+#   12,000 where Marten falls off a cliff (901 req/s, -97%)
+#   39,000 where Celeriant peaked in the published run (389,759)
+conn_500    TASKS=500
+conn_12k    TASKS=12000
+conn_39k    TASKS=39000

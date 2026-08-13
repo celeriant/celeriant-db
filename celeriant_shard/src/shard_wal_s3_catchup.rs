@@ -1527,7 +1527,8 @@ mod tests {
     use celeriant_wal::datablocks::datablock_kind::DatablockKind;
     use celeriant_wal::metablocks::metablock_event_batch::MetablockEventBatch;
     use celeriant_wal::metablocks::metablock_kind::MetablockKind;
-    use glommio::{LocalExecutorBuilder, Placement};
+    use celeriant_wal::segment_summary::segment_summary_payload::SegmentSummaryPayload;
+use glommio::{LocalExecutorBuilder, Placement};
 
     use celeriant_distributed::paths::fallback_batch_path;
     use celeriant_wal::aggregate_key::AggregateKey;
@@ -3396,7 +3397,7 @@ mod tests {
             }
 
             // Sidecar files on disk and decoded-cache entries for every id.
-            let stub = Rc::new(celeriant_wal::segment_summary::SegmentSummaryPayload {
+            let stub = Rc::new(SegmentSummaryPayload {
                 orgs: vec![],
                 aggregate_types: vec![],
                 aggregates: vec![],

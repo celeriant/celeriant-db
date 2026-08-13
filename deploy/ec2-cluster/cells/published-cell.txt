@@ -1,0 +1,12 @@
+# Rung 5 — the published 64-core i4i.metal cell.
+#
+# Every campaign finding applied at once, replicated pair, single AZ, mTLS ON (the deploy
+# default and what a real deployment runs; F-43 prices mTLS at -4.6% throughput / +16.7% p99,
+# so a cleartext headline would not be honest).
+#
+#   num_shards 128        one per vCPU — F-4, +13.3% over one-per-core AT SATURATION
+#   fsync 1,000 us        inside the plateau on both storage classes — F-1
+#   replication 15,000 us the measured optimum, +9.8% over the default — F-13
+#
+# Judged worse-of-N across ABBA reps.
+published  NUM_SHARDS=128 FSYNC_DELAY_US=1000 REPLICATION_DELAY_US=15000

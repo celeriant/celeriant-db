@@ -1,0 +1,13 @@
+# Same hardware, same ladder, SERVER DEFAULTS for both delays.
+#
+# This is the arm that isolates tuning from hardware. Comparing the tuned 16xlarge against the
+# website's historical figure would conflate the tuning with unknown methodology differences
+# (client type, duration, worse-of-N vs mean, shard count). Measuring defaults on the same box,
+# same harness, same ABBA ordering makes the tuning delta attributable.
+#
+# No FSYNC_DELAY_US / REPLICATION_DELAY_US lines at all -> deploy.sh emits nothing -> the
+# binary's own defaults apply (17,000 us both). NUM_SHARDS omitted -> defaults to num_cpus = 64.
+def_32k    TASKS=32000
+def_60k    TASKS=60000
+def_100k   TASKS=100000
+def_132k   TASKS=132000

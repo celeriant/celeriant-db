@@ -29,6 +29,11 @@ if [[ -n "$KEY_FILE" ]]; then
   SSH_OPTS="$SSH_OPTS -i $KEY_FILE"
 fi
 
+# Campaign knobs and the node env generator live in node-env-lib.sh, shared with the cell
+# sweep driver so the two cannot drift apart.
+source "$SCRIPT_DIR/node-env-lib.sh"
+init_campaign_knobs
+
 # Read CDK outputs
 STACK_NAME="CeleriantKtlsTestStack"
 echo "==> Reading stack outputs from $STACK_NAME"
@@ -39,9 +44,39 @@ get_output() {
 }
 
 LEADER_PUB=$(get_output LeaderPublicIp)
-FOLLOWER_PUB=$(get_output FollowerPublicIp)
 LEADER_IP=$(get_output LeaderPrivateIp)
+# Absent when the stack was synthesised with -c dataNodeCount=1. An empty follower is the
+# standalone signal throughout this script; DATA_NODE_PUBS drives every per-node loop so a
+# single-node stack never tries to reach a node that does not exist.
+FOLLOWER_PUB=$(get_output FollowerPublicIp)
 FOLLOWER_IP=$(get_output FollowerPrivateIp)
+DATA_NODE_PUBS="$LEADER_PUB"
+DATA_NODE_COUNT=1
+if [[ -n "$FOLLOWER_PUB" ]]; then
+  DATA_NODE_PUBS="$LEADER_PUB $FOLLOWER_PUB"
+  DATA_NODE_COUNT=2
+fi
+
+# Topology must agree with the standalone knob, or the run produces a plausible-looking
+# number that means nothing:
+#
+#   standalone + follower  — both nodes get the same env and run as two UNRELATED databases.
+#                            run-benchmark.sh seeds the client pool with both addresses, so
+#                            the reported throughput is the sum of two separate DBs.
+#   replicated + no follower — nothing to replicate to; the replication delay under test
+#                            never engages, and the cell silently measures standalone.
+#
+# Both are wrong-number generators rather than crashes, so fail here instead.
+if [[ "$STANDALONE" == "true" && -n "$FOLLOWER_PUB" ]]; then
+  echo "ERROR: STANDALONE=true but the stack has a follower ($FOLLOWER_PUB)." >&2
+  echo "       Redeploy the stack with -c dataNodeCount=1 (make infra DATA_NODES=1)." >&2
+  exit 1
+fi
+if [[ "$STANDALONE" != "true" && -z "$FOLLOWER_PUB" ]]; then
+  echo "ERROR: single-data-node stack but STANDALONE is not 'true' (got '${STANDALONE:-unset}')." >&2
+  echo "       Set STANDALONE=true, or redeploy with -c dataNodeCount=2 for a replicated run." >&2
+  exit 1
+fi
 BUCKET=$(get_output BucketName)
 REGION=$(get_output Region)
 INSTANCE_TYPE=$(get_output InstanceType)
@@ -67,7 +102,11 @@ for i in $(seq 1 "$CLIENT_COUNT"); do
 done
 
 echo "  Leader:   $LEADER_PUB ($LEADER_IP)"
-echo "  Follower: $FOLLOWER_PUB ($FOLLOWER_IP)"
+if [[ -n "$FOLLOWER_PUB" ]]; then
+  echo "  Follower: $FOLLOWER_PUB ($FOLLOWER_IP)"
+else
+  echo "  Follower: (none — single data node)"
+fi
 echo "  Clients:  $CLIENT_PUBS ($CLIENT_COUNT nodes)"
 echo "  Bucket:   $BUCKET"
 echo "  Region:   $REGION"
@@ -100,7 +139,9 @@ fi
 # fails on boot with "GLIBC_2.XX not found". `make build` / `make build-arm` build
 # inside the amazonlinux:2023 container so the binary links against 2.34.
 if command -v objdump >/dev/null 2>&1; then
-  MAX_GLIBC=$(objdump -T "$BINARY" 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sed 's/GLIBC_//' | sort -V | tail -1)
+  # `|| true`: grep exits 1 when the binary references no GLIBC symbols, and under
+  # `set -o pipefail` that kills the whole script silently, mid-deploy, with no message.
+  MAX_GLIBC=$(objdump -T "$BINARY" 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sed 's/GLIBC_//' | sort -V | tail -1 || true)
   if [[ -n "$MAX_GLIBC" && "$(printf '2.34\n%s\n' "$MAX_GLIBC" | sort -V | tail -1)" != "2.34" ]]; then
     echo "ERROR: $BINARY links against GLIBC $MAX_GLIBC, but Amazon Linux 2023 has 2.34."
     echo "       This is a host build and will not run on EC2. Rebuild in the container:"
@@ -117,7 +158,10 @@ if [[ ! -f "$CERT_DIR/node.crt" ]]; then
 else
   EXISTING_SANS=$(openssl x509 -in "$CERT_DIR/client-server.crt" -noout -text 2>/dev/null \
     | grep -A1 "Subject Alternative Name" | tail -1 || echo "")
-  if ! echo "$EXISTING_SANS" | grep -q "$LEADER_IP" || ! echo "$EXISTING_SANS" | grep -q "$FOLLOWER_IP"; then
+  if ! echo "$EXISTING_SANS" | grep -q "$LEADER_IP"; then
+    echo "  Cert SANs don't match current IPs — regenerating"
+    NEEDS_CERTS=true
+  elif [[ -n "$FOLLOWER_IP" ]] && ! echo "$EXISTING_SANS" | grep -q "$FOLLOWER_IP"; then
     echo "  Cert SANs don't match current IPs — regenerating"
     NEEDS_CERTS=true
   fi
@@ -125,7 +169,10 @@ fi
 if [[ "$NEEDS_CERTS" == "true" ]]; then
   echo "==> Generating TLS certificates"
   CLIENT1_IP=$(get_output ClientPrivateIp)
-  bash "$SCRIPT_DIR/generate-certs.sh" "$LEADER_IP" "$FOLLOWER_IP" "$CLIENT1_IP"
+  # generate-certs.sh takes exactly three IPs and interpolates each into the SAN list, so an
+  # empty follower would emit a malformed "IP:" and fail openssl. With one data node the
+  # leader IP stands in for the follower slot; a duplicated SAN entry is harmless.
+  bash "$SCRIPT_DIR/generate-certs.sh" "$LEADER_IP" "${FOLLOWER_IP:-$LEADER_IP}" "$CLIENT1_IP"
 fi
 
 SSH="ssh $SSH_OPTS ec2-user"
@@ -170,43 +217,16 @@ done
 echo ""
 echo "==> Generating and deploying env files"
 
-generate_env() {
-  local NODE_IP=$1
-  cat <<EOF
-CELERIANT_DATA_ROOT=/var/lib/celeriant
-CELERIANT_LISTEN_ADDRESS=0.0.0.0
-CELERIANT_CLIENT_PORT=10000
-CELERIANT_REPLICATION_PORT=10001
-CELERIANT_LOG_LEVEL=info
-CELERIANT_METRICS_ENABLED=true
-CELERIANT_METRICS_PORT=9090
-CELERIANT_ADVERTISED_CLIENT_ADDRESS=${NODE_IP}:10000
-CELERIANT_ADVERTISED_REPLICATION_ADDRESS=${NODE_IP}:10001
-CELERIANT_S3_ENABLED=true
-CELERIANT_S3_REGION=${REGION}
-CELERIANT_S3_BUCKET=${BUCKET}
-CELERIANT_TLS_MODE=strict
-CELERIANT_TLS_CA_CERT=/etc/celeriant/certs/client-ca.crt
-CELERIANT_TLS_INTRACLUSTER_CA_CERT=/etc/celeriant/certs/intracluster-ca.crt
-CELERIANT_TLS_NODE_CERT=/etc/celeriant/certs/node.crt
-CELERIANT_TLS_NODE_KEY=/etc/celeriant/certs/node.key
-CELERIANT_TLS_CLIENT_CERT=/etc/celeriant/certs/client-server.crt
-CELERIANT_TLS_CLIENT_KEY=/etc/celeriant/certs/client-server.key
-CELERIANT_TLS_CLIENT_AUTH=require
-CELERIANT_MEMORY_CONSUMPTION_PERCENT=60
-CELERIANT_SHARD_LOG_PREALLOCATE_BYTES=134217728
-EOF
-}
-
 # Deploy env files to /etc/celeriant/ (read by systemd EnvironmentFile)
 generate_env "$LEADER_IP" > /tmp/celeriant-leader.env
-generate_env "$FOLLOWER_IP" > /tmp/celeriant-follower.env
-
 $SCP /tmp/celeriant-leader.env ec2-user@${LEADER_PUB}:/tmp/celeriant.env
 $SSH@${LEADER_PUB} 'sudo mv /tmp/celeriant.env /etc/celeriant/celeriant.env'
 
-$SCP /tmp/celeriant-follower.env ec2-user@${FOLLOWER_PUB}:/tmp/celeriant.env
-$SSH@${FOLLOWER_PUB} 'sudo mv /tmp/celeriant.env /etc/celeriant/celeriant.env'
+if [[ -n "$FOLLOWER_PUB" ]]; then
+  generate_env "$FOLLOWER_IP" > /tmp/celeriant-follower.env
+  $SCP /tmp/celeriant-follower.env ec2-user@${FOLLOWER_PUB}:/tmp/celeriant.env
+  $SSH@${FOLLOWER_PUB} 'sudo mv /tmp/celeriant.env /etc/celeriant/celeriant.env'
+fi
 
 echo "==> Tuning kernel network parameters on all nodes"
 for HOST in $LEADER_PUB $FOLLOWER_PUB ${CLIENT_PUBS//,/ }; do
@@ -237,6 +257,15 @@ CLIENT_INSTANCE_TYPE=$CLIENT_INSTANCE_TYPE
 STORAGE_TYPE=$STORAGE_TYPE
 ARCH=$ARCH
 KEY_FILE=$KEY_FILE
+DATA_NODE_COUNT=$DATA_NODE_COUNT
+TLS_MODE=$TLS_MODE
+S3_ENABLED=$S3_ENABLED
+NUM_SHARDS=$NUM_SHARDS
+FSYNC_DELAY_US=$FSYNC_DELAY_US
+REPLICATION_DELAY_US=$REPLICATION_DELAY_US
+RESERVE_COORDINATOR_SHARD=$RESERVE_COORDINATOR_SHARD
+MESH_CHANNEL_SIZE=$MESH_CHANNEL_SIZE
+STANDALONE=$STANDALONE
 EOF
 echo ""
 echo "==> Wrote $ENV_FILE (used by Makefile)"

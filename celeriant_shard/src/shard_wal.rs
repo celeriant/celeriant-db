@@ -4715,6 +4715,7 @@ mod tests {
     use celeriant_msg::request::requests::{ReplicationBatchItem, ReplicationBatchRequest, SingleAggregateDelete, WatchRequest};
     use celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES;
     use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
+use celeriant_wal::segment_summary::segment_aggregate_entry::SegmentAggregateEntry;
     use crate::timestamp_config::TimestampConfig;
     use celeriant_disk::files::read_fixed_records_visit_const::{read_fixed_records_visit_const, ReadVisitError};
     use crate::shard_wal_compact::SCAN_CHUNK_SIZE;
@@ -10725,10 +10726,10 @@ mod tests {
 
             let entry_a = post.aggregates.iter().find(|e| e.aggregate_id == 1).expect("tombstoned A still listed");
             assert!(entry_a.is_deleted, "A's fallback entry must reflect its deleted state");
-            assert_eq!(entry_a.client_set, celeriant_wal::segment_summary::ClientSet::Unknown,
+            assert_eq!(entry_a.client_set, ClientSet::Unknown,
                 "fallback must not regenerate client sets from survivors");
             let entry_b = post.aggregates.iter().find(|e| e.aggregate_id == 2).expect("B survives");
-            assert_eq!(entry_b.client_set, celeriant_wal::segment_summary::ClientSet::Unknown);
+            assert_eq!(entry_b.client_set, ClientSet::Unknown);
 
             for (agg, entry) in [(&agg_a, entry_a), (&agg_b, entry_b)] {
                 assert_ne!(entry.newest_metablock_pos, 0);
@@ -12426,7 +12427,6 @@ mod tests {
     fn v1_summary_degrades_to_none() {
         glommio_test!({
             use crate::shard_wal_sync::summary_path;
-            use celeriant_wal::segment_summary::{SegmentSummaryBlock, SegmentSummaryPayload};
             use celeriant_wire::disk::versioned_block::serialize_versioned_message_heap;
 
             let (_tmp, dir) = test_dir();
@@ -12436,16 +12436,14 @@ mod tests {
             trigger_rotation(&shard).await;
 
             // Overwrite the sealed segment's sidecar with a v1-stamped file.
-            let block = SegmentSummaryBlock {
-                payload: SegmentSummaryPayload {
-                    orgs: vec![1],
-                    aggregate_types: vec![],
-                    aggregates: vec![],
-                    complete: true,
-                    aggregate_bloom: None,
-                    client_bloom: None,
-                    schema_bloom: None,
-                },
+            let block = SegmentSummaryPayload {
+                orgs: vec![1],
+                aggregate_types: vec![],
+                aggregates: vec![],
+                complete: true,
+                aggregate_bloom: None,
+                client_bloom: None,
+                schema_bloom: None,
             };
             let bytes = serialize_versioned_message_heap(&block, 1).unwrap();
             std::fs::write(summary_path(shard.log_segments_cache.shard_dir(), 1), &bytes).unwrap();
@@ -12564,7 +12562,6 @@ mod tests {
 
     #[test]
     fn summary_hint_decision_table() {
-        use celeriant_wal::segment_summary::{ClientSet, SegmentAggregateEntry, SegmentSummaryPayload};
 
         let agg = key(1, 1, 1);
         let present = client_id_bloom_hash(7);
@@ -13839,7 +13836,6 @@ mod tests {
             {
                 use crate::shard_wal_sync::summary_path;
                 use celeriant_wal::constants::WIRE_VERSION_SEGMENT_SUMMARY_BLOCK;
-                use celeriant_wal::segment_summary::SegmentSummaryBlock;
                 use celeriant_wire::disk::versioned_block::serialize_versioned_message_heap;
 
                 let mut payload = read_segment_summary(shard.log_segments_cache.shard_dir(), 1).await.expect("sealed sidecar must exist");
@@ -13850,7 +13846,7 @@ mod tests {
                         e.client_set = ClientSet::Unknown;
                     }
                 }
-                let bytes = serialize_versioned_message_heap(&SegmentSummaryBlock { payload }, WIRE_VERSION_SEGMENT_SUMMARY_BLOCK).unwrap();
+                let bytes = serialize_versioned_message_heap(&payload, WIRE_VERSION_SEGMENT_SUMMARY_BLOCK).unwrap();
                 std::fs::write(summary_path(shard.log_segments_cache.shard_dir(), 1), &bytes).unwrap();
                 shard.summary_cache.borrow_mut().pop(&1);
             }

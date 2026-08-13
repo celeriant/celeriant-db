@@ -1,0 +1,19 @@
+# The cheap tier as it would actually ship: REPLICATED pair on EBS.
+#
+# Standalone was the wrong topology to publish. On EBS an acknowledged write already survives
+# instance loss (the volume outlives the instance), so replication is not buying durability
+# here — it is buying availability, and specifically ROLLING UPGRADES. Without a follower every
+# release is a hard downtime window, which is a cost paid every deploy rather than only on
+# hardware failure.
+#
+# Stock gp3 (3,000 IOPS / 125 MB/s), server-default delays: F-15 measured tuning at +2.4% on
+# this class of box because it is CPU-bound at its peak, not window-bound. Not worth a
+# configuration footnote on an entry tier.
+#
+# Successor to ec2-benchmark-entry-arm-20260810 (c6g.xlarge pair, Graviton2, 29,292 req/s at
+# 2,000 concurrency). c7g.xlarge is Graviton3 with 4 physical cores.
+conn_1k   TASKS=1000
+conn_2k   TASKS=2000
+conn_4k   TASKS=4000
+conn_8k   TASKS=8000
+conn_16k  TASKS=16000

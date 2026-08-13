@@ -730,7 +730,10 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    use glommio::{LocalExecutorBuilder, Placement};
+    use celeriant_wal::segment_summary::client_set::ClientSet;
+use celeriant_wal::segment_summary::segment_aggregate_entry::SegmentAggregateEntry;
+use celeriant_wal::segment_summary::segment_summary_payload::SUMMARY_PAYLOAD_MAX_BYTES;
+use glommio::{LocalExecutorBuilder, Placement};
 
     use celeriant_memcache::shard_log_queue_item::ShardLogQueueItem;
     use celeriant_wal::aggregate_key::AggregateKey;
@@ -1310,7 +1313,6 @@ mod tests {
         glommio_test!({
             use celeriant_wal::aggregate_type_key::AggregateTypeKey;
             use celeriant_wal::constants::{AGGREGATE_BLOOM_BYTES, CLIENT_BLOOM_BYTES};
-            use celeriant_wal::segment_summary::{ClientSet, SegmentAggregateEntry, SegmentSummaryPayload, SUMMARY_PAYLOAD_MAX_BYTES};
 
             let tmp = tempfile::tempdir().unwrap();
             let dir = tmp.path().join("shard");

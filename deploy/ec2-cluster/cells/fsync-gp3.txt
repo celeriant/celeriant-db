@@ -1,0 +1,29 @@
+# Rung 2 — fsync-delay sweep, gp3 EBS, STANDALONE.
+#
+# gp3's binding constraint is different from i4i's. Both classes are write-through with
+# fua=0, so the kernel never issues an NVMe FLUSH on either and flush latency is not what
+# binds here — the IOPS cap is. That predicts gp3 wants a LONGER delay than i4i, since a
+# longer window coalesces more writes per IOP. The two arms are expected to diverge from the
+# 17ms incumbent in OPPOSITE directions, which is the whole point of sweeping both.
+#
+# Range runs well past 17ms deliberately: at 68000us on the homelab, amortisation worked
+# exactly as designed (batch doubled, flushes dropped 3.5x) and throughput still collapsed
+# 49%, because the window is charged to every write's median latency. If gp3's optimum is
+# genuinely long, the collapse should arrive later here than it did on NVMe.
+#
+# Before trusting any number from this file, confirm the volume is not running at the stock
+# 125 MB/s: CloudFormation cannot set gp3 Throughput, so it must be raised after deploy with
+#   aws ec2 modify-volume --volume-id <id> --throughput 1000
+# Otherwise this measures the gp3 default rather than gp3.
+
+# Low-end points added after the i4i result: i4i turned out to be FLAT from 100 µs to 6,400 µs
+# and then fall off a cliff, rather than having a tuned optimum. Without points below 1,000 µs
+# there is no way to tell whether gp3 has a plateau too, or a genuine interior optimum — and
+# "flat band with a cliff" versus "peaked curve" is the actual shape question.
+fsync_250     FSYNC_DELAY_US=250
+fsync_1000    FSYNC_DELAY_US=1000
+fsync_4000    FSYNC_DELAY_US=4000
+fsync_8000    FSYNC_DELAY_US=8000
+fsync_17000   FSYNC_DELAY_US=17000
+fsync_34000   FSYNC_DELAY_US=34000
+fsync_68000   FSYNC_DELAY_US=68000

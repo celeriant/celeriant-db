@@ -1,0 +1,11 @@
+# fsync window on the cheap EBS tier, at its measured peak concurrency (8,000).
+#
+# The earlier scale-down ladder ran at server defaults on the reasoning that metal's tuning did
+# not transfer to i4i.16xlarge. That reasoning was misapplied: the 16xlarge is INSTANCE STORE.
+# This tier is gp3, and F-12 swept gp3 directly — 250 us beat the 17,000 us default by +42%
+# there. The 57.4% iowait seen at 2,000 connections is the same tax.
+fs_default   TASKS=8000
+fs_500       TASKS=8000 FSYNC_DELAY_US=500
+fs_1000      TASKS=8000 FSYNC_DELAY_US=1000
+fs_4000      TASKS=8000 FSYNC_DELAY_US=4000
+fs_8000      TASKS=8000 FSYNC_DELAY_US=8000

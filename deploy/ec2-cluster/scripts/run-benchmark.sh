@@ -77,6 +77,23 @@ CONNS_PER_CLIENT="${BENCH_CONNS:-auto}"
 PINNED="${BENCH_PINNED:-1}"
 CONN_MODE=$([[ "$PINNED" == "0" ]] && echo "pooled" || echo "pinned")
 
+# Seed address. On a single-data-node (standalone) stack there is no follower, so the seed
+# is the leader itself — the pool just sees the same node twice, which is harmless.
+SEED_IP="${FOLLOWER_IP:-$LEADER_IP}"
+
+# Client TLS must match the server's. The server's mode is recorded in .cluster-env by
+# deploy.sh. CLUSTER_PLAINTEXT is read with `.is_ok()`, so ANY value enables cleartext —
+# including "false". It must be exported only when cleartext is genuinely wanted.
+CLUSTER_TLS_ENV=""
+if [[ "${TLS_MODE:-strict}" == "disabled" ]]; then
+  CLUSTER_TLS_ENV="CLUSTER_PLAINTEXT=1"
+else
+  CLUSTER_TLS_ENV="CLUSTER_CA_CERT=/etc/celeriant/certs/client-ca.crt \
+     CLUSTER_CLIENT_CERT=/etc/celeriant/certs/client.crt \
+     CLUSTER_CLIENT_KEY=/etc/celeriant/certs/client.key \
+     CLUSTER_SERVER_NAME=${LEADER_IP}"
+fi
+
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 SAFE_TYPE=$(echo "$INSTANCE_TYPE" | tr '.' '-')
 RESULT_DIR="$CDK_DIR/results"
@@ -88,7 +105,7 @@ echo "  Data nodes:  $INSTANCE_TYPE ($STORAGE_TYPE storage)"
 echo "  Client node: ${CLIENT_INSTANCE_TYPE:-$INSTANCE_TYPE}"
 echo "  Clients:     $CLIENT_COUNT ($CLIENT_PUBS)"
 echo "  Address 1:   $LEADER_IP:10000 (primary)"
-echo "  Address 2:   $FOLLOWER_IP:10000 (seed)"
+echo "  Address 2:   $SEED_IP:10000 (seed)"
 echo "  Total tasks: $TOTAL_TASKS (${TASKS_PER_CLIENT}/client)$AUTO_NOTE"
 echo "  Connections: $CONNS_PER_CLIENT per node per client"
 echo "  Duration:    ${DURATION}s"
@@ -105,8 +122,19 @@ cat > "$RESULT_FILE" <<EOF
 # Clients:     $CLIENT_COUNT
 # Storage:     $STORAGE_TYPE
 # Leader IP:   $LEADER_IP
-# Follower IP: $FOLLOWER_IP
+# Follower IP: ${FOLLOWER_IP:-(none - standalone)}
+# Data nodes:  ${DATA_NODE_COUNT:-2}
 # Region:      $REGION
+#
+# --- Campaign cell (session/goal.md). Empty = server default applied, not "unset knob". ---
+# TLS mode:              ${TLS_MODE:-strict}
+# S3 enabled:            ${S3_ENABLED:-true}
+# num_shards:            ${NUM_SHARDS:-(default: CPU count)}
+# fsync_delay_us:        ${FSYNC_DELAY_US:-(default: 17000)}
+# replication_delay_us:  ${REPLICATION_DELAY_US:-(default: 17000)}
+# reserve_coord_shard:   ${RESERVE_COORDINATOR_SHARD:-(default: false)}
+# mesh_channel_size:     ${MESH_CHANNEL_SIZE:-(default: 512)}
+# standalone:            ${STANDALONE:-(default: false)}
 # Total tasks: $TOTAL_TASKS
 # Tasks/client: $TASKS_PER_CLIENT
 # Connections: $CONNS_PER_CLIENT per node per client ($CONN_MODE)
@@ -129,11 +157,8 @@ for HOST in $CLIENT_PUBS; do
 
   ssh $SSH_OPTS ec2-user@${HOST} \
     "CLUSTER_ADDRESS_1=${LEADER_IP}:10000 \
-     CLUSTER_ADDRESS_2=${FOLLOWER_IP}:10000 \
-     CLUSTER_CA_CERT=/etc/celeriant/certs/client-ca.crt \
-     CLUSTER_CLIENT_CERT=/etc/celeriant/certs/client.crt \
-     CLUSTER_CLIENT_KEY=/etc/celeriant/certs/client.key \
-     CLUSTER_SERVER_NAME=${LEADER_IP} \
+     CLUSTER_ADDRESS_2=${SEED_IP}:10000 \
+     ${CLUSTER_TLS_ENV} \
      CLUSTER_TASKS=${TASKS_PER_CLIENT} \
      CLUSTER_CONNECTIONS=${CONNS_PER_CLIENT} \
      CLUSTER_DURATION=${DURATION} \

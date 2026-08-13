@@ -29,6 +29,19 @@ export class Ec2ClusterStack extends cdk.Stack {
     const instanceType = this.node.tryGetContext('instanceType') ?? 'c6id.2xlarge';
     const clientInstanceType = this.node.tryGetContext('clientInstanceType') ?? instanceType;
     const clientCount = Math.min(parseInt(this.node.tryGetContext('clientCount') ?? '1', 10), 4);
+    // Data nodes: 2 (leader + follower) for replicated runs, 1 for standalone.
+    //
+    // Standalone is not "deploy two and only start one". Both nodes get the same env file,
+    // so with CELERIANT_STANDALONE=true a two-node stack is two unrelated databases, and the
+    // benchmark seeds a client pool across both — summing two independent DBs into one
+    // throughput number. Standalone runs must not have a follower at all.
+    //
+    // It is also a hard quota constraint: Standard Spot vCPU is 192 in ap-southeast-2 and
+    // i4i.metal is 128 vCPU, so a metal pair (256) cannot launch regardless of client count.
+    const dataNodeCount = parseInt(this.node.tryGetContext('dataNodeCount') ?? '2', 10);
+    if (dataNodeCount !== 1 && dataNodeCount !== 2) {
+      throw new Error(`dataNodeCount must be 1 or 2, got '${dataNodeCount}'.`);
+    }
     const keyPairName = this.node.tryGetContext('keyPair');
     const storageType = this.node.tryGetContext('storageType') ?? 'instance-store';
     const ebsDataVolumeSize = parseInt(this.node.tryGetContext('ebsDataVolumeSize') ?? '100', 10);
@@ -51,6 +64,14 @@ export class Ec2ClusterStack extends cdk.Stack {
     // No maxPrice: capping at anything below on-demand only adds capacity failures.
     // -c spot=false reverts to on-demand.
     const spot = String(this.node.tryGetContext('spot') ?? 'true') === 'true';
+    // Spot is settable per role, because the two halves fail independently. The first
+    // i4i.metal attempt died with the data node AND all four clients unavailable on spot;
+    // clients are cheap enough on-demand (c6i.4xlarge $0.888/hr) that paying for them to
+    // guarantee placement is far cheaper than an on-demand data node ($13.17/hr for
+    // i4i.metal). -c spotClients=false buys the clients outright and leaves the expensive
+    // half on spot.
+    const spotData = String(this.node.tryGetContext('spotData') ?? String(spot)) === 'true';
+    const spotClients = String(this.node.tryGetContext('spotClients') ?? String(spot)) === 'true';
 
     // Detect ARM (Graviton) instance types for correct AMI selection.
     // ARM families end in 'g' or 'gn' before the dot (i4g, c7g, c7gn, im4gn, is4gen, etc.)
@@ -191,9 +212,21 @@ export class Ec2ClusterStack extends cdk.Stack {
       '',
       '# RAID0-stripe all NVMe instance-store devices into /dev/md0',
       'dnf install -y mdadm',
+      '# Select by device MODEL, never by name. The old list was a positional guess',
+      '# (/dev/nvme1n1../dev/nvme4n1) that assumed the root EBS volume is nvme0n1. On',
+      '# i4i.metal the root lands on nvme4n1 and the eight instance stores occupy nvme0n1-3',
+      '# and nvme5n1-8, so the guess fed the MOUNTED ROOT DISK to mdadm and the array failed',
+      '# with "Device or resource busy" — cloud-init errored and /var/lib/celeriant was never',
+      '# mounted, silently leaving the benchmark on the root EBS volume. The fixed-length list',
+      '# also capped the array at 4 devices when metal has 8. Excluding anything with a',
+      '# mountpoint keeps the root volume out regardless of where it enumerates.',
       'DEVS=()',
-      'for dev in /dev/nvme1n1 /dev/nvme2n1 /dev/nvme3n1 /dev/nvme4n1; do',
-      '  [[ -b "$dev" ]] && DEVS+=("$dev")',
+      'for dev in /dev/nvme*n1; do',
+      '  [[ -b "$dev" ]] || continue',
+      '  model=$(cat /sys/block/$(basename "$dev")/device/model 2>/dev/null || true)',
+      '  [[ "$model" == *"Instance Storage"* ]] || continue',
+      '  [[ -z "$(lsblk -no MOUNTPOINT "$dev" | tr -d " \\n")" ]] || continue',
+      '  DEVS+=("$dev")',
       'done',
       '',
       'if [[ ${#DEVS[@]} -ge 2 ]]; then',
@@ -217,13 +250,15 @@ export class Ec2ClusterStack extends cdk.Stack {
     ] : [
       '',
       '# Mount local NVMe instance store for data',
-      '# Find the first NVMe instance store device (skip root EBS which is also NVMe)',
+      '# Select by MODEL, not by name — the root EBS volume is also an nvme device and does',
+      '# not reliably enumerate as nvme0n1 (on i4i.metal it is nvme4n1). See the raid0 branch.',
       'DATA_DEV=""',
-      'for dev in /dev/nvme1n1 /dev/nvme2n1 /dev/nvme3n1; do',
-      '  if [[ -b "$dev" ]]; then',
-      '    DATA_DEV="$dev"',
-      '    break',
-      '  fi',
+      'for dev in /dev/nvme*n1; do',
+      '  [[ -b "$dev" ]] || continue',
+      '  model=$(cat /sys/block/$(basename "$dev")/device/model 2>/dev/null || true)',
+      '  [[ "$model" == *"Instance Storage"* ]] || continue',
+      '  [[ -z "$(lsblk -no MOUNTPOINT "$dev" | tr -d " \\n")" ]] || continue',
+      '  DATA_DEV="$dev"; break',
       'done',
       '',
       'if [[ -n "$DATA_DEV" ]]; then',
@@ -272,7 +307,7 @@ export class Ec2ClusterStack extends cdk.Stack {
     // --- Spot launch template (market options only) ---
     // One-time request that terminates on reclaim: the cluster is rebuilt from scratch for
     // every benchmark, so there is nothing to preserve across an interruption.
-    const spotTemplate = spot
+    const spotTemplate = (spotData || spotClients)
       ? new ec2.LaunchTemplate(this, 'SpotTemplate', {
         spotOptions: {
           requestType: ec2.SpotRequestType.ONE_TIME,
@@ -288,6 +323,7 @@ export class Ec2ClusterStack extends cdk.Stack {
       userData: string,
       instType: string,
       extraBlockDevices?: ec2.BlockDevice[],
+      useSpot = true,
     ): ec2.Instance => {
       const ud = ec2.UserData.forLinux();
       ud.addCommands(userData);
@@ -312,7 +348,7 @@ export class Ec2ClusterStack extends cdk.Stack {
         vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC, ...(az && { availabilityZones: [az] }) },
       });
 
-      if (spotTemplate) {
+      if (spotTemplate && useSpot) {
         // `AWS::EC2::Instance` has no market options in CloudFormation, so spot has to
         // arrive via a launch template. Only the market options come from the template —
         // everything else is set on the instance itself, which takes precedence.
@@ -340,24 +376,31 @@ export class Ec2ClusterStack extends cdk.Stack {
       : undefined;
 
     // --- Instances ---
-    const leader = createInstance('Leader', nodeRole, nodeUserData, instanceType, dataBlockDevices);
-    const follower = createInstance('Follower', nodeRole, nodeUserData, instanceType, dataBlockDevices);
+    const leader = createInstance('Leader', nodeRole, nodeUserData, instanceType, dataBlockDevices, spotData);
+    const follower = dataNodeCount === 2
+      ? createInstance('Follower', nodeRole, nodeUserData, instanceType, dataBlockDevices, spotData)
+      : undefined;
 
     const clients: ec2.Instance[] = [];
     for (let i = 1; i <= clientCount; i++) {
       const name = clientCount === 1 ? 'Client' : `Client${i}`;
-      clients.push(createInstance(name, clientRole, clientUserData, clientInstanceType));
+      clients.push(createInstance(name, clientRole, clientUserData, clientInstanceType, undefined, spotClients));
     }
 
     // --- Outputs ---
     new cdk.CfnOutput(this, 'LeaderPrivateIp', { value: leader.instancePrivateIp });
-    new cdk.CfnOutput(this, 'FollowerPrivateIp', { value: follower.instancePrivateIp });
     new cdk.CfnOutput(this, 'LeaderPublicIp', { value: leader.instancePublicIp });
-    new cdk.CfnOutput(this, 'FollowerPublicIp', { value: follower.instancePublicIp });
     new cdk.CfnOutput(this, 'BucketName', { value: bucket.bucketName });
     new cdk.CfnOutput(this, 'Region', { value: cdk.Aws.REGION });
     new cdk.CfnOutput(this, 'LeaderInstanceId', { value: leader.instanceId });
-    new cdk.CfnOutput(this, 'FollowerInstanceId', { value: follower.instanceId });
+    new cdk.CfnOutput(this, 'DataNodeCount', { value: String(dataNodeCount) });
+    // Omitted entirely when standalone — consumers treat an absent follower as the signal
+    // to run single-node, rather than reading a stale or duplicated address.
+    if (follower) {
+      new cdk.CfnOutput(this, 'FollowerPrivateIp', { value: follower.instancePrivateIp });
+      new cdk.CfnOutput(this, 'FollowerPublicIp', { value: follower.instancePublicIp });
+      new cdk.CfnOutput(this, 'FollowerInstanceId', { value: follower.instanceId });
+    }
     new cdk.CfnOutput(this, 'InstanceType', { value: instanceType });
     new cdk.CfnOutput(this, 'ClientInstanceType', { value: clientInstanceType });
     new cdk.CfnOutput(this, 'ClientCount', { value: String(clientCount) });
@@ -366,7 +409,7 @@ export class Ec2ClusterStack extends cdk.Stack {
       new cdk.CfnOutput(this, 'EbsSpec', { value: `gp3 ${ebsDataVolumeSize}GB ${ebsIops}iops` });
     }
     new cdk.CfnOutput(this, 'Raid0', { value: String(raid0) });
-    new cdk.CfnOutput(this, 'Spot', { value: String(spot) });
+    new cdk.CfnOutput(this, 'Spot', { value: `data=${spotData} clients=${spotClients}` });
     new cdk.CfnOutput(this, 'Architecture', { value: dataIsArm ? 'arm64' : 'x86_64' });
 
     // Client outputs — backward compatible: first client uses 'ClientPublicIp'/'ClientPrivateIp'

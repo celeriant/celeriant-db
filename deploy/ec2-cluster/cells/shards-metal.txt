@@ -1,0 +1,51 @@
+# Rung 3 — shard count at FIXED cores, i4i.metal, STANDALONE.
+#
+# This is the cell the whole session exists to get right. The prior campaign's headline —
+# "32 shards on 16 physical cores beat 16 shards by 5.1%, so cap-shards-at-physical-cores is
+# challenged" — does not follow from the cell that produced it. rerun.sh pinned every server
+# thread to cpus 0-15 in BOTH arms. On i4i.8xlarge cpus 0-15 are sixteen distinct physical
+# cores, one SMT sibling each, so the 16-shard arm ran one reactor per hardware thread and
+# the 32-shard arm ran two reactors time-sharing those SAME sixteen threads. Neither arm ever
+# touched a second SMT sibling. The cell varied reactor density on a fixed thread set; it did
+# not vary SMT at all.
+#
+# The Ryzen spike answered it properly with a disjoint client: shards-equal-vCPUs beat
+# shards-equal-physical-cores by 37.4% at fixed physical cores. Two thirds of that is reactor
+# count alone (+21.6% on the same hardware threads); the second sibling adds a further 13.0%.
+# An SMT sibling is worth ~89% of a real core for this workload. This rung asks whether that
+# holds at 64 cores across two sockets.
+#
+# BEFORE RUNNING, verify the sibling mapping on the box. These lists assume the usual Intel
+# EC2 enumeration where cpu N and cpu N+64 are siblings of one core:
+#     lscpu -p=CPU,CORE,SOCKET | grep -v '^#' | sort -t, -k2 -n | head
+# If the enumeration differs, smt_pairs below is measuring something else entirely.
+#
+# Reading results: glommio pops CpuSets LIFO while shard ids go FIFO, so shard i lands on
+# cpu_list[n-1-i]. Shard 0 — the coordinator when reserve_coordinator_shard is on — lands on
+# the LAST cpu in the list.
+#
+# The client MUST be remote (it is: clientCount=4 on separate nodes). A co-located client is
+# precisely what wrecked the original i4i cell, and even on the Ryzen spike client CPU rose
+# 3.6 -> 6.6 cpu-equivalents across the arms, making +37.4% a floor rather than a ceiling.
+
+# 64 shards, one per PHYSICAL core, second sibling of every core left idle.
+one_per_core    NUM_SHARDS=64  CPU_LIST=0-63  FSYNC_DELAY_US=1000
+
+# 128 shards, one per vCPU — shards equal to vCPUs, the Ryzen's winning arm.
+one_per_vcpu    NUM_SHARDS=128 CPU_LIST=0-127 FSYNC_DELAY_US=1000
+
+# 64 shards packed onto 32 physical cores as sibling PAIRS. Same reactor count as
+# one_per_core on half the cores: isolates the value of an SMT sibling against a real core.
+smt_pairs       NUM_SHARDS=64  CPU_LIST=0-31,64-95  FSYNC_DELAY_US=1000
+
+# 64 reactors time-sharing 32 hardware threads — the shape the prior campaign actually ran,
+# reproduced deliberately so the old headline can be compared against the corrected cells.
+oversubscribed  NUM_SHARDS=64  CPU_LIST=0-31  FSYNC_DELAY_US=1000
+
+# reserve_coordinator_shard as a deliberate axis (goal item 5). It defaults to false while
+# every campaign number was measured with the harness forcing it true. Shard 0 alone carries
+# the S3 lease manager, schema-registration coordination, the shutdown handler and the
+# heartbeat loop. One shard in 64 is 1.6% of the box against 6% at 16 shards, so the trade
+# moves with core count and has never been measured at this size.
+vcpu_reserve    NUM_SHARDS=128 CPU_LIST=0-127 RESERVE_COORDINATOR_SHARD=true FSYNC_DELAY_US=1000
+vcpu_noreserve  NUM_SHARDS=128 CPU_LIST=0-127 RESERVE_COORDINATOR_SHARD=false FSYNC_DELAY_US=1000

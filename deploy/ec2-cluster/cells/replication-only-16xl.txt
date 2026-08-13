@@ -1,0 +1,20 @@
+# Does the replication-delay optimum transfer across instance types?
+#
+# ONE factor. FSYNC_DELAY_US is deliberately absent so the server default (17,000 us) applies
+# unchanged in every cell — the previous 16xlarge comparison moved both knobs at once and
+# therefore could not attribute its result to either.
+#
+# Competing predictions:
+#   RTT-bound   -> the window amortises a same-AZ round trip, which does not vary by instance
+#                  type, so the peak should land near 15,000 us as it did on metal.
+#   batch-bound -> the window sets batch size (throughput x window). At 60k connections 15 ms
+#                  buys 15,861 writes on metal but only 7,000 here, so the peak should shift
+#                  out toward ~34,000 us.
+# These are distinguishable: 34 ms cost -45% on metal.
+repl_250    REPLICATION_DELAY_US=250
+repl_4000   REPLICATION_DELAY_US=4000
+repl_8000   REPLICATION_DELAY_US=8000
+repl_15000  REPLICATION_DELAY_US=15000
+repl_17000  REPLICATION_DELAY_US=17000
+repl_25000  REPLICATION_DELAY_US=25000
+repl_34000  REPLICATION_DELAY_US=34000

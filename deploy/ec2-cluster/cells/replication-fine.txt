@@ -1,0 +1,10 @@
+# Rung 4b — fine sampling around the anomalous peak at 17,000 us.
+# The coarse sweep found a sharp isolated maximum there with a regime change in the CPU
+# profile (busy 83%->18%, iowait 12%->81%). Either the peak is a narrow resonance, in which
+# case the optimum is fragile and should not be quoted, or the curve genuinely turns over
+# between 8k and 34k and the coarse grid just missed the shoulders.
+repl_12000    REPLICATION_DELAY_US=12000 FSYNC_DELAY_US=1000
+repl_15000    REPLICATION_DELAY_US=15000 FSYNC_DELAY_US=1000
+repl_17000    REPLICATION_DELAY_US=17000 FSYNC_DELAY_US=1000
+repl_20000    REPLICATION_DELAY_US=20000 FSYNC_DELAY_US=1000
+repl_25000    REPLICATION_DELAY_US=25000 FSYNC_DELAY_US=1000

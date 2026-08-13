@@ -1,0 +1,20 @@
+# The publishable cell across a concurrency ladder, for celeriant.io.
+#
+# Matches the existing page's methodology: four load-generating clients, mTLS on both the
+# client and replication paths, replicated pair in a single AZ, one event per acknowledged
+# write. Concurrency points chosen to cover the page's current 60,000 headline and its
+# "holds out to 132,000 concurrent" claim.
+#
+# Tuning is the campaign's output:
+#   num_shards 128         one per vCPU (F-4)
+#   fsync 1,000 us         inside the plateau on both storage classes (F-1)
+#   replication 15,000 us  measured optimum, +9.8% over the default (F-13)
+#
+# TASKS is a harness knob (total in-flight writes, split across clients), not a server env var.
+# Running the ladder as ONE sweep keeps every point inside the same ABBA ordering, so drift
+# cannot masquerade as a concurrency effect.
+
+conn_32k   TASKS=32000  NUM_SHARDS=128 FSYNC_DELAY_US=1000 REPLICATION_DELAY_US=15000
+conn_60k   TASKS=60000  NUM_SHARDS=128 FSYNC_DELAY_US=1000 REPLICATION_DELAY_US=15000
+conn_100k  TASKS=100000 NUM_SHARDS=128 FSYNC_DELAY_US=1000 REPLICATION_DELAY_US=15000
+conn_132k  TASKS=132000 NUM_SHARDS=128 FSYNC_DELAY_US=1000 REPLICATION_DELAY_US=15000

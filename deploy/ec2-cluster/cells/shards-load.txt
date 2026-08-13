@@ -1,0 +1,7 @@
+# Goal item 4: does the shard optimum move with load?
+# The prior i4i sweep had 32 shards best at 4,000 connections and 16 best at saturation, but
+# those columns carry the collision confound (co-located client). Re-asked cleanly with remote
+# clients. No CPU_LIST: taskset cannot pin this build (see run-cell-sweep.sh), and it is not
+# needed — NUM_SHARDS=64 lands one shard per physical core, 128 one per vCPU.
+one_per_core    NUM_SHARDS=64  FSYNC_DELAY_US=1000
+one_per_vcpu    NUM_SHARDS=128 FSYNC_DELAY_US=1000

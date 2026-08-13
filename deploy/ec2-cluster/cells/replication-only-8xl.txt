@@ -1,0 +1,23 @@
+# Does the replication-delay optimum transfer off metal? (settles M-5)
+#
+# ONE factor. FSYNC_DELAY_US absent so the server default applies unchanged in every cell —
+# the earlier 16xlarge tuned-vs-defaults comparison moved both knobs at once and could not
+# attribute its result to either.
+#
+# Concurrency fixed at 8,000 to match the metal replication sweep exactly, so instance type is
+# the only variable that differs.
+#
+# Competing predictions:
+#   RTT-bound   -> amortises a same-AZ round trip, which does not vary by instance type, so the
+#                  peak should land near 15,000 us as it did on metal.
+#   batch-bound -> the window sets batch size (throughput x window). This box does roughly a
+#                  third of metal's throughput, so the peak should shift OUT past 34,000 us.
+# 34 ms cost -45% on metal, so the two are easy to tell apart.
+repl_250    TASKS=8000 REPLICATION_DELAY_US=250
+repl_4000   TASKS=8000 REPLICATION_DELAY_US=4000
+repl_8000   TASKS=8000 REPLICATION_DELAY_US=8000
+repl_15000  TASKS=8000 REPLICATION_DELAY_US=15000
+repl_17000  TASKS=8000 REPLICATION_DELAY_US=17000
+repl_25000  TASKS=8000 REPLICATION_DELAY_US=25000
+repl_34000  TASKS=8000 REPLICATION_DELAY_US=34000
+repl_50000  TASKS=8000 REPLICATION_DELAY_US=50000

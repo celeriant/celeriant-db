@@ -78,8 +78,16 @@ $SCP "$INFRA_SRC/grafana-provisioning/datasources/datasources.yml" \
 $SCP "$INFRA_SRC/grafana-provisioning/dashboards/dashboards.yml" \
      ec2-user@"$INFRA_PUB":~/celeriant-infra/grafana-provisioning/dashboards/
 
+# On a single-data-node stack the follower target line is DELETED, not substituted: an
+# empty IP leaves a bare ":9090" target, which Prometheus rejects outright — the container
+# then never starts and the run silently loses all metrics.
+if [[ -n "${FOLLOWER_IP:-}" ]]; then
+  FOLLOWER_SED=(-e "s|FOLLOWER_HOST_PLACEHOLDER|$FOLLOWER_IP|g")
+else
+  FOLLOWER_SED=(-e "/FOLLOWER_HOST_PLACEHOLDER/d")
+fi
 sed -e "s|LEADER_HOST_PLACEHOLDER|$LEADER_IP|g" \
-    -e "s|FOLLOWER_HOST_PLACEHOLDER|$FOLLOWER_IP|g" \
+    "${FOLLOWER_SED[@]}" \
     -e "s|METRICS_PORT_PLACEHOLDER|9090|g" \
     "$INFRA_SRC/prometheus.yml" | $SSH@"$INFRA_PUB" 'cat > ~/celeriant-infra/prometheus.yml'
 

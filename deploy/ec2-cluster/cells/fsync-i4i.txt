@@ -1,0 +1,30 @@
+# Rung 2 — fsync-delay sweep, i4i instance store, STANDALONE.
+#
+# Run with:
+#   CELLS_FILE=cells/fsync-i4i.txt REPS=2 SWEEP_STANDALONE=true SWEEP_TLS_MODE=disabled \
+#     bash scripts/run-cell-sweep.sh
+#
+# The rule the local spikes established: the optimal fsync delay is bounded below by the
+# device's flush duration under concurrency. Any delay shorter than a flush is a no-op,
+# because the coordinator cannot flush more often than the previous flush completes. On the
+# homelab Samsung the flush is 20.7ms at 16 shards, which is why everything from 250us to
+# 4000us measured identically and why 17ms looked "optimal" — it sat inside a free band
+# rather than being tuned.
+#
+# i4i's flush is 116us at one writer, 359us at fifteen, 473us at thirty-two. So the free
+# band is roughly fifty times narrower and the predicted optimum is in the HUNDREDS OF
+# MICROSECONDS, with 17ms being close to pure latency tax. This sweep is the test of that
+# prediction — it is a registered prediction, so record where it actually lands even if it
+# disagrees.
+#
+# 17000 is included not as a candidate but as the incumbent: it is the binary's compiled-in
+# default and every prior campaign number was measured at it.
+
+fsync_100     FSYNC_DELAY_US=100
+fsync_200     FSYNC_DELAY_US=200
+fsync_400     FSYNC_DELAY_US=400
+fsync_800     FSYNC_DELAY_US=800
+fsync_1600    FSYNC_DELAY_US=1600
+fsync_3200    FSYNC_DELAY_US=3200
+fsync_6400    FSYNC_DELAY_US=6400
+fsync_17000   FSYNC_DELAY_US=17000

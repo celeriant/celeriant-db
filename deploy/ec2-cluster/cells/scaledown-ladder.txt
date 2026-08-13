@@ -1,0 +1,19 @@
+# The "scales down to" tier: SINGLE node, EBS, standalone (no replication).
+#
+# Rationale for standalone here: on EBS an acknowledged write survives instance stop,
+# terminate and host failure, because the volume outlives the instance — which is exactly what
+# instance store does NOT give you. Replication on EBS is therefore mostly an AVAILABILITY
+# feature (it cuts RTO from "attach the volume elsewhere and recover" to "the follower already
+# has it"), not a durability one. A cheap tier can honestly trade that for half the price,
+# provided the page says so.
+#
+# Stock gp3 deliberately: 3,000 IOPS and 125 MB/s are included free, and F-10 showed the fsync
+# path is latency-bound, never exceeding 4% of 16,000 provisioned IOPS. Paying for IOPS on this
+# tier would be pure waste.
+#
+# Delays left at server defaults — the tuning measured on metal did not transfer to the
+# 16xlarge, so it certainly should not be assumed here.
+conn_2k    TASKS=2000
+conn_8k    TASKS=8000
+conn_16k   TASKS=16000
+conn_32k   TASKS=32000
