@@ -2,7 +2,25 @@
 
 A fast, distributed, append-only write-ahead log built specifically for event sourcing. 
 
-This is a serious, but somewhat still experimental project and is not vibe-coded. See [PROVENANCE.md](PROVENANCE.md). This readme is written by me.
+```rust
+// write your events to an aggregate
+await pool.WriteAsync(key, [event], expectedVersion: version);
+
+// you can do atomic, cross-aggregate writes with optimistic concurrency control
+await pool.WriteAsync(new WriteRequest {
+    Writes = new() {
+        [from] = new() { Events = [withdrawn], ExpectedVersion = fromVersion },
+        [to]   = new() { Events = [deposited], ExpectedVersion = toVersion },
+    },
+});
+
+// per-aggregate reads for read models
+await foreach (var batch in pool.ReadAllAsync(key, ReadFilters.From(version)))
+    foreach (var e in batch.Events)
+        state = Apply(state, e);
+```
+
+This is a serious, but somewhat still experimental project and is not vibe-coded. See [ORIGINS.md](ORIGINS.md). This readme is written by me.
 
 My main interests trace back to:
 
@@ -11,7 +29,7 @@ My main interests trace back to:
 
 The goal is to build a fundamental, open source substrate that is fast, safe, correct and can linearlise events across 1 or many aggregates via OCC.
 
-**fast** - up to 500k writes/sec. stable at 325k with p99 201ms. Redis speed recent write cache for catchups.
+**fast** - up to 1 million writes/sec. Redis speed recent write cache for catchups.
 
 **safe** - write to disk before ack. No 'web scale' in-mem buffer bullshit. Doesn't blow up when you get to 100 million aggregates.
 

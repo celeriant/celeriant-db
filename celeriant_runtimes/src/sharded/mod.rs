@@ -10,3 +10,8 @@ pub mod signal_handler;
 pub mod routing_rule;
 pub mod tls_config;
 pub mod tls_reloader;
+
+#[cfg(test)] mod adversarial_promotion_window_tests;
+#[cfg(test)] mod lease_renewal_contract_tests;
+#[cfg(test)] mod orchestrator_status_contract_tests;
+#[cfg(test)] mod self_renewal_delivery_tests;

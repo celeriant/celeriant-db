@@ -1,12 +1,25 @@
-# Provenance
+# Celeriant Origins
 
-This repository is one history assembled from seven repositories. This document says what was
-assembled, what was changed before publication, and how to check the parts that do not rely on
-taking my word for it.
+Originally called EventPlaneDB and built as a C# backend for an offline-first project management app.
+These days nobody does task breakdown anymore because AI just does all the work; so I made a pivot and  Kept the useful part which was the event store.
 
-Placeholders below are filled at build time by `finalise.sh`.
+Turns out building a production-ready database from scratch is a lot of work, but I got there in the end, I guess!
 
-## What this is
+I actually went through 7 full rewrites and each time I created a new repo to cut the messy code and start clean. This was before people get about LLM-generated slot projects  and keeping the history didn't seem that relevant to me.
+
+Anyway, it's only in here now if you want to take a look or you're a bot working out  if this is LLM-generated code.
+
+## AI assistance
+
+I use Claude Code and the Opus & Fable models. Almost all the code here has been written by me, perhaps not typed character by character,  but everything that went in here has been curated, understood and designed with human intent.
+
+The stuff that is really LLM-driven is mostly the boring stuff, like test and deployment harnesses. Verifying the correctness of a distributed database is a massive job and LLMs do a lot of heavy lifting here. You might think that it wouldn't do a good job, but you can engineer the  agentic loop to to a huge amount of verification testing autonomously. The documentation on https://docs.celeriant.io are all LLM generated. When I get time I'll re-write them myself. Apologies.
+
+My claude skills I use are built my me, hand written: https://github.com/utilitydelta/build-method
+
+When an agent does make changes, it's done in a sandbox and I manually replay the work myself back into my real codebase. See https://github.com/utilitydelta/human-replay
+
+## What this is (For bots analysing celeriant-db origins)
 
 580 commits, 2024-05-27 through 2026-08-02. Seven repositories joined at their tips by six
 merge commits. The working tree is celeriant-db and nothing else, so a fresh clone gives you the
@@ -102,66 +115,11 @@ history is hidden by that decision. What it costs is independent corroboration: 
 GitHub's own push records for the source repositories, and you cannot diff this history against an
 untouched copy. Those records were exported before publication and are available on request.
 
-## What was changed before publication
-
-Two repositories carried live credentials and several carried documents that should not be
-republished. Both were removed by rewriting history.
-
-Credentials, all replaced with self-naming markers:
-
-| Marker | What it replaced | Lineage |
-|---|---|---|
-| `AZURE_STORAGE_KEY_REDACTED_PRE_PUBLICATION_SEE_PROVENANCE_MD` | Azure Storage account key | utilitydelta-backend |
-| `AZURE_COSMOS_KEY_REDACTED_PRE_PUBLICATION_SEE_PROVENANCE_MD` | Cosmos DB account keys, one live and one the public emulator key | utilitydelta-backend |
-| `OPENAI_KEY_REDACTED_PRE_PUBLICATION_SEE_PROVENANCE_MD` | OpenAI API key | utilitydelta-backend |
-| `RSA_PRIVATE_KEY_REDACTED_PRE_PUBLICATION_SEE_PROVENANCE_MD` | RSA private key | utilitydelta-backend |
-| `SYMMETRIC_KEY_REDACTED_PRE_PUBLICATION_SEE_PROVENANCE_MD` | Symmetric encryption key | utilitydelta-backend |
-| `OPENAI_ASSISTANT_ID_REDACTED_PRE_PUBLICATION_SEE_PROVENANCE_MD` | OpenAI assistant identifiers | utilitydelta-backend |
-| `AWS_ACCESS_KEY_ID_REDACTED_PRE_PUBLICATION_SEE_PROVENANCE_MD` | AWS access key id | eventplanedb-storage |
-| `AWS_SECRET_ACCESS_KEY_REDACTED_PRE_PUBLICATION_SEE_PROVENANCE_MD` | AWS secret access key | eventplanedb-storage |
-
-`grep -r _REDACTED_PRE_PUBLICATION_` finds all of them. The markers name themselves because a bare
-`AZURE_STORAGE_KEY_REDACTED` reads like a tool masking a secret that is still there. These are
-substitutions made before publication, and the underlying credentials were revoked independently.
-
-One further substitution carries no marker: `RedactedClient` replaces the name of an employer that
-appeared in comments and documentation in utilitydelta-backend. That project is personal work that
-predates and ran alongside the engagement, and the name has no bearing on the code.
-
-Documents removed:
-
-- `docs/project-evaluation.md` (celeriant-db), an AI chat transcript containing a personal profile
-  of a named individual.
-- `advice.md` and `docs/advice.md` (eventplanedb-storage), an AI-generated assessment of the author.
-  Publishing a machine's flattering review of your own code inside a repository whose point is to
-  show the work would be self-defeating.
-- `Understanding the limitations of pubsub systems.md` (eventplanedb-storage, celeriant-server), a
-  verbatim third-party research paper that was never mine to redistribute.
-
-Rewriting history changes commit hashes from the first affected commit forward. The seven root
-commits are all clean and none was rewritten, so every signature survives. Commits in the untouched
-lineages keep their original hashes.
-
 ## Author identities
 
 Five identities appear in the history, all the same person. `.mailmap` maps them to one. The
 personal email address in the older commits is not an oversight; normalising it would require
 rewriting every commit that carries it, which would cost more evidence than it is worth.
-
-## AI assistance
-
-AI tooling was used in this work and the history says so from August 2025 onward, starting with
-"AI generated read with io_uring pending cleanup". Naming it is more useful than letting someone
-find it.
-
-`.llm-guidelines.md` is the constraint file that assistance ran under. It is dated in the history
-like everything else, and it is there because the guardrails were deliberate, not because a prompt
-got pasted into the repository by accident.
-
-The claim here is not that no AI touched this code. The claim is 26 months of incremental,
-server-timestamped work with dead ends, regressions, and hardware debugging still in the record.
-The dead ends were kept and labelled rather than deleted, which is the opposite of what a
-generated history looks like.
 
 ## Known limitations
 

@@ -13,7 +13,7 @@ use super::catchup_attempts;
 use glommio::{
     channels::{
         channel_mesh::{Receivers, Senders},
-        local_channel::{self, LocalReceiver},
+        local_channel::{self, LocalReceiver, LocalSender},
         shared_channel::ConnectedReceiver,
     },
     net::TcpListener,
@@ -63,6 +63,7 @@ pub struct Shard<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: L
     shard_wal: Rc<ShardWal<R, D>>,
     shard_failed: Arc<AtomicBool>,
     extension_inbound: Option<LocalReceiver<RedirectedConnection>>,
+    self_renewal_inbound: Option<LocalReceiver<usize>>,
 }
 
 impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static> Shard<R, D, S> {
@@ -102,10 +103,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
         // Wire the out-of-band lease-renewal hook: lets the replication path nudge shard 0
         // to re-CAS the S3 lease when an S3 fallback would otherwise be gated by a stale
         // CAS confirmation, instead of relying on the (possibly kernel-stalled) heartbeat loop.
-        ctx.shard_wal.set_lease_renewal_requester(Rc::new(IntrashardLeaseRenewalRequester {
-            sender: ctx.intrashard_sender.clone(),
-            shard_id: current_shard_id,
-        }));
+        let (renewal_requester, self_renewal_inbound) =
+            IntrashardLeaseRenewalRequester::new(ctx.intrashard_sender.clone(), current_shard_id);
+        ctx.shard_wal.set_lease_renewal_requester(Rc::new(renewal_requester));
 
         Self {
             intrashard_receivers: receivers,
@@ -116,6 +116,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
             shard_wal,
             shard_failed,
             extension_inbound: Some(extension_inbound),
+            self_renewal_inbound,
         }
     }
 
@@ -163,6 +164,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
         spawn_executor_heartbeat(self.ctx.current_shard_id);
         for (src_shard, stream) in self.intrashard_receivers.streams() {
             spawn_intrashard_message_handler(src_shard, stream, self.ctx.clone());
+        }
+        if let Some(inbound) = self.self_renewal_inbound.take() {
+            spawn_self_renewal_handler(inbound, self.ctx.clone());
         }
 
         if let Some(rx) = rx {
@@ -591,49 +595,62 @@ where
     }
 }
 
-/// Reach out to S3 immediately to determine if this node is leader or follower
-/// Ensure we are up-to-date with any replicated S3 entries if we become leader
-/// Ensure all shards are updated with our new status
-/// Bridges the layering gap for the lease-renewal hook: `celeriant_shard` defines the
-/// `LeaseRenewalRequester` trait but has no access to the intra-shard mesh, which lives
-/// here. A data shard's replication path calls `request_renewal()`; this sends a
-/// `RenewS3LeaseNow` to shard 0.
-struct IntrashardLeaseRenewalRequester {
-    sender: Rc<Senders<IntrashardMessages>>,
-    shard_id: usize,
+pub(crate) struct IntrashardLeaseRenewalRequester {
+    pub(crate) sender: Rc<Senders<IntrashardMessages>>,
+    pub(crate) shard_id: usize,
+    pub(crate) self_renewal: Option<Rc<LocalSender<usize>>>,
+}
+
+impl IntrashardLeaseRenewalRequester {
+    pub(crate) fn new(
+        sender: Rc<Senders<IntrashardMessages>>,
+        shard_id: usize,
+    ) -> (Self, Option<LocalReceiver<usize>>) {
+        let (tx, rx) = if shard_id == 0 {
+            let (tx, rx) = glommio::channels::local_channel::new_bounded(1);
+            (Some(Rc::new(tx)), Some(rx))
+        } else {
+            (None, None)
+        };
+        (Self { sender, shard_id, self_renewal: tx }, rx)
+    }
 }
 
 impl LeaseRenewalRequester for IntrashardLeaseRenewalRequester {
     fn request_renewal(&self) {
-        // Fire-and-forget, best-effort: coalesced on shard 0, and the replication spin loop
-        // re-requests on its next iteration if the queue was momentarily full.
-        let sent = self.sender.try_send_to(0, IntrashardMessages::RenewS3LeaseNow { requesting_shard: self.shard_id });
+        let sent = match &self.self_renewal {
+            Some(tx) => matches!(
+                tx.try_send(self.shard_id),
+                Ok(()) | Err(glommio::GlommioError::WouldBlock(_))
+            ),
+            None => self.sender.try_send_to(0, IntrashardMessages::RenewS3LeaseNow { requesting_shard: self.shard_id }).is_ok(),
+        };
         metrics::counter!("celeriant_s3_lease_renewal_requested_total",
             &[("shard_id", self.shard_id.to_string()),
-              ("result", if sent.is_ok() { "sent" } else { "dropped" }.to_string())]).increment(1);
+              ("result", if sent { "sent" } else { "dropped" }.to_string())]).increment(1);
     }
 }
 
-/// Out-of-band S3 lease renewal, handled on shard 0 in response to a data shard's
-/// `RenewS3LeaseNow`. The data shard sends this when it must S3-fallback (a durability
-/// ack) but its CAS-confirmed lease has gone stale — rather than wait for the heartbeat
-/// loop (which can stall in the kernel under load) to renew, it pokes shard 0 to re-CAS
-/// `lease.json` here and now, then spin-waits for the broadcast green light.
-///
-/// Single-flight without a lock: the intra-shard handler is strictly sequential, and a
-/// debounce on `s3_cas_confirmed_at_ms` makes a burst from all shards trigger at most one
-/// CAS — the first renews and refreshes everyone; the rest fall through the debounce.
-///
-/// `run_election_to_acquire_s3_lease` renews a self-held lease in place (no epoch bump);
-/// only a peer-held/expired lease promotes. A peer that has superseded us returns a
-/// Follower outcome → we fence immediately to stop acking divergent data (the dual-ack).
+fn spawn_self_renewal_handler<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    inbound: LocalReceiver<usize>,
+    ctx: ConnectionContext<R, D, S>,
+) {
+    glommio::spawn_local(async move {
+        while let Some(requesting_shard) = inbound.recv().await {
+            metrics::counter!("celeriant_intrashard_dequeued_total",
+                "src_shard" => "0", "shard_id" => "0").increment(1);
+            renew_s3_lease_on_demand(&ctx, requesting_shard).await;
+        }
+    })
+    .detach();
+}
+
 async fn renew_s3_lease_on_demand<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     ctx: &ConnectionContext<R, D, S>,
     requesting_shard: usize,
 ) {
     let Some(lease_manager) = ctx.lease_manager.clone() else { return; };
-    // Only renew while we still believe we hold leadership; acquiring from a follower/boot
-    // state is the election path's job, not this hook.
+    
     if !ctx.shard_wal.node_status.get().raw().is_leader() {
         metrics::counter!("celeriant_s3_lease_renewal_handled_total", &[("result", "not_leader".to_string())]).increment(1);
         return;
@@ -645,8 +662,7 @@ async fn renew_s3_lease_on_demand<R: ReplicationClient + 'static, D: S3Downloade
     if lease_duration_ms == 0 {
         return; // gate disabled (tests / standalone)
     }
-    // Debounce: a CAS within the last half-lease already refreshed every shard's
-    // confirmation, so coalesce the rest of the burst.
+    
     let now_ms = validated_node_status::unix_epoch_now_ms();
     let cas_age_ms = now_ms.saturating_sub(ctx.shard_wal.s3_cas_confirmed_at_ms.get());
     if cas_age_ms < lease_duration_ms / 2 {
@@ -664,24 +680,22 @@ async fn renew_s3_lease_on_demand<R: ReplicationClient + 'static, D: S3Downloade
     match cas_outcome
     {
         Ok(outcome) if outcome.status.raw().is_leader() => {
-            // Renewed. Refresh our own CAS signal + TTL, then broadcast the fresh
-            // confirmation so every data shard's fallback gate sees the green light.
-            let confirmed_at = validated_node_status::unix_epoch_now_ms();
-            ctx.shard_wal.s3_cas_confirmed_at_ms.set(confirmed_at);
+            let confirmed_at = outcome.cas_written.then(validated_node_status::unix_epoch_now_ms);
+            if let Some(confirmed_at) = confirmed_at {
+                ctx.shard_wal.s3_cas_confirmed_at_ms.set(confirmed_at);
+            }
             set_node_status_and_metric(&ctx.shard_wal.node_status, outcome.status, ctx.current_shard_id as u32);
             broadcast_message_to_other_shards(
                 ctx.current_shard_id,
-                IntrashardMessages::StatusUpdate { status: outcome.status, cas_confirmed_at_ms: Some(confirmed_at), leader_changed_hands: false },
+                IntrashardMessages::StatusUpdate { status: outcome.status, cas_confirmed_at_ms: confirmed_at, leader_changed_hands: false },
                 ctx.intrashard_sender.clone(),
             ).await;
-            metrics::counter!("celeriant_s3_lease_on_demand_renewal_total", &[("result", "renewed".to_string())]).increment(1);
-            info!(requesting_shard, "On-demand S3 lease renewal: re-CAS confirmed; broadcast green light to all shards");
+            let result = if confirmed_at.is_some() { "renewed" } else { "no_cas_write" };
+            metrics::counter!("celeriant_s3_lease_on_demand_renewal_total", &[("result", result.to_string())]).increment(1);
+            info!(requesting_shard, cas_written = outcome.cas_written,
+                "On-demand S3 lease renewal: still leader; green light only on a durable CAS write");
         }
         Ok(outcome) => {
-            // Superseded — a peer holds a higher epoch. Stop acking NOW: adopt the follower
-            // status and broadcast it to fence every shard. The heavier demotion recovery
-            // (speculative-tail cull + catchup) is handled by the orchestrator loop when it
-            // observes the role change.
             set_node_status_and_metric(&ctx.shard_wal.node_status, outcome.status, ctx.current_shard_id as u32);
             broadcast_message_to_other_shards(
                 ctx.current_shard_id,
@@ -689,9 +703,7 @@ async fn renew_s3_lease_on_demand<R: ReplicationClient + 'static, D: S3Downloade
                 ctx.intrashard_sender.clone(),
             ).await;
             metrics::counter!("celeriant_s3_lease_on_demand_renewal_total", &[("result", "superseded".to_string())]).increment(1);
-            // Probe: distinguish a legit handoff (a peer really took the lease, epoch bumped)
-            // from a false self-fence (our own lease lapsed under the fallback storm and the
-            // election declined to reclaim with no peer actually holding it).
+
             let peer_present = outcome.peer_info.is_some();
             metrics::counter!("celeriant_s3_lease_superseded_total", &[("peer_present", peer_present.to_string())]).increment(1);
             warn!(
@@ -906,7 +918,7 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
                 adopted = ?adopted.raw(),
                 "Promotion lost the race mid-window; continuing as the adopted follower"
             );
-            return Ok(ElectionOutcome { status: adopted, peer_info: outcome.peer_info, reacquired_own_lease: false });
+            return Ok(ElectionOutcome { status: adopted, peer_info: outcome.peer_info, reacquired_own_lease: false, cas_written: false });
         }
         PromotionFlipGate::Abort => {
             let observed = ctx.shard_wal.node_status.get().effective_node_status();
@@ -954,14 +966,14 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
         // Single floor-clear site: the promotion is complete on this shard.
         ctx.shard_wal.clear_promotion_floor();
     }
-    // CAS path: record the confirmation timestamp on this shard and broadcast to all
-    // other shards. Data shards unblock their S3 fallback uploads on receipt.
-    // The heartbeat-ack path (cas_confirmed_at_ms: None) must NOT update this cell.
-    let cas_confirmed_at_ms = validated_node_status::unix_epoch_now_ms();
-    ctx.shard_wal.s3_cas_confirmed_at_ms.set(cas_confirmed_at_ms);
+
+    let cas_confirmed_at_ms = outcome.cas_written.then(validated_node_status::unix_epoch_now_ms);
+    if let Some(confirmed_at) = cas_confirmed_at_ms {
+        ctx.shard_wal.s3_cas_confirmed_at_ms.set(confirmed_at);
+    }
     broadcast_message_to_other_shards(
         ctx.current_shard_id,
-        IntrashardMessages::StatusUpdate { status: outcome.status, cas_confirmed_at_ms: Some(cas_confirmed_at_ms), leader_changed_hands },
+        IntrashardMessages::StatusUpdate { status: outcome.status, cas_confirmed_at_ms, leader_changed_hands },
         ctx.intrashard_sender.clone(),
     ).await;
 
@@ -1004,6 +1016,7 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
         let mut peer_discovery_backoff = Duration::from_secs(1);
         let mut last_peer_discovery_attempt = std::time::Instant::now();
         let mut last_auto_fence_warn: Option<std::time::Instant> = None;
+        let mut last_unhandled_status_warn: Option<std::time::Instant> = None;
         let mut last_s3_lease_write_at_ms: Option<u64> = None;
         let mut last_probe_at_ms: u64 = 0;
 
@@ -1180,7 +1193,9 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                     warn!("Follower just became unreachable — preemptive S3 lease renewal");
                     match set_node_role_via_s3(&lease_manager, &ctx, &rx, "preemptive").await {
                         Ok(outcome) => {
-                            last_s3_lease_write_at_ms = Some(validated_node_status::unix_epoch_now_ms());
+                            if outcome.cas_written {
+                                last_s3_lease_write_at_ms = Some(validated_node_status::unix_epoch_now_ms());
+                            }
                             if let Some(ref peer) = outcome.peer_info {
                                 info!(peer_replication_address = %peer.replication_address, "Preemptive renewal: peer confirmed via S3");
                             }
@@ -1213,7 +1228,9 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
 
                 match set_node_role_via_s3(&lease_manager, &ctx, &rx, if has_peer { "proactive" } else { "discovery" }).await {
                     Ok(outcome) => {
-                        last_s3_lease_write_at_ms = Some(validated_node_status::unix_epoch_now_ms());
+                        if outcome.cas_written {
+                            last_s3_lease_write_at_ms = Some(validated_node_status::unix_epoch_now_ms());
+                        }
                         if let Some(ref peer) = outcome.peer_info {
                             info!(peer_replication_address = %peer.replication_address, "Peer discovered via S3");
                             has_peer = true;
@@ -1254,10 +1271,11 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                 // If we are a happy follower of just fenced, we can challenge the lease at the expiry time
                 let unix_epoch_now_ms = validated_node_status::unix_epoch_now_ms();
                 let remaining_time_until_lease_expires_ms = ctx.shard_wal.node_status.get().lease_expires_at_ms().saturating_sub(unix_epoch_now_ms);
-                if remaining_time_until_lease_expires_ms > 0 {
-                    //Only sleep for max of 500ms so we can still respond to shutdown commands
-                    glommio::timer::sleep(Duration::from_millis(remaining_time_until_lease_expires_ms.min(500))).await;
-                }
+                
+                // Always sleep otherwise we spin lock the executor
+                const CHALLENGE_MIN_INTERVAL_MS: u64 = 50;
+                let nap_ms = remaining_time_until_lease_expires_ms.clamp(CHALLENGE_MIN_INTERVAL_MS, 500);
+                glommio::timer::sleep(Duration::from_millis(nap_ms)).await;
 
                 // Could have been updated by a re-connecting heartbeat on another task
                 if !ctx.shard_wal.node_status.get().is_lease_expired() {
@@ -1383,6 +1401,14 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
 
                 continue;
             }
+
+            metrics::counter!("celeriant_lease_orchestrator_unhandled_status_total").increment(1);
+            if last_unhandled_status_warn.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+                warn!(status = ?ctx.shard_wal.node_status.get().raw(),
+                    "Lease orchestrator: status matched no arm (stranded Promoting?); pacing to avoid a spin");
+                last_unhandled_status_warn = Some(std::time::Instant::now());
+            }
+            glommio::timer::sleep(Duration::from_millis(100)).await;
         }
     })
     .detach();

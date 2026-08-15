@@ -19,6 +19,9 @@ pub struct ElectionOutcome {
     /// Restart-proof: derived from the durable S3 lease holder, not in-memory epoch.
     /// False on genesis acquire, promote-over-peer, or any follower outcome.
     pub reacquired_own_lease: bool,
+    /// True only when THIS election durably wrote `lease.json` (create or conditional put
+    /// that S3 accepted). False when we merely re-read a lease and concluded we still hold it.
+    pub cas_written: bool,
 }
 
 pub struct S3LeaseManager<S: LeaseStore> {
@@ -73,11 +76,11 @@ impl<S: LeaseStore> S3LeaseManager<S> {
                 debug!("Election: no existing lease in S3 — racing to create");
                 let lease = Lease::new_initial(
                     self.config.node_id,
-                    now,
+                    validated_node_status::unix_epoch_now_ms(),
                     self.config.s3_lease_duration.as_millis() as u64,
                 );
                 match self.store.put_lease_create_only(&lease).await {
-                    Ok(_) => self.become_leader(&lease, false).await,
+                    Ok(_) => self.become_leader(&lease, false, true).await,
                     Err(LeaseStoreError::AlreadyExists) => {
                         let lwe = self.store.get_lease().await?.ok_or_else(|| {
                             LeaseStoreError::Unavailable {
@@ -109,17 +112,18 @@ impl<S: LeaseStore> S3LeaseManager<S> {
                 );
                 let duration_ms = self.config.s3_lease_duration.as_millis() as u64;
                 let is_own_lease = lwe.lease.leader_node_id == self.config.node_id;
+                let now_before_write = validated_node_status::unix_epoch_now_ms();
                 let next = if is_own_lease {
-                    lwe.lease.renew(now, duration_ms)
+                    lwe.lease.renew(now_before_write, duration_ms)
                 } else {
-                    lwe.lease.promote(self.config.node_id, now, duration_ms)
+                    lwe.lease.promote(self.config.node_id, now_before_write, duration_ms)
                 };
                 match self
                     .store
                     .put_lease_conditional(&next, &lwe.etag)
                     .await
                 {
-                    Ok(_) => self.become_leader(&next, is_own_lease).await,
+                    Ok(_) => self.become_leader(&next, is_own_lease, true).await,
                     Err(LeaseStoreError::PreconditionFailed) => {
                         let new_lwe = self.store.get_lease().await?.ok_or_else(|| {
                             LeaseStoreError::Unavailable {
@@ -134,7 +138,8 @@ impl<S: LeaseStore> S3LeaseManager<S> {
                         // genuinely changed hands or expired; otherwise the re-read lease is
                         // still ours and valid, so we remain the legitimate leader.
                         let still_ours = new_lwe.lease.leader_node_id == self.config.node_id;
-                        let expired = new_lwe.lease.is_expired(now);
+                        let now_after_roundtrips = validated_node_status::unix_epoch_now_ms();
+                        let expired = new_lwe.lease.is_expired(now_after_roundtrips);
                         let stay_leader = still_ours && !expired;
                         tracing::warn!(
                             attempted_own_lease = is_own_lease,
@@ -142,12 +147,13 @@ impl<S: LeaseStore> S3LeaseManager<S> {
                             reread_leader_node_id = new_lwe.lease.leader_node_id,
                             reread_lease_epoch = new_lwe.lease.lease_epoch,
                             reread_expired = expired,
+                            election_elapsed_ms = now_after_roundtrips.saturating_sub(now),
                             still_ours,
                             stay_leader,
                             "Election CAS PreconditionFailed — re-read lease"
                         );
                         if stay_leader {
-                            self.become_leader(&new_lwe.lease, true).await
+                            self.become_leader(&new_lwe.lease, true, false).await
                         } else {
                             self.become_follower(&new_lwe.lease).await
                         }
@@ -184,10 +190,11 @@ impl<S: LeaseStore> S3LeaseManager<S> {
             ),
             peer_info,
             reacquired_own_lease: false,
+            cas_written: false,
         })
     }
 
-    async fn become_leader(&self, lease: &Lease, reacquired_own_lease: bool) -> Result<ElectionOutcome, LeaseStoreError> {
+    async fn become_leader(&self, lease: &Lease, reacquired_own_lease: bool, cas_written: bool) -> Result<ElectionOutcome, LeaseStoreError> {
         let peer_info = self.discover_peer().await.ok().flatten();
         Ok(ElectionOutcome {
             status: ValidatedNodeStatus::create_custom_status(
@@ -197,6 +204,7 @@ impl<S: LeaseStore> S3LeaseManager<S> {
             ),
             peer_info,
             reacquired_own_lease,
+            cas_written,
         })
     }
 }
@@ -217,6 +225,7 @@ mod tests {
         get_membership_responses:
             RefCell<Vec<Result<Option<MembershipWithEtag>, LeaseStoreError>>>,
         registered_memberships: RefCell<Vec<Membership>>,
+        get_lease_delay_ms: std::cell::Cell<u64>,
     }
 
     impl MockLeaseStore {
@@ -228,6 +237,7 @@ mod tests {
                 put_membership_responses: RefCell::new(vec![]),
                 get_membership_responses: RefCell::new(vec![]),
                 registered_memberships: RefCell::new(vec![]),
+                get_lease_delay_ms: std::cell::Cell::new(0),
             }
         }
 
@@ -277,6 +287,11 @@ mod tests {
 
     impl LeaseStore for MockLeaseStore {
         async fn get_lease(&self) -> Result<Option<LeaseWithEtag>, LeaseStoreError> {
+            // Simulates a slow S3 round-trip so a test can let a lease lapse mid-election.
+            let delay = self.get_lease_delay_ms.get();
+            if delay > 0 {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
             self.get_lease_responses.borrow_mut().remove(0)
         }
 
@@ -315,11 +330,15 @@ mod tests {
     }
 
     fn test_config(node_id: u128) -> S3LeaseConfig {
+        test_config_with_lease_ms(node_id, 5000)
+    }
+
+    fn test_config_with_lease_ms(node_id: u128, lease_ms: u64) -> S3LeaseConfig {
         S3LeaseConfig {
             node_id,
             advertised_client_address: format!("127.0.0.1:{}", 10000 + node_id),
             advertised_replication_address: format!("127.0.0.1:{}", 11000 + node_id),
-            s3_lease_duration: Duration::from_secs(5),
+            s3_lease_duration: Duration::from_millis(lease_ms),
             max_clock_drift: Duration::from_millis(500)
         }
     }
@@ -356,6 +375,153 @@ mod tests {
                 )),
             ],
         }
+    }
+
+    // --- cas_written: only a durable write may refresh the S3-confirmation signal ---
+    //
+    // Callers gate `s3_cas_confirmed_at_ms` on `cas_written`, and that cell is what opens the
+    // S3-fallback durability gate. Reporting a write that did not happen lets a node ack
+    // durability off a lease nobody re-confirmed.
+
+    #[test]
+    fn genesis_acquire_reports_a_cas_write() {
+        let store = MockLeaseStore::new();
+        store.push_get_lease(Ok(None));
+        store.push_put_lease_create_only(Ok("etag1".into()));
+        store.push_get_membership(Ok(None));
+
+        let manager = S3LeaseManager::new(store, test_config(1));
+        let outcome = block_on(manager.run_election_to_acquire_s3_lease()).unwrap();
+
+        assert!(outcome.cas_written, "a successful create-only put IS a durable write");
+    }
+
+    #[test]
+    fn successful_conditional_put_reports_a_cas_write() {
+        let store = MockLeaseStore::new();
+        let now = validated_node_status::unix_epoch_now_ms();
+        store.push_get_lease(Ok(Some(make_lease_with_etag(1, 3, now, 30_000))));
+        store.push_put_lease_conditional(Ok("etag2".into()));
+        store.push_get_membership(Ok(None));
+
+        let manager = S3LeaseManager::new(store, test_config(1));
+        let outcome = block_on(manager.run_election_to_acquire_s3_lease()).unwrap();
+
+        assert!(outcome.status.raw().is_leader());
+        assert!(outcome.cas_written, "an accepted conditional put IS a durable write");
+    }
+
+    /// The split-brain-relevant case. Our CAS is rejected; we re-read and find the lease is
+    /// still ours and live, so we stay leader — but we wrote nothing, so we must not claim a
+    /// fresh S3 confirmation.
+    #[test]
+    fn precondition_failed_but_still_ours_reports_no_cas_write() {
+        let store = MockLeaseStore::new();
+        let now = validated_node_status::unix_epoch_now_ms();
+        store.push_get_lease(Ok(Some(make_lease_with_etag(1, 3, now, 30_000))));
+        store.push_put_lease_conditional(Err(LeaseStoreError::PreconditionFailed));
+        store.push_get_lease(Ok(Some(make_lease_with_etag(1, 3, now, 30_000))));
+        store.push_get_membership(Ok(None));
+
+        let manager = S3LeaseManager::new(store, test_config(1));
+        let outcome = block_on(manager.run_election_to_acquire_s3_lease()).unwrap();
+
+        assert!(outcome.status.raw().is_leader(), "still our live lease — leadership is retained");
+        assert!(
+            !outcome.cas_written,
+            "our conditional put was REJECTED; re-reading a lease is not a durable write"
+        );
+    }
+
+    /// Expiry must be judged against the clock AFTER the election's S3 round-trips, not the
+    /// reading taken at entry. Here the lease is live when the election starts and lapses while
+    /// the (slow) re-read is in flight. Judging on the entry clock would keep this node leader
+    /// on a dead lease — exactly the state that lets a batch be written on an expired lease.
+    #[test]
+    fn lease_that_lapses_during_a_slow_election_is_not_treated_as_live() {
+        let store = MockLeaseStore::new();
+        let now = validated_node_status::unix_epoch_now_ms();
+        // Live at entry (60ms of life), dead by the time the 200ms re-read returns.
+        store.push_get_lease(Ok(Some(make_lease_with_etag(1, 3, now, 60))));
+        store.push_put_lease_conditional(Err(LeaseStoreError::PreconditionFailed));
+        store.push_get_lease(Ok(Some(make_lease_with_etag(1, 3, now, 60))));
+        store.push_get_membership(Ok(None));
+        store.get_lease_delay_ms.set(200);
+
+        let manager = S3LeaseManager::new(store, test_config(1));
+        let outcome = block_on(manager.run_election_to_acquire_s3_lease()).unwrap();
+
+        assert!(
+            !outcome.status.raw().is_leader(),
+            "the lease expired mid-election; staying leader on it risks a stale-writer ack"
+        );
+        assert!(!outcome.cas_written);
+    }
+
+    /// D11 decision sweep — does the stale-clock fix demote in cases the old code kept as leader?
+    ///
+    /// Deliberately asserts almost nothing. It prints a decision table for the
+    /// `PreconditionFailed -> still ours` branch across (lease life at entry) x (per-round-trip
+    /// delay). Run it on this commit and on 2e27358 and diff the two tables: the difference IS
+    /// the D11 answer.
+    ///
+    /// This exists because three separate cluster injections failed to reach this branch — the
+    /// heartbeat kept the lease alive, then an infinite `retry_s3_operation` blocked the
+    /// orchestrator inside the paused store instead of letting it fence. A branch this narrow is
+    /// cheaper and more honestly measured here than chased around a live cluster.
+    #[test]
+    fn d11_demotion_decision_sweep() {
+        println!("D11-SWEEP\tlease_life_ms\tdelay_ms\tdecision");
+        let mut demotions = 0;
+        for lease_life_ms in [30_000u64, 1_000, 300, 120, 60] {
+            for delay_ms in [0u64, 50, 100, 200, 400] {
+                let store = MockLeaseStore::new();
+                let now = validated_node_status::unix_epoch_now_ms();
+                store.push_get_lease(Ok(Some(make_lease_with_etag(1, 3, now, lease_life_ms))));
+                store.push_put_lease_conditional(Err(LeaseStoreError::PreconditionFailed));
+                store.push_get_lease(Ok(Some(make_lease_with_etag(1, 3, now, lease_life_ms))));
+                store.push_get_membership(Ok(None));
+                store.get_lease_delay_ms.set(delay_ms);
+
+                let manager = S3LeaseManager::new(store, test_config(1));
+                let outcome = block_on(manager.run_election_to_acquire_s3_lease()).unwrap();
+                let decision = if outcome.status.raw().is_leader() { "stay_leader" } else { "DEMOTE" };
+                if decision == "DEMOTE" {
+                    demotions += 1;
+                }
+                println!("D11-SWEEP\t{lease_life_ms}\t{delay_ms}\t{decision}");
+            }
+        }
+        println!("D11-SWEEP-TOTAL\tdemotions={demotions}/25");
+    }
+
+    /// The write path has the same stale-clock hazard as the re-read path, and it is worse:
+    /// here we DO report `cas_written`, so the caller stamps a fresh confirmation and opens the
+    /// S3-fallback gate. If the lease we wrote was built from the pre-round-trip clock, it can
+    /// already be expired by the time the put returns, leaving the gate open on a dead lease.
+    #[test]
+    fn slow_election_writes_a_lease_that_is_still_live_when_it_lands() {
+        let store = MockLeaseStore::new();
+        let now = validated_node_status::unix_epoch_now_ms();
+        store.push_get_lease(Ok(Some(make_lease_with_etag(1, 3, now, 100))));
+        store.push_put_lease_conditional(Ok("etag2".into()));
+        store.push_get_membership(Ok(None));
+        // The `get_lease` round-trip alone outlives the whole lease duration.
+        store.get_lease_delay_ms.set(250);
+
+        let manager = S3LeaseManager::new(store, test_config_with_lease_ms(1, 100));
+        let outcome = block_on(manager.run_election_to_acquire_s3_lease()).unwrap();
+
+        assert!(outcome.status.raw().is_leader());
+        assert!(outcome.cas_written, "the conditional put was accepted");
+        let landed_at = validated_node_status::unix_epoch_now_ms();
+        assert!(
+            outcome.status.lease_expires_at_ms() > landed_at,
+            "the lease this election wrote expired {}ms before the put returned, yet cas_written \
+             is true — the caller will stamp a fresh confirmation and open the durability gate \
+             on a dead lease",
+            landed_at.saturating_sub(outcome.status.lease_expires_at_ms())
+        );
     }
 
     #[test]
