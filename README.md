@@ -218,7 +218,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Write
     let order_event = OrderPlaced { order_id: 42, amount_cents: 9995 };
     let events = vec![json_event(1, &order_event)?];
-    pool.write_events(key.clone(), events).await?;
+    let my_client_id: u128 = 1; // stable id per writing service, used for idempotency tracking
+    pool.write_events(key.clone(), events, my_client_id).await?;
 
     // Read
     let response = pool.read(ReadRequest {
