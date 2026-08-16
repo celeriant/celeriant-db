@@ -39,7 +39,7 @@ pipelining — true per-request throughput.
 - **PostgreSQL peak: 42,721 req/s** at 500 concurrency
 - Throughput **decreases monotonically** as connections increase
 - At 12,000 connections PostgreSQL falls off a cliff: throughput drops 97% from 12.7k to <1k req/s
-- For reference, Celeriant on the same hardware peaks at **419,132 req/s** at 39,000 concurrency
+- For reference, Celeriant on the same hardware peaks at **446,667 req/s** at 24,000 concurrency
   (2 data nodes, fsync on both before ack). See `ec2-benchmark-metal-20260813.md`.
 
 ### Connection scaling

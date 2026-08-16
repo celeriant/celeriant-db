@@ -130,7 +130,7 @@ cat > "$RESULT_FILE" <<EOF
 # TLS mode:              ${TLS_MODE:-strict}
 # S3 enabled:            ${S3_ENABLED:-true}
 # num_shards:            ${NUM_SHARDS:-(default: CPU count)}
-# fsync_delay_us:        ${FSYNC_DELAY_US:-(default: 17000)}
+# fsync_delay_us:        ${FSYNC_DELAY_US:-(default: 1000)}
 # replication_delay_us:  ${REPLICATION_DELAY_US:-(default: 17000)}
 # reserve_coord_shard:   ${RESERVE_COORDINATOR_SHARD:-(default: false)}
 # mesh_channel_size:     ${MESH_CHANNEL_SIZE:-(default: 512)}

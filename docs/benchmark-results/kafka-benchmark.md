@@ -40,7 +40,7 @@ true per-request throughput.
 ### Throughput
 
 - **Kafka peak: 24,162 req/s** at 60,000 concurrency — effectively flat from 18k onward
-- For reference, Celeriant on the same hardware peaks at **419,132 req/s** at 39,000 concurrency
+- For reference, Celeriant on the same hardware peaks at **446,667 req/s** at 24,000 concurrency
   (2 data nodes, fsync on both before ack). See `ec2-benchmark-metal-20260813.md`.
 
 ### Latency

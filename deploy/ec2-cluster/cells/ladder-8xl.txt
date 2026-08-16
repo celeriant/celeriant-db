@@ -1,0 +1,30 @@
+# Connection ladder on 2x i4i.8xlarge (32 vCPU/node, 2x NVMe RAID0), current main.
+#
+# Re-measures the README mid tier. The published 419,132 at 39,000 connections ran on FULL
+# stock defaults (fsync 17,000 us, replication 17,000 us) — see
+# results/20260813-204755_i4i-8xlarge_instance-store.txt. This run carries the i4i.metal
+# tuning instead, so it is not a like-for-like re-run of that cell; it is what the tier
+# looks like tuned.
+#
+#   fsync 1,000 us         now the binary default (was 17,000). Swept on metal and on the
+#                          gp3 16c arm, never on this box; both arms say the fast band is
+#                          100-6,400 us and that 17,000 costs 30-50%.
+#   replication 15,000 us  metal's measured optimum. NOTE this is contested here:
+#                          results/20260813-192847_sweep_replication-only-8xl.csv has the
+#                          curve declining monotonically on this instance type, with 250 us
+#                          at 213,206 against 139,005 at 15,000 (8,000 conns, ONE rep —
+#                          pass 2 died REPLICATION_NOT_ESTABLISHED, so it is unconfirmed).
+#
+# num_shards left unset: the server already defaults to one per vCPU, which is what metal
+# measured best at saturation.
+#
+# Levels bracket the old 39,000 peak on both sides so the knee is located, not assumed.
+# Three c7i.4xlarge clients, matching the Kafka/Marten parity hardware; 72,000 is 24,000
+# tasks per client, so watch for the client becoming the limiter at the top of the ladder.
+
+conn_24k  TASKS=24000 FSYNC_DELAY_US=1000 REPLICATION_DELAY_US=15000
+conn_32k  TASKS=32000 FSYNC_DELAY_US=1000 REPLICATION_DELAY_US=15000
+conn_39k  TASKS=39000 FSYNC_DELAY_US=1000 REPLICATION_DELAY_US=15000
+conn_48k  TASKS=48000 FSYNC_DELAY_US=1000 REPLICATION_DELAY_US=15000
+conn_60k  TASKS=60000 FSYNC_DELAY_US=1000 REPLICATION_DELAY_US=15000
+conn_72k  TASKS=72000 FSYNC_DELAY_US=1000 REPLICATION_DELAY_US=15000

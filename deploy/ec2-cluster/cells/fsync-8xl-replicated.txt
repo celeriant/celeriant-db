@@ -1,0 +1,27 @@
+# First fsync sweep on a REPLICATED cluster. 2x i4i.8xlarge, 24,000 connections.
+#
+# The knob has only ever been swept on two standalone single nodes:
+#   fsync-sweep-metal  i4i.metal, 8x NVMe RAID0, standalone, CLEARTEXT, 128 shards, 32k conns
+#   fsync-sweep-gp3    c6i.4xlarge, EBS gp3, standalone, 16 shards, 8k conns
+# Neither paid for a follower round-trip or mTLS. The 1,000 us value now shipping as the binary
+# default, and underpinning the published 409,676, was extrapolated here from those — the
+# "anything under ~6 ms is equally good" bound has never been checked on this tier.
+#
+# ONE factor. REPLICATION_DELAY_US pinned at 15,000 in every cell (the published config), so
+# fsync is the only thing moving and every cell is directly comparable to the 409,676 baseline.
+# Concurrency fixed at 24,000, the published cell.
+#
+# 17,000 is the former default and is included as the known-bad anchor: if it does not come out
+# clearly worst here, the sweep itself is suspect.
+#
+# Run-to-run spread on this box under the cell-sweep harness has been ~10% at 24k (see
+# 8xl-ladder-tuned), against 2.3% for plain repeated benchmarks. Treat any gap under ~10% as
+# unresolved, and re-verify a winner with plain reps before publishing it.
+
+fsync_100    TASKS=24000 FSYNC_DELAY_US=100   REPLICATION_DELAY_US=15000
+fsync_250    TASKS=24000 FSYNC_DELAY_US=250   REPLICATION_DELAY_US=15000
+fsync_1000   TASKS=24000 FSYNC_DELAY_US=1000  REPLICATION_DELAY_US=15000
+fsync_2000   TASKS=24000 FSYNC_DELAY_US=2000  REPLICATION_DELAY_US=15000
+fsync_4000   TASKS=24000 FSYNC_DELAY_US=4000  REPLICATION_DELAY_US=15000
+fsync_8000   TASKS=24000 FSYNC_DELAY_US=8000  REPLICATION_DELAY_US=15000
+fsync_17000  TASKS=24000 FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=15000

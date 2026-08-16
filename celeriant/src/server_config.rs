@@ -289,9 +289,9 @@ pub struct ServerConfig {
 
     #[arg(
         long,
-        default_value_t = 17000,
+        default_value_t = 4000,
         env = "CELERIANT_FSYNC_DELAY_US",
-        help = "Amortised fsync duration block (17ms)"
+        help = "Amortised fsync duration block (4ms)"
     )]
     pub fsync_delay_us: u64,
 
@@ -1012,7 +1012,7 @@ impl Default for ServerConfig {
             max_catchup_gap_bytes: None,
             max_promotion_batch_bytes: None,
             s3_max_concurrent_fallback_uploads: 2,
-            fsync_delay_us: 17000,
+            fsync_delay_us: 4000,
             replication_delay_us: 17000,
             s3_replication_delay_us: 500000,
             replication_rollback_cooldown_us: 500000,

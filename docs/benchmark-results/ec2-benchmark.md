@@ -5,7 +5,7 @@
 **A pair of bare-metal AWS boxes sustains 1,057,417 durable, replicated, encrypted writes per
 second — every one of them `fdatasync()`ed to disk on both nodes before the client hears "yes",
 at a median of 48 ms.** On the same hardware where Kafka and PostgreSQL were measured, Celeriant
-is **9.8× PostgreSQL/Marten and 17.3× Kafka**, while being the only one of the three that
+is **10.5× PostgreSQL/Marten and 18.5× Kafka**, while being the only one of the three that
 actually flushes to disk on both nodes before acknowledging. And the cheapest cluster worth
 running — two 4-core ARM boxes on stock EBS, about **$295 a month** — does 67,720 of the same
 durable writes per second, which is more throughput per dollar than any of the big machines.
@@ -24,8 +24,9 @@ Every figure below is measured, not modelled — current `main`, Sydney (`ap-sou
 - **Storage is the decision that matters.** Local NVMe holds ~400 k/s flat; the same box on EBS
   peaks at 313 k/s and then *declines*, ending 63% behind. Stripe every NVMe you have: RAID0 is
   +32% throughput at 64 vCPU and 4× the capacity.
-- **One shipped default is badly wrong.** The 17 ms fsync amortisation window gives up **a third
-  of the machine** on instance store and −29.6% on gp3. Anything under ~6 ms is equally good.
+- **One shipped default was badly wrong, and is now fixed.** The old 17 ms fsync amortisation
+  window gave up **a third of the machine** on instance store and −29.6% on gp3. Anything under
+  ~6 ms is equally good; the shipped default is now 1 ms.
 - **Small clusters do not degrade gracefully.** They shed tens of thousands of errors past
   their knee, and a 1-vCPU node can wedge at 100% CPU and never come back. Know the ceiling for
   your tier and stay under it.
@@ -38,7 +39,7 @@ Peak *clean* throughput — the highest level that ran with zero client-visible 
 |---|---|---|---|---|---|---|---|
 | **Flagship** | 2× i4i.metal (128 vCPU) | 8× NVMe RAID0 | **1,057,417** | 60,000 | 48 ms | 108 ms | ~$3,700/mo spot |
 | Large | 2× i4i.16xlarge (64 vCPU) | 4× NVMe RAID0 | 466,640 | 60,000 | 97 ms | 264 ms | ~$9,600/mo |
-| Mid | 2× i4i.8xlarge (32 vCPU) | 4× NVMe RAID0 | 419,132 | 39,000 | 78 ms | 169 ms | ~$4,800/mo |
+| Mid | 2× i4i.8xlarge (32 vCPU) | 2× NVMe RAID0 | 446,667 | 24,000 | 44 ms | 109 ms | ~$4,800/mo |
 | **Entry** | 2× c7g.xlarge (4 vCPU ARM) | stock gp3 | **67,720** | 8,000 | 113 ms | 165 ms | **~$295/mo** |
 | Single node | 1× c6i.xlarge (4 vCPU) | stock gp3 | 86,658 | 8,000 | 85 ms | 108 ms | ~$172/mo |
 | Floor | 2× c6g.medium (1 vCPU) | stock gp3 | 12,289 | 3,000 | 183 ms | 284 ms | ~$82/mo |
@@ -49,8 +50,8 @@ demand it is $26.33/hr, about $19,200 a month.
 
 Two things in that table are worth a second look.
 
-**The 32-core box gets 90% of the 64-core box's throughput for half the money.** Doubling vCPUs
-from 32 to 64 buys 11%; going to 64 *physical* cores on `i4i.metal` buys 2.3× over that. Cores
+**The 32-core box gets 96% of the 64-core box's throughput for half the money.** Doubling vCPUs
+from 32 to 64 buys 4%; going to 64 *physical* cores on `i4i.metal` buys 2.3× over that. Cores
 that share an SMT sibling are not cores.
 
 **One un-replicated `c6i.xlarge` beats the replicated ARM pair** — 86,658 against 67,720 — because
@@ -65,12 +66,12 @@ request, wait for the ack, no batching. Each system at *its own* best concurrenc
 
 | system | peak writes/s | at connections | nodes | what "acknowledged" means |
 |---|---|---|---|---|
-| **Celeriant** | **419,132** | 39,000 | 2 | `fdatasync` on **both** nodes before ack |
+| **Celeriant** | **446,667** | 24,000 | 2 | `fdatasync` on **both** nodes before ack |
 | PostgreSQL / Marten | 42,721 | 500 | 2 | `synchronous_commit` + synchronous standby |
 | Kafka | 24,162 | 60,000 | 3 | **none** — page cache, ack after replication |
 
 Kafka is simultaneously the slowest and the weakest on durability, on one more node. Its p99
-reaches 2.1 s at 39,000 connections against Celeriant's 169 ms.
+reaches 1.3 s at 24,000 connections against Celeriant's 109 ms.
 
 **The shape matters more than the peak.** PostgreSQL is genuinely competitive at low concurrency
 and then hits the process-per-connection wall:
@@ -102,7 +103,7 @@ Durable writes per second, per dollar of monthly on-demand spend:
 | 2× c6g.xlarge | 46,715 | 269 | 174 |
 | 2× c6g.medium | 12,289 | 82 | 150 |
 | 2× i4i.large | 30,200 | 301 | 100 |
-| 2× i4i.8xlarge | 419,132 | 4,800 | 87 |
+| 2× i4i.8xlarge | 446,667 | 4,800 | 93 |
 | 2× i4i.metal | 1,057,417 | 19,200 | 55 |
 | 2× i4i.16xlarge | 466,640 | 9,600 | 49 |
 
@@ -131,8 +132,8 @@ neither faster nor trustworthy. **Spread width locates the knee independently of
 curve**, which is a useful thing to watch for on any hardware.
 
 Configuration: 128 shards (one per vCPU), fsync window 1,000 µs, replication window 15,000 µs.
-Those last two are measured values that ship pinned to the `i4i-metal` deploy profile — they are
-not generic defaults, and the section below explains why.
+The fsync value has since become the binary's default. The replication value remains pinned to
+the `i4i-metal` deploy profile and is not a generic default; the section below explains why.
 
 For scale: the same box standalone and in cleartext does 1,936,064 writes/s. Replication plus
 mTLS costs about 45% of that. The replicated, encrypted number is the one worth quoting because
@@ -193,7 +194,7 @@ Celeriant amortises two things over short time windows: `fsync` calls, and repli
 They look like the same knob. They are not, they have opposite characters, and **they must never
 be tuned together.**
 
-### The fsync window: the shipped default costs half the machine
+### The fsync window: the former default cost half the machine
 
 Swept on `i4i.metal`, standalone, at 32,000 connections:
 
@@ -203,7 +204,7 @@ Swept on `i4i.metal`, standalone, at 32,000 connections:
 | 800 µs | 1,886,768 | −4.9% |
 | 1,600 µs | 1,983,860 | — |
 | 6,400 µs | 1,911,055 | −3.7% |
-| **17,000 µs (default)** | **1,325,348** | **−33.2%** |
+| **17,000 µs (former default)** | **1,325,348** | **−33.2%** |
 
 Putting the window back inside the fast band is worth **+49.7%** on this box.
 
@@ -213,7 +214,7 @@ naming one would be unsupported.** The recommendation is a bound, not a value: *
 window under ~6 ms.**
 
 The same knob on gp3 behaves the same way and punishes long windows harder: 250 µs through
-8,000 µs are within 1.5% of each other, the 17,000 µs default costs −29.6%, and 68,000 µs costs
+8,000 µs are within 1.5% of each other, the 17,000 µs former default costs −29.6%, and 68,000 µs costs
 −73.6%. A prediction that gp3 would want a *longer* window than instance store, on the theory
 that its IOPS cap binds, was measured and falsified — the path is latency-bound, not IOPS-bound.
 
@@ -251,7 +252,7 @@ genuinely pays. On `i4i.metal` the curve is **bimodal** — two maxima with a tr
 | 250 µs | 340,787 | 82% | 1% | CPU-bound, many small sends |
 | 8,000 µs | 286,905 | 83% | 12% | trough |
 | **15,000 µs** | **407,158** | **21%** | 78% | batch-bound — the optimum |
-| 17,000 µs (default) | 370,667 | 18% | 81% | |
+| 17,000 µs (former fsync default) | 370,667 | 18% | 81% | |
 | 34,000 µs | 205,174 | 11% | 89% | over-batched |
 
 15,000 µs beats the shipped default by **+9.8%** and delivers +19% over the 250 µs peak **while

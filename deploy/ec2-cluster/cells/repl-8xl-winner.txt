@@ -1,0 +1,11 @@
+# 3-rep confirmation of the replication sweep winner: 8,000 us, fsync 4,000, 24,000 conns.
+#
+# Single-rep sweep put this at 449,777 (+8.8% over the published 413,441) with zero errors and
+# the lowest CPU of the fast band. The band it belongs to runs at 92-94% busy, and two of its
+# neighbours (250 and 4,000 us) threw 155 and 478 errors respectively while 1,000 and 8,000 were
+# clean — non-monotonic, so the errors read as a threshold being grazed near saturation rather
+# than a property of the window.
+#
+# THE TEST: stay clean across 3 reps. Any errors and this falls back to 15,000 us, which runs
+# at 83% CPU with real headroom and a better p99 (93 ms against 106 ms).
+repl_8000_confirm  TASKS=24000 FSYNC_DELAY_US=4000 REPLICATION_DELAY_US=8000

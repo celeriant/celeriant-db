@@ -2,7 +2,7 @@
 
 A fast, distributed, append-only write-ahead log built specifically for event sourcing. 
 
-```rust
+```csharp
 // write your events to an aggregate
 await pool.WriteAsync(key, [event], expectedVersion: version);
 
@@ -99,7 +99,7 @@ ap-southeast-2, single AZ.
 | Tier         | Cluster                     | Storage      | Durable writes/s | At connections | P50   | P99   | Cost           |
 | ------------ | --------------------------- | ------------ | ---------------- | -------------- | ----- | ----- | -------------- |
 | **Flagship** | 2× i4i.metal (128 vCPU)     | 8× NVMe RAID0 | **1,057,417**   | 60,000         | 48ms  | 108ms | ~$19,200/mo    |
-| Mid          | 2× i4i.8xlarge (32 vCPU)    | 4× NVMe RAID0 | 419,132         | 39,000         | 78ms  | 169ms | ~$4,800/mo     |
+| Mid          | 2× i4i.8xlarge (32 vCPU)    | 2× NVMe RAID0 | 446,667         | 24,000         | 44ms  | 109ms | ~$4,800/mo     |
 | **Entry**    | 2× c7g.xlarge (4 vCPU ARM)  | stock gp3    | **67,720**       | 8,000          | 113ms | 165ms | **~$295/mo**   |
 
 ### Against Kafka and PostgreSQL
@@ -109,13 +109,13 @@ c7i.4xlarge clients. Each system at its own best concurrency.
 
 | System            | Peak req/s  | P99 at peak | Nodes | TLS            | Fsync      | OCC |
 | ----------------- | ----------- | ----------- | ----- | -------------- | ---------- | --- |
-| **Celeriant**     | **419,132** | **169ms**   | 2     | mTLS (kTLS)    | Both nodes | Yes |
+| **Celeriant**     | **446,667** | **109ms**   | 2     | mTLS (kTLS)    | Both nodes | Yes |
 | PostgreSQL/Marten | 42,721      | 46ms        | 2     | mTLS (OpenSSL) | Both nodes | Yes |
 | Kafka             | ~24,000     | ~1,342ms    | 3     | TLS            | None       | No  |
 
-9.8x Marten and 17.3x Kafka. Kafka is the slowest and the weakest on durability, on one more node.
+10.5x Marten and 18.5x Kafka. Kafka is the slowest and the weakest on durability, on one more node.
 
-Celeriant P99 stays under 100ms up to 24,000 concurrent connections. PostgreSQL delivers
+Celeriant P99 is 109ms at 24,000 concurrent connections. PostgreSQL delivers
 excellent latency at low concurrency but collapses at 12,000 connections (throughput drops 98%).
 Kafka plateaus at ~24k req/s regardless of concurrency, without fsync or per-aggregate ordering.
 

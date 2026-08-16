@@ -1,0 +1,26 @@
+# Does the replication window have anything left on 2x i4i.8xlarge? Settles the last inherited
+# value behind the published mid-tier number.
+#
+# ONE factor. FSYNC_DELAY_US pinned at 4,000 in every cell — the measured winner from
+# fsync-8xl-replicated (2026-08-16), and pinned rather than defaulted because the binary
+# deployed on this cluster still carries the old 1,000 us default.
+#
+# Concurrency fixed at 24,000, the published cell. Baseline to beat: 413,441 at p99 91 ms.
+#
+# Why the earlier answer does not carry over: cells/replication-only-8xl.txt was swept on
+# 2026-08-13 under the OLD 17,000 us fsync default and declined monotonically, with 250 us at
+# 213,206 against 139,005 at 15,000 (8,000 conns, one rep). That regime is gone.
+#
+# The incumbent 15,000 is metal's measured optimum, inherited here on no local evidence.
+# 17,000 is the binary's replication default.
+#
+# ONE rep: the fsync sweep on this same cluster held sub-1% spread across all 7 cells, so a
+# single pass locates the shape. The winner gets 3 reps afterwards for the published figure.
+
+repl_250    TASKS=24000 FSYNC_DELAY_US=4000 REPLICATION_DELAY_US=250
+repl_1000   TASKS=24000 FSYNC_DELAY_US=4000 REPLICATION_DELAY_US=1000
+repl_4000   TASKS=24000 FSYNC_DELAY_US=4000 REPLICATION_DELAY_US=4000
+repl_8000   TASKS=24000 FSYNC_DELAY_US=4000 REPLICATION_DELAY_US=8000
+repl_15000  TASKS=24000 FSYNC_DELAY_US=4000 REPLICATION_DELAY_US=15000
+repl_17000  TASKS=24000 FSYNC_DELAY_US=4000 REPLICATION_DELAY_US=17000
+repl_25000  TASKS=24000 FSYNC_DELAY_US=4000 REPLICATION_DELAY_US=25000

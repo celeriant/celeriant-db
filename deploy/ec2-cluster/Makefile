@@ -49,6 +49,24 @@ PROFILE ?= default
 
 ifeq ($(PROFILE),i4i-32c)
   override CDK_ARGS += -c instanceType=i4i.8xlarge -c clientInstanceType=c7i.4xlarge -c clientCount=3
+  # Measured on this hardware 2026-08-16, one factor at a time, at 24,000 connections.
+  #
+  #   fsync 4,000 us       swept 100-17,000 on a REPLICATED pair (the first such sweep — the
+  #                        older metal and gp3 sweeps were both standalone single nodes). All
+  #                        three 4,000 reps beat all three 1,000 reps against sub-1% spread.
+  #                        Also the binary default now, so this pin is explicit, not corrective.
+  #
+  #   replication 8,000 us metal's 15,000 costs -8.8% here. The 250-8,000 band all runs 445-455k
+  #                        against 413k at 15,000, but it trades tail for throughput (p99 106 vs
+  #                        93 ms) and runs the box at 92-94% CPU instead of 83%. 8,000 is the
+  #                        fastest cell that stayed clean: 250 and 4,000 threw 155 and 478 errors
+  #                        while 1,000 and 8,000 took none, which reads as a threshold grazed
+  #                        near saturation rather than a property of the window. Confirmed 3/3
+  #                        clean at 446,667 (0.12% spread).
+  #
+  # Do NOT copy the replication value to metal: 15,000 is metal's own measured optimum there.
+  FSYNC_DELAY_US ?= 4000
+  REPLICATION_DELAY_US ?= 8000
 else ifeq ($(PROFILE),i4i-64c)
   override CDK_ARGS += -c instanceType=i4i.16xlarge -c clientInstanceType=c7i.4xlarge -c clientCount=4
 else ifeq ($(PROFILE),i4g-32c)
@@ -71,7 +89,8 @@ else ifeq ($(PROFILE),i4i-metal)
   # Measured amortisation windows for THIS hardware. Both were swept on the box; neither is a
   # guess, and they are NOT interchangeable defaults for other instance types:
   #
-  #   fsync 1,000 us       the binary's 17,000 us default costs -49.7% here. Nitro instance
+  #   fsync 1,000 us       now also the binary default. The old 17,000 us default cost -49.7%
+  #                        here, which is what moved it. Nitro instance
   #                        store advertises write-through with fua=0, so the kernel elides the
   #                        NVMe FLUSH entirely — there is no device I/O for a long window to
   #                        amortise, only latency to pay. Anything from 100 us to 6,400 us
@@ -128,7 +147,7 @@ MESH_CHANNEL_SIZE ?=
 STANDALONE ?=
 TLS_MODE ?= strict
 
-.PHONY: help build build-arm infra certs deploy start stop restart status logs \
+.PHONY: help build build-arm infra certs deploy check-disks start stop restart status logs \
         setup-infra run-benchmark run-sweep s3-fallback sync-env teardown teardown-data
 
 help: ## Show this help
@@ -266,6 +285,10 @@ logs: ## Tail logs from both data nodes (Ctrl+C to stop)
 # ---------------------------------------------------------------------------
 # Benchmarks
 # ---------------------------------------------------------------------------
+
+check-disks: ## Pre-flight the NVMe on each data node (run after 'deploy', before 'start')
+	@if [[ -z "$(LEADER_PUB)" ]]; then printf "$(RED)No .cluster-env — run 'make deploy' or 'make sync-env' first$(RESET)\n"; exit 1; fi
+	@bash scripts/check-disks.sh
 
 setup-infra: ## Stand up Prometheus/Loki/Grafana on client #1 + promtail on data nodes
 	@if [[ -z "$(CLIENT_PUBS)" ]]; then printf "$(RED)No .cluster-env — run 'make deploy' or 'make sync-env' first$(RESET)\n"; exit 1; fi
