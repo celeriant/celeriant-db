@@ -1,6 +1,6 @@
 # Local Development Cluster
 
-Docker Compose stack that runs a 2-node Celeriant cluster with full observability on localhost. Builds from source using the repo root Dockerfile.
+Docker Compose stack that runs a 2-node Celeriant cluster with full observability on localhost. Builds from source using the repo root Dockerfile. This is the dev stack for testing your working tree. Just want to try Celeriant? Pull the published image instead: see the quick start in the [root README](../../README.md).
 
 ## What You Get
 
