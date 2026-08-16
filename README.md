@@ -1,4 +1,4 @@
-# Celeriant - An experimental event sourcing database
+## celeriant is an experimental event sourcing database
 
 A fast, distributed, append-only write-ahead log built specifically for event sourcing. 
 
@@ -161,13 +161,14 @@ cargo build --release -p celeriant
 **macOS / Windows** Use Docker (the container provides the Linux kernel):
 
 ```bash
-docker build -t celeriant:local .
 docker run -d --name celeriant \
   --security-opt seccomp=unconfined \
   -p 10000:10000 \
-  celeriant:local \
+  ghcr.io/celeriant/celeriant \
   --standalone --data-root /var/lib/celeriant --num-shards 1
 ```
+
+Or build the image yourself: `docker build -t celeriant:local .`
 
 `--standalone` runs a single node with no S3 or replication. For a full localhost two-node cluster with Grafana, Prometheus, and MinIO, see [deploy/local-cluster](deploy/local-cluster/docker-compose.yml).
 

@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  client-crates:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The portable client closure plus the guide compile check. The server
+      # crates need io_uring and a longer build; they are exercised by the
+      # integration/chaos suites, not this quick gate.
+      - name: Build
+        run: cargo build -p celeriant_wal -p celeriant_crypto -p celeriant_wire -p celeriant_msg -p celeriant_client_wire -p celeriant_client_tokio -p celeriant_cli
+
+      - name: Test
+        run: cargo test -p celeriant_wal -p celeriant_crypto -p celeriant_wire -p celeriant_msg -p celeriant_client_wire -p celeriant_client_tokio -p celeriant_cli

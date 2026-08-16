@@ -1,6 +1,8 @@
 [package]
 name = "celeriant_wire"
-description = "Internal: wire protocol framing, serialization, and compression for Celeriant"
+description = "Wire protocol framing, serialization, and compression for Celeriant"
+keywords = ["event-sourcing", "database", "eventstore", "celeriant"]
+categories = ["database"]
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

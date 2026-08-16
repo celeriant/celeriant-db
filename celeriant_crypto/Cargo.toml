@@ -1,6 +1,8 @@
 [package]
 name = "celeriant_crypto"
-description = "Internal: cryptographic identity, authentication, and PKI for Celeriant"
+description = "Cryptographic identity, authentication, and PKI for Celeriant clients and servers"
+keywords = ["event-sourcing", "database", "eventstore", "celeriant"]
+categories = ["database"]
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

@@ -2,6 +2,14 @@ name: Publish Docker Image
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Semver tag for the image (e.g. 0.1.0); also tagged latest + sha"
+        required: false
+        default: ""
+  push:
+    tags:
+      - "v*"
 
 permissions:
   contents: read
@@ -24,6 +32,17 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Semver tag comes from the pushed git tag (v0.1.0 -> 0.1.0) or the
+      # workflow_dispatch version input; empty means latest + sha only.
+      - name: Resolve version tag
+        id: ver
+        run: |
+          V="${{ inputs.version }}"
+          if [ -z "$V" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            V="${GITHUB_REF#refs/tags/v}"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -32,5 +51,6 @@ jobs:
           tags: |
             ghcr.io/celeriant/celeriant:latest
             ghcr.io/celeriant/celeriant:${{ github.sha }}
+            ${{ steps.ver.outputs.version != '' && format('ghcr.io/celeriant/celeriant:{0}', steps.ver.outputs.version) || '' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

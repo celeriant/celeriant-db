@@ -2,6 +2,26 @@
 
 This guide covers the concepts and patterns you need to build event-sourced systems with Celeriant. For installation and a minimal example, see the [client README](../celeriant_client_tokio/README.md).
 
+## Dependencies
+
+The client crate does the work, but the request and key types it consumes live in two sibling crates:
+
+```bash
+cargo add celeriant_client_tokio celeriant_msg celeriant_wal
+cargo add celeriant_crypto   # only for TLS/mTLS and RSA client identity
+```
+
+Common imports used throughout this guide:
+
+```rust
+use celeriant_client_tokio::{CeleriantClient, CeleriantPool, PoolOptions, json_event, from_json};
+use celeriant_wal::aggregate_key::AggregateKey;
+use celeriant_msg::request::requests::{ReadRequest, WriteRequest};
+use celeriant_msg::request::read_filters::ReadFilters;
+```
+
+If your event structs carry `Uuid` fields, enable the `serde` feature: `cargo add uuid --features serde,v4,v5`.
+
 ## Aggregates and keys
 
 Every event in Celeriant lives inside an aggregate, addressed by three IDs:
@@ -53,7 +73,8 @@ A single connection is fine for scripts, admin tools, or simple use cases. The c
 For production workloads, `CeleriantPool` is what you want. It manages connections and routes operations to the right node:
 
 - **Writes** always go to the leader. If the leader moves (failover), the pool detects this via `NotLeader` errors and reroutes automatically.
-- **Reads** are distributed across all nodes via round-robin. Set `route_reads_to_followers` if you want to keep the leader free for writes.
+- **Reads** also go to the leader by default. This gives you read-your-writes: a read issued after a successful write sees that write.
+- **Follower reads** are explicit. Set `route_reads_to_followers` to send reads to followers and keep the leader free for writes. Follower reads are eventually consistent: a follower can lag the leader, and a node rejoining the cluster can be seconds or more behind. A read on a lagging follower returns whatever that node has, including "aggregate does not exist" for an aggregate you just wrote. Only opt in if your read path tolerates stale data, or you poll for convergence. If every follower is unreachable, reads and watches fall back to the leader rather than failing — so a follower outage costs leader load, not availability.
 
 ```rust
 let pool = CeleriantPool::new(
@@ -74,9 +95,9 @@ Key pool options:
 | `connection_timeout` | 5s | TCP connect timeout |
 | `request_timeout` | 30s | Per-request timeout |
 | `idle_timeout` | 25s | Evict idle connections (must be below server's `slow_client_timeout`) |
-| `route_reads_to_followers` | false | Keep leader free for writes |
-| `compression` | Zstd level 3 | Auto-compress large payloads |
-| `auto_compression_threshold` | 1024 bytes | Minimum payload size before compression kicks in |
+| `max_request_size` | 10 MB | Reject outgoing requests larger than this |
+| `max_response_size` | 64 MB | Reject incoming responses larger than this |
+| `route_reads_to_followers` | false | Send reads to followers (eventually consistent; leader is last resort, see above) |
 | `max_leader_retries` | 3 | Seed nodes to try on failover |
 
 ## TLS and mTLS
@@ -199,7 +220,7 @@ The simplest write pushes events into a single aggregate:
 
 ```rust
 let events = vec![json_event(1, &OrderPlaced { order_id, amount: 99.95 })?];
-pool.write_events(key.clone(), events).await?;
+pool.write_events(key.clone(), events, my_client_id).await?;
 ```
 
 `event_type_major` and `event_type_minor` identify the event's schema version. Use major for breaking changes, minor for backwards-compatible additions. These tie into the schema registry.
@@ -212,13 +233,15 @@ Pass `expected_version` to guard a write. If another writer has appended to the 
 pool.write_events_with(
     key,
     events,
+    my_client_id,
     WriteEventsOptions {
-        client_id: my_client_id,
         expected_version: Some(current_version),
         ..Default::default()
     },
 ).await?;
 ```
+
+Where does `current_version` come from? Your last read, `aggregate_details`, or the `max_aggregate_version` on a previous `WriteResponse`.
 
 When a concurrency conflict happens, the error tells you exactly what went wrong:
 
@@ -263,16 +286,12 @@ let writes = HashMap::from([
         allow_create: true,
         expected_version: Some(from_version),
         enforce_client_idempotency: true,
-        compression_type_id: 0,
-        compression_level: None,
     }),
     (to_key, SingleAggregateWrite {
         events: vec![transfer_in_event],
         allow_create: true,
         expected_version: Some(to_version),
         enforce_client_idempotency: true,
-        compression_type_id: 0,
-        compression_level: None,
     }),
 ]);
 
@@ -288,7 +307,7 @@ pool.write(WriteRequest {
 
 This eliminates a whole class of problems that normally require sagas. Transfer between two accounts? Atomic. Reserve inventory while placing an order? Atomic. Any business rule that spans aggregates within the same shard can be enforced in a single request.
 
-The constraint: all aggregates in a single write must belong to the same shard. Shard assignment is deterministic (by aggregate ID, type, or org, configured server-side), so you know at design time which aggregates can participate in the same atomic write.
+The constraint: all aggregates in a single write must belong to the same shard. Shard assignment is deterministic: `routing_field % num_shards` on the low bits, where the routing field is `aggregate_id` by default (see Sharding in the [README](../README.md)) and `num_shards` is server configuration. So you know at design time which aggregates can participate in the same atomic write. A cross-shard batch is rejected with a `ShardRouting` error that reports the server's shard count.
 
 ## Reading events
 
@@ -351,6 +370,9 @@ let details = pool.aggregate_details(AggregateDetailsRequest {
 Celeriant validates events against registered schemas at write time. Server-side enforcement. Malformed events are rejected before they hit the log.
 
 ```rust
+use celeriant_wal::schema_key::SchemaKey;
+use celeriant_wal::schema_type::SchemaType;
+
 pool.register_schema(RegisterSchemaRequest {
     correlation_id: None,
     client_id: my_client_id,
@@ -377,7 +399,7 @@ let request = WatchRequest {
     orgs: Some(HashSet::from([org_id])),
     aggregate_types: Some(HashSet::from([order_type_id])),
     aggregates: None,
-    operation_types: Some(HashSet::from([1])), // Write
+    operation_types: Some(HashSet::from([1])), // Write only
 };
 
 let mut watch = pool.watch(request, WatchOptions::default()).await?;
@@ -386,11 +408,14 @@ loop {
     let response = watch.next().await?;
     for evt in &response.events {
         // evt.org_id, evt.aggregate_type_id, evt.aggregate_id
-        // evt.operation - Write, Create, Delete, TrimStart
+        // evt.operation - Delete = 0, Write = 1, TrimStart = 3, Create = 5
         // evt.from_aggregate_version, evt.to_aggregate_version
+        // evt.keep_from_aggregate_version - set on TrimStart events
     }
 }
 ```
+
+Operation codes: `Delete = 0`, `Write = 1`, `TrimStart = 3`, `Create = 5`. The first write to a new aggregate emits two events: a `Create` (versions unset) followed by a `Write` with `from`/`to` versions. `TrimStart` events carry `keep_from_aggregate_version` instead of a version range. If you filter `operation_types` to writes only, as above, creates are silently dropped.
 
 Watch events tell you *what changed*, not *what the events contain*. You then read the aggregate to get the actual data. This keeps the watch stream lightweight and lets you decide what to fetch.
 
@@ -398,7 +423,7 @@ You can filter by org, aggregate type, specific aggregates, and operation types.
 
 The pool handles multi-shard routing internally. If the watch request spans multiple shards, the pool spawns per-shard connections and multiplexes the results.
 
-Use `watch.next_timeout(duration)` if you need a non-blocking check.
+Use `watch.next_timeout(duration)` if you need a bounded wait. It returns `Ok(None)` when the timeout elapses with no events.
 
 ## Trimming and deleting
 
@@ -417,6 +442,8 @@ pool.trim_start(TrimStartRequest {
 ```
 
 Useful for aggregates with high event volume where you've already built snapshots or projections from the older events.
+
+After a trim, reading from a version below the trim point fails with `ReadError::UnavailableBatchIndex`, which reports the `minimum_available_version`. Readers of trimmed aggregates should start from `aggregate_details().min_aggregate_version` rather than version 1.
 
 ### Deleting aggregates
 
@@ -469,7 +496,7 @@ while let Some(result) = iter.next().await {
 let all_orgs = pool.list_orgs(ListOptions::default()).await?.collect().await?;
 ```
 
-`ListOptions` lets you include deleted aggregates and hint the shard count:
+`ListOptions` lives at `celeriant_client_tokio::list_operations::ListOptions`. It lets you include deleted aggregates and hint the shard count:
 
 ```rust
 let options = ListOptions {
@@ -481,17 +508,9 @@ let options = ListOptions {
 
 ## Compression
 
-Celeriant compresses request payloads automatically when they exceed a threshold. The default is Zstd with a 1024-byte threshold. Payloads under 1KB are sent uncompressed.
+Wire compression is automatic and transparent. Payloads of 1KB or more are compressed with dictionary Zstd; smaller payloads go uncompressed, where compression costs more than it saves. The dictionary is exchanged during the Identify handshake, so identified connections get better ratios on small structured events than a plain compressor would.
 
-Supported algorithms: Zstd, Snappy, Brotli, Gzip, or None.
-
-Configure via pool options:
-
-```rust
-PoolOptions::new("localhost:10000")
-    .with_compression(CompressionType::Zstd { level: 3 })
-    .with_auto_compression_threshold(2048)
-```
+There is nothing to configure on the client. Write your events, read them back; the wire handles it.
 
 ## Error handling
 

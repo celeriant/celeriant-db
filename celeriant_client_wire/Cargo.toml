@@ -1,6 +1,8 @@
 [package]
 name = "celeriant_client_wire"
-description = "Internal: Send-safe, throughput-first client frame I/O over celeriant_wire"
+description = "Send-safe client frame I/O over the Celeriant wire protocol"
+keywords = ["event-sourcing", "database", "eventstore", "celeriant"]
+categories = ["database"]
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

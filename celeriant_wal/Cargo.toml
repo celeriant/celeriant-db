@@ -1,6 +1,8 @@
 [package]
 name = "celeriant_wal"
-description = "Internal: write-ahead log data structures for the Celeriant event store"
+description = "Write-ahead log data structures for the Celeriant event store (aggregate keys, events, schemas)"
+keywords = ["event-sourcing", "database", "eventstore", "celeriant"]
+categories = ["database"]
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

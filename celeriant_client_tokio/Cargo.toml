@@ -1,6 +1,8 @@
 [package]
 name = "celeriant_client_tokio"
 description = "Async Tokio client for the Celeriant event store with connection pooling, leader routing, and TLS"
+keywords = ["event-sourcing", "database", "eventstore", "celeriant"]
+categories = ["database"]
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

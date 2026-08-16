@@ -45,6 +45,7 @@ Integration tests spawn the Celeriant server as a subprocess. Build it before ru
 
 ```bash
 cargo build -p celeriant --release
+cargo build -p celeriant_wal_inspect --release   # some tests (e.g. stale_lease_restart_split_brain) shell out to it
 ```
 
 ### Running

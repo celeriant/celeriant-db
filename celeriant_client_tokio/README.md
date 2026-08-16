@@ -34,14 +34,15 @@ docker run -d --name celeriant \
 
 ```rust
 use celeriant_client_tokio::{CeleriantClient, json_event};
-use celeriant_wal::AggregateKey;
+use celeriant_wal::aggregate_key::AggregateKey;
 
 let mut client = CeleriantClient::connect("localhost:10000").await?;
 
 let key = AggregateKey::new(org_id, aggregate_type_id, aggregate_id);
-let events = vec![json_event(1, 0, &OrderPlaced { order_id, amount: 99.95 })?];
+let events = vec![json_event(1, &OrderPlaced { order_id, amount: 99.95 })?];
 
-client.write_events(&key, &events).await?;
+let my_client_id: u128 = 1; // stable id per writing service, used for idempotency tracking
+client.write_events(key, events, my_client_id).await?;
 ```
 
 ### 3. Read it back
@@ -51,7 +52,7 @@ use celeriant_client_tokio::from_json;
 use celeriant_msg::request::read_filters::ReadFilters;
 use celeriant_msg::request::requests::ReadRequest;
 
-let response = client.read(&ReadRequest {
+let response = client.read(ReadRequest {
     correlation_id: None,
     aggregate_key: key,
     filters: ReadFilters::new(1),
@@ -62,13 +63,13 @@ let order: OrderPlaced = from_json(&response.event_batches[0].events[0])?;
 
 ## Connection pool
 
-`CeleriantPool` manages connections, routes writes to the leader, distributes reads across nodes. Implements `CeleriantPoolApi` for testing and DI.
+`CeleriantPool` manages connections and routes both writes and reads to the leader, so reads see your own writes. Follower reads are an explicit opt-in via `route_reads_to_followers`; if every follower is down they fall back to the leader instead of failing. Implements `CeleriantPoolApi` for testing and DI.
 
 ```rust
 use celeriant_client_tokio::{CeleriantPool, PoolOptions};
 
 let pool = CeleriantPool::new(PoolOptions::new("localhost:10000")
-    .with_seed_addresses(vec!["localhost:10001".into()]));
+    .with_seed_addresses(vec!["localhost:10002".into()]));
 
 pool.write(request).await?;
 let response = pool.read(read_request).await?;
@@ -80,14 +81,14 @@ The pool also supports `delete`, `trim_start`, `aggregate_details`, `register_sc
 
 ```rust
 use celeriant_client_tokio::ClientTlsConfig;
-use celeriant_crypto::PkiManager;
+use celeriant_crypto::pki::PkiManager;
 
 let ca = PkiManager::load_ca_bundle(Path::new("ca.crt"))?;
 let (certs, key) = PkiManager::load_identity(Path::new("client.crt"), Path::new("client.key"))?;
-let tls_config = PkiManager::build_client_config(&ca, &certs, &key)?;
-let tls = ClientTlsConfig::new(tls_config, "localhost");
+let tls_config = PkiManager::build_client_config(&ca, certs, key)?;
+let tls = ClientTlsConfig::new(tls_config, "localhost".try_into()?);
 
-let mut client = CeleriantClient::connect_tls("localhost:10010", &tls).await?;
+let mut client = CeleriantClient::connect_tls("localhost:10010", tls).await?;
 ```
 
 ## Examples

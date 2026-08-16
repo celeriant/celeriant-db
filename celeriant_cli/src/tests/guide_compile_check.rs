@@ -347,6 +347,7 @@ const _: () = {
             let _ = evt.operation;
             let _ = evt.from_aggregate_version;
             let _ = evt.to_aggregate_version;
+            let _ = evt.keep_from_aggregate_version;
         }
 
         let _ = watch

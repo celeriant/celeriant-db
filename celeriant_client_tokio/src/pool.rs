@@ -74,7 +74,8 @@ macro_rules! leader_route {
     }};
 }
 
-/// Round-robin across read-eligible nodes.
+/// Route a read across `read_addresses()` in order (leader-pinned by default,
+/// rotated followers on opt-in).
 ///
 /// `$pool` must be `&CeleriantPool`.
 /// `$client` is the name to bind the `&mut CeleriantClient` to inside `$body`.
@@ -82,8 +83,10 @@ macro_rules! leader_route {
 /// that returns `Result<_, ClientError>`. The macro expands inline so that
 /// async method borrows have no lifetime issues.
 ///
-/// On `ConnectionFailed` the node is skipped; any other error is returned
-/// immediately. Returns `Err(err_all_unreachable())` if no node succeeds.
+/// Connection-class failures skip to the next candidate (clearing the leader
+/// cache when the pinned leader was the one that failed). In leader-pinned
+/// mode `ServerBusy`/`RequestTimeout` return to the caller rather than
+/// silently downgrading the read to a follower.
 macro_rules! read_route {
     ($pool:expr, $client:ident => $body:expr) => {{
         let pool: &CeleriantPool = $pool;
@@ -91,10 +94,9 @@ macro_rules! read_route {
         if addrs.is_empty() {
             return Err(err_no_addresses());
         }
-        let n = addrs.len();
-        let start = pool.read_counter.fetch_add(1, Ordering::Relaxed) as usize % n;
-        for i in 0..n {
-            let addr = &addrs[(start + i) % n];
+        let to_followers = pool.options.route_reads_to_followers;
+        for (i, addr) in addrs.iter().enumerate() {
+            let pinned_leader = !to_followers && i == 0;
             let node = pool.get_or_create_node(addr);
             match node.get().await {
                 Ok(mut conn) => {
@@ -103,29 +105,46 @@ macro_rules! read_route {
                         Ok(resp) => return Ok(resp),
                         Err(ClientError::ConnectionFailed(_)) => {
                             conn.mark_broken();
+                            if pinned_leader { pool.clear_leader(); }
                             continue;
                         }
                         Err(ClientError::ConnectionTimeout) => {
                             conn.mark_broken();
+                            if pinned_leader { pool.clear_leader(); }
                             continue;
                         }
                         Err(ClientError::WireError(_)) => {
                             conn.mark_broken();
+                            if pinned_leader { pool.clear_leader(); }
                             continue;
                         }
                         Err(ClientError::ReadError(_)) => {
                             conn.mark_broken();
+                            if pinned_leader { pool.clear_leader(); }
                             continue;
                         }
-                        Err(ClientError::RequestTimeout) => {
+                        Err(e @ ClientError::RequestTimeout) => {
                             conn.mark_broken();
-                            continue;
+                            // Last candidate: surface the real error, never
+                            // "all unreachable" the node answered.
+                            if to_followers && i + 1 < addrs.len() { continue; }
+                            return Err(e);
                         }
-                        Err(ClientError::ServerBusy) => continue,
+                        Err(e @ ClientError::ServerBusy) => {
+                            if to_followers && i + 1 < addrs.len() { continue; }
+                            return Err(e);
+                        }
                         Err(e) => return Err(e),
                     }
                 }
-                Err(ClientError::ConnectionFailed(_)) => continue,
+                Err(ClientError::ConnectionFailed(_)) => {
+                    if pinned_leader { pool.clear_leader(); }
+                    continue;
+                }
+                Err(ClientError::ConnectionTimeout) => {
+                    if pinned_leader { pool.clear_leader(); }
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -187,7 +206,9 @@ pub struct PoolOptions {
     /// Idle connection lifetime before eviction (default: 25s).
     /// Keep shorter than server's slow_client_timeout (default 30s).
     pub idle_timeout: Duration,
-    /// When true, reads go only to followers (default: false)
+    /// When true, reads and watch subscriptions go to followers instead of the
+    /// leader; sheds leader load but gives up read-your-writes. If every
+    /// follower fails, the leader serves as last resort (default: false)
     pub route_reads_to_followers: bool,
     /// Maximum number of seed nodes to try during leader failover (default: 3)
     pub max_leader_retries: usize,
@@ -201,8 +222,8 @@ impl Default for PoolOptions {
             tls_config: None,
             identity_config: None,
             max_connections_per_node: 10,
-            connection_timeout: Duration::from_secs(2),
-            request_timeout: Duration::from_secs(2),
+            connection_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(30),
             max_request_size: 10_000_000,
             max_response_size: 64 * 1024 * 1024,
             idle_timeout: Duration::from_secs(25),
@@ -701,6 +722,9 @@ impl CeleriantPool {
 
     /// Create a dedicated non-pooled WatchConnection.
     ///
+    /// Dials the current leader by default; with `route_reads_to_followers`
+    /// it dials a follower to keep subscription load off the leader, falling
+    /// through to the remaining candidates (leader last) on connect failure.
     /// The pool's TLS and identity configuration are applied to the watch
     /// connection, overriding any values set on `options`. The pool's dict
     /// cache is threaded in so the watch stream can decompress ZstdDict responses.
@@ -709,37 +733,64 @@ impl CeleriantPool {
         request: WatchRequest,
         mut options: WatchOptions,
     ) -> Result<WatchConnection, ClientError> {
-        let address = self.primary_address();
         options.tls_config = self.options.tls_config.clone();
         options.identity_config = self.options.identity_config.clone();
+        // Without a dial timeout a black-holed node stalls failover for the
+        // OS TCP timeout; default to the pool's connection timeout.
+        if options.timeout.is_none() {
+            options.timeout = Some(self.options.connection_timeout);
+        }
 
+        let addrs = self.read_addresses();
+        if addrs.is_empty() {
+            return Err(err_no_addresses());
+        }
+        let to_followers = self.options.route_reads_to_followers;
         let known_sha = self.dict_cache.lock().unwrap().last_sha.clone();
-        let dict_cache = Arc::clone(&self.dict_cache);
-        WatchConnection::connect_with_dict(
-            &address,
-            request,
-            options,
-            known_sha,
-            move |sha| dict_cache.lock().unwrap().cache.get(sha).cloned(),
-        ).await
+        for (i, addr) in addrs.iter().enumerate() {
+            let dict_cache = Arc::clone(&self.dict_cache);
+            let result = WatchConnection::connect_with_dict(
+                addr,
+                request.clone(),
+                options.clone(),
+                known_sha.clone(),
+                move |sha| dict_cache.lock().unwrap().cache.get(sha).cloned(),
+            ).await;
+            match result {
+                Ok(conn) => return Ok(conn),
+                Err(ClientError::ConnectionFailed(_) | ClientError::ConnectionTimeout)
+                    if i < addrs.len() - 1 =>
+                {
+                    if !to_followers && i == 0 {
+                        self.clear_leader();
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(err_all_unreachable())
     }
 
     // --- Low-level access ---
 
-    /// Borrow a connection from any read-eligible node.
+    /// Borrow a connection from the read-routing candidate set (leader by default).
     pub async fn get_connection(&self) -> Result<PooledConnection, ClientError> {
         let addrs = self.read_addresses();
         if addrs.is_empty() {
             return Err(err_no_addresses());
         }
-        let n = addrs.len();
-        let start = self.read_counter.fetch_add(1, Ordering::Relaxed) as usize % n;
-        for i in 0..n {
-            let addr = &addrs[(start + i) % n];
+        let to_followers = self.options.route_reads_to_followers;
+        for (i, addr) in addrs.iter().enumerate() {
             let node = self.get_or_create_node(addr);
             match node.get().await {
                 Ok(conn) => return Ok(conn),
-                Err(ClientError::ConnectionFailed(_)) => continue,
+                Err(ClientError::ConnectionFailed(_)) | Err(ClientError::ConnectionTimeout) => {
+                    if !to_followers && i == 0 {
+                        self.clear_leader();
+                    }
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -859,18 +910,57 @@ impl CeleriantPool {
         leader_route!(self, try_addr)
     }
 
-    /// Return addresses eligible for reads, respecting `route_reads_to_followers`.
+    /// Ordered read candidates honoring `route_reads_to_followers`.
+    ///
+    /// Default: cached leader (or primary) first so reads see their own writes;
+    /// the remaining nodes are connection-failure fallback only. Opt-in:
+    /// followers rotated to spread load, then the leader LAST; reached only
+    /// when every follower failed, so a follower outage degrades to leader
+    /// reads instead of a read outage.
     fn read_addresses(&self) -> Vec<String> {
         let all = self.options.all_addresses();
         if !self.options.route_reads_to_followers {
-            return all;
+            let leader = self.current_or_primary_leader();
+            // Unset primary with seed-only config: nothing to pin yet.
+            if leader.is_empty() {
+                return all;
+            }
+            let mut addrs = Vec::with_capacity(all.len() + 1);
+            addrs.push(leader);
+            for a in all {
+                if a != addrs[0] {
+                    addrs.push(a);
+                }
+            }
+            return addrs;
         }
-        // Exclude leader from read candidates.
         let leader = { self.leader_address.read().unwrap().clone() };
-        match leader {
-            Some(ref l) => all.into_iter().filter(|a| a != l).collect(),
-            None => all,
+        let Some(leader) = leader else {
+            let mut candidates = all;
+            if candidates.len() > 1 {
+                let start = self.read_counter.fetch_add(1, Ordering::Relaxed) as usize % candidates.len();
+                candidates.rotate_left(start);
+            }
+            return candidates;
+        };
+        let mut candidates: Vec<String> = all.into_iter().filter(|a| *a != leader).collect();
+        if candidates.len() > 1 {
+            let start = self.read_counter.fetch_add(1, Ordering::Relaxed) as usize % candidates.len();
+            candidates.rotate_left(start);
         }
+        candidates.push(leader);
+        candidates
+    }
+
+    /// Test hook: the address a watch subscription dials first — the leader by
+    /// default, a rotating follower on opt-in. `watch()` itself iterates the
+    /// full candidate list, so this exists only to pin the routing contract.
+    #[cfg(test)]
+    fn watch_address(&self) -> String {
+        self.read_addresses()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| self.primary_address())
     }
 
     fn current_or_primary_leader(&self) -> String {
@@ -881,6 +971,7 @@ impl CeleriantPool {
             .unwrap_or_else(|| self.options.address.clone())
     }
 
+    #[cfg(test)]
     fn primary_address(&self) -> String {
         self.options.address.clone()
     }
@@ -1471,5 +1562,267 @@ mod tests {
         // Verify the first pointer is still returned.
         let found = pool.dict_for_sha("sha1").unwrap();
         assert!(Arc::ptr_eq(&found, &bytes));
+    }
+
+    // Blind-oracle routing tests (session/goal.md contract, authored unseen).
+    #[test]
+    fn oracle_default_no_leader_primary_first_all_known_once() {
+        let pool = CeleriantPool::new(
+            PoolOptions::new("p:1").with_seed_addresses(vec!["b:1".into(), "c:1".into()]),
+        );
+        let addrs = pool.read_addresses();
+        assert_eq!(addrs.first().map(String::as_str), Some("p:1"));
+        assert_eq!(addrs.len(), 3);
+        let uniq: std::collections::HashSet<&String> = addrs.iter().collect();
+        assert_eq!(uniq.len(), 3);
+        for a in ["p:1", "b:1", "c:1"] {
+            assert!(addrs.iter().any(|x| x == a), "missing {a}");
+        }
+    }
+
+    #[test]
+    fn oracle_default_cached_leader_seed_first_primary_later() {
+        let pool = CeleriantPool::new(
+            PoolOptions::new("p:1").with_seed_addresses(vec!["b:1".into(), "c:1".into()]),
+        );
+        pool.update_leader("b:1".into());
+        let addrs = pool.read_addresses();
+        assert_eq!(addrs.first().map(String::as_str), Some("b:1"));
+        // primary is still a fallback candidate, just not first
+        assert!(addrs[1..].iter().any(|x| x == "p:1"));
+        assert_eq!(addrs.len(), 3);
+        let uniq: std::collections::HashSet<&String> = addrs.iter().collect();
+        assert_eq!(uniq.len(), 3);
+    }
+
+    #[test]
+    fn oracle_default_order_stable_across_calls() {
+        let pool = CeleriantPool::new(
+            PoolOptions::new("p:1").with_seed_addresses(vec!["b:1".into(), "c:1".into()]),
+        );
+        pool.update_leader("c:1".into());
+        let first = pool.read_addresses();
+        // default mode pins the leader: no rotation between calls
+        for _ in 0..5 {
+            assert_eq!(pool.read_addresses(), first);
+        }
+    }
+
+    #[test]
+    fn oracle_default_watch_leader_else_primary() {
+        let pool = CeleriantPool::new(
+            PoolOptions::new("p:1").with_seed_addresses(vec!["b:1".into()]),
+        );
+        assert_eq!(pool.watch_address(), "p:1");
+        pool.update_leader("b:1".into());
+        assert_eq!(pool.watch_address(), "b:1");
+    }
+
+    #[test]
+    fn oracle_default_clear_leader_reverts_to_primary_first() {
+        let pool = CeleriantPool::new(
+            PoolOptions::new("p:1").with_seed_addresses(vec!["b:1".into(), "c:1".into()]),
+        );
+        pool.update_leader("b:1".into());
+        pool.clear_leader();
+        let addrs = pool.read_addresses();
+        assert_eq!(addrs.first().map(String::as_str), Some("p:1"));
+        assert_eq!(pool.watch_address(), "p:1");
+    }
+
+    #[test]
+    fn oracle_default_second_update_wins() {
+        let pool = CeleriantPool::new(
+            PoolOptions::new("p:1").with_seed_addresses(vec!["b:1".into(), "c:1".into()]),
+        );
+        pool.update_leader("b:1".into());
+        pool.update_leader("c:1".into());
+        let addrs = pool.read_addresses();
+        assert_eq!(addrs.first().map(String::as_str), Some("c:1"));
+        assert_eq!(pool.watch_address(), "c:1");
+    }
+
+    #[test]
+    fn oracle_default_unknown_leader_goes_first_knowns_follow() {
+        let pool = CeleriantPool::new(
+            PoolOptions::new("p:1").with_seed_addresses(vec!["b:1".into()]),
+        );
+        pool.update_leader("x:9".into());
+        let addrs = pool.read_addresses();
+        // cached leader leads even when outside the known set; knowns remain fallbacks
+        assert_eq!(addrs.first().map(String::as_str), Some("x:9"));
+        for a in ["p:1", "b:1"] {
+            assert_eq!(addrs.iter().filter(|x| *x == a).count(), 1, "{a} once");
+        }
+        assert_eq!(pool.watch_address(), "x:9");
+    }
+
+    #[test]
+    fn oracle_optin_leader_present_but_last() {
+        let pool = CeleriantPool::new(
+            PoolOptions::new("p:1")
+                .with_seed_addresses(vec!["b:1".into(), "c:1".into()])
+                .with_route_reads_to_followers(true),
+        );
+        pool.update_leader("p:1".into());
+        // amendment 2: leader is a candidate again, but only as last resort
+        let addrs = pool.read_addresses();
+        assert_eq!(addrs.last().map(String::as_str), Some("p:1"));
+        assert_eq!(addrs.iter().filter(|x| *x == "p:1").count(), 1);
+        for a in ["b:1", "c:1"] {
+            assert_eq!(addrs[..addrs.len() - 1].iter().filter(|x| *x == a).count(), 1, "{a} once before leader");
+        }
+        assert_eq!(addrs.len(), 3);
+    }
+
+    #[test]
+    fn oracle_optin_no_leader_all_known_candidates() {
+        let pool = CeleriantPool::new(
+            PoolOptions::new("p:1")
+                .with_seed_addresses(vec!["b:1".into(), "c:1".into()])
+                .with_route_reads_to_followers(true),
+        );
+        let addrs = pool.read_addresses();
+        assert_eq!(addrs.len(), 3);
+        for a in ["p:1", "b:1", "c:1"] {
+            assert_eq!(addrs.iter().filter(|x| *x == a).count(), 1, "{a} once");
+        }
+    }
+
+    #[test]
+    fn oracle_optin_rotation_covers_all_followers() {
+        let pool = CeleriantPool::new(
+            PoolOptions::new("p:1")
+                .with_seed_addresses(vec!["b:1".into(), "c:1".into(), "d:1".into()])
+                .with_route_reads_to_followers(true),
+        );
+        pool.update_leader("p:1".into());
+        let mut firsts = std::collections::HashSet::new();
+        for _ in 0..12 {
+            let addrs = pool.read_addresses();
+            // leader never leads, always closes the list
+            assert_ne!(addrs[0], "p:1");
+            assert_eq!(addrs.last().map(String::as_str), Some("p:1"));
+            firsts.insert(addrs[0].clone());
+        }
+        // load spread: every follower must lead the list eventually
+        for a in ["b:1", "c:1", "d:1"] {
+            assert!(firsts.contains(a), "{a} never first");
+        }
+    }
+
+    #[test]
+    fn oracle_optin_watch_never_leader_and_rotates() {
+        let pool = CeleriantPool::new(
+            PoolOptions::new("p:1")
+                .with_seed_addresses(vec!["b:1".into(), "c:1".into()])
+                .with_route_reads_to_followers(true),
+        );
+        pool.update_leader("p:1".into());
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            let w = pool.watch_address();
+            assert_ne!(w, "p:1", "watch must avoid the leader");
+            seen.insert(w);
+        }
+        assert!(seen.contains("b:1") && seen.contains("c:1"), "watch must rotate followers");
+    }
+
+    #[test]
+    fn oracle_optin_watch_no_followers_falls_back() {
+        let pool = CeleriantPool::new(
+            PoolOptions::new("p:1").with_route_reads_to_followers(true),
+        );
+        pool.update_leader("p:1".into());
+        // amendment 2: no followers means the leader itself is the sole candidate
+        assert_eq!(pool.watch_address(), "p:1");
+    }
+
+    #[test]
+    fn oracle_optin_single_node_leader_read_addresses_safe() {
+        let pool = CeleriantPool::new(
+            PoolOptions::new("p:1").with_route_reads_to_followers(true),
+        );
+        pool.update_leader("p:1".into());
+        // amendment 2: single node that is the leader => exactly [leader], never empty
+        assert_eq!(pool.read_addresses(), vec!["p:1".to_string()]);
+    }
+
+    #[test]
+    fn oracle_optin_clear_leader_restores_rotation() {
+        let pool = CeleriantPool::new(
+            PoolOptions::new("p:1")
+                .with_seed_addresses(vec!["b:1".into(), "c:1".into()])
+                .with_route_reads_to_followers(true),
+        );
+        pool.update_leader("b:1".into());
+        // while cached, b:1 is pinned to the tail and never leads
+        for _ in 0..6 {
+            let addrs = pool.read_addresses();
+            assert_ne!(addrs[0], "b:1");
+            assert_eq!(addrs.last().map(String::as_str), Some("b:1"));
+        }
+        pool.clear_leader();
+        // no leader cached: all nodes rotate, b:1 leads again eventually
+        let mut firsts = std::collections::HashSet::new();
+        for _ in 0..12 {
+            let addrs = pool.read_addresses();
+            assert_eq!(addrs.len(), 3);
+            firsts.insert(addrs[0].clone());
+        }
+        assert!(firsts.contains("b:1"), "b:1 never first after clear");
+    }
+
+    #[test]
+    fn oracle_optin_only_latest_leader_last() {
+        let pool = CeleriantPool::new(
+            PoolOptions::new("p:1")
+                .with_seed_addresses(vec!["b:1".into(), "c:1".into()])
+                .with_route_reads_to_followers(true),
+        );
+        pool.update_leader("b:1".into());
+        pool.update_leader("c:1".into());
+        let addrs = pool.read_addresses();
+        // only the latest leader takes the tail; the prior one rejoins the followers
+        assert_eq!(addrs.last().map(String::as_str), Some("c:1"));
+        assert_eq!(addrs.iter().filter(|x| *x == "c:1").count(), 1);
+        for a in ["b:1", "p:1"] {
+            assert_eq!(addrs[..addrs.len() - 1].iter().filter(|x| *x == a).count(), 1, "{a} once before leader");
+        }
+        assert_eq!(addrs.len(), 3);
+    }
+
+    #[test]
+    fn oracle_optin_offlist_leader_still_last() {
+        let pool = CeleriantPool::new(
+            PoolOptions::new("p:1")
+                .with_seed_addresses(vec!["b:1".into()])
+                .with_route_reads_to_followers(true),
+        );
+        pool.update_leader("x:9".into());
+        // a cached leader outside the seed set is still the last-resort candidate
+        let addrs = pool.read_addresses();
+        assert_eq!(addrs.last().map(String::as_str), Some("x:9"));
+        assert_eq!(addrs.iter().filter(|x| *x == "x:9").count(), 1);
+        for a in ["p:1", "b:1"] {
+            assert_eq!(addrs[..addrs.len() - 1].iter().filter(|x| *x == a).count(), 1, "{a} once before leader");
+        }
+        assert_eq!(addrs.len(), 3);
+    }
+
+    #[test]
+    fn oracle_optin_leader_is_last_resort() {
+        let pool = CeleriantPool::new(
+            PoolOptions::new("p:1")
+                .with_seed_addresses(vec!["b:1".into(), "c:1".into()])
+                .with_route_reads_to_followers(true),
+        );
+        pool.update_leader("p:1".into());
+        // every call: a follower opens the list, the leader closes it
+        for _ in 0..8 {
+            let addrs = pool.read_addresses();
+            assert!(addrs[0] == "b:1" || addrs[0] == "c:1", "got {addrs:?}");
+            assert_eq!(addrs.last().map(String::as_str), Some("p:1"));
+        }
     }
 }

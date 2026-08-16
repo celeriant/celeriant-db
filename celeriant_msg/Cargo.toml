@@ -1,6 +1,8 @@
 [package]
 name = "celeriant_msg"
-description = "Internal: request/response message types for the Celeriant wire protocol"
+description = "Request/response message types for the Celeriant wire protocol"
+keywords = ["event-sourcing", "database", "eventstore", "celeriant"]
+categories = ["database"]
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

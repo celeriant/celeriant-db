@@ -19,10 +19,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build client crates
-        run: cargo build --release -p celeriant_wal -p celeriant_crypto -p celeriant_wire -p celeriant_msg -p celeriant_client_tokio
+        run: cargo build --release -p celeriant_wal -p celeriant_crypto -p celeriant_wire -p celeriant_msg -p celeriant_client_wire -p celeriant_client_tokio
 
       - name: Test client crates
-        run: cargo test -p celeriant_wal -p celeriant_crypto -p celeriant_wire -p celeriant_msg -p celeriant_client_tokio
+        run: cargo test -p celeriant_wal -p celeriant_crypto -p celeriant_wire -p celeriant_msg -p celeriant_client_wire -p celeriant_client_tokio
 
   publish:
     runs-on: ubuntu-latest
@@ -37,9 +37,12 @@ jobs:
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        # Topological order; cargo waits for each publish to be available before
+        # returning, so the next crate's verify build can resolve it.
         run: |
-          cargo publish -p celeriant_wal --no-verify
-          cargo publish -p celeriant_crypto --no-verify
-          cargo publish -p celeriant_wire --no-verify
-          cargo publish -p celeriant_msg --no-verify
-          cargo publish -p celeriant_client_tokio --no-verify
+          cargo publish -p celeriant_wal
+          cargo publish -p celeriant_crypto
+          cargo publish -p celeriant_wire
+          cargo publish -p celeriant_msg
+          cargo publish -p celeriant_client_wire
+          cargo publish -p celeriant_client_tokio
