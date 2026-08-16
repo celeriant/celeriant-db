@@ -39,10 +39,17 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         # Topological order; cargo waits for each publish to be available before
         # returning, so the next crate's verify build can resolve it.
+        # Idempotent: already-published versions are skipped, so a re-dispatch
+        # after a mid-chain failure (e.g. the new-crate rate limit) resumes
+        # where the previous run stopped.
         run: |
-          cargo publish -p celeriant_wal
-          cargo publish -p celeriant_crypto
-          cargo publish -p celeriant_wire
-          cargo publish -p celeriant_msg
-          cargo publish -p celeriant_client_wire
-          cargo publish -p celeriant_client_tokio
+          set -u
+          for crate in celeriant_wal celeriant_crypto celeriant_wire celeriant_msg celeriant_client_wire celeriant_client_tokio; do
+            out=$(cargo publish -p "$crate" 2>&1) && { echo "published $crate"; continue; }
+            echo "$out"
+            if echo "$out" | grep -q "already exists"; then
+              echo "$crate already published, skipping"
+            else
+              exit 1
+            fi
+          done
