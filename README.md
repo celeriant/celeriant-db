@@ -8,6 +8,7 @@ await pool.WriteAsync(key, [event], expectedVersion: version);
 
 // you can do atomic, cross-aggregate writes with optimistic concurrency control
 await pool.WriteAsync(new WriteRequest {
+    ClientId = clientId,
     Writes = new() {
         [from] = new() { Events = [withdrawn], ExpectedVersion = fromVersion },
         [to]   = new() { Events = [deposited], ExpectedVersion = toVersion },
