@@ -205,6 +205,7 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 - Replication port always requires mTLS (`ClientAuthMode::Require`, hardcoded). Client port mTLS is configurable (default: `Require`).
 - kTLS (kernel TLS offload) is used for all connections. Session tickets are prohibited - they desync kernel TLS sequence counters. kTLS support is verified at startup.
 - TLS handshake has a 10-second timeout and 128KB buffer cap.
+- The handshake path must complete in bounded time for any byte sequence a peer sends, torn trailing record included. That timeout is not a backstop: a non-yielding poll starves it along with every other task on the executor, freezing the shard core.
 - All certs use ECDSA P-256. CA certs have `pathLen:0`. Node certs carry both `serverAuth` and `clientAuth` EKU. Client certs carry only `clientAuth`.
 - API keys are stored as SHA-256 hashes only; raw keys are never stored server-side. Comparison is constant-time.
 - Four API key slots: two ReadWrite, two ReadOnly. `ReadOnly` blocks write/delete/trim/schema operations.

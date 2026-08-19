@@ -149,10 +149,17 @@ impl CeleriantClient {
 
         let stream = match tls_config {
             None => stream,
-            Some(cfg) => ktls_connect(stream, cfg.client_config, cfg.server_name)
-                .await
-                .map_err(ClientError::KtlsError)?
-                .0,
+            Some(cfg) => {
+                let (stream, trailing) = ktls_connect(stream, cfg.client_config, cfg.server_name)
+                    .await
+                    .map_err(ClientError::KtlsError)?;
+                debug_assert!(
+                    trailing.is_empty(),
+                    "DROPPED DATA from celeriant! sent {} bytes before first request",
+                    trailing.len()
+                );
+                stream
+            }
         };
 
         Ok(Self {

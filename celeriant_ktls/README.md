@@ -40,6 +40,8 @@ Post-Handshake:                 ▼
 - TLS 1.3 is the only permitted version. No fallback.
 - Session tickets are prohibited. They desync kernel TLS sequence counters.
 - Trailing bytes from the handshake must be processed before reading from the kernel-encrypted stream. Dropping them silently loses application data.
+- `ktls_accept` and `ktls_connect` return in bounded time for any byte sequence a peer sends. A handshake that never yields starves every task on that executor, the caller's own timeout included.
+- The post-handshake drain reads no further than the end of the one partially received record. Trailing bytes are bounded by the resident buffer plus one record. Everything past that stays in the kernel where kTLS decrypts it.
 - kTLS support is verified at startup via `setsockopt` probe. Fatal if missing.
 - Handshake buffer is capped at 128KB. Prevents unbounded allocation from oversized handshake messages.
 - All `unsafe` blocks are limited to Linux system calls. No pointer arithmetic, no aliasing.
@@ -48,7 +50,7 @@ Post-Handshake:                 ▼
 
 | Type | Purpose |
 |------|---------|
-| `KtlsError` | Error enum covering TLS, I/O, kernel support, cipher, and setsockopt failures |
+| `KtlsError` | Error enum covering TLS, I/O, kernel support, cipher, setsockopt, and post-handshake drain failures |
 
 ## Key Functions
 
@@ -106,6 +108,10 @@ TCP buffer: [handshake records | app data records]
 ```
 
 During the handshake, `TcpStream::read` may pull application data records into the userspace buffer alongside the final handshake flight. Rustls decrypts these records, but kernel TLS hasn't been installed yet so the kernel doesn't know about them. These bytes are collected and returned as `trailing_bytes`. The caller must process them before reading from the now-kernel-encrypted stream.
+
+That last record is often torn. TCP splits the peer's first application-data record across segments, so the handshake finishes holding a record header that promises more bytes than have arrived. Leaving them to the kernel does not work: userspace already consumed the record's head, and kTLS picks up at the next record boundary it sees. The drain reads the remainder itself and stops at that record's last byte.
+
+A peer that never sends the remainder gets `KtlsError::TrailingRecordTimeout` after `DRAIN_DEADLINE` (5s). The deadline guards against a slow dribble, nothing more. The size bound comes from the sized read, not the clock.
 
 ### Session tickets disabled for internode connections
 

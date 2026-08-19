@@ -1,12 +1,13 @@
 use std::mem::size_of;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use glommio::net::TcpStream;
 use rustls::ConnectionTrafficSecrets;
-use rustls::client::UnbufferedClientConnection;
-use rustls::server::UnbufferedServerConnection;
+use rustls::client::{ClientConnectionData, UnbufferedClientConnection};
+use rustls::server::{ServerConnectionData, UnbufferedServerConnection};
 use rustls::unbuffered::{ConnectionState, EncodeError, UnbufferedStatus};
 use rustls_pki_types::ServerName;
 use tracing::debug;
@@ -15,6 +16,10 @@ use tracing::debug;
 /// 16KB + 5-byte header, so 128KB gives ample room for multi-record flights
 /// while preventing unbounded allocation from malicious peers.
 const MAX_HANDSHAKE_BUF: usize = 128 * 1024; // 131_072 bytes
+
+/// Can't wait forever for a split application-data record. 
+/// Anything over this just gets its connection killed
+const DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 
 // Linux kTLS ULP constants
 const SOL_TCP: libc::c_int = 6;
@@ -69,6 +74,8 @@ pub enum KtlsError {
     UnsupportedCipher,
     HandshakeIncomplete,
     SetsockoptFailed(std::io::Error),
+    TrailingRecordTimeout,
+    NoProgress,
 }
 
 impl From<rustls::Error> for KtlsError {
@@ -98,6 +105,11 @@ impl std::fmt::Display for KtlsError {
             Self::UnsupportedCipher => write!(f, "unsupported TLS cipher suite for kTLS"),
             Self::HandshakeIncomplete => write!(f, "TLS handshake incomplete"),
             Self::SetsockoptFailed(e) => write!(f, "setsockopt failed: {e}"),
+            Self::TrailingRecordTimeout => write!(
+                f,
+                "timed out waiting for the rest of a partial TLS record after handshake"
+            ),
+            Self::NoProgress => write!(f, "TLS connection state cannot be advanced"),
         }
     }
 }
@@ -153,6 +165,15 @@ pub fn verify_ktls_support() -> Result<(), KtlsError> {
         Err(KtlsError::KernelNotSupported)
     }
 }
+
+#[cfg(test)]
+mod drain_contract_tests;
+
+#[cfg(test)]
+mod review_evidence_tests;
+
+#[cfg(test)]
+mod accept_bounded_completion;
 
 #[cfg(test)]
 mod tests {
@@ -217,7 +238,7 @@ mod tests {
     /// Generate a self-signed CA + node certificate for testing.
     /// Returns (ServerConfig, ClientConfig) with secret extraction enabled
     /// and session tickets disabled (required for kTLS-to-kTLS).
-    fn test_tls_configs() -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
+    pub(crate) fn test_tls_configs() -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
         use rcgen::{CertificateParams, Issuer, KeyPair};
         use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
@@ -272,7 +293,7 @@ mod tests {
     #[test]
     fn test_ktls_connect_accept_roundtrip() {
         let _ = tracing_subscriber::fmt()
-            .with_env_filter("debug")
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .try_init();
 
         if verify_ktls_support().is_err() {
@@ -359,34 +380,170 @@ pub async fn ktls_connect(
     Ok((stream, trailing))
 }
 
-/// Drain any remaining TLS records from the incoming buffer after the handshake
-/// completes. Extracts decrypted application data into `trailing`.
-macro_rules! drain_remaining_records {
-    ($conn:expr, $incoming:expr, $incoming_filled:expr, $outgoing:expr, $stream:expr, $trailing:expr) => {
-        while $incoming_filled > 0 {
-            let UnbufferedStatus { discard: d, state: s } =
-                $conn.process_tls_records(&mut $incoming[..$incoming_filled]);
-            let encode = match s? {
-                ConnectionState::EncodeTlsData(mut etd) => {
-                    let n = etd.encode(&mut $outgoing)?;
-                    Some(n)
-                }
-                ConnectionState::TransmitTlsData(ttd) => { ttd.done(); None }
-                ConnectionState::WriteTraffic(_) => None,
-                ConnectionState::ReadTraffic(mut rt) => {
-                    while let Some(Ok(record)) = rt.next_record() {
-                        $trailing.extend_from_slice(record.payload);
-                    }
-                    None
-                }
-                _ => { drain_discard(&mut $incoming, &mut $incoming_filled, d); break; }
-            };
-            drain_discard(&mut $incoming, &mut $incoming_filled, d);
-            if let Some(n) = encode {
-                $stream.write_all(&$outgoing[..n]).await?;
-            }
+/// rustls exposes `process_tls_records` on two separate inherent impls, one per
+/// connection data type. Naming it in a trait lets server and client share one
+/// drain implementation instead of a macro expanded per call site.
+trait ProcessRecords {
+    type Data;
+    fn process_records<'c, 'i>(
+        &'c mut self,
+        incoming: &'i mut [u8],
+    ) -> UnbufferedStatus<'c, 'i, Self::Data>;
+}
+
+impl ProcessRecords for UnbufferedServerConnection {
+    type Data = ServerConnectionData;
+    fn process_records<'c, 'i>(
+        &'c mut self,
+        incoming: &'i mut [u8],
+    ) -> UnbufferedStatus<'c, 'i, Self::Data> {
+        self.process_tls_records(incoming)
+    }
+}
+
+impl ProcessRecords for UnbufferedClientConnection {
+    type Data = ClientConnectionData;
+    fn process_records<'c, 'i>(
+        &'c mut self,
+        incoming: &'i mut [u8],
+    ) -> UnbufferedStatus<'c, 'i, Self::Data> {
+        self.process_tls_records(incoming)
+    }
+}
+
+/// Keep pulling bytes off the wire even after the handshake is done
+/// TCP can split app data records across multiple segments so we gotta loop
+/// If don't pull the whole byte block for the entire record kTLS will send
+/// our connection layer the second half and it's fail deserialisation
+/// every iteration either consumes bytes, advances connection state, awaits a read, or returns
+async fn drain_remaining_records<C: ProcessRecords>(
+    conn: &mut C,
+    stream: &mut TcpStream,
+    incoming: &mut Vec<u8>,
+    incoming_filled: &mut usize,
+    outgoing: &mut [u8],
+    trailing: &mut Vec<u8>,
+) -> Result<(), KtlsError> {
+    let deadline = Instant::now() + DRAIN_DEADLINE;
+
+    while *incoming_filled > 0 {
+        if Instant::now() >= deadline {
+            return Err(KtlsError::TrailingRecordTimeout);
         }
-    };
+
+        let UnbufferedStatus { discard, state } =
+            conn.process_records(&mut incoming[..*incoming_filled]);
+
+        let mut encoded = None;
+        let advanced = match state? {
+            ConnectionState::EncodeTlsData(mut etd) => {
+                encoded = Some(etd.encode(outgoing)?);
+                true
+            }
+            ConnectionState::TransmitTlsData(ttd) => {
+                ttd.done();
+                true
+            }
+            ConnectionState::ReadTraffic(mut rt) => {
+                while let Some(record) = rt.next_record() {
+                    let record = record?;
+                    // rustls decrypts out-of-place today and always reports 0. A
+                    // future in-place variant would need the payload copied out
+                    // before discarding, so trip here rather than corrupt.
+                    debug_assert_eq!(record.discard, 0, "rustls reported a per-record discard");
+                    trailing.extend_from_slice(record.payload);
+                }
+                true
+            }
+            // Handshake done but some bytes left over, let rustls continue waiting on the rest
+            ConnectionState::WriteTraffic(_) | ConnectionState::BlockedHandshake => false,
+            ConnectionState::PeerClosed | ConnectionState::Closed => break,
+            // Other states like 0-RTT data, which the handshake loop has already
+            // drained by the time we get here, plus any future rustls states added in new versions
+            _ => return Err(KtlsError::NoProgress),
+        };
+
+        drain_discard(incoming, incoming_filled, discard);
+        if let Some(n) = encoded {
+            stream.write_all(&outgoing[..n]).await?;
+        }
+        if advanced || discard > 0 {
+            continue;
+        }
+
+        // Nothing moved. If the pending record is already whole, more bytes
+        // cannot help; rustls simply will not act on it.
+        let want = want_for_pending_record(incoming, *incoming_filled);
+        if want == 0 {
+            return Err(KtlsError::NoProgress);
+        }
+        read_more_bounded(deadline, stream, incoming, incoming_filled, want).await?;
+    }
+
+    Ok(())
+}
+
+/// Bytes still missing before `buf[..filled]` holds one whole TLS record.
+/// `buf[0]` is a record boundary; `drain_discard` compacts consumed records
+/// away; so this describes the record the drain is currently stuck on.
+///
+/// A record is a 5-byte header plus a body whose length is bytes 3..5 of the
+/// header, big-endian. While the header itself is torn the body length is not
+/// yet knowable, so only the header's remainder is asked for; the next call,
+/// with the header complete, asks for the body. Zero means the record is whole.
+#[inline]
+fn want_for_pending_record(buf: &[u8], filled: usize) -> usize {
+    const HEADER: usize = 5;
+    if filled < HEADER {
+        return HEADER - filled;
+    }
+    let body = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+    (HEADER + body).saturating_sub(filled)
+}
+
+/// Await more bytes of the one record left half-received by the handshake,
+/// bounded by `deadline`. The read stops at that record's last byte (`want`),
+/// so the drain can never pull a following record out of the kernel's reach and
+/// into `trailing`. Awaiting is the point: it hands the executor back so its
+/// timers; including the caller's own handshake timeout; keep running.
+async fn read_more_bounded(
+    deadline: Instant,
+    stream: &mut TcpStream,
+    incoming: &mut Vec<u8>,
+    incoming_filled: &mut usize,
+    want: usize,
+) -> Result<(), KtlsError> {
+    let now = Instant::now();
+    if now >= deadline {
+        return Err(KtlsError::TrailingRecordTimeout);
+    }
+
+    let start = *incoming_filled;
+    let need = start + want;
+    // need is 5 + a u16 body length, so at most 65_540; always under MAX_HANDSHAKE_BUF.
+    if need > incoming.len() {
+        incoming.resize(need, 0);
+    }
+
+    let read = glommio::timer::timeout(deadline - now, async {
+        Ok::<_, glommio::GlommioError<()>>(stream.read(&mut incoming[start..need]).await)
+    })
+    .await;
+
+    match read {
+        Ok(inner) => {
+            let n = inner?;
+            if n == 0 {
+                return Err(KtlsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed with a partial TLS record after handshake",
+                )));
+            }
+            *incoming_filled = start + n;
+            Ok(())
+        }
+        Err(_) => Err(KtlsError::TrailingRecordTimeout),
+    }
 }
 
 async fn drive_handshake_server(
@@ -429,12 +586,14 @@ async fn drive_handshake_server(
                 // once kTLS is installed, the kernel can't see bytes that were
                 // already consumed from the TCP receive buffer by userspace.
                 let mut trailing = Vec::new();
-                while let Some(Ok(record)) = rt.next_record() {
+                while let Some(record) = rt.next_record() {
+                    let record = record?;
+                    debug_assert_eq!(record.discard, 0, "rustls reported a per-record discard");
                     trailing.extend_from_slice(record.payload);
                 }
                 drop(rt);
                 drain_discard(&mut incoming, &mut incoming_filled, discard);
-                drain_remaining_records!(conn, incoming, incoming_filled, outgoing, stream, trailing);
+                drain_remaining_records(&mut conn, stream, &mut incoming, &mut incoming_filled, &mut outgoing, &mut trailing).await?;
                 debug!(incoming_filled, trailing_bytes = trailing.len(), "server: extracting kernel connection");
                 return Ok((conn.dangerous_into_kernel_connection()?.0, trailing));
             }
@@ -442,13 +601,22 @@ async fn drive_handshake_server(
             ConnectionState::WriteTraffic(_) => {
                 let mut trailing = Vec::new();
                 drain_discard(&mut incoming, &mut incoming_filled, discard);
-                drain_remaining_records!(conn, incoming, incoming_filled, outgoing, stream, trailing);
+                drain_remaining_records(&mut conn, stream, &mut incoming, &mut incoming_filled, &mut outgoing, &mut trailing).await?;
                 debug!(incoming_filled, trailing_bytes = trailing.len(), "server: extracting kernel connection");
                 return Ok((conn.dangerous_into_kernel_connection()?.0, trailing));
             }
 
             ConnectionState::ReadEarlyData(mut red) => {
-                while red.next_record().is_some() {}
+                // The state promises at least one 0-RTT record. Consuming none
+                // would leave the loop re-parsing the same bytes without ever
+                // reading or exiting.
+                let mut any = false;
+                while red.next_record().is_some() {
+                    any = true;
+                }
+                if !any {
+                    return Err(KtlsError::NoProgress);
+                }
             }
 
             ConnectionState::PeerClosed | ConnectionState::Closed => {
@@ -501,12 +669,14 @@ async fn drive_handshake_client(
 
             ConnectionState::ReadTraffic(mut rt) => {
                 let mut trailing = Vec::new();
-                while let Some(Ok(record)) = rt.next_record() {
+                while let Some(record) = rt.next_record() {
+                    let record = record?;
+                    debug_assert_eq!(record.discard, 0, "rustls reported a per-record discard");
                     trailing.extend_from_slice(record.payload);
                 }
                 drop(rt);
                 drain_discard(&mut incoming, &mut incoming_filled, discard);
-                drain_remaining_records!(conn, incoming, incoming_filled, outgoing, stream, trailing);
+                drain_remaining_records(&mut conn, stream, &mut incoming, &mut incoming_filled, &mut outgoing, &mut trailing).await?;
                 debug!(incoming_filled, trailing_bytes = trailing.len(), "client: extracting kernel connection");
                 return Ok((conn.dangerous_into_kernel_connection()?.0, trailing));
             }
@@ -514,7 +684,7 @@ async fn drive_handshake_client(
             ConnectionState::WriteTraffic(_) => {
                 let mut trailing = Vec::new();
                 drain_discard(&mut incoming, &mut incoming_filled, discard);
-                drain_remaining_records!(conn, incoming, incoming_filled, outgoing, stream, trailing);
+                drain_remaining_records(&mut conn, stream, &mut incoming, &mut incoming_filled, &mut outgoing, &mut trailing).await?;
                 debug!(incoming_filled, trailing_bytes = trailing.len(), "client: extracting kernel connection");
                 return Ok((conn.dangerous_into_kernel_connection()?.0, trailing));
             }
@@ -533,12 +703,17 @@ async fn drive_handshake_client(
     }
 }
 
+/// Compact the consumed prefix out of `buf`, leaving the next record at offset 0.
+///
+/// `buf.len()` is the read window and must never change here: only `filled`
+/// tracks how much of it holds data. Shrinking the window would eventually make
+/// `buf[filled..]` empty, turning the next read into a false EOF.
 #[inline]
-fn drain_discard(buf: &mut Vec<u8>, filled: &mut usize, discard: usize) {
+fn drain_discard(buf: &mut [u8], filled: &mut usize, discard: usize) {
     if discard > 0 {
         debug_assert!(discard <= *filled, "rustls asked to discard more than filled");
         let discard = discard.min(*filled);
-        buf.drain(..discard);
+        buf.copy_within(discard..*filled, 0);
         *filled -= discard;
     }
 }
