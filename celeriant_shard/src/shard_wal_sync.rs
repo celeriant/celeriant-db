@@ -21,7 +21,7 @@ use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_wal::constants::{self, EntryHashBytes, FIRST_AGGREGATE_VERSION, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, MIN_WRITE_ALIGNMENT, WIRE_VERSION_SEGMENT_SUMMARY_BLOCK, WIRE_VERSION_WAL_METABLOCK};
 use celeriant_wire::codec::compression::DictCodec;
 
-use celeriant_wal::aggregate_client_key::client_id_bloom_hash;
+use celeriant_wal::aggregate_client_key::{AggregateClientKey, client_id_bloom_hash};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::metablocks::metablock::Metablock;
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
@@ -246,6 +246,16 @@ fn commit_sync(
 
         match &queue_item.metablock.wal_metablock_type {
             MetablockKind::EventBatchMetadata(event_batch_metadata) => {
+                // For follower to keep track of latest client_seq. Leader tracks it pre-fsync
+                if commit_target != CommitTarget::DeferToReplicationAck && event_batch_metadata.max_client_seq > 0 {
+                    shard_mem_cache.merge_aggregate_client_seq_max(
+                        AggregateClientKey::new(event_batch_metadata.aggregate_key.clone(), event_batch_metadata.client_id),
+                        event_batch_metadata.max_client_seq,
+                        queue_item.metablock.wal_seq,
+                    );
+                    metrics::counter!("celeriant_client_seq_merge_on_apply_total").increment(1);
+                }
+
                 match commit_target {
                     CommitTarget::FullCommit => {
                         event_collector.add_write_event(event_batch_metadata);
@@ -1344,3 +1354,4 @@ use glommio::{LocalExecutorBuilder, Placement};
         });
     }
 }
+

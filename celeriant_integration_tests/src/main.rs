@@ -240,6 +240,7 @@ async fn dispatch_test(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         "compaction_standalone" => compaction_standalone::run().await,
         "bug_kick_after_restart" => bug_kick_after_restart::run().await,
         "connection_test" => connection_test::run().await,
+        "debug_client_seq_dedup_across_promotion" => debug_client_seq_dedup_across_promotion::run().await,
         "debug_demotion_cull_acked_loss" => debug_demotion_cull_acked_loss::run().await,
         "debug_follower_pressure" => debug_follower_pressure::run().await,
         "stale_lease_restart_split_brain" => stale_lease_restart_split_brain::run().await,

@@ -711,6 +711,17 @@ impl<V: Validate> ShardMemCache<V> {
         );
     }
 
+    /// Record `client_seq` for a client on aggregate. Does max-merge
+    pub fn merge_aggregate_client_seq_max(&mut self, aggregate_client_key: AggregateClientKey, client_seq: u64, wal_seq: u64) {
+        if let Some(existing) = self.aggregate_write_client_snapshots.get_mut(&aggregate_client_key) {
+            if client_seq > existing.0 {
+                *existing = (client_seq, wal_seq);
+            }
+        } else {
+            self.aggregate_write_client_snapshots.put(aggregate_client_key, (client_seq, wal_seq));
+        }
+    }
+
     pub fn put_aggregate_into_cache_as_deleted(
         &mut self,
         aggregate_key: AggregateKey,
@@ -907,14 +918,7 @@ impl<V: Validate> ShardMemCache<V> {
             // (wal_seq > read cursor) from durable.
             let batch_wal_seq = queue_positions.wal_seq;
             for (client_id, client_seq) in queue_positions.client_seqes {
-                let client_key = AggregateClientKey::new(key.clone(), client_id);
-                if let Some(existing) = self.aggregate_write_client_snapshots.get_mut(&client_key) {
-                    if client_seq > existing.0 {
-                        *existing = (client_seq, batch_wal_seq);
-                    }
-                } else {
-                    self.aggregate_write_client_snapshots.put(client_key, (client_seq, batch_wal_seq));
-                }
+                self.merge_aggregate_client_seq_max(AggregateClientKey::new(key.clone(), client_id), client_seq, batch_wal_seq);
             }
 
             // Clean up queue entry only if it hasn't been updated by a newer write.

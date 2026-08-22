@@ -64,6 +64,7 @@ pub mod invariant_replication_convergence;
 pub mod invariant_replication_queue_pressure;
 pub mod invariant_s3_fallback_dedup;
 pub mod leader_read_visibility;
+pub mod debug_client_seq_dedup_across_promotion;
 pub mod debug_demotion_cull_acked_loss;
 pub mod metamorphic_common;
 pub mod metamorphic_cull_parity;

@@ -1021,6 +1021,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             distributed: true,
         },
         TestEntry {
+            name: "debug_client_seq_dedup_across_promotion",
+            description: "a replayed (client_id, client_seq) whose original is already durable must not be re-committed by the node that promotes",
+            estimated_secs: 120,
+            categories: &[Debug, Correctness],
+            distributed: true,
+        },
+        TestEntry {
             name: "debug_demotion_cull_acked_loss",
             description: "Fence-bounce demotion cull rewinds past peer-acked entries; reconciliation probe must re-supply them before the leader dies",
             estimated_secs: 100,
