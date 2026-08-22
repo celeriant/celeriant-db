@@ -35,7 +35,7 @@ pub struct Metablock {
     /// segment file (0 = none). Node-local like datablock_position, excluded from
     /// the hash chain; lets the reverse scan skip foreign metablocks.
     pub previous_aggregate_metablock_pos: u64,
-    /// Different types of fixed 512 byte metablocks
+    /// Payload variant of this metablock. The whole block is FIXED_BLOCK_SIZE_BYTES
     pub wal_metablock_type: MetablockKind,
     /// Type of datablock linked to this metablock, if any
     pub datablock: DatablockStorageKind,

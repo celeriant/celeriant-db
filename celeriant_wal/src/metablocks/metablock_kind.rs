@@ -9,7 +9,7 @@ use crate::metablocks::{
 };
 
 /// Different kinds of WAL metablocks
-/// All metablocks are fixed size 512 byte blocks
+/// All metablocks are fixed size FIXED_BLOCK_SIZE_BYTES blocks
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, DeepSizeOf)]
 pub enum MetablockKind {
     EventBatchMetadata(MetablockEventBatch),

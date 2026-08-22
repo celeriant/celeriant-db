@@ -117,7 +117,7 @@ impl<'a> ReverseMetablockScanner<'a> {
         self
     }
 
-    /// Scan metablocks in reverse, calling visitor for each 512-byte block.
+    /// Scan metablocks in reverse, calling visitor for each FIXED_BLOCK_SIZE_BYTES block.
     /// Visitor returns:
     /// - Ok(Some(result)) to stop and return the result
     /// - Ok(None) to continue scanning
@@ -173,7 +173,13 @@ impl<'a> ReverseMetablockScanner<'a> {
 
             // Check bloom filter - skip entire log segment if key definitely not present
             if let Some(hash) = self.bloom_filter_hash {
-                if !bloom.borrow().may_contain_hash(hash) {
+                metrics::counter!("celeriant_read_bloom_gate_total").increment(1);
+                let bloom = bloom.borrow();
+                // An absent bloom answers "maybe" for every key, so the segment is walked
+                // for reasons the bloom never had a say in. Counted apart from a real hit.
+                if bloom.is_absent() {
+                    metrics::counter!("celeriant_read_bloom_absent_total").increment(1);
+                } else if !bloom.may_contain_hash(hash) {
                     metrics::counter!("celeriant_read_bloom_short_circuit_total").increment(1);
                     tracing::trace!(log_id, "Bloom filter skip");
                     return Ok(None);
@@ -198,6 +204,10 @@ impl<'a> ReverseMetablockScanner<'a> {
 
         if metablocks_end <= metablocks_start {
             return Ok(None);
+        }
+
+        if self.bloom_filter_hash.is_some() {
+            metrics::counter!("celeriant_read_segments_walked_total").increment(1);
         }
 
         let mut found: Option<T> = None;
@@ -257,7 +267,11 @@ impl<'a> ReverseMetablockScanner<'a> {
             };
 
             if let Some(hash) = self.bloom_filter_hash {
-                if !bloom.borrow().may_contain_hash(hash) {
+                metrics::counter!("celeriant_read_bloom_gate_total").increment(1);
+                let bloom = bloom.borrow();
+                if bloom.is_absent() {
+                    metrics::counter!("celeriant_read_bloom_absent_total").increment(1);
+                } else if !bloom.may_contain_hash(hash) {
                     metrics::counter!("celeriant_read_bloom_short_circuit_total").increment(1);
                     return Ok(None);
                 }
@@ -287,6 +301,12 @@ impl<'a> ReverseMetablockScanner<'a> {
 
         let guard = log_segment_file.lock_reader("scan_chain_single_log").await?;
         let dma_file = guard.as_ref().ok_or(ScanError::NoFileHandle { log_id })?;
+
+        // Counted only once the read can actually happen, matching scan_single_log:
+        // a lock timeout or a missing handle is not a walk in either function.
+        if self.bloom_filter_hash.is_some() {
+            metrics::counter!("celeriant_read_segments_walked_total").increment(1);
+        }
 
         let window = self.chain_follow_window;
         let mut win_start = 0u64;
