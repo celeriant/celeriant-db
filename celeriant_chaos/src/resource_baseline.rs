@@ -11,26 +11,36 @@ pub struct ResourceSnapshot {
 /// SSH to `host`, find the celeriant process's PID via systemctl, then read
 /// fd count and VmRSS in one remote shell invocation.
 pub async fn snapshot(host: &str) -> Result<ResourceSnapshot, String> {
-    // One ssh: get PID, count fds, read VmRSS.
-    let cmd = "pid=$(systemctl show -p MainPID --value celeriant); \
-               ls /proc/$pid/fd | wc -l; \
-               awk '/VmRSS/{print $2}' /proc/$pid/status";
+    let host = host.to_string();
+    // On a blocking thread, and with `BatchMode`/`ConnectTimeout` like every
+    // other ssh in the harness. Driven directly on a tokio worker this call
+    // could not be cancelled by a `timeout` at the call site — a future that
+    // never yields never observes the deadline — and an ssh that connects and
+    // then stalls had nothing bounding it at all.
+    tokio::task::spawn_blocking(move || {
+        // One ssh: get PID, count fds, read VmRSS.
+        let cmd = "pid=$(systemctl show -p MainPID --value celeriant); \
+                   ls /proc/$pid/fd | wc -l; \
+                   awk '/VmRSS/{print $2}' /proc/$pid/status";
 
-    let out = Command::new("ssh")
-        .arg(host)
-        .arg(cmd)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("spawn ssh {host}: {e}"))?;
+        let out = Command::new("ssh")
+            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", &host])
+            .arg(cmd)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("spawn ssh {host}: {e}"))?;
 
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("ssh {host} exited {}: {}", out.status, stderr.trim()));
-    }
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(format!("ssh {host} exited {}: {}", out.status, stderr.trim()));
+        }
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    parse_snapshot_output(&stdout)
-        .ok_or_else(|| format!("failed to parse snapshot output from {host}: {:?}", stdout.trim()))
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        parse_snapshot_output(&stdout)
+            .ok_or_else(|| format!("failed to parse snapshot output from {host}: {:?}", stdout.trim()))
+    })
+    .await
+    .map_err(|e| format!("resource snapshot join: {e}"))?
 }
 
 /// Parse two-line output: first line is fd count, second is VmRSS kB.
@@ -126,7 +136,7 @@ mod tests {
         let after = snap(164, 512000); // exactly at tolerance limit
         let results = baseline_checks("node1", &before, &after);
         let fd = results.iter().find(|r| r.name == "FdReturnToBaseline").unwrap();
-        assert!(fd.passed, "{}", fd.detail);
+        assert!(fd.passed(), "{}", fd.detail);
         assert!(fd.detail.contains("node1"));
     }
 
@@ -136,7 +146,7 @@ mod tests {
         let after = snap(165, 512000); // 100 + 64 + 1 = over tolerance
         let results = baseline_checks("node1", &before, &after);
         let fd = results.iter().find(|r| r.name == "FdReturnToBaseline").unwrap();
-        assert!(!fd.passed, "{}", fd.detail);
+        assert!(!fd.passed(), "{}", fd.detail);
         assert!(fd.detail.contains("exceeded by 1"));
     }
 
@@ -147,7 +157,7 @@ mod tests {
         let after = snap(100, 4_194_304);
         let results = baseline_checks("node1", &before, &after);
         let rss = results.iter().find(|r| r.name == "RssBounded").unwrap();
-        assert!(rss.passed, "{}", rss.detail);
+        assert!(rss.passed(), "{}", rss.detail);
     }
 
     #[test]
@@ -158,7 +168,7 @@ mod tests {
         let after = snap(100, 6 * 1024 * 1024 + 1);
         let results = baseline_checks("node1", &before, &after);
         let rss = results.iter().find(|r| r.name == "RssBounded").unwrap();
-        assert!(!rss.passed, "{}", rss.detail);
+        assert!(!rss.passed(), "{}", rss.detail);
     }
 
     #[test]
@@ -170,7 +180,7 @@ mod tests {
         let after = snap(100, 3_228_320);
         let results = baseline_checks("node1", &before, &after);
         let rss = results.iter().find(|r| r.name == "RssBounded").unwrap();
-        assert!(rss.passed, "{}", rss.detail);
+        assert!(rss.passed(), "{}", rss.detail);
     }
 
     #[test]
@@ -192,6 +202,6 @@ mod tests {
         let after = snap(0, 500_000); // 500 MiB — under the 1 GiB floor
         let results = baseline_checks("node1", &before, &after);
         let rss = results.iter().find(|r| r.name == "RssBounded").unwrap();
-        assert!(rss.passed, "{}", rss.detail);
+        assert!(rss.passed(), "{}", rss.detail);
     }
 }

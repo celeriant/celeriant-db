@@ -54,7 +54,7 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use crate::sharded::intrashard_messages::IntrashardMessages;
 use crate::sharded::shard::IntrashardLeaseRenewalRequester;
 
-/// Production default is 1024 (`--mesh-channel-size`); anything non-trivial is
+/// Production default is 8192 (`--mesh-channel-size`); anything non-trivial is
 /// fine here because these tests issue a handful of messages on an idle
 /// executor — a full queue would be a scaffolding bug, not the contract.
 const MESH_CHANNEL_SIZE: usize = 128;

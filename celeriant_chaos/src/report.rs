@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::scenario::ScenarioReport;
+use crate::scenario::{ScenarioOutcome, ScenarioReport};
 
 pub struct RunDir {
     pub root: PathBuf,
@@ -29,16 +29,26 @@ pub fn write_run_report(dir: &RunDir, scenarios: &[ScenarioReport]) -> Result<()
     md.push_str("# Chaos Run Report\n\n");
     md.push_str(&format!("Run directory: `{}`\n\n", dir.root.display()));
 
-    let pass = scenarios.iter().filter(|s| s.passed).count();
+    let pass = scenarios.iter().filter(|s| s.outcome.is_pass()).count();
+    let inconclusive = scenarios.iter().filter(|s| s.outcome == ScenarioOutcome::Inconclusive).count();
     let total = scenarios.len();
-    md.push_str(&format!("**{} / {} scenarios passed**\n\n", pass, total));
+    md.push_str(&format!("**{} / {} scenarios passed**", pass, total));
+    // Called out on the headline rather than buried in the table: an inconclusive
+    // run measured nothing, and reading it as a near-pass is the whole mistake
+    // this verdict exists to prevent.
+    if inconclusive > 0 {
+        md.push_str(&format!(" — {inconclusive} INCONCLUSIVE (reached no regime where the measurement means anything)"));
+    }
+    md.push_str("\n\n");
 
     md.push_str("## Summary\n\n");
-    md.push_str("| Scenario | Verdict | Throughput | Errors | P50 | P99 | Failed checks |\n");
+    // "Unmet" rather than "Failed": the column lists every check that did not
+    // pass, and an inconclusive one has not failed.
+    md.push_str("| Scenario | Verdict | Throughput | Errors | P50 | P99 | Unmet checks |\n");
     md.push_str("|---|---|---|---|---|---|---|\n");
     for s in scenarios {
-        let verdict = if s.passed { "PASS" } else { "FAIL" };
-        let failed: Vec<&str> = s.checks.iter().filter(|c| !c.passed).map(|c| c.name).collect();
+        let verdict = s.outcome.label();
+        let failed: Vec<&str> = s.checks.iter().filter(|c| !c.passed()).map(|c| c.name).collect();
         md.push_str(&format!(
             "| {} | {} | {:.0} req/s | {} | {}ms | {}ms | {} |\n",
             s.name,
@@ -71,7 +81,16 @@ pub fn write_run_report(dir: &RunDir, scenarios: &[ScenarioReport]) -> Result<()
         ));
         md.push_str("### Checks\n\n");
         for c in &s.checks {
-            let mark = if c.passed { "PASS" } else { "FAIL" };
+            // Three states, not two. A check that could not be evaluated is not
+            // a failure, and rendering it as one hides the difference between
+            // "this is broken" and "this run never reached the regime".
+            let mark = if c.passed() {
+                "PASS"
+            } else if c.is_inconclusive() {
+                "INCONCLUSIVE"
+            } else {
+                "FAIL"
+            };
             md.push_str(&format!("- **{}** [{}] — {}\n", c.name, mark, c.detail));
         }
         md.push('\n');

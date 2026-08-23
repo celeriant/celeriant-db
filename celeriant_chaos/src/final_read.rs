@@ -210,6 +210,29 @@ async fn verify_one_aggregate(
     (verified, failures, false)
 }
 
+/// Test seam for `payload_roundtrip_verdict`: builds the `PayloadFail` records
+/// from raw bodies so the verdict logic can be exercised without a cluster.
+#[cfg(test)]
+pub fn payload_verdict_for_test(
+    total_verified: u64,
+    node_aggregate_count: usize,
+    total_unreadable: u64,
+    got: &[Vec<u8>],
+) -> CheckResult {
+    let fails: Vec<PayloadFail> = got
+        .iter()
+        .enumerate()
+        .map(|(i, g)| PayloadFail {
+            node: "n".into(),
+            aggregate_id: i as u128,
+            client_seq: i as u64 + 1,
+            expected: expected_payload(i as u128, i as u64 + 1),
+            got: g.clone(),
+        })
+        .collect();
+    payload_roundtrip_verdict(total_verified, node_aggregate_count, total_unreadable, &fails)
+}
+
 /// Verify payload bytes for a deterministic sample of acked aggregates on
 /// both nodes.
 ///
@@ -299,6 +322,35 @@ fn payload_roundtrip_verdict(
     total_unreadable: u64,
     all_failures: &[PayloadFail],
 ) -> CheckResult {
+    // This check reconstructs the expected body as `[t-{agg}-s-{seq}]`, which is
+    // the opaque bench workload's format and nothing else's. A scenario writing
+    // a different payload — `cardinality_pressure` writes banking JSON — would
+    // otherwise have every single sample "mismatch" and read as catastrophic
+    // corruption. So: if EVERY sample missed and every one of them is a
+    // well-formed JSON object, this is the wrong check for the workload, not a
+    // corrupt store. Say so instead of failing.
+    //
+    // A PARTIAL miss stays a failure. That is the shape real corruption takes,
+    // and it must not hide behind this escape hatch.
+    // `total_verified` counts MATCHES only, so "every sample missed" is
+    // `total_verified == 0` with failures present — not `failures == verified`,
+    // which compares a count against the zero it can never equal.
+    if !all_failures.is_empty() && total_verified == 0 {
+        let all_json = all_failures
+            .iter()
+            .all(|f| serde_json::from_slice::<serde_json::Value>(&f.got).is_ok_and(|v| v.is_object()));
+        if all_json {
+            return CheckResult::inconclusive(
+                "PayloadRoundTrip",
+                format!(
+                    "all {} sampled payloads are JSON objects, not this check's `[t-<agg>-s-<seq>]` \
+                     form — the workload does not write reconstructible bodies, so byte-level \
+                     round-trip was not verified (not evidence of corruption, and not a pass)",
+                    all_failures.len()
+                ),
+            );
+        }
+    }
     if !all_failures.is_empty() {
         let capped: Vec<String> = all_failures
             .iter()
@@ -408,20 +460,20 @@ mod tests {
         // A cluster-wide read outage: 0 verified, 0 failures, but every read
         // errored. Was: silent pass ("nothing to verify"). Must fail closed.
         let r = payload_roundtrip_verdict(0, 10, MAX_UNREADABLE + 1, &[]);
-        assert!(!r.passed);
+        assert!(!r.passed());
         assert!(r.detail.contains("unreadable"), "{}", r.detail);
     }
 
     #[test]
     fn verdict_passes_within_unreadable_tolerance() {
         let r = payload_roundtrip_verdict(20, 24, MAX_UNREADABLE, &[]);
-        assert!(r.passed, "{}", r.detail);
+        assert!(r.passed(), "{}", r.detail);
     }
 
     #[test]
     fn verdict_passes_when_nothing_unreadable_and_clean() {
         let r = payload_roundtrip_verdict(48, 24, 0, &[]);
-        assert!(r.passed, "{}", r.detail);
+        assert!(r.passed(), "{}", r.detail);
     }
 
     #[test]
@@ -434,7 +486,7 @@ mod tests {
             got: b"[t-1-s-3]".to_vec(),
         };
         let r = payload_roundtrip_verdict(10, 24, 0, &[fail]);
-        assert!(!r.passed);
+        assert!(!r.passed());
         assert!(r.detail.contains("mismatch"), "{}", r.detail);
     }
 

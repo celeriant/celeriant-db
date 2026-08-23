@@ -7,6 +7,7 @@ use celeriant_chaos::actions::find_project_root;
 use celeriant_chaos::config::ClusterConfig;
 use celeriant_chaos::report::{RunDir, write_run_report, write_scenario};
 use celeriant_chaos::scenario::{
+    DefectParams, run_promotion_failure_survival, run_write_outage_selfheal,
     ScenarioParams, ScenarioReport, run_baseline, run_bridge, run_cas_storm_scenario,
     run_clock_scrambler, run_duplicate_replay,
     run_follower_graceful_stop, run_follower_sigkill, run_single_node_isolation,
@@ -20,7 +21,9 @@ use celeriant_chaos::scenario::{
     run_partition_leader_follower_replication, run_partition_leader_minio,
     run_watch_storm, run_watch_storm_failover,
     run_cold_segment_reads, run_nemesis_composition, run_schema_under_partition,
+    run_cardinality_pressure,
 };
+use celeriant_chaos::cardinality_workload::{CardinalityParams, Preset};
 
 #[derive(Parser)]
 #[command(name = "celeriant-chaos", about = "Chaos test orchestrator for the RPi cluster")]
@@ -29,7 +32,9 @@ struct Args {
     #[arg(long)]
     full: bool,
 
-    /// Run one scenario by name. See README for the list; a few sit outside --full.
+    /// Run one scenario by name. See README for the list; a few sit outside
+    /// --full, including the defect reproductions `write_outage_selfheal` and
+    /// `promotion_failure_survival`.
     #[arg(long)]
     scenario: Option<String>,
 
@@ -75,6 +80,93 @@ struct Args {
     /// exactly, e.g. after triaging a Heisenbug from a printed seed.
     #[arg(long)]
     seed: Option<u64>,
+
+    // --- cardinality_pressure only ---
+    /// Fill budget for `cardinality_pressure`: smoke (10min), short (1h),
+    /// deep (5h). The oldest dormancy age the run can measure is bounded by
+    /// how long the fill ran, so this is not just a duration knob — `deep`
+    /// reaches a part of the reheat curve `short` cannot.
+    #[arg(long, default_value = "smoke")]
+    preset: String,
+
+    /// Override the preset's fill budget, in seconds.
+    #[arg(long)]
+    fill_duration: Option<u64>,
+
+    /// Stop the fill when the data filesystem crosses this percentage. A clock
+    /// without a disk watchdog is how a fast day produces ENOSPC instead of a
+    /// result.
+    #[arg(long, default_value = "70")]
+    disk_high_water: u64,
+
+    /// `shard_log_preallocate_bytes` applied to both nodes. Everything in the
+    /// segment-summary pipeline scales linearly with it.
+    #[arg(long, default_value = "268435456")]
+    segment_bytes: u64,
+
+    /// `MEMORY_CONSUMPTION_PERCENT` applied to both nodes.
+    #[arg(long, default_value = "20")]
+    memory_percent: u64,
+
+    /// Target aggregates per segment. The payload mix is DERIVED from this and
+    /// `--segment-bytes`, never passed raw: bloom load is set by the mix
+    /// relative to the segment size, so holding the mix constant across two
+    /// segment sizes makes the two stages incomparable.
+    #[arg(long, default_value = "200000")]
+    target_aggs_per_segment: u64,
+
+    /// R distinct replicas per account in the contention phase.
+    #[arg(long, default_value = "8")]
+    contention_factor: usize,
+
+    /// New aggregates per second, CLUSTER-WIDE, divided across `--tasks`.
+    /// Never per-task: otherwise a 16k-connection run mints sixteen times
+    /// faster than a 1k-connection run and their reheat curves are not
+    /// comparable.
+    #[arg(long, default_value = "50")]
+    birth_rate: f64,
+
+    /// Run the SIGKILL failover phase in `cardinality_pressure`.
+    ///
+    /// Off by default. Failover under a behind-follower is a separate confirmed
+    /// defect with its own red test (`failover_pressure_matrix`), and it panics
+    /// a shard — so leaving it on makes every run FAIL for reasons unrelated to
+    /// memory or cardinality. Phase 4's graceful stop/start of both nodes still
+    /// runs, so the cold-restart delta is unaffected.
+    #[arg(long)]
+    failover: bool,
+
+    /// Reheat probes per second, cluster-wide, divided across `--tasks`.
+    #[arg(long, default_value = "5")]
+    reheat_rate: f64,
+
+    // --- write_outage_selfheal / promotion_failure_survival only ---
+    //
+    // Separate from `--tasks` and `--birth-rate` on purpose. Both defects were
+    // observed at ONE load shape, and these scenarios are reproductions of that
+    // shape — inheriting the suite-wide defaults would silently run them at a
+    // load neither defect has ever been seen at.
+    /// Fill tasks for the defect scenarios. Multiple of 3. Default 3000 — the
+    /// connection count the wedge formed at.
+    #[arg(long)]
+    defect_tasks: Option<usize>,
+
+    /// New aggregates per second, cluster-wide, for the defect scenarios.
+    /// Default 400 — the birth rate the wedge formed at.
+    #[arg(long)]
+    defect_birth_rate: Option<f64>,
+
+    /// Seconds of load before `write_outage_selfheal` stops it, and the floor
+    /// for `promotion_failure_survival`'s observation window. Default 120 —
+    /// the field wedge formed inside 60.
+    #[arg(long)]
+    defect_load_secs: Option<u64>,
+
+    /// Idle seconds `write_outage_selfheal` watches after ALL load stops.
+    /// Default 120, floored at 90 — the field already disproved recovery over
+    /// 90 seconds, so a shorter window cannot say anything new.
+    #[arg(long)]
+    defect_settle_secs: Option<u64>,
 }
 
 /// Entropy source for the default seed: no `rand` crate dependency here, so
@@ -122,6 +214,27 @@ async fn main() -> Result<(), String> {
         seed,
     };
 
+    let card = CardinalityParams {
+        failover_phase: args.failover,
+        preset: Preset::parse(&args.preset)?,
+        fill_duration: args.fill_duration.map(std::time::Duration::from_secs),
+        disk_high_water_pct: args.disk_high_water,
+        segment_bytes: args.segment_bytes,
+        memory_percent: args.memory_percent,
+        target_aggs_per_segment: args.target_aggs_per_segment,
+        contention_factor: args.contention_factor,
+        birth_rate_per_sec: args.birth_rate,
+        reheat_rate_per_sec: args.reheat_rate,
+    };
+
+    let defect_defaults = DefectParams::default();
+    let defect = DefectParams {
+        tasks: args.defect_tasks.unwrap_or(defect_defaults.tasks),
+        birth_rate_per_sec: args.defect_birth_rate.unwrap_or(defect_defaults.birth_rate_per_sec),
+        load_secs: args.defect_load_secs.unwrap_or(defect_defaults.load_secs),
+        settle_secs: args.defect_settle_secs.unwrap_or(defect_defaults.settle_secs),
+    };
+
     let scenarios_to_run: Vec<&str> = match args.scenario.as_deref() {
         Some("baseline") => vec!["baseline"],
         Some("follower_graceful_stop") => vec!["follower_graceful_stop"],
@@ -156,6 +269,14 @@ async fn main() -> Result<(), String> {
         Some("cold_segment_reads") => vec!["cold_segment_reads"],
         Some("nemesis_composition") => vec!["nemesis_composition"],
         Some("schema_under_partition") => vec!["schema_under_partition"],
+        // Deliberately NOT in --full: the fill alone runs for up to five hours.
+        // Lives alongside bench_load_sweep as a --scenario-only entry.
+        Some("cardinality_pressure") => vec!["cardinality_pressure"],
+        // Defect reproductions. Deliberately NOT in --full: both are expected
+        // RED until the server is fixed, and both leave the rig busy for
+        // several minutes restarting a cluster they deliberately broke.
+        Some("write_outage_selfheal") => vec!["write_outage_selfheal"],
+        Some("promotion_failure_survival") => vec!["promotion_failure_survival"],
         Some(other) => return Err(format!("unknown scenario: {other}")),
         None if args.full => vec![
             "baseline",
@@ -201,9 +322,9 @@ async fn main() -> Result<(), String> {
     };
 
     if args.soak > 0 {
-        run_soak(&cfg, params, &scenarios_to_run, args.soak, args.soak_continue_on_failure).await
+        run_soak(&cfg, params, card, defect, &scenarios_to_run, args.soak, args.soak_continue_on_failure).await
     } else {
-        run_single_pass(&cfg, params, &scenarios_to_run).await
+        run_single_pass(&cfg, params, card, defect, &scenarios_to_run).await
     }
 }
 
@@ -215,6 +336,8 @@ async fn main() -> Result<(), String> {
 async fn run_one_iteration(
     cfg: &ClusterConfig,
     params: ScenarioParams,
+    card: CardinalityParams,
+    defect: DefectParams,
     scenarios_to_run: &[&str],
 ) -> Result<(Vec<ScenarioReport>, RunDir), String> {
     let dir = RunDir::create(&cfg.deploy_dir)?;
@@ -260,6 +383,9 @@ async fn run_one_iteration(
             "idempotency_audit_minio_outage" => run_idempotency_audit_minio_outage(cfg, params, &dir.root).await?,
             "idempotency_audit_partition_then_kill_minio" => run_idempotency_audit_partition_then_kill_minio(cfg, params, &dir.root).await?,
             "idempotency_audit_fast_blackout" => run_idempotency_audit_fast_blackout(cfg, params, &dir.root).await?,
+            "cardinality_pressure" => run_cardinality_pressure(cfg, params, card, &dir.root).await?,
+            "write_outage_selfheal" => run_write_outage_selfheal(cfg, params, card, defect, &dir.root).await?,
+            "promotion_failure_survival" => run_promotion_failure_survival(cfg, params, card, defect, &dir.root).await?,
             _ => unreachable!(),
         };
         write_scenario(&dir, &report)?;
@@ -274,10 +400,12 @@ async fn run_one_iteration(
 async fn run_single_pass(
     cfg: &ClusterConfig,
     params: ScenarioParams,
+    card: CardinalityParams,
+    defect: DefectParams,
     scenarios_to_run: &[&str],
 ) -> Result<(), String> {
-    let (reports, dir) = run_one_iteration(cfg, params, scenarios_to_run).await?;
-    let pass = reports.iter().filter(|s| s.passed).count();
+    let (reports, dir) = run_one_iteration(cfg, params, card, defect, scenarios_to_run).await?;
+    let pass = reports.iter().filter(|s| s.outcome.is_pass()).count();
     println!();
     println!("=== {} / {} scenarios passed ===", pass, reports.len());
     println!("Report: {}/report.md", dir.root.display());
@@ -294,6 +422,8 @@ async fn run_single_pass(
 async fn run_soak(
     cfg: &ClusterConfig,
     params: ScenarioParams,
+    card: CardinalityParams,
+    defect: DefectParams,
     scenarios_to_run: &[&str],
     soak_secs: u64,
     continue_on_failure: bool,
@@ -326,7 +456,7 @@ async fn run_soak(
             elapsed, soak_secs, remaining,
         );
 
-        let (reports, dir) = match run_one_iteration(cfg, iter_params, scenarios_to_run).await {
+        let (reports, dir) = match run_one_iteration(cfg, iter_params, card, defect, scenarios_to_run).await {
             Ok(pair) => pair,
             Err(e) => {
                 eprintln!("soak iteration {iteration} bring-up or report write failed: {e}");
@@ -341,7 +471,7 @@ async fn run_soak(
             }
         };
 
-        let pass = reports.iter().filter(|s| s.passed).count();
+        let pass = reports.iter().filter(|s| s.outcome.is_pass()).count();
         let iter_passed = pass == reports.len();
         if iter_passed {
             total_pass += 1;
@@ -351,7 +481,7 @@ async fn run_soak(
             failed_iterations.push((iteration, dir.root.clone()));
             let failed_names: Vec<&str> = reports
                 .iter()
-                .filter(|s| !s.passed)
+                .filter(|s| !s.outcome.is_pass())
                 .map(|s| s.name.as_str())
                 .collect();
             eprintln!(

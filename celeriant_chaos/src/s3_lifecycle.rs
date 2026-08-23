@@ -195,7 +195,7 @@ mod tests {
             ranges: vec![(1, 100), (101, 200), (201, 300)],
         };
         let results = shard_checks(&shard);
-        assert!(results.iter().all(|r| r.passed), "unexpected failures: {:?}", results);
+        assert!(results.iter().all(|r| r.passed()), "unexpected failures: {:?}", results);
     }
 
     #[test]
@@ -208,7 +208,7 @@ mod tests {
             ranges: vec![(1, 150), (100, 200)],
         };
         let results = shard_checks(&shard);
-        assert!(results.iter().all(|r| r.passed), "overlap should not fail: {:?}", results);
+        assert!(results.iter().all(|r| r.passed()), "overlap should not fail: {:?}", results);
     }
 
     #[test]
@@ -219,7 +219,7 @@ mod tests {
             ranges: vec![(1, 100), (150, 200)],
         };
         let results = shard_checks(&shard);
-        let gap_fail = results.iter().find(|r| r.name == "S3FallbackNoGaps" && !r.passed);
+        let gap_fail = results.iter().find(|r| r.name == "S3FallbackNoGaps" && !r.passed());
         assert!(gap_fail.is_some(), "expected gap failure, got: {:?}", results);
         assert!(gap_fail.unwrap().detail.contains("shard_1"));
     }
@@ -232,7 +232,7 @@ mod tests {
             ranges: vec![(200, 100)],
         };
         let results = shard_checks(&shard);
-        let bad = results.iter().find(|r| r.name == "S3FallbackRangeValid" && !r.passed);
+        let bad = results.iter().find(|r| r.name == "S3FallbackRangeValid" && !r.passed());
         assert!(bad.is_some(), "expected range failure: {:?}", results);
     }
 
@@ -245,7 +245,7 @@ mod tests {
             ranges: vec![(101, 200), (1, 100)],
         };
         let results = shard_checks(&shard);
-        let gap_fail = results.iter().find(|r| r.name == "S3FallbackNoGaps" && !r.passed);
+        let gap_fail = results.iter().find(|r| r.name == "S3FallbackNoGaps" && !r.passed());
         assert!(gap_fail.is_none(), "sorting not applied: {:?}", results);
     }
 

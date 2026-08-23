@@ -60,6 +60,14 @@ impl Scraper {
             // node_role and so swaps one tick late after a promotion — that
             // tick falls inside the invariant's stability guard.
             let mut config_leader_leads = true;
+            // Interning table for `metric_keys_present`, one slot per host. The
+            // set changes only when a counter registers for the first time, so
+            // after the first few ticks every sample can share one allocation
+            // instead of carrying its own 78-entry BTreeSet<String>. Without
+            // this a 5-hour run retains ~74,000 owned copies, and `snapshot()`
+            // clones the whole Vec with two or three clones live at once.
+            let mut interned: std::collections::HashMap<String, std::sync::Arc<std::collections::BTreeSet<String>>> =
+                std::collections::HashMap::new();
             loop {
                 let t_ms = elapsed_ms(start, Instant::now());
                 let (leader_sample, follower_sample) = if config_leader_leads {
@@ -75,6 +83,18 @@ impl Scraper {
                     config_leader_leads = true;
                 } else if follower_sample.ok && follower_sample.node_role >= 0.5 {
                     config_leader_leads = false;
+                }
+                let mut leader_sample = leader_sample;
+                let mut follower_sample = follower_sample;
+                for sample in [&mut leader_sample, &mut follower_sample] {
+                    match interned.get(&sample.host) {
+                        Some(prev) if **prev == *sample.metric_keys_present => {
+                            sample.metric_keys_present = std::sync::Arc::clone(prev);
+                        }
+                        _ => {
+                            interned.insert(sample.host.clone(), std::sync::Arc::clone(&sample.metric_keys_present));
+                        }
+                    }
                 }
                 store_clone.push(leader_sample).await;
                 store_clone.push(follower_sample).await;

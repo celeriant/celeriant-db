@@ -4,23 +4,56 @@ use crate::sample::NodeSample;
 use std::collections::HashMap;
 use crate::tip_fork;
 
+/// Verdict of a single check.
+///
+/// The third state exists because a time-boxed run can end without the
+/// measurement ever becoming meaningful — no rotation, no age spread, a fill
+/// that stopped early. That is not a pass and it is not a defect in the
+/// database; reporting it as either is a lie. `cold_segment_reads` currently
+/// emits `pass_with_detail("SegmentRotationOccurred", "no rotation reached —
+/// cold path not exercised")`, which is a green tick on a run that measured
+/// nothing. This is the type that lets a run say so instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum CheckOutcome {
+    Pass,
+    Fail,
+    /// The check could not be evaluated: the run never reached a regime where
+    /// it means anything. Distinct from Fail — nothing is known to be wrong.
+    Inconclusive,
+}
+
 /// Result of a single check against the captured run data.
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckResult {
     pub name: &'static str,
-    pub passed: bool,
+    pub outcome: CheckOutcome,
     pub detail: String,
 }
 
 impl CheckResult {
     pub fn pass(name: &'static str) -> Self {
-        Self { name, passed: true, detail: "ok".into() }
+        Self { name, outcome: CheckOutcome::Pass, detail: "ok".into() }
     }
     pub fn pass_with_detail(name: &'static str, detail: impl Into<String>) -> Self {
-        Self { name, passed: true, detail: detail.into() }
+        Self { name, outcome: CheckOutcome::Pass, detail: detail.into() }
     }
     pub fn fail(name: &'static str, detail: impl Into<String>) -> Self {
-        Self { name, passed: false, detail: detail.into() }
+        Self { name, outcome: CheckOutcome::Fail, detail: detail.into() }
+    }
+    /// The run did not reach a state where this check means anything. Say so;
+    /// do not dress it as a pass.
+    pub fn inconclusive(name: &'static str, detail: impl Into<String>) -> Self {
+        Self { name, outcome: CheckOutcome::Inconclusive, detail: detail.into() }
+    }
+
+    pub fn passed(&self) -> bool {
+        self.outcome == CheckOutcome::Pass
+    }
+    pub fn failed(&self) -> bool {
+        self.outcome == CheckOutcome::Fail
+    }
+    pub fn is_inconclusive(&self) -> bool {
+        self.outcome == CheckOutcome::Inconclusive
     }
 }
 
@@ -1135,70 +1168,14 @@ mod tests {
             host: host.to_string(),
             t_ms,
             ok: true,
-            error: None,
             node_role: if host == LEADER { 1.0 } else { 0.0 },
             wal_seq_max,
             wal_seq_by_shard,
-            read_wal_seq_by_shard: BTreeMap::new(),
-            parked_commit_depth_by_shard: BTreeMap::new(),
-            last_self_acked_by_shard: BTreeMap::new(),
-            node_status_code_by_shard: BTreeMap::new(),
-            executor_heartbeat_ms_by_shard: BTreeMap::new(),
-            writes_total: 0,
-            write_errors_total: 0,
-            leader_elections_total: 0,
-            heartbeat_failures_total: 0,
-            s3_fallbacks_total: 0,
-            s3_lease_on_demand_renewal_total: 0,
-            s3_fallback_lease_unconfirmed_total: 0,
-            shard_panics_total: 0,
-            node_starts_total: 0,
-            client_connections_active: 0,
-            watch_subscribers_active: 0,
-            capture_dropped_items_total: 0,
-            capture_dropped_bytes_total: 0,
-            writes_accepted_no_prior_client_seq_total: 0,
-            cache_client_scan_not_found_total: 0,
-            cache_client_scan_found_total: 0,
-            truncate_dropped_committed_events_total: 0,
-            truncate_dropped_committed_bytes_total: 0,
-            replication_rollback_deferred_total: 0,
-            truncate_dropped_self_acked_events_total: 0,
-            truncate_dropped_self_acked_wal_seqs_total: 0,
-            s3_catchup_self_uploads_seen_total: 0,
-            truncate_refused_due_to_ack_barrier_total: 0,
-            s3_catchup_same_epoch_divergence_total: 0,
-            cull_stale_client_seq_lru: 0,
-            cull_stale_agg_lru: 0,
-            client_idempotency_violations_total: 0,
-            client_idempotency_inflight_total: 0,
-            take_pending_replication_dropped_batches: 0,
-            truncate_divergence_advanced_total: 0,
-            truncate_divergence_advanced_wal_seqs_total: 0,
-            read_bloom_short_circuit_total: 0,
-            barrier_sync_fsync_total: 0,
-            barrier_sync_fsync_failed_total: 0,
-            probe_gap_detected_total: 0,
-            probe_gap_send_success_total: 0,
-            probe_gap_send_failed_total: 0,
-            catchup_empty_fetch_total: 0,
-            catchup_fallback_total: 0,
-            catchup_fetch_error_total: 0,
-            tombstone_snapshot_regression_total: 0,
-            position_snapshot_stale_commit_total: 0,
-            commit_notify_sent_total: 0,
-            commit_notify_received_total: 0,
-            s3_catchup_barrier_timeout_total: 0,
-            s3_catchup_stall_bail_total: 0,
-            s3_catchup_task_started_total: 0,
-            intrashard_status_broadcast_dropped_total: 0,
-            s3_catchup_completion_dropped_total: 0,
-            stuck_handlers: Vec::new(),
-            mesh_dequeued_by_pair: std::collections::BTreeMap::new(),
             // All guarded counters "exported": these tests target the
             // read-cursor/leader-stability checks, not check_counter's
             // presence guard (covered by its own tests below).
-            metric_keys_present: ALL_GUARDED_COUNTER_KEYS.iter().map(|s| s.to_string()).collect(),
+            metric_keys_present: std::sync::Arc::new(ALL_GUARDED_COUNTER_KEYS.iter().map(|s| s.to_string()).collect()),
+            ..Default::default()
         }
     }
 
@@ -1225,13 +1202,13 @@ mod tests {
         // (eagerly registered at startup on both nodes) going absent means
         // a rename/removal, not a healthy-zero — must not read as PASS.
         let mut a = sample(LEADER, 0, &[(1, 100)]);
-        a.metric_keys_present = std::collections::BTreeSet::new();
+        a.metric_keys_present = std::sync::Arc::new(std::collections::BTreeSet::new());
         let mut b = sample(LEADER, 500, &[(1, 200)]);
-        b.metric_keys_present = std::collections::BTreeSet::new();
+        b.metric_keys_present = std::sync::Arc::new(std::collections::BTreeSet::new());
         let mut c = sample(FOLLOWER, 0, &[(1, 100)]);
-        c.metric_keys_present = std::collections::BTreeSet::new();
+        c.metric_keys_present = std::sync::Arc::new(std::collections::BTreeSet::new());
         let mut d = sample(FOLLOWER, 500, &[(1, 200)]);
-        d.metric_keys_present = std::collections::BTreeSet::new();
+        d.metric_keys_present = std::sync::Arc::new(std::collections::BTreeSet::new());
         let samples = [a, b, c, d];
         let data = run_data(&samples);
         let r = check_counter(
@@ -1241,7 +1218,7 @@ mod tests {
             |s| s.leader_elections_total,
             0,
         );
-        assert!(!r.passed);
+        assert!(!r.passed());
         assert!(r.detail.contains("not exported"), "{}", r.detail);
     }
 
@@ -1251,17 +1228,17 @@ mod tests {
         // healthy cluster is normal, not an oracle-blind signal. Must NOT
         // fail closed — that would false-RED every healthy run.
         let mut a = sample(LEADER, 0, &[(1, 100)]);
-        a.metric_keys_present = std::collections::BTreeSet::new();
+        a.metric_keys_present = std::sync::Arc::new(std::collections::BTreeSet::new());
         let mut b = sample(LEADER, 500, &[(1, 200)]);
-        b.metric_keys_present = std::collections::BTreeSet::new();
+        b.metric_keys_present = std::sync::Arc::new(std::collections::BTreeSet::new());
         let mut c = sample(FOLLOWER, 0, &[(1, 100)]);
-        c.metric_keys_present = std::collections::BTreeSet::new();
+        c.metric_keys_present = std::sync::Arc::new(std::collections::BTreeSet::new());
         let mut d = sample(FOLLOWER, 500, &[(1, 200)]);
-        d.metric_keys_present = std::collections::BTreeSet::new();
+        d.metric_keys_present = std::sync::Arc::new(std::collections::BTreeSet::new());
         let samples = [a, b, c, d];
         let data = run_data(&samples);
         let r = check_counter("NoShardPanics", "celeriant_shard_panics_total", &data, |s| s.shard_panics_total, 0);
-        assert!(r.passed, "{}", r.detail);
+        assert!(r.passed(), "{}", r.detail);
     }
 
     #[test]
@@ -1272,7 +1249,7 @@ mod tests {
         let samples = [a, b];
         let data = run_data(&samples);
         let r = check_counter("NoShardPanics", "celeriant_shard_panics_total", &data, |s| s.shard_panics_total, 0);
-        assert!(r.passed, "{}", r.detail);
+        assert!(r.passed(), "{}", r.detail);
     }
 
     #[test]
@@ -1284,7 +1261,7 @@ mod tests {
         let samples = [a, b];
         let data = run_data(&samples);
         let r = check_counter("NoShardPanics", "celeriant_shard_panics_total", &data, |s| s.shard_panics_total, 0);
-        assert!(!r.passed);
+        assert!(!r.passed());
         assert!(r.detail.contains("delta 3"), "{}", r.detail);
     }
 
@@ -1312,7 +1289,7 @@ mod tests {
         assert_eq!(samples[2].wal_seq_max, 238594);
         assert_eq!(samples[3].wal_seq_max, 238594);
 
-        assert!(!result.passed, "expected FAIL but got PASS: {}", result.detail);
+        assert!(!result.passed(), "expected FAIL but got PASS: {}", result.detail);
         assert!(result.detail.contains("shard_3") || result.detail.contains("shard 3"),
             "detail should name the forked shard: {}", result.detail);
     }
@@ -1328,7 +1305,7 @@ mod tests {
         ];
         let data = run_data(&samples);
         let result = check_eventual_convergence(&data);
-        assert!(result.passed, "expected PASS but got FAIL: {}", result.detail);
+        assert!(result.passed(), "expected PASS but got FAIL: {}", result.detail);
     }
 
     /// One shard is lagging but monotonically advancing in the progress window — PASS.
@@ -1346,7 +1323,7 @@ mod tests {
         ];
         let data = run_data(&samples);
         let result = check_eventual_convergence(&data);
-        assert!(result.passed, "expected PASS but got FAIL: {}", result.detail);
+        assert!(result.passed(), "expected PASS but got FAIL: {}", result.detail);
     }
 
     #[test]
@@ -1358,7 +1335,7 @@ mod tests {
         let samples = vec![a, b];
         let data = run_data(&samples);
         let r = check_read_within_write(&data);
-        assert!(r.passed, "{}", r.detail);
+        assert!(r.passed(), "{}", r.detail);
         assert!(r.detail.contains("2 ticks"), "{}", r.detail);
     }
 
@@ -1371,7 +1348,7 @@ mod tests {
         let samples = vec![a, b];
         let data = run_data(&samples);
         let r = check_read_within_write(&data);
-        assert!(r.passed, "{}", r.detail);
+        assert!(r.passed(), "{}", r.detail);
         assert!(r.detail.contains("1 single-tick render races ignored"), "{}", r.detail);
     }
 
@@ -1384,7 +1361,7 @@ mod tests {
         let samples = vec![a, b];
         let data = run_data(&samples);
         let r = check_read_within_write(&data);
-        assert!(!r.passed);
+        assert!(!r.passed());
         assert!(r.detail.contains("read 101 > write 100"), "{}", r.detail);
         assert!(r.detail.contains("then"), "{}", r.detail);
     }
@@ -1403,7 +1380,7 @@ mod tests {
         let samples = vec![a, b, c, d];
         let data = run_data(&samples);
         let r = check_read_within_write(&data);
-        assert!(r.passed, "{}", r.detail);
+        assert!(r.passed(), "{}", r.detail);
         assert!(r.detail.contains("2 single-tick render races ignored"), "{}", r.detail);
     }
 
@@ -1414,7 +1391,7 @@ mod tests {
         let samples = vec![sample(LEADER, 0, &[(1, 100)])];
         let data = run_data(&samples);
         let r = check_read_within_write(&data);
-        assert!(!r.passed);
+        assert!(!r.passed());
         assert!(r.detail.contains("oracle lost its instrument"), "{}", r.detail);
     }
 
@@ -1451,7 +1428,7 @@ mod tests {
         samples.extend(tick(8_000, true, (200, 150), (200, 180)));
         let data = run_data(&samples);
         let r = check_never_ahead(&data);
-        assert!(!r.passed, "{}", r.detail);
+        assert!(!r.passed(), "{}", r.detail);
         assert!(r.detail.contains("shard_1"), "{}", r.detail);
         assert!(r.detail.contains("read 180 > max(leader high-water"), "{}", r.detail);
         assert!(r.detail.contains("then"), "{}", r.detail);
@@ -1470,7 +1447,7 @@ mod tests {
         samples.extend(tick(8_000, true, (300, 300), (300, 250))); // clean again
         let data = run_data(&samples);
         let r = check_never_ahead(&data);
-        assert!(r.passed, "{}", r.detail);
+        assert!(r.passed(), "{}", r.detail);
         assert!(r.detail.contains("1 single-tick blips ignored"), "{}", r.detail);
     }
 
@@ -1491,7 +1468,7 @@ mod tests {
         }
         let data = run_data(&samples);
         let r = check_never_ahead(&data);
-        assert!(r.passed, "{}", r.detail);
+        assert!(r.passed(), "{}", r.detail);
     }
 
     // Same shape but the stale cursor PERSISTS past the guard after the
@@ -1507,7 +1484,7 @@ mod tests {
         }
         let data = run_data(&samples);
         let r = check_never_ahead(&data);
-        assert!(!r.passed, "{}", r.detail);
+        assert!(!r.passed(), "{}", r.detail);
         // Comparison must follow roles, not config slots: the config-LEADER
         // slot is the follower after the flip.
         assert!(r.detail.contains(&format!("follower {LEADER}")), "{}", r.detail);
@@ -1528,7 +1505,7 @@ mod tests {
         samples.extend(tick(9_000, true, (200, 150), (200, 180)));
         let data = run_data(&samples);
         let r = check_never_ahead(&data);
-        assert!(r.passed, "{}", r.detail);
+        assert!(r.passed(), "{}", r.detail);
     }
 
     // Leader restart regresses its read GAUGE (persisted read lags the
@@ -1551,7 +1528,7 @@ mod tests {
         }
         let data = run_data(&samples);
         let r = check_never_ahead(&data);
-        assert!(r.passed, "{}", r.detail);
+        assert!(r.passed(), "{}", r.detail);
     }
 
     // Demoted old leader whose final pre-stop confirms outran the last scrape:
@@ -1574,7 +1551,7 @@ mod tests {
         }
         let data = run_data(&samples);
         let r = check_never_ahead(&data);
-        assert!(r.passed, "{}", r.detail);
+        assert!(r.passed(), "{}", r.detail);
     }
 
     // Follower in S3 catchup (status code 2) full-commits by design: its read
@@ -1594,7 +1571,7 @@ mod tests {
         }
         let data = run_data(&samples);
         let r = check_never_ahead(&data);
-        assert!(r.passed, "{}", r.detail);
+        assert!(r.passed(), "{}", r.detail);
     }
 
     // After the status settles back to Follower the shard guard re-arms and a
@@ -1619,7 +1596,7 @@ mod tests {
         }
         let data = run_data(&samples);
         let r = check_never_ahead(&data);
-        assert!(!r.passed, "{}", r.detail);
+        assert!(!r.passed(), "{}", r.detail);
         assert!(r.detail.contains("read 300"), "{}", r.detail);
     }
 
@@ -1638,7 +1615,7 @@ mod tests {
         }
         let data = run_data(&samples);
         let r = check_never_ahead(&data);
-        assert!(!r.passed, "{}", r.detail);
+        assert!(!r.passed(), "{}", r.detail);
         assert!(r.detail.contains("high-water 100"), "{}", r.detail);
     }
 
@@ -1652,7 +1629,7 @@ mod tests {
         }
         let data = run_data(&samples);
         let r = check_never_ahead(&data);
-        assert!(r.passed, "{}", r.detail);
+        assert!(r.passed(), "{}", r.detail);
         assert!(r.detail.contains("0 stable ticks"), "{}", r.detail);
     }
 
@@ -1689,7 +1666,7 @@ mod tests {
         }
         let data = run_data(&samples);
         let r = check_never_ahead(&data);
-        assert!(!r.passed, "poisoned hw masked the violation: {}", r.detail);
+        assert!(!r.passed(), "poisoned hw masked the violation: {}", r.detail);
         assert!(r.detail.contains("read 300"), "{}", r.detail);
     }
 
@@ -1710,7 +1687,7 @@ mod tests {
         }
         let data = run_data(&samples);
         let r = check_never_ahead(&data);
-        assert!(r.passed, "{}", r.detail);
+        assert!(r.passed(), "{}", r.detail);
         assert!(r.detail.contains("shard_2 0/"), "{}", r.detail);
         assert!(r.detail.contains("status series absent"), "{}", r.detail);
         assert!(r.detail.contains("NEVER AUDITED"), "{}", r.detail);
@@ -1746,7 +1723,7 @@ mod tests {
         }
         let data = run_data(&samples);
         let r = check_never_ahead(&data);
-        assert!(r.passed, "inherited steadiness clock audited too early: {}", r.detail);
+        assert!(r.passed(), "inherited steadiness clock audited too early: {}", r.detail);
     }
 
     // ReadConvergedAtQuiesce: read == write per shard on both hosts' final
@@ -1760,7 +1737,7 @@ mod tests {
             rsample(FOLLOWER, 5_000, 0.0, &[(1, 200, 200), (2, 80, 80)]),
         ];
         let r = check_read_converged_at_quiesce(&samples, LEADER, FOLLOWER);
-        assert!(r.passed, "{}", r.detail);
+        assert!(r.passed(), "{}", r.detail);
         assert!(r.detail.contains("4 host-shards"), "{}", r.detail);
     }
 
@@ -1774,7 +1751,7 @@ mod tests {
             rsample(FOLLOWER, 5_000, 0.0, &[(1, 200, 200), (2, 80, 61)]),
         ];
         let r = check_read_converged_at_quiesce(&samples, LEADER, FOLLOWER);
-        assert!(!r.passed);
+        assert!(!r.passed());
         assert!(r.detail.contains(&format!("{FOLLOWER} shard_2")), "{}", r.detail);
         assert!(r.detail.contains("read 61 != write 80"), "{}", r.detail);
     }
@@ -1788,7 +1765,7 @@ mod tests {
             sample(FOLLOWER, 5_000, &[(1, 200)]),
         ];
         let r = check_read_converged_at_quiesce(&samples, LEADER, FOLLOWER);
-        assert!(!r.passed);
+        assert!(!r.passed());
         assert!(r.detail.contains("unattestable"), "{}", r.detail);
     }
 
@@ -1800,7 +1777,7 @@ mod tests {
             NodeSample::unreachable(FOLLOWER.into(), 5_000, "down".into()),
         ];
         let r = check_read_converged_at_quiesce(&samples, LEADER, FOLLOWER);
-        assert!(!r.passed);
+        assert!(!r.passed());
         assert!(r.detail.contains(&format!("no ok sample for {FOLLOWER}")), "{}", r.detail);
     }
 
@@ -1817,7 +1794,7 @@ mod tests {
             rsample(FOLLOWER, 5_000, 0.0, &[(2, 217_198, 217_198)]),
         ];
         let r = check_read_converged_at_quiesce(&samples, LEADER, FOLLOWER);
-        assert!(r.passed, "{}", r.detail);
+        assert!(r.passed(), "{}", r.detail);
     }
 
     // Wedged drain with traffic: read < write on BOTH final ticks. The write
@@ -1831,7 +1808,7 @@ mod tests {
             rsample(FOLLOWER, 5_000, 0.0, &[(1, 200, 200)]),
         ];
         let r = check_read_converged_at_quiesce(&samples, LEADER, FOLLOWER);
-        assert!(!r.passed);
+        assert!(!r.passed());
         assert!(r.detail.contains(&format!("{LEADER} shard_1")), "{}", r.detail);
     }
 
@@ -1849,8 +1826,53 @@ mod tests {
             }
         }
         let r = check_read_converged_at_quiesce(&samples, LEADER, FOLLOWER);
-        assert!(!r.passed);
+        assert!(!r.passed());
         assert!(r.detail.contains("freshness bound"), "{}", r.detail);
         assert!(r.detail.contains(FOLLOWER), "{}", r.detail);
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    use crate::scenario::ScenarioOutcome;
+
+    #[test]
+    fn a_failure_outranks_an_inconclusive() {
+        // The dangerous direction: a check that had nothing to say must never
+        // soften a check that found something wrong.
+        let checks = vec![
+            CheckResult::pass("A"),
+            CheckResult::inconclusive("B", "no rotation reached"),
+            CheckResult::fail("C", "tip fork"),
+        ];
+        assert_eq!(ScenarioOutcome::of(&checks), ScenarioOutcome::Fail);
+        assert!(!ScenarioOutcome::of(&checks).is_pass());
+    }
+
+    #[test]
+    fn inconclusive_wins_only_when_nothing_failed() {
+        let checks = vec![CheckResult::pass("A"), CheckResult::inconclusive("B", "no age spread")];
+        assert_eq!(ScenarioOutcome::of(&checks), ScenarioOutcome::Inconclusive);
+        // The whole point of the third state: this must NOT read as success.
+        assert!(!ScenarioOutcome::of(&checks).is_pass());
+    }
+
+    #[test]
+    fn all_pass_is_the_only_pass() {
+        let checks = vec![CheckResult::pass("A"), CheckResult::pass_with_detail("B", "12 segments")];
+        assert_eq!(ScenarioOutcome::of(&checks), ScenarioOutcome::Pass);
+        assert!(ScenarioOutcome::of(&checks).is_pass());
+        assert_eq!(ScenarioOutcome::of(&[]), ScenarioOutcome::Pass);
+    }
+
+    #[test]
+    fn inconclusive_is_neither_passed_nor_failed() {
+        // Consumers filter on these three predicates; an inconclusive check
+        // leaking into either bucket is how it would get silently reclassified.
+        let c = CheckResult::inconclusive("B", "nothing to measure");
+        assert!(!c.passed());
+        assert!(!c.failed());
+        assert!(c.is_inconclusive());
     }
 }

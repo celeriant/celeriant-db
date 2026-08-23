@@ -19,7 +19,7 @@
 # binary's changes.
 #
 # Server defaults as of this binary, for reference only — do not mirror them here:
-#   fsync_delay_us 17000, replication_delay_us 17000, mesh_channel_size 512,
+#   fsync_delay_us 17000, replication_delay_us 17000, mesh_channel_size 8192,
 #   num_shards = CPU count, reserve_coordinator_shard false, standalone false.
 #
 # Changing any of these on an existing data directory is a HARD START FAILURE, because they

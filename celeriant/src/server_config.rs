@@ -118,7 +118,7 @@ pub struct ServerConfig {
 
     #[arg(
         long,
-        default_value = "512",
+        default_value = "8192",
         env = "CELERIANT_MESH_CHANNEL_SIZE",
         help = "Mesh channel size for inter-shard communication"
     )]
@@ -1068,6 +1068,37 @@ impl Default for ServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The clap default and `ServerConfig::default()` must agree. `487f8c1` cut
+    /// the clap default to 512 and left the struct at 8192, which also made
+    /// `check_field!` report the value as user-overridden on every boot.
+    #[test]
+    fn mesh_channel_size_clap_default_matches_struct_default() {
+        use clap::CommandFactory;
+        let cmd = ServerConfig::command();
+        let arg = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "mesh_channel_size")
+            .expect("mesh_channel_size arg");
+        let declared: usize = arg
+            .get_default_values()
+            .first()
+            .expect("mesh_channel_size has a clap default")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(declared, ServerConfig::default().mesh_channel_size);
+    }
+
+    /// The same invariant for every field, via the mechanism `log_non_defaults`
+    /// already uses. Sensitive to `CELERIANT_*` in the environment, which is why
+    /// the mesh_channel_size check above reads clap's declared default instead.
+    #[test]
+    fn no_clap_default_drifts_from_struct_default() {
+        let drift = ServerConfig::parse_from(["celeriant"]).non_default_entries();
+        assert!(drift.is_empty(), "clap defaults drift from ServerConfig::default(): {drift:?}");
+    }
 
     #[test]
     fn to_compression_meta() {

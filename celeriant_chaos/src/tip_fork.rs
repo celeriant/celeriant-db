@@ -470,20 +470,20 @@ mod tests {
     fn verdict_fails_closed_on_zero_shards_checked() {
         // Every shard skipped (SSH/tool unavailable) — must not read as PASS.
         let r = verdict("NoDivergentShardTips", 0, &[], "0 shard(s) checked, skipped: shard_1: no WAL header".into());
-        assert!(!r.passed);
+        assert!(!r.passed());
         assert!(r.detail.contains("oracle unattestable"), "{}", r.detail);
     }
 
     #[test]
     fn verdict_passes_when_shards_checked_and_clean() {
         let r = verdict("NoDivergentShardTips", 3, &[], "3 shard(s) checked".into());
-        assert!(r.passed, "{}", r.detail);
+        assert!(r.passed(), "{}", r.detail);
     }
 
     #[test]
     fn verdict_fails_on_real_issue_even_with_shards_checked() {
         let r = verdict("NoDivergentShardTips", 1, &["shard_1 DIVERGENT-TIP FORK".to_string()], "1 shard(s) checked".into());
-        assert!(!r.passed);
+        assert!(!r.passed());
         assert!(r.detail.contains("DIVERGENT-TIP FORK"));
     }
 }

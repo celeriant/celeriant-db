@@ -1,11 +1,15 @@
 // Lib target so dev bins (replay) share the harness modules with the
 // celeriant-chaos orchestrator bin.
 pub mod actions;
+pub mod cardinality_checks;
+pub mod cardinality_deliverable;
+pub mod cardinality_workload;
 pub mod checkers;
 pub mod config;
 pub mod disk_truth;
 pub mod epoch_oracle;
 pub mod final_read;
+pub mod host_poll;
 pub mod invariants;
 pub mod journal_assert;
 pub mod logs;

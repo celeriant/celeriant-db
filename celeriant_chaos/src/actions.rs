@@ -65,10 +65,19 @@ pub enum Action {
     /// already-healed partition (the Makefile target loops on `-C` and exits
     /// cleanly once no rules match).
     Heal { src: String, dst: String, port: u16 },
+    /// Rewrite both nodes' systemd units with a scenario-chosen memory budget
+    /// and segment size, then `daemon-reload`. The unit is not restarted, so
+    /// this must run BEFORE bring-up for the new environment to take effect.
+    ///
+    /// `cardinality_pressure` needs it: the memory percentage and
+    /// `shard_log_preallocate_bytes` are the two dials the scenario is built
+    /// around, and everything in the segment-summary pipeline scales linearly
+    /// with the second one.
+    UpdateServiceConfig { memory_percent: u64, segment_bytes: u64 },
 }
 
 impl Action {
-    fn make_target(&self) -> &'static str {
+    pub(crate) fn make_target(&self) -> &'static str {
         match self {
             Self::TeardownData => "teardown-data",
             Self::StartInfra => "start-infra",
@@ -91,13 +100,14 @@ impl Action {
             Self::RestoreClock { .. } => "restore-clock",
             Self::FillDisk { .. } => "fill-disk",
             Self::CleanDisk { .. } => "clean-disk",
+            Self::UpdateServiceConfig { .. } => "update-service",
         }
     }
 
     /// Extra `KEY=VALUE` variables to set when invoking the target. Used to
     /// skip interactive confirmation prompts in destructive targets like
     /// `teardown-data`, and to pass dynamic partition targets (SRC/DST/PORT).
-    fn make_vars(&self) -> Vec<String> {
+    pub(crate) fn make_vars(&self) -> Vec<String> {
         match self {
             Self::TeardownData => vec!["FORCE=yes".to_string()],
             Self::Partition { src, dst, port } | Self::Heal { src, dst, port } => {
@@ -127,6 +137,12 @@ impl Action {
             Self::CleanDisk { host } => {
                 vec![format!("HOST={host}")]
             }
+            Self::UpdateServiceConfig { memory_percent, segment_bytes } => {
+                vec![
+                    format!("MEMORY_CONSUMPTION_PERCENT={memory_percent}"),
+                    format!("SHARD_LOG_PREALLOCATE_BYTES={segment_bytes}"),
+                ]
+            }
             _ => Vec::new(),
         }
     }
@@ -142,27 +158,32 @@ impl<'a> ActionExecutor<'a> {
     }
 
     pub fn run(&self, action: &Action) -> Result<(), String> {
-        self.run_make(action.make_target(), &action.make_vars())
+        run_make_in(&self.cfg.deploy_dir, action.make_target(), &action.make_vars())
     }
+}
 
-    fn run_make(&self, target: &str, vars: &[String]) -> Result<(), String> {
-        let mut cmd = Command::new("make");
-        cmd.arg("-s").arg(target);
-        cmd.arg("DANGEROUS=1");
-        for v in vars {
-            cmd.arg(v);
-        }
-        let status = cmd
-            .current_dir(&self.cfg.deploy_dir)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .map_err(|e| format!("spawn make {target}: {e}"))?;
-        if !status.success() {
-            return Err(format!("make {target} exited with {status}"));
-        }
-        Ok(())
+/// The `make` invocation itself, free of the borrowed config.
+///
+/// `ActionExecutor` borrows its `ClusterConfig`, so a caller that must own its
+/// arguments — a `spawn_blocking` closure, which is where every blocking action
+/// belongs if a deadline at the call site is to mean anything — cannot use it.
+pub fn run_make_in(deploy_dir: &Path, target: &str, vars: &[String]) -> Result<(), String> {
+    let mut cmd = Command::new("make");
+    cmd.arg("-s").arg(target);
+    cmd.arg("DANGEROUS=1");
+    for v in vars {
+        cmd.arg(v);
     }
+    let status = cmd
+        .current_dir(deploy_dir)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| format!("spawn make {target}: {e}"))?;
+    if !status.success() {
+        return Err(format!("make {target} exited with {status}"));
+    }
+    Ok(())
 }
 
 /// Find the project root by walking up from CWD until we hit a Cargo.toml

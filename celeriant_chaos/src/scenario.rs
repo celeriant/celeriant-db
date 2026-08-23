@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::actions::{Action, ActionExecutor};
 use crate::config::ClusterConfig;
-use crate::invariants::{CheckResult, RunData, ScenarioExpectations, run_all};
+use crate::invariants::{CheckOutcome, CheckResult, RunData, ScenarioExpectations, run_all};
 use crate::logs::fetch_journal;
 use crate::sample::{NodeSample, elapsed_ms};
 use crate::scrape::Scraper;
@@ -46,10 +46,52 @@ impl Default for ScenarioParams {
     }
 }
 
+/// Verdict for a whole scenario, aggregated from its checks.
+///
+/// `Inconclusive` is not a soft failure. A time-boxed run that never rotated a
+/// segment, never reached an age spread, or stopped early on the disk watchdog
+/// has not found a defect — it has failed to reach the regime where its
+/// measurements mean anything. `smoke` is inconclusive by construction and that
+/// is the correct result for a run whose only job was proving the harness
+/// assembles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum ScenarioOutcome {
+    Pass,
+    Fail,
+    Inconclusive,
+}
+
+impl ScenarioOutcome {
+    /// A failure outranks an inconclusive: something is known to be wrong, and
+    /// a check that merely had nothing to say must not soften that verdict.
+    pub fn of(checks: &[CheckResult]) -> Self {
+        if checks.iter().any(|c| c.failed()) {
+            Self::Fail
+        } else if checks.iter().any(|c| c.is_inconclusive()) {
+            Self::Inconclusive
+        } else {
+            Self::Pass
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Fail => "FAIL",
+            Self::Inconclusive => "INCONCLUSIVE",
+        }
+    }
+
+    /// Only a clean pass counts as success for an exit code or a soak gate.
+    pub fn is_pass(self) -> bool {
+        self == Self::Pass
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct ScenarioReport {
     pub name: String,
-    pub passed: bool,
+    pub outcome: ScenarioOutcome,
     pub params: ScenarioParamsJson,
     pub bench: BenchmarkSummary,
     pub checks: Vec<CheckResult>,
@@ -83,6 +125,12 @@ pub struct ScenarioReport {
     /// Trended across soak iterations to catch fallback-object leaks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub s3_lifecycle: Option<crate::s3_lifecycle::S3LifecycleReport>,
+    /// `cardinality_pressure`'s deliverable as typed numbers: the three reheat
+    /// cost curves, the cold/warm delta, and the run shape they were measured
+    /// under. The summary markdown renders from this, so a headline figure can
+    /// be re-derived from the run JSON instead of parsed out of prose.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cardinality: Option<crate::cardinality_deliverable::CardinalityDeliverable>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -252,6 +300,99 @@ pub async fn build_bench_pool(
     .map_err(|e| format!("pool build: {e}"))
 }
 
+/// One pool per shard lane, so a connection can settle on one shard and stay.
+///
+/// Shard affinity in `Population::birth` is necessary but not sufficient. Every
+/// task drawing from one shared pool defeats it: checkout is a FIFO free-list
+/// with no task-to-connection binding, while a connection is sticky to whichever
+/// shard it last served (`check_client_redirect` migrates the stream and the new
+/// executor becomes `ctx.current_shard_id`). A task in lane 1 therefore keeps
+/// drawing connections last used by lanes 2 and 3 and migrating them back.
+///
+/// Measured on the first real run: `celeriant_connection_redirects_total` reached
+/// **163,258 against 215,757 writes** — about 76% of requests hauling a TCP
+/// stream across the glommio mesh. `celeriant_mesh_channel_full_total` stayed at
+/// zero, so none of it failed; it was pure cost, landing in every latency the
+/// reheat curve reports.
+///
+/// Task `t` uses `pools[t % DATA_SHARDS]`, matching the lane `Population::birth`
+/// assigns it. Total connections are unchanged: `DATA_SHARDS × (tasks /
+/// DATA_SHARDS)`.
+pub async fn build_lane_pools(
+    cfg: &ClusterConfig,
+    up: &ClusterUp,
+    params: ScenarioParams,
+) -> Result<Vec<std::sync::Arc<Pool>>, String> {
+    build_lane_pools_with_timeout(cfg, up, params, celeriant_bench::DEFAULT_REQUEST_TIMEOUT).await
+}
+
+/// Per-request deadline for the phase 3 and phase 5 read pools.
+///
+/// The fill's 5s deadline censored phase 5 outright. Run 1787054105: 11,729 of
+/// 12,000 cold reads timed out, and the 271 survivors reported p50 4,811ms, p99
+/// 5,095ms and max 5,154ms — three numbers all pinned against the deadline, none
+/// of them the cost of a cold read. Phase 3's warm max of 4,789ms says the
+/// censoring reaches the baseline too at any larger population.
+///
+/// Sized from the only two hard numbers available:
+///   * >5s per cold read at ~1 sealed segment per shard (the censored run above);
+///   * ~12 sealed segments per shard projected for the `deep` preset.
+///
+/// A cold read reverse-scans back through segments, so scale that lower bound
+/// linearly: 12 x 5s = 60s of scan, plus the ~5s queueing floor phase 3 already
+/// showed at ~3,000-way concurrency with every cache hot. The resulting 65s is
+/// itself only a lower bound — 5s was never the cold cost, just where we stopped
+/// looking — so double it for the tail nobody has ever seen.
+///
+/// Worst case: each phase issues ~12,000 reads across ~3,000 tasks, 4 reads deep
+/// per task. If every single read hung, a phase costs 4 x 130s = 8m40s and the
+/// pair costs 17m20s — bounded, and ~6% of the `deep` preset's 5h fill.
+///
+/// Phases 3 and 5 MUST share this. They are the two halves of one delta, and a
+/// censored baseline compared against an uncensored cold side would render as a
+/// finding.
+pub const READ_REQUEST_TIMEOUT: Duration = Duration::from_secs(130);
+
+/// Lane pools for the read phases, on `READ_REQUEST_TIMEOUT` rather than the
+/// write-shaped default. Built fresh for each read phase; the fill's pools are
+/// deliberately left alone, because lengthening the write deadline would change
+/// the throughput and backpressure that shaped the population being measured.
+pub async fn build_read_pools(
+    cfg: &ClusterConfig,
+    up: &ClusterUp,
+    params: ScenarioParams,
+) -> Result<Vec<std::sync::Arc<Pool>>, String> {
+    build_lane_pools_with_timeout(cfg, up, params, READ_REQUEST_TIMEOUT).await
+}
+
+async fn build_lane_pools_with_timeout(
+    cfg: &ClusterConfig,
+    up: &ClusterUp,
+    params: ScenarioParams,
+    request_timeout: Duration,
+) -> Result<Vec<std::sync::Arc<Pool>>, String> {
+    let lanes = crate::cardinality_workload::DATA_SHARDS as usize;
+    let per_lane = (params.tasks / lanes).max(1);
+    let mut pools = Vec::with_capacity(lanes);
+    for lane in 0..lanes {
+        let pool = PoolBuilder {
+            address1: &up.bench_primary,
+            address2: &up.bench_seed,
+            server_name: Some(up.bench_primary.split(':').next().unwrap_or(&up.bench_primary)),
+            ca_cert: cfg.ca_cert.to_str().unwrap(),
+            client_cert: cfg.client_cert.to_str().unwrap(),
+            client_key: cfg.client_key.to_str().unwrap(),
+            plaintext: false,
+            max_connections: per_lane,
+        }
+        .build_with_request_timeout(request_timeout)
+        .await
+        .map_err(|e| format!("lane {lane} pool build: {e}"))?;
+        pools.push(pool);
+    }
+    Ok(pools)
+}
+
 /// Per-op history recorder for the idempotent bench, writing
 /// `<run_dir>/<scenario>-history.jsonl`. Creation failure disables recording
 /// (warn, not abort) — the metric predicates still run.
@@ -381,6 +522,67 @@ pub async fn finish_history_and_check(
     checks
 }
 
+/// Deadline for any single tear-down / evaluation step.
+///
+/// Everything in this phase runs after the measurement is already in hand, so
+/// no step is worth the run. Run 1787056102 wedged here for 37 minutes and had
+/// to be SIGKILLed, losing a report that was fully computed except for the
+/// write; a bounded step degrades one check instead. Generous rather than
+/// tight — an ssh to a loaded Pi legitimately takes tens of seconds — because
+/// the point is liveness, not latency.
+pub const TEARDOWN_STEP_BUDGET: Duration = Duration::from_secs(120);
+
+/// Disk-truth gets its own, larger budget: up to `MAX_DISK_TRUTH_ENTRIES` × 2
+/// nodes serial `celeriant-wal-inspect` invocations over ssh, each of which
+/// scans segments. It is also the one step whose loss is expensive — it is what
+/// clears an over-reported `NoClientSeqGaps` — so it is worth waiting for.
+pub const DISK_TRUTH_BUDGET: Duration = Duration::from_secs(600);
+
+/// Run one tear-down step under a deadline, announcing itself on both sides.
+///
+/// `None` means the step blew its budget. Every caller must degrade to
+/// INCONCLUSIVE on `None`: losing one check is survivable, losing the report is
+/// not. The step is also the missing progress output — phase 7 printed nothing
+/// across its entire duration, which is why a 37-minute hang could only be
+/// localised to a 185-line block.
+async fn step<T>(
+    scen: &str,
+    what: &str,
+    budget: Duration,
+    f: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    println!("[{scen}] step: {what}");
+    let t0 = Instant::now();
+    match tokio::time::timeout(budget, f).await {
+        Ok(v) => {
+            println!("[{scen}] step: {what} — done in {:.1}s", t0.elapsed().as_secs_f32());
+            Some(v)
+        }
+        Err(_) => {
+            println!(
+                "[{scen}] step: {what} — TIMED OUT after {}s, degrading to inconclusive",
+                budget.as_secs()
+            );
+            None
+        }
+    }
+}
+
+/// `step` for work that blocks its thread.
+///
+/// A `timeout` around a future that never yields cannot fire, so anything
+/// driving `std::process::Command` directly has to reach a blocking thread
+/// first or the deadline is decorative. The blocking thread is not cancelled on
+/// timeout — it drains when its ssh finally returns — but the run moves on.
+async fn step_blocking<T: Send + 'static>(
+    scen: &str,
+    what: &str,
+    budget: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    step(scen, what, budget, async move { tokio::task::spawn_blocking(f).await.ok() }).await.flatten()
+}
+
 /// Standard tear-down: settle scraper one more tick, stop services, splice
 /// the bench window out of the sample stream, run invariants against the
 /// supplied expectations, harvest logs on failure, and produce a report.
@@ -437,7 +639,7 @@ pub async fn tear_down_and_evaluate_with_audit(
     // Paired with a `total_flagged` count so the NoClientSeqGaps override
     // below can tell "every flagged aggregate was disk-verified" from
     // "only the first MAX_DISK_TRUTH_ENTRIES of a larger set were" (N2).
-    let disk_truth_computed: Option<(Vec<crate::disk_truth::DiskTruthEntry>, usize)> =
+    let disk_truth_planned: Option<(Vec<celeriant_bench::DeepAuditEntry>, usize)> =
         integrity.as_ref().filter(|i| !i.failing_task_acks.is_empty()).map(|i| {
             use celeriant_bench::DeepAuditEntry;
             let by_key: std::collections::HashMap<String, &DeepAuditEntry> = deep_audit
@@ -474,34 +676,67 @@ pub async fn tear_down_and_evaluate_with_audit(
             } else {
                 println!("[{scenario_name}] disk-truth: verifying {} flagged aggregates via wal-inspect on both nodes", synthesised.len());
             }
-            let verified = crate::disk_truth::verify_against_disk_truth(
-                &cfg.leader_host,
-                &cfg.follower_host,
-                &synthesised,
-            );
+            (synthesised, total_flagged)
+        });
+    // Bounded and off the async threads: `verify_against_disk_truth` is a
+    // serial run of `celeriant-wal-inspect` over ssh, one invocation per
+    // aggregate per node, and nothing in it had a deadline.
+    let mut timed_out_checks: Vec<CheckResult> = Vec::new();
+    let disk_truth_computed: Option<(Vec<crate::disk_truth::DiskTruthEntry>, usize)> = match disk_truth_planned {
+        None => None,
+        Some((synthesised, total_flagged)) => {
+            let (leader, follower) = (cfg.leader_host.clone(), cfg.follower_host.clone());
+            let verified = match step_blocking(
+                scenario_name,
+                "disk-truth wal-inspect",
+                DISK_TRUTH_BUDGET,
+                move || crate::disk_truth::verify_against_disk_truth(&leader, &follower, &synthesised),
+            )
+            .await
+            {
+                Some(v) => v,
+                None => {
+                    // No entries means the `NoClientSeqGaps` override below
+                    // cannot fire, which is the safe direction — but the reason
+                    // has to be on the record, or the run reads as a real gap.
+                    timed_out_checks.push(CheckResult::inconclusive(
+                        "DiskTruthVerified",
+                        format!(
+                            "wal-inspect over {total_flagged} flagged aggregates exceeded {}s — \
+                             disk truth unknown, so NoClientSeqGaps stands on the audit alone",
+                            DISK_TRUTH_BUDGET.as_secs()
+                        ),
+                    ));
+                    Vec::new()
+                }
+            };
             let truly_missing: u64 = verified.iter().map(|v| v.actually_missing.len() as u64).sum();
             let overreported: u64 = verified.iter().map(|v| v.audit_overreported.len() as u64).sum();
             println!(
                 "[{scenario_name}] disk-truth: {} aggregates checked, audit overreported {} seqs, actually missing {} seqs",
                 verified.len(), overreported, truly_missing
             );
-            (verified, total_flagged)
-        });
+            Some((verified, total_flagged))
+        }
+    };
     let (disk_truth_report, disk_truth_total_flagged): (Option<Vec<crate::disk_truth::DiskTruthEntry>>, usize) =
         match disk_truth_computed {
             Some((v, total_flagged)) => (Some(v), total_flagged),
             None => (None, 0),
         };
 
-    let executor = ActionExecutor::new(cfg);
-
     // Resource leak check: snapshot fd/RSS while services are still up and
     // compare against the bring-up baseline.
-    let mut env_checks: Vec<CheckResult> = Vec::new();
+    let mut env_checks: Vec<CheckResult> = timed_out_checks;
     for (host, before) in &up.resource_before {
-        match crate::resource_baseline::snapshot(host).await {
-            Ok(after) => env_checks.extend(crate::resource_baseline::baseline_checks(host, before, &after)),
-            Err(e) => println!("[{scenario_name}] resource after-snapshot skipped for {host}: {e}"),
+        let what = format!("resource after-snapshot {host}");
+        match step(scenario_name, &what, TEARDOWN_STEP_BUDGET, crate::resource_baseline::snapshot(host)).await {
+            Some(Ok(after)) => env_checks.extend(crate::resource_baseline::baseline_checks(host, before, &after)),
+            Some(Err(e)) => println!("[{scenario_name}] resource after-snapshot skipped for {host}: {e}"),
+            None => env_checks.push(CheckResult::inconclusive(
+                "FdReturnToBaseline",
+                format!("{host}: after-snapshot ssh exceeded {}s — fd/RSS leak unattestable", TEARDOWN_STEP_BUDGET.as_secs()),
+            )),
         }
     }
 
@@ -516,16 +751,35 @@ pub async fn tear_down_and_evaluate_with_audit(
 
     // Give the scraper one more tick before stopping it.
     sleep(Duration::from_millis(750)).await;
-    let outcome = up.scraper.stop().await;
+    let outcome = step(scenario_name, "stop scraper", TEARDOWN_STEP_BUDGET, up.scraper.stop())
+        .await
+        .ok_or_else(|| format!("{scenario_name}: scraper did not stop within {}s", TEARDOWN_STEP_BUDGET.as_secs()))?;
     let samples = outcome.store.snapshot().await;
 
-    println!("[{scenario_name}] stop services");
-    let _ = executor.run(&Action::StopAll);
+    {
+        // `systemd`'s own `TimeoutStopSec` is 90s per unit and the target stops
+        // them in sequence, so this budget has to clear two of those.
+        const STOP_ALL_BUDGET: Duration = Duration::from_secs(300);
+        let deploy_dir = cfg.deploy_dir.clone();
+        let (target, vars) = (Action::StopAll.make_target(), Action::StopAll.make_vars());
+        let _ = step_blocking(scenario_name, "stop services", STOP_ALL_BUDGET, move || {
+            crate::actions::run_make_in(&deploy_dir, target, &vars)
+        })
+        .await;
+    }
 
     // Post-stop oracles: WAL state is quiescent, MinIO is still up (teardown-data
     // only runs at the NEXT scenario's bring-up).
-    env_checks.extend(crate::epoch_oracle::run_epoch_oracle(cfg, 4).await);
-    let s3_lifecycle_report = crate::s3_lifecycle::audit_s3_fallback().await;
+    match step(scenario_name, "epoch oracle", TEARDOWN_STEP_BUDGET, crate::epoch_oracle::run_epoch_oracle(cfg, 4)).await {
+        Some(c) => env_checks.extend(c),
+        None => env_checks.push(CheckResult::inconclusive(
+            "EpochMonotonicPerChain",
+            format!("epoch oracle exceeded {}s — WAL epoch invariants unattestable", TEARDOWN_STEP_BUDGET.as_secs()),
+        )),
+    }
+    let s3_lifecycle_report = step(scenario_name, "s3 lifecycle audit", TEARDOWN_STEP_BUDGET, crate::s3_lifecycle::audit_s3_fallback())
+        .await
+        .flatten();
     if let Some(ref report) = s3_lifecycle_report {
         println!(
             "[{scenario_name}] s3-lifecycle: {} residual fallback objects across {} shards",
@@ -566,8 +820,8 @@ pub async fn tear_down_and_evaluate_with_audit(
         if disk_truth_override_applies(entries, disk_truth_total_flagged, MAX_DISK_TRUTH_ENTRIES) {
             let overreported: u64 = entries.iter().map(|e| e.audit_overreported.len() as u64).sum();
             for check in checks.iter_mut() {
-                if check.name == "NoClientSeqGaps" && !check.passed {
-                    check.passed = true;
+                if check.name == "NoClientSeqGaps" && check.failed() {
+                    check.outcome = CheckOutcome::Pass;
                     check.detail = format!(
                         "audit reported gaps but disk-truth verified all {} of {} flagged aggregates are clean ({} seqs overreported)",
                         entries.len(), disk_truth_total_flagged, overreported,
@@ -590,7 +844,20 @@ pub async fn tear_down_and_evaluate_with_audit(
     // at teardown, so a missing or unreadable journal is itself a fail (N4) —
     // it must not silently drop the JournalNoPanics/NoAbort/NoErrorStorm
     // checks and count a crashed node as never-run.
-    let log_files = harvest_logs(cfg, scenario_name, outcome.wall_start, outcome.wall_end, run_dir);
+    let log_files = {
+        // journalctl over ssh, one node at a time, and the fetch had no
+        // deadline. A failed fetch is already a `JournalHarvested` fail below,
+        // so a timeout lands in the same place instead of stalling the report.
+        const JOURNAL_BUDGET: Duration = Duration::from_secs(300);
+        let (leader, follower) = (cfg.leader_host.clone(), cfg.follower_host.clone());
+        let (scen, dir) = (scenario_name.to_string(), run_dir.clone());
+        let (wall_start, wall_end) = (outcome.wall_start, outcome.wall_end);
+        step_blocking(scenario_name, "harvest journals", JOURNAL_BUDGET, move || {
+            harvest_journals(&leader, &follower, &scen, wall_start, wall_end, &dir)
+        })
+        .await
+        .unwrap_or_default()
+    };
     for (label, _host) in [("cs1", &cfg.leader_host), ("cs2", &cfg.follower_host)] {
         let basename = format!("{scenario_name}.{label}.log");
         if !log_files.contains(&basename) {
@@ -612,18 +879,31 @@ pub async fn tear_down_and_evaluate_with_audit(
         }
     }
 
-    let passed = checks.iter().all(|c| c.passed);
-    if !passed {
-        let failed: Vec<&str> = checks.iter().filter(|c| !c.passed).map(|c| c.name).collect();
-        println!("[{scenario_name}] FAIL — {}", failed.join(", "));
-        for c in checks.iter().filter(|c| !c.passed) {
-            println!("[{scenario_name}]   {}: {}", c.name, c.detail);
+    // A failure outranks an inconclusive: something is known to be wrong, and
+    // that verdict should not be softened by a check that merely had nothing to
+    // say. Inconclusive only wins when nothing failed.
+    let verdict = ScenarioOutcome::of(&checks);
+    match verdict {
+        ScenarioOutcome::Fail => {
+            let failed: Vec<&str> = checks.iter().filter(|c| c.failed()).map(|c| c.name).collect();
+            println!("[{scenario_name}] FAIL — {}", failed.join(", "));
+            for c in checks.iter().filter(|c| c.failed()) {
+                println!("[{scenario_name}]   {}: {}", c.name, c.detail);
+            }
         }
+        ScenarioOutcome::Inconclusive => {
+            let unmet: Vec<&str> = checks.iter().filter(|c| c.is_inconclusive()).map(|c| c.name).collect();
+            println!("[{scenario_name}] INCONCLUSIVE — {}", unmet.join(", "));
+            for c in checks.iter().filter(|c| c.is_inconclusive()) {
+                println!("[{scenario_name}]   {}: {}", c.name, c.detail);
+            }
+        }
+        ScenarioOutcome::Pass => {}
     }
 
     Ok(ScenarioReport {
         name: scenario_name.into(),
-        passed,
+        outcome: verdict,
         params: ScenarioParamsJson {
             tasks: params.tasks,
             duration_secs: params.duration_secs,
@@ -642,6 +922,7 @@ pub async fn tear_down_and_evaluate_with_audit(
         deep_audit,
         disk_truth: disk_truth_report,
         s3_lifecycle: s3_lifecycle_report,
+        cardinality: None,
     })
 }
 
@@ -709,7 +990,7 @@ pub fn data_integrity_check(report: &DataIntegrityReport, max_unreadable: u64) -
             .collect();
         return CheckResult {
             name: NAME,
-            passed: false,
+            outcome: CheckOutcome::Fail,
             detail: format!(
                 "{} task(s) with gaps; {} acked client_seq value(s) missing total; sample: [{}]",
                 report.tasks_with_gaps,
@@ -721,7 +1002,7 @@ pub fn data_integrity_check(report: &DataIntegrityReport, max_unreadable: u64) -
     if report.tasks_unreadable > max_unreadable {
         return CheckResult {
             name: NAME,
-            passed: false,
+            outcome: CheckOutcome::Fail,
             detail: format!(
                 "{} task(s) unreadable during audit (allowed {})",
                 report.tasks_unreadable, max_unreadable,
@@ -4861,7 +5142,7 @@ pub async fn run_bench_load_sweep(
 
     let report = ScenarioReport {
         name: SCEN.to_string(),
-        passed: all_nonzero,
+        outcome: if all_nonzero { ScenarioOutcome::Pass } else { ScenarioOutcome::Fail },
         params: ScenarioParamsJson {
             tasks: last_tasks,
             duration_secs: base_params.duration_secs,
@@ -4880,6 +5161,7 @@ pub async fn run_bench_load_sweep(
         deep_audit: None,
         s3_lifecycle: None,
         disk_truth: None,
+        cardinality: None,
     };
     Ok(report)
 }
@@ -4894,9 +5176,21 @@ fn harvest_logs(
     wall_end: std::time::SystemTime,
     run_dir: &PathBuf,
 ) -> Vec<String> {
+    harvest_journals(&cfg.leader_host, &cfg.follower_host, scenario_name, wall_start, wall_end, run_dir)
+}
+
+/// `harvest_logs` with owned hosts, so it can be handed to `spawn_blocking`.
+fn harvest_journals(
+    leader_host: &str,
+    follower_host: &str,
+    scenario_name: &str,
+    wall_start: std::time::SystemTime,
+    wall_end: std::time::SystemTime,
+    run_dir: &std::path::Path,
+) -> Vec<String> {
     let pad = Duration::from_secs(5);
     let mut written = Vec::new();
-    for (label, host) in [("cs1", &cfg.leader_host), ("cs2", &cfg.follower_host)] {
+    for (label, host) in [("cs1", leader_host), ("cs2", follower_host)] {
         let basename = format!("{scenario_name}.{label}.log");
         let dest = run_dir.join(&basename);
         match fetch_journal(host, wall_start, wall_end, pad, &dest) {
@@ -4913,14 +5207,113 @@ fn harvest_logs(
 }
 
 async fn wait_for_stable_leader(scraper: &Scraper, timeout: Duration) -> Result<(), String> {
+    wait_for_stable_leader_since(scraper, timeout, 0).await
+}
+
+/// Wait until the cluster's *current* state is one leader and one follower,
+/// ignoring every sample taken before `since_ms`.
+///
+/// The recency floor is the whole point. This used to scan the entire scraper
+/// history for any sample with `node_role >= 0.5` and any with `< 0.5`, which is
+/// sound only against an empty store — its original caller runs right after
+/// bring-up. Called again after a mid-run restart, the store already holds
+/// thousands of samples on both sides of the threshold, so both `find`s hit on
+/// the first tick and the barrier returns in ~500ms no matter what the cluster
+/// is doing. Everything downstream then measures a cluster that may still be
+/// replaying `rebuild_active_segment_chain_tips`, and the cold-restart delta —
+/// the deliverable — is taken against an unsettled node.
+///
+/// It also now genuinely evaluates the latest sample *per host*, which is what
+/// the old comment claimed but the code did not do: two samples from the same
+/// host at different times could satisfy both halves.
+/// Per-shard node status codes, from `celeriant_node_status_code`.
+/// `0=BootCatchup 1=Follower 2=FollowerCatchingUp 3=Promoting 4=Leader 5=Fenced 6=Standalone`
+const STATUS_FOLLOWER_STEADY: u64 = 1;
+const STATUS_LEADER: u64 = 4;
+
+/// Wait until one node leads and every other node has **rejoined as a steady
+/// follower on every shard**.
+///
+/// `wait_for_stable_leader_since` is not this. It keys on `node_role`, and
+/// `node_role < 0.5` means only "not leader" — a node that is booting
+/// (`BootCatchup`), still replaying (`FollowerCatchingUp`), or mid-election
+/// (`Promoting`) all report it. So that barrier clears as soon as the follower
+/// is reachable, which is well before it holds the data.
+///
+/// That gap falsified a real measurement. Phase 5 reads through pools seeded on
+/// both nodes, so reads landed on a follower that did not yet have the
+/// aggregate and came back empty in ~0.25ms — no scan, no bytes — reading as a
+/// spectacularly fast cold path and dragging the cold p50 *below* the warm one.
+/// `EventualConvergence` in the same run had the follower 496 wal_seqs behind.
+///
+/// `FollowerCatchingUp` -> `Follower` is exactly the transition that says the
+/// replay finished, which makes this the signal to wait on rather than a
+/// wal_seq comparison the follower itself has not acted on yet.
+async fn wait_for_follower_rejoin(
+    scen: &str,
+    scraper: &Scraper,
+    timeout: Duration,
+    since_ms: u64,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let mut last = String::from("no samples");
+    while Instant::now() < deadline {
+        sleep(Duration::from_millis(500)).await;
+        let snap = scraper.store().snapshot().await;
+        let mut latest: std::collections::BTreeMap<String, &NodeSample> = Default::default();
+        for s in snap.iter().filter(|s| s.ok && s.t_ms >= since_ms) {
+            latest.insert(s.host.clone(), s);
+        }
+        if latest.len() < 2 {
+            last = format!("only {} host(s) reporting", latest.len());
+            continue;
+        }
+        let mut leaders = 0usize;
+        let mut steady_followers = 0usize;
+        let mut detail = Vec::new();
+        for (host, s) in &latest {
+            let codes: Vec<u64> = s.node_status_code_by_shard.values().copied().collect();
+            if codes.is_empty() {
+                detail.push(format!("{host}: no shard status"));
+                continue;
+            }
+            if codes.iter().all(|c| *c == STATUS_LEADER) {
+                leaders += 1;
+            } else if codes.iter().all(|c| *c == STATUS_FOLLOWER_STEADY) {
+                steady_followers += 1;
+            } else {
+                detail.push(format!("{host}: shards {codes:?}"));
+            }
+        }
+        if leaders == 1 && steady_followers >= 1 {
+            return Ok(());
+        }
+        last = if detail.is_empty() {
+            format!("{leaders} leader(s), {steady_followers} steady follower(s)")
+        } else {
+            detail.join("; ")
+        };
+    }
+    println!("[{scen}] follower did not reach steady Follower within {timeout:?}: {last}");
+    Err(last)
+}
+
+async fn wait_for_stable_leader_since(
+    scraper: &Scraper,
+    timeout: Duration,
+    since_ms: u64,
+) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         sleep(Duration::from_millis(500)).await;
         let snap = scraper.store().snapshot().await;
-        // Look at the most recent sample per host.
-        let last_l = snap.iter().rev().find(|s| s.ok && s.node_role >= 0.5);
-        let last_f = snap.iter().rev().find(|s| s.ok && s.node_role < 0.5);
-        if last_l.is_some() && last_f.is_some() {
+        let mut latest: std::collections::BTreeMap<&str, f64> = std::collections::BTreeMap::new();
+        for s in snap.iter().filter(|s| s.ok && s.t_ms >= since_ms) {
+            latest.insert(s.host.as_str(), s.node_role);
+        }
+        let leaders = latest.values().filter(|r| **r >= 0.5).count();
+        let followers = latest.values().filter(|r| **r < 0.5).count();
+        if leaders == 1 && followers >= 1 {
             return Ok(());
         }
     }
@@ -5085,7 +5478,9 @@ pub async fn run_cold_segment_reads(
             ),
         )
     } else {
-        CheckResult::pass_with_detail(
+        // Not a pass. Nothing ever went cold, so every cold-path check below it
+        // was evaluated against a warm cluster and proved nothing.
+        CheckResult::inconclusive(
             "SegmentRotationOccurred",
             format!(
                 "no rotation reached (leader={leader_seg_count} follower={follower_seg_count} \
@@ -5896,5 +6291,2475 @@ async fn assert_schema_enforced(
             }
             Err(e) => return CheckResult::fail(name, format!("non-conforming write never resolved: {e}")),
         }
+    }
+}
+
+// ===========================================================================
+// cardinality_pressure
+// ===========================================================================
+
+/// Data root and systemd unit of the CHAOS instance.
+///
+/// Both nodes also run a production celeriant under a different unit and a
+/// different data root. Pointing the RSS poller or the segment counter at the
+/// wrong one would report prod's memory and prod's segments as this run's
+/// result, which is worse than not measuring at all.
+const CARDINALITY_DATA_ROOT: &str = "/var/lib/nvme/celeriant-data";
+const CARDINALITY_UNIT: &str = "celeriant.service";
+
+/// Phase 2 and phase 6 are the only windows with full history recording on, so
+/// both are bounded in minutes. The fill cannot record: the recorder drops on a
+/// full 65536-slot channel and `check_idempotency` fails closed on any drop.
+const CONTENTION_SECS: u64 = 120;
+const FAILOVER_WINDOW_SECS: u64 = 90;
+const FAILOVER_KILL_AT_SECS: u64 = 20;
+const FAILOVER_RESTART_AFTER_SECS: u64 = 20;
+/// Keys drawn per age bucket per task for the phase 3 / phase 5 read probes.
+const READS_PER_BUCKET: usize = 4;
+/// Reheat samples a bucket needs before it counts as populated. Below this the
+/// percentiles are noise dressed as a curve.
+const MIN_REHEAT_OPS_PER_BUCKET: u64 = 5;
+/// Total sampled ack-ledger entries across all tasks.
+const LEDGER_TARGET: usize = 100_000;
+/// Ledger entries actually audited. The ledger is already a uniform sample, so
+/// an even stride over it stays uniform; the cap is what keeps the audit's
+/// round-trip count bounded when the fill reached tens of millions of keys.
+const AUDIT_SAMPLE: usize = 512;
+const GROWTH_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+/// Quiet period between dropping phase 2's pool and starting phase 3's reads.
+/// Long enough for the server to close several hundred connections; short
+/// enough not to let the "warm" cluster start going cold on us, which would
+/// bias the delta the other way.
+const P2_DRAIN_SETTLE: Duration = Duration::from_secs(10);
+/// Budget for the follower to catch up after the phase 4 restart, before any
+/// cold read is measured. Generous because an unconverged follower does not
+/// slow the measurement down, it silently falsifies it.
+const CONVERGENCE_AFTER_RESTART: Duration = Duration::from_secs(120);
+/// Cap on concurrent contention writers, well inside the 28,232 ephemeral-port
+/// budget per destination.
+const MAX_CONTENTION_TASKS: usize = 4096;
+/// Assumed follower catch-up throughput, used only to size the phase 6
+/// convergence wait. An assumption, not a measurement — a follower one segment
+/// behind replays up to `segment_bytes` over TCP and `max_catchup_gap_bytes` is
+/// unset on the Pis, so the constant fixed in `wait_for_wal_convergence`'s
+/// callers elsewhere is far too short at 1GB segments.
+const ASSUMED_CATCHUP_BYTES_PER_SEC: u64 = 20 * 1024 * 1024;
+
+/// `cardinality_pressure`: drive tens of millions of independent aggregates and
+/// clients through a memory-constrained two-node cluster, then measure what the
+/// cold path costs.
+///
+/// Cardinality is an **output** of this run, not an input: the fill is
+/// time-boxed and reaches whatever it reaches. What the run asserts is that it
+/// got to a regime where its measurements mean something — and when it did not,
+/// it says INCONCLUSIVE rather than passing.
+///
+/// Phases: 0 constrain, 1 fill (the long one, with the reheat probe running
+/// throughout), 2 contention, 3 hot reads, 4 restart, 5 cold reads (the delta),
+/// 6 SIGKILL + failover, 7 evaluate.
+pub async fn run_cardinality_pressure(
+    cfg: &ClusterConfig,
+    params: ScenarioParams,
+    card: crate::cardinality_workload::CardinalityParams,
+    run_dir: &PathBuf,
+) -> Result<ScenarioReport, String> {
+    use crate::cardinality_deliverable as cd;
+    use crate::cardinality_workload as cw;
+    use celeriant_bench::population::{AgeBucket, Member, Population};
+    use celeriant_bench::read_workload::ReheatCostCurve;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const SCEN: &str = "cardinality_pressure";
+
+    // ---- Phase 0: constrain -------------------------------------------------
+    cw::validate_tasks(params.tasks)?;
+    let fill_budget = card.fill_budget();
+    let mix = card.large_event_fraction();
+    let achieved = card.achieved_aggs_per_segment();
+    let birth_interval = cw::per_task_interval(card.birth_rate_per_sec, params.tasks);
+    let reheat_interval = cw::per_task_interval(card.reheat_rate_per_sec, params.tasks);
+
+    println!("[{SCEN}] phase 0: constrain");
+    println!(
+        "[{SCEN}]   preset={} fill budget={}s  tasks={} ({} per data shard)",
+        card.preset.name(),
+        fill_budget.as_secs(),
+        params.tasks,
+        params.tasks / cw::DATA_SHARDS as usize,
+    );
+    println!(
+        "[{SCEN}]   segment={:.0}MB  memory={}%  target {} aggs/segment -> derived large-event mix {:.1}% -> achieves {} aggs/segment (design point {})",
+        card.segment_bytes as f64 / (1024.0 * 1024.0),
+        card.memory_percent,
+        card.target_aggs_per_segment,
+        mix * 100.0,
+        achieved,
+        cw::BLOOM_DESIGN_POINT_AGGS_PER_SEGMENT,
+    );
+    println!(
+        "[{SCEN}]   birth {:.1}/s cluster-wide ({}), reheat {:.1}/s cluster-wide ({}), disk high-water {}%",
+        card.birth_rate_per_sec,
+        birth_interval.map(|d| format!("1 per {:.1}s per task", d.as_secs_f64())).unwrap_or_else(|| "disabled".into()),
+        card.reheat_rate_per_sec,
+        reheat_interval.map(|d| format!("1 per {:.1}s per task", d.as_secs_f64())).unwrap_or_else(|| "disabled".into()),
+        card.disk_high_water_pct,
+    );
+
+    let executor = ActionExecutor::new(cfg);
+    // Before bring-up: the unit is rewritten and daemon-reloaded but not
+    // restarted, so the new environment takes effect when bring_up_cluster
+    // starts the nodes.
+    executor.run(&Action::UpdateServiceConfig {
+        memory_percent: card.memory_percent,
+        segment_bytes: card.segment_bytes,
+    })?;
+    // `update-service` rewrites both nodes' systemd units and nothing else puts
+    // them back, so without a restore this scenario's 20% memory and segment
+    // size persist into every later `--scenario`/`--full` invocation and every
+    // soak iteration — silently, and read as the cluster's normal settings.
+    // Captured from config.env rather than hardcoded so the restore tracks
+    // whatever the rig is actually configured for.
+    let baseline_cfg = read_service_baseline(cfg);
+
+    let up = bring_up_cluster(cfg, SCEN, run_dir).await?;
+    let pool = build_bench_pool(cfg, &up, params).await?;
+    // Lane-pinned pools carry the phase 1 fill; `pool` stays for the smoke test
+    // and the schema probe, both of which touch one fixed key. The read phases
+    // build their own — see `READ_REQUEST_TIMEOUT` — so this one keeps the
+    // write-shaped deadline the fill was characterised on.
+    let lane_pools = build_lane_pools(cfg, &up, params).await?;
+    println!("[{SCEN}] smoke test");
+    smoke_test(&pool).await.map_err(|e| format!("smoke: {e}"))?;
+
+    let mut extra_checks: Vec<CheckResult> = Vec::new();
+    extra_checks.push(assert_account_schemas_enforced(&pool).await);
+
+    let node_ram_bytes = ssh_mem_total_bytes(&cfg.leader_host).await;
+
+    let poll_store = crate::host_poll::HostPollStore::new();
+    let poll_handle = crate::host_poll::spawn(
+        vec![cfg.leader_host.clone(), cfg.follower_host.clone()],
+        CARDINALITY_UNIT.to_string(),
+        CARDINALITY_DATA_ROOT.to_string(),
+        Duration::from_secs(1),
+        poll_store.clone(),
+    );
+
+    // ---- Phase 1: fill ------------------------------------------------------
+    let bench_window_start_ms = up.elapsed_ms();
+    println!("[{SCEN}] phase 1: fill — birth + decay + age-stratified reheat, {}s budget", fill_budget.as_secs());
+
+    let fill_start = Instant::now();
+    let stop = Arc::new(AtomicBool::new(false));
+    let counters = Arc::new(cw::FillCounters::default());
+    let fill_curve = Arc::new(StdMutex::new(ReheatCostCurve::new(
+        "Reheat cost by age — during the fill (phase 1)",
+        params.seed,
+    )));
+    let ledger_capacity = (LEDGER_TARGET / params.tasks).max(8);
+
+    let mut fill_handles = Vec::with_capacity(params.tasks);
+    for task_id in 0..params.tasks {
+        fill_handles.push(tokio::spawn(cw::run_fill_task(
+            lane_pools[task_id % lane_pools.len()].clone(),
+            cw::FillConfig {
+                task_id: task_id as u32,
+                tasks: params.tasks,
+                seed: params.seed,
+                large_event_fraction: mix,
+                budget: fill_budget,
+                birth_interval,
+                reheat_interval,
+                ledger_capacity,
+            },
+            stop.clone(),
+            counters.clone(),
+            fill_curve.clone(),
+            fill_start,
+        )));
+    }
+
+    // Cardinality growth is sampled here rather than derived at the end:
+    // `CardinalityGrew` needs the trajectory, because a population that stopped
+    // growing collapses the non-stationary model to the stationary one.
+    let mut growth: Vec<(u64, u64, u64)> = Vec::new();
+    let mut ticks = 0u64;
+    let fill_stop_reason = loop {
+        sleep(GROWTH_SAMPLE_INTERVAL).await;
+        ticks += 1;
+        let elapsed = fill_start.elapsed();
+        let births = counters.births.load(Ordering::Relaxed);
+        let clients = counters.clients.load(Ordering::Relaxed);
+        growth.push((elapsed.as_millis() as u64, births, clients));
+        let used = poll_store.max_data_fs_used_pct();
+        if ticks % 12 == 0 {
+            // Errors are named here, not just counted. This line was the only
+            // record run 1787056102 left of an 80.5% write-error cliff, and
+            // "errors=44048" said nothing about what they were.
+            let by_kind = counters.tally().summary();
+            println!(
+                "[{SCEN}]   t={}s aggregates={} clients={} writes={} errors={} dup_acks={} disk={}% rss_peak={}MB{}",
+                elapsed.as_secs(),
+                births,
+                clients,
+                counters.writes_ok.load(Ordering::Relaxed),
+                counters.write_errors.load(Ordering::Relaxed),
+                counters.duplicate_acks.load(Ordering::Relaxed),
+                used,
+                poll_store.peak_rss_kb() / 1024,
+                if by_kind.is_empty() { String::new() } else { format!("  [{by_kind}]") },
+            );
+        }
+        if let Some(reason) = cw::fill_stop(elapsed, fill_budget, used, card.disk_high_water_pct) {
+            break reason;
+        }
+    };
+    stop.store(true, Ordering::Relaxed);
+    let fill_elapsed = fill_start.elapsed();
+    println!("[{SCEN}] phase 1 stopping: {}", fill_stop_reason.label());
+
+    let mut populations: Vec<Population> = Vec::with_capacity(params.tasks);
+    let mut ledger_acks: Vec<TaskAckSummary> = Vec::new();
+    let mut fill_latencies: Vec<u64> = Vec::new();
+    let mut fill_totals = cw::FillTotals::default();
+    for h in fill_handles {
+        match h.await {
+            Ok(out) => {
+                fill_totals.writes_ok += out.totals.writes_ok;
+                fill_totals.write_errors += out.totals.write_errors;
+                fill_totals.duplicate_acks += out.totals.duplicate_acks;
+                fill_totals.occ_retries += out.totals.occ_retries;
+                fill_totals.reheats_ok += out.totals.reheats_ok;
+                fill_totals.reheat_errors += out.totals.reheat_errors;
+                fill_totals.errors_by_kind.merge(&out.totals.errors_by_kind);
+                fill_latencies.extend(out.latencies);
+                ledger_acks.extend(out.ledger.to_task_ack_summaries());
+                populations.push(out.population);
+            }
+            Err(e) => eprintln!("[{SCEN}] fill task join: {e}"),
+        }
+    }
+    // Retire the fill's pools the moment the fill is done, and do not carry
+    // them across the phase-4 restart.
+    //
+    // `NodePool` only evicts on checkout (`pool.rs:392-404`), so an idle pool
+    // holds every connection it ever opened for as long as the process lives.
+    // After phase 4 the peers are gone and those sockets sit in CLOSE_WAIT:
+    // run 1787056102 ended with 478 of them, 447 to one node, still open 25
+    // minutes later. Nothing here needs them again, and an fd nobody will ever
+    // check out is a leak whatever else is true.
+    drop(lane_pools);
+    // The run's cardinality figure. Exact, because every mint is a fresh id by
+    // construction — unlike `AckLedger::ack_offers`, which double-counts a key
+    // that was sampled out and later written again.
+    let distinct_aggregates: u64 = populations.iter().map(|p| p.births_total()).sum();
+    let distinct_clients = counters.clients.load(Ordering::Relaxed);
+    println!(
+        "[{SCEN}] phase 1 done in {}s: {} aggregates, {} clients, {} writes ({} errors), {} reheats ({} failed), {} ledger entries",
+        fill_elapsed.as_secs(),
+        distinct_aggregates,
+        distinct_clients,
+        fill_totals.writes_ok,
+        fill_totals.write_errors,
+        fill_totals.reheats_ok,
+        fill_totals.reheat_errors,
+        ledger_acks.len(),
+    );
+    let fill_errors_by_kind = fill_totals.errors_by_kind.summary();
+    if !fill_errors_by_kind.is_empty() {
+        println!("[{SCEN}] phase 1 write errors by kind: {fill_errors_by_kind}");
+    }
+    println!(
+        "[{SCEN}] phase 1 OCC retries absorbed: {}, retries the server had already committed: {}",
+        fill_totals.occ_retries, fill_totals.duplicate_acks,
+    );
+
+    // The read plan is drawn ONCE, here, and phases 3 and 5 both use it: same
+    // keys, same buckets, same concurrency, so the only difference between them
+    // is that a restart emptied every cache.
+    let plan_now_ms = fill_start.elapsed().as_millis() as u64;
+    let read_plan = cw::build_read_plan(&mut populations, plan_now_ms, READS_PER_BUCKET);
+    let planned_reads: usize = read_plan.iter().map(|p| p.len()).sum();
+    println!("[{SCEN}] read plan: {planned_reads} keys across {} tasks", read_plan.len());
+
+    // One hot account per task for the contention and failover windows.
+    let hot: Vec<Member> = populations
+        .iter_mut()
+        .filter_map(|p| {
+            AgeBucket::ALL.iter().find_map(|b| p.sample_by_age(plan_now_ms, *b))
+        })
+        .collect();
+    if hot.is_empty() {
+        // Every age bucket starts at 5 minutes, so a fill shorter than that
+        // leaves nothing sampleable. Phases 2 and 6 then have no accounts to
+        // drive and say so rather than inventing one outside a shard lane.
+        println!("[{SCEN}] WARNING: no aggregate reached the youngest age bucket — phases 2 and 6 have no hot set");
+    }
+
+    // ---- Phase 2: contention ------------------------------------------------
+    let replicas = card.contention_factor.max(1);
+    let accounts = (MAX_CONTENTION_TASKS / replicas).min(hot.len());
+    let contention_tasks = accounts * replicas;
+    println!(
+        "[{SCEN}] phase 2: contention — {accounts} accounts x {replicas} replicas = {contention_tasks} writers, {CONTENTION_SECS}s, history ON"
+    );
+    let p2_history = new_history_recorder(&format!("{SCEN}-contention"), run_dir);
+    let mut p2_stats = cw::HotWriterStats::default();
+    let mut p2_latencies: Vec<u64> = Vec::new();
+    let mut p2_acks: Vec<celeriant_bench::TaskAckSummary> = Vec::new();
+    if contention_tasks > 0 {
+        let p2_pool =
+            build_bench_pool(cfg, &up, ScenarioParams { tasks: contention_tasks, ..params }).await?;
+        let mut handles = Vec::with_capacity(contention_tasks);
+        for (i, member) in hot.iter().take(accounts).enumerate() {
+            for r in 0..replicas {
+                handles.push(tokio::spawn(cw::run_hot_writer(
+                    p2_pool.clone(),
+                    cw::HotWriterConfig {
+                        member: *member,
+                        replica: r as u32,
+                        process: (i * replicas + r) as u32,
+                        duration: Duration::from_secs(CONTENTION_SECS),
+                        seed: params.seed,
+                        large_event_fraction: mix,
+                    },
+                    p2_history.clone(),
+                    None,
+                )));
+            }
+        }
+        for h in handles {
+            if let Ok((s, lat)) = h.await {
+                p2_stats.ok += s.ok;
+                p2_stats.errors += s.errors;
+                p2_stats.occ_retries += s.occ_retries;
+                p2_latencies.extend(lat);
+                // One summary per (aggregate, client). This is what makes the
+                // contention phase's oracles do anything: passed an empty slice
+                // they read zero aggregates, and monotonicity, final-read parity
+                // and payload round-trip all report PASS having checked nothing
+                // — in the only window where R clients race on one aggregate.
+                if s.max_acked_client_seq > 0 {
+                    p2_acks.push(celeriant_bench::TaskAckSummary {
+                        aggregate_key: celeriant_bench::account_workload::account_key(s.aggregate_id),
+                        client_id: s.client_id,
+                        max_acked_client_seq: s.max_acked_client_seq,
+                    });
+                }
+            }
+        }
+    }
+    println!(
+        "[{SCEN}] phase 2 done: {} acked, {} errors, {} OCC retries ({:.2} retries per acked write)",
+        p2_stats.ok,
+        p2_stats.errors,
+        p2_stats.occ_retries,
+        p2_stats.occ_retries as f64 / p2_stats.ok.max(1) as f64,
+    );
+    extra_checks.extend(
+        finish_history_and_check(&format!("{SCEN}-contention"), cfg, p2_history, &p2_acks, params.seed).await,
+    );
+    extra_checks.push(CheckResult::pass_with_detail(
+        "OccRetryDepth",
+        format!(
+            "{} retries across {} acked contended writes ({:.2} per ack) at R={replicas}",
+            p2_stats.occ_retries,
+            p2_stats.ok,
+            p2_stats.occ_retries as f64 / p2_stats.ok.max(1) as f64,
+        ),
+    ));
+
+    // ---- Phase 3: hot reads -------------------------------------------------
+    //
+    // Settle first. Phase 2 runs `contention_factor x accounts` writers on their
+    // own pool; dropping it tears those connections down while phase 3 is trying
+    // to establish its own, and the first run of this scenario paid for it —
+    // **99 errors in 240 ops with a p99 of 30,023.80ms**, which is exactly the
+    // 30s connection timeout, against 240 ops and 0 errors in the identical
+    // phase 5. Phase 3 is the WARM baseline of the cold-restart delta, so a
+    // degraded number there inflates the headline ratio. `p2_pool` is already
+    // out of scope by here; this waits for the server to finish closing its
+    // side before anything is measured.
+    sleep(P2_DRAIN_SETTLE).await;
+
+    let hot_curve = Arc::new(StdMutex::new(ReheatCostCurve::new(
+        "Age-stratified reads — warm cluster (phase 3)",
+        params.seed,
+    )));
+    println!(
+        "[{SCEN}] phase 3: hot reads — {planned_reads} keys, {} concurrent, {:.0}s read deadline",
+        read_plan.len(),
+        READ_REQUEST_TIMEOUT.as_secs_f64(),
+    );
+    // Own pools, not the fill's: the read phases measure latency and must not be
+    // censored by a deadline chosen for write liveness. Dropped before phase 4
+    // stops the nodes; phase 5 builds its own on the same constant.
+    let read_pools = build_read_pools(cfg, &up, params).await?;
+    run_read_plan(&read_pools, &read_plan, &hot_curve).await;
+    drop(read_pools);
+
+    // ---- Phase 4: restart ---------------------------------------------------
+    println!("[{SCEN}] phase 4: stop both nodes, restart, wait for stable leader");
+    // Floor for the stability barrier, taken BEFORE the stop: every sample
+    // already in the store describes the pre-restart cluster, and the whole
+    // point of this barrier is to observe the post-restart one. Using the
+    // scraper's own clock avoids needing its start Instant.
+    let pre_restart_ms = up
+        .scraper
+        .store()
+        .snapshot()
+        .await
+        .iter()
+        .map(|s| s.t_ms)
+        .max()
+        .unwrap_or(0);
+    let _ = executor.run(&Action::StopAll);
+    sleep(Duration::from_secs(5)).await;
+    executor.run(&Action::StartCs1)?;
+    sleep(Duration::from_secs(5)).await;
+    // Stamped AFTER the staged start, not before it. With `restart_t0` taken
+    // ahead of the 5s gap between the two node starts, that sleep sat inside
+    // the measured window and `ColdRestartReady` carried a 5-second constant:
+    // it reported ~6.0s whether the node recovered instantly or took five
+    // seconds, and could not resolve anything below its own floor. Measuring
+    // from the last start makes the number the cluster's convergence time.
+    let restart_t0 = Instant::now();
+    executor.run(&Action::StartCs2)?;
+    match wait_for_stable_leader_since(&up.scraper, Duration::from_secs(300), pre_restart_ms + 1).await {
+        Ok(()) => {
+            println!("[{SCEN}] phase 4: leader stable after {:.1}s", restart_t0.elapsed().as_secs_f32());
+            // Leadership is not readiness. The barrier above only asserts that
+            // one node leads and the other follows; it says nothing about the
+            // follower having the data. Phase 5 reads through pools seeded on
+            // BOTH nodes, so without this wait a read can land on a follower
+            // still catching up and come back empty in ~0.25ms — no segment
+            // scan, no bytes — which reads as a spectacularly fast cold path
+            // and drags the cold p50 below the warm one. Observed exactly that:
+            // p50 0.25ms against a p99 of 4,024ms, with `EventualConvergence`
+            // reporting the follower 496 wal_seqs behind in the same run.
+            // Status-based, not wal_seq-based: FollowerCatchingUp -> Follower is
+            // the follower's own statement that its replay finished.
+            if let Err(why) =
+                wait_for_follower_rejoin(SCEN, &up.scraper, CONVERGENCE_AFTER_RESTART, pre_restart_ms + 1).await
+            {
+                extra_checks.push(CheckResult::inconclusive(
+                    "ColdReadBaselineTrustworthy",
+                    format!(
+                        "follower never reached steady Follower before the cold reads ({why}); \
+                         phase 5 reads both nodes, so a read landing on a node without the data \
+                         returns empty in microseconds and reads as a fast cold path"
+                    ),
+                ));
+            }
+            println!("[{SCEN}] phase 4: cluster ready after {:.1}s", restart_t0.elapsed().as_secs_f32());
+            extra_checks.push(CheckResult::pass_with_detail(
+                "ColdRestartReady",
+                format!(
+                    "both nodes restarted and a stable leader was elected in {:.1}s (segment size {:.0}MB)",
+                    restart_t0.elapsed().as_secs_f32(),
+                    card.segment_bytes as f64 / (1024.0 * 1024.0),
+                ),
+            ));
+        }
+        Err(e) => extra_checks.push(CheckResult::fail(
+            "ColdRestartReady",
+            format!("no stable leader within 300s after the phase 4 restart: {e}"),
+        )),
+    }
+
+    // ---- Phase 5: cold reads — THE DELTA ------------------------------------
+    let cold_curve = Arc::new(StdMutex::new(ReheatCostCurve::new(
+        "Age-stratified reads — after restart, every cache empty (phase 5)",
+        params.seed,
+    )));
+    println!(
+        "[{SCEN}] phase 5: cold reads — identical keys, identical concurrency, {:.0}s read deadline",
+        READ_REQUEST_TIMEOUT.as_secs_f64(),
+    );
+    // Built fresh here, and on the SAME constant as phase 3. These two curves are
+    // the two halves of one delta; comparing a censored baseline against an
+    // uncensored cold side would be worse than censoring both, because it would
+    // look like a result.
+    //
+    // Fresh also because every connection dialled before phase 4 belongs to a
+    // peer that is gone, and the pool's checkout is a FIFO free-list with no
+    // liveness probe (`celeriant_client_tokio/src/pool.rs:393-404`), so it hands
+    // those out; worse, the `read_all` path this phase uses never calls
+    // `mark_broken`, so a failed connection goes straight back into the list.
+    // Same class as the `P2_DRAIN_SETTLE` fix above, at the restart boundary.
+    let read_pools = build_read_pools(cfg, &up, params).await?;
+    run_read_plan(&read_pools, &read_plan, &cold_curve).await;
+    drop(read_pools);
+    // Named, not just counted. A bare error total cannot tell a client-side
+    // request timeout (which censors the latency distribution and makes the
+    // surviving ops a survivorship-biased sample) from a dead connection.
+    if let Ok(c) = cold_curve.lock() {
+        let by_kind = c.error_summary();
+        if !by_kind.is_empty() {
+            println!("[{SCEN}] phase 5 read errors by kind: {by_kind}");
+        }
+    }
+
+    // `NoBloomAbsentSegments` is evaluated after this point: a sealed segment
+    // that lost its bloom across the restart answers maybe-present for every
+    // key, which is correctness-adjacent rather than merely slow.
+    let post_restart_samples = up.scraper.store().snapshot().await;
+    let hosts = vec![cfg.leader_host.clone(), cfg.follower_host.clone()];
+    extra_checks.push(crate::cardinality_checks::no_bloom_absent_segments(&post_restart_samples, &hosts));
+
+    // ---- Phase 6: SIGKILL + failover (opt-in) --------------------------------
+    // Outputs hoisted so the report renders identically whether or not the
+    // phase ran. `None` means "not measured", which `timing_check` already
+    // renders as INCONCLUSIVE rather than as a zero.
+    let mut promotion_ms: Option<u64> = None;
+    let mut ready_ms: Option<u64> = None;
+    let mut gap: Option<Duration> = None;
+    #[allow(unused_assignments)]
+    let mut max_ack_gap: Option<Duration> = None;
+    let mut p6_stats = cw::HotWriterStats::default();
+    let mut p6_latencies: Vec<u64> = Vec::new();
+    let mut bench_window_end_ms = up.elapsed_ms();
+
+    // The integrity audit is over PHASE 1's ledger, so it runs whether or not
+    // the failover phase does. Gating it behind phase 6 would have made the
+    // scenario's correctness evidence disappear the moment failover was
+    // switched off — which is the opposite of disambiguating.
+    let audit_acks = stride_sample(&ledger_acks, AUDIT_SAMPLE);
+    println!("[{SCEN}] audit: {} of {} sampled ledger entries", audit_acks.len(), ledger_acks.len());
+    let (integrity, deep) = run_integrity_and_deep_audit(SCEN, &pool, &audit_acks, 32).await;
+    // Last user of `pool`. Same reason as `lane_pools` above: its connections
+    // predate the phase-4 restart, and phase 7 must not be able to draw one.
+    drop(pool);
+    extra_checks.push(data_integrity_check(&integrity, (audit_acks.len() as u64 / 50).max(5)));
+
+    if !card.failover_phase {
+        println!("[{SCEN}] phase 6: skipped (--failover to enable). Failover under a behind \
+follower is a separate confirmed defect with its own test; running it here would fail this \
+run for reasons unrelated to memory or cardinality.");
+    } else {
+        let leader_now = detect_leader(cfg, &up.scraper)
+            .await
+            .unwrap_or_else(|| cfg.leader_host.clone());
+        let (kill, restart, killed_host) = if leader_now == cfg.leader_host {
+            (Action::KillCs1, Action::StartCs1, cfg.leader_host.clone())
+        } else {
+            (Action::KillCs2, Action::StartCs2, cfg.follower_host.clone())
+        };
+        println!("[{SCEN}] phase 6: SIGKILL {killed_host} mid-write, 10Hz role scrape, full history ON");
+
+        let p6_history = new_history_recorder(&format!("{SCEN}-failover"), run_dir);
+        let origin = Instant::now();
+        let availability = Arc::new(cw::AvailabilityClock::new(origin));
+        let (role_samples, role_stop) = spawn_role_watch(cfg, origin);
+
+        let p6_pool = build_bench_pool(cfg, &up, params).await?;
+        let mut p6_handles = Vec::with_capacity(hot.len());
+        for (i, member) in hot.iter().enumerate() {
+            p6_handles.push(tokio::spawn(cw::run_hot_writer(
+                p6_pool.clone(),
+                cw::HotWriterConfig {
+                    member: *member,
+                    replica: 0,
+                    process: i as u32,
+                    duration: Duration::from_secs(FAILOVER_WINDOW_SECS),
+                    seed: params.seed ^ 0xF0,
+                    large_event_fraction: mix,
+                },
+                p6_history.clone(),
+                Some(availability.clone()),
+            )));
+        }
+
+        sleep(Duration::from_secs(FAILOVER_KILL_AT_SECS)).await;
+        executor.run(&kill)?;
+        // Marked AFTER the kill returns: writes acked while the ssh was in flight
+        // were served by a live leader and belong on the before side. Marking first
+        // would classify them as "after" and report a gap of nearly zero.
+        availability.mark_kill();
+        let kill_ms = origin.elapsed().as_millis() as u64;
+
+        sleep(Duration::from_secs(FAILOVER_RESTART_AFTER_SECS)).await;
+        println!("[{SCEN}] phase 6: restarting {killed_host}");
+        executor.run(&restart)?;
+        let restart_ms = origin.elapsed().as_millis() as u64;
+
+        for h in p6_handles {
+            if let Ok((s, lat)) = h.await {
+                p6_stats.ok += s.ok;
+                p6_stats.errors += s.errors;
+                p6_stats.occ_retries += s.occ_retries;
+                p6_latencies.extend(lat);
+            }
+        }
+        // Keep the 10Hz window open past the writers until the killed node is
+        // observed ready. `ShardWal::open` rebuilds the active segment's chain tips
+        // before serving, which at 1GB segments can outlast the write window — and
+        // reporting "not observed" for a node that simply had not finished yet
+        // would hide the very number this measurement exists for.
+        let ready_deadline = Instant::now() + Duration::from_secs(180);
+        let roles = loop {
+            let snapshot = role_samples.lock().await.clone();
+            if cw::restart_ready_ms(&snapshot, &killed_host, restart_ms).is_some()
+                || Instant::now() >= ready_deadline
+            {
+                break snapshot;
+            }
+            sleep(Duration::from_secs(1)).await;
+        };
+        role_stop.notify_one();
+        promotion_ms = cw::promotion_latency_ms(&roles, &killed_host, kill_ms);
+        ready_ms = cw::restart_ready_ms(&roles, &killed_host, restart_ms);
+        gap = availability.gap();
+        max_ack_gap = availability.max_ack_gap();
+        println!(
+            "[{SCEN}] phase 6: promotion {}, write-availability gap {}, restart-to-ready {}",
+            promotion_ms.map(|v| format!("{v}ms")).unwrap_or_else(|| "not observed".into()),
+            gap.map(|g| format!("{:.3}ms", g.as_secs_f64() * 1000.0)).unwrap_or_else(|| "not observed".into()),
+            ready_ms.map(|v| format!("{v}ms")).unwrap_or_else(|| "not observed".into()),
+        );
+
+        // Convergence budget scaled to the segment size: a follower one segment
+        // behind replays up to `segment_bytes` over TCP.
+        let converge_budget = Duration::from_secs(
+            (card.segment_bytes / ASSUMED_CATCHUP_BYTES_PER_SEC).max(60),
+        );
+        println!("[{SCEN}] waiting up to {}s for WAL convergence", converge_budget.as_secs());
+        wait_for_wal_convergence(SCEN, cfg, converge_budget).await;
+        bench_window_end_ms = up.elapsed_ms();
+
+        // Report-only on the first run: nobody has measured what any of these do at
+        // this population size, and a threshold invented before the first run is a
+        // threshold that gets tuned until the run passes.
+        extra_checks.push(timing_check(
+            "PromotionLatency",
+            promotion_ms,
+            "survivor took leadership",
+            "no promotion observed in the 10Hz window",
+        ));
+        // Leads with the anchor-free number. The orchestrator cannot know when the
+        // SIGKILL actually landed — `make kill-*` is a blocking ssh that fires the
+        // signal early and returns late — so any gap anchored to a stamped instant
+        // is biased by an ssh round trip, in the direction that flatters the system.
+        // The largest observed silence between consecutive acks needs no anchor.
+        extra_checks.push(timing_check(
+            "WriteAvailabilityGap",
+            max_ack_gap.map(|g| g.as_millis() as u64),
+            "largest silence between consecutive client acks across the failover window \
+             (anchor-free, microsecond resolution)",
+            "fewer than two acks landed in the window",
+        ));
+        extra_checks.push(timing_check(
+            "WriteAvailabilityGapAnchored",
+            gap.map(|g| g.as_millis() as u64),
+            "last ack before the stamped kill to first ack after — kept for comparison only; \
+             the stamp trails the real SIGKILL by one ssh round trip",
+            "the window never saw an ack on both sides of the kill",
+        ));
+        extra_checks.push(timing_check(
+            "RestartToReady",
+            ready_ms,
+            "killed node rejoined and its shards reported a WAL sequence",
+            "the killed node was not observed ready before the window closed",
+        ));
+
+        extra_checks.extend(
+            finish_history_and_check(&format!("{SCEN}-failover"), cfg, p6_history, &audit_acks, params.seed).await,
+        );
+
+    }
+
+    // ---- Phase 7: evaluate --------------------------------------------------
+    //
+    // Every step from here announces itself and runs under a deadline. Run
+    // 1787056102 entered this block, printed nothing for 37 minutes and had to
+    // be SIGKILLed; the whole measurement was already in hand and was lost
+    // anyway. Nothing after the last write is worth the run.
+    println!("[{SCEN}] phase 7: evaluate");
+    let per_shard = cw::merge_shard_counts(&[
+        step(SCEN, "segments per shard (leader)", TEARDOWN_STEP_BUDGET, ssh_segments_per_shard(&cfg.leader_host))
+            .await
+            .unwrap_or_default(),
+        step(SCEN, "segments per shard (follower)", TEARDOWN_STEP_BUDGET, ssh_segments_per_shard(&cfg.follower_host))
+            .await
+            .unwrap_or_default(),
+    ]);
+    let final_samples = step(SCEN, "final metric snapshot", TEARDOWN_STEP_BUDGET, up.scraper.store().snapshot())
+        .await
+        .unwrap_or_default();
+    poll_store.request_stop();
+    let peak_rss_kb = poll_store.peak_rss_kb();
+    let peak_disk_pct = poll_store.max_data_fs_used_pct();
+    let rss_by_host = step(SCEN, "peak RSS by host", TEARDOWN_STEP_BUDGET, poll_store.peak_rss_by_host())
+        .await
+        .unwrap_or_default();
+
+    let populated = fill_curve
+        .lock()
+        .map(|c| c.populated_buckets(MIN_REHEAT_OPS_PER_BUCKET).len())
+        .unwrap_or(0);
+
+    // Read out before the struct literal: a guard in a `let` initialiser lives
+    // to the semicolon, so locking these inline took `hot_curve` twice in one
+    // statement and deadlocked the whole run short of the summary.
+    let curves = cd::Curves::snapshot(&fill_curve, &hot_curve, &cold_curve);
+
+    // Built before the checks and the markdown, and both then read from it: the
+    // JSON section, the check details and the summary table are one set of
+    // numbers or they are three untrustworthy ones.
+    let deliverable = cd::CardinalityDeliverable {
+        shape: cd::RunShape::new(&card, params.tasks, fill_elapsed),
+        reached: cd::Reached {
+            distinct_aggregates,
+            distinct_clients,
+            fill_writes_ok: fill_totals.writes_ok,
+            fill_write_errors: fill_totals.write_errors,
+            reheat_probes_ok: fill_totals.reheats_ok,
+            reheat_probes_failed: fill_totals.reheat_errors,
+            ledger_entries: ledger_acks.len(),
+        },
+        aggs_per_segment: cd::AggsPerSegment::new(
+            &card,
+            distinct_aggregates,
+            &cd::shard_segments(&per_shard),
+        ),
+        segments_per_shard: cd::shard_segments(&per_shard),
+        peak_rss: cd::PeakRss::new(&card, peak_rss_kb, &rss_by_host, node_ram_bytes),
+        fill_curve: curves.fill,
+        warm_curve: curves.warm,
+        cold_curve: curves.cold,
+        cold_vs_warm: curves.cold_vs_warm,
+    };
+
+    extra_checks.push(crate::cardinality_checks::cardinality_grew(&growth));
+    // Before anything else reads the curves: a censored curve is not a slow
+    // result, it is the absence of one, and it renders identically to a measured
+    // curve unless something says so.
+    extra_checks.push(crate::cardinality_checks::read_latency_uncensored(
+        &[
+            ("phase 3 (warm)", &deliverable.warm_curve),
+            ("phase 5 (cold)", &deliverable.cold_curve),
+        ],
+        READ_REQUEST_TIMEOUT,
+    ));
+    // The fingerprint of stream desync. Counted since the client gained
+    // correlation validation; this is what finally reads the counter.
+    extra_checks.push(crate::cardinality_checks::no_correlation_mismatches(
+        &[
+            ("phase 2 (fill)", &deliverable.fill_curve),
+            ("phase 3 (warm)", &deliverable.warm_curve),
+            ("phase 5 (cold)", &deliverable.cold_curve),
+        ],
+        Some((
+            fill_totals.writes_ok,
+            fill_totals.errors_by_kind.get(
+                crate::cardinality_workload::FillWriteError::CorrelationMismatch,
+            ),
+        )),
+    ));
+    extra_checks.push(crate::cardinality_checks::age_spread_reached(populated, MIN_REHEAT_OPS_PER_BUCKET));
+    extra_checks.push(crate::cardinality_checks::rotations_reached(&per_shard));
+    extra_checks.push(crate::cardinality_checks::no_rotation_enospc(&final_samples, &hosts));
+    extra_checks.push(crate::cardinality_checks::bloom_effectiveness(&final_samples, &hosts));
+    extra_checks.push(crate::cardinality_checks::sidecar_high_water(&final_samples, &hosts));
+    extra_checks.push(crate::cardinality_checks::disk_watchdog(&poll_store, card.disk_high_water_pct));
+    extra_checks.push(match node_ram_bytes {
+        Some(ram) => crate::cardinality_checks::honest_memory_budget(
+            peak_rss_kb,
+            card.declared_budget_bytes(ram),
+            ram,
+        ),
+        // Without the node's RAM there is no budget to compare against, and a
+        // ratio against a guessed denominator is worse than no number.
+        None => CheckResult::inconclusive(
+            "HonestMemoryBudget",
+            format!("peak RSS {peak_rss_kb} kB, but MemTotal could not be read — no declared budget to compare against"),
+        ),
+    });
+    // goal.md asks for the OBSERVED density against the design point, not the
+    // sizing formula run forward on its own inputs. `achieved` is the model;
+    // quoting it as a measurement would make the run unfalsifiable, since it
+    // cannot disagree with the request for any reason other than a clamp.
+    let aps = &deliverable.aggs_per_segment;
+    extra_checks.push(match aps.observed_lower_bound {
+        None => CheckResult::inconclusive(
+            "AggregatesPerSegment",
+            format!(
+                "no segment rotated, so density was never observed; the derived mix of {:.1}% large \
+                 events at {:.0}MB models {} aggs/segment against a design point of {}",
+                mix * 100.0,
+                card.segment_bytes as f64 / (1024.0 * 1024.0),
+                aps.model,
+                aps.design_point,
+            ),
+        ),
+        // Lower bound, and deliberately labelled as one: an aggregate whose
+        // chain crosses a boundary is entered into every segment bloom it
+        // touches, so real bloom load is at or above this.
+        Some(observed) => CheckResult::pass_with_detail(
+            "AggregatesPerSegment",
+            format!(
+                "observed >= {observed} aggs/segment ({distinct_aggregates} aggregates over \
+                 {} segments; lower bound — chains spanning a boundary enter several \
+                 blooms). Model said {} for a target of {} at {:.1}% large events. \
+                 Bloom design point {}",
+                aps.observed_total_segments,
+                aps.model,
+                card.target_aggs_per_segment,
+                mix * 100.0,
+                aps.design_point,
+            ),
+        ),
+    });
+
+    let summary = render_cardinality_report(
+        &card,
+        &deliverable,
+        CardinalityRun {
+            fill_stop_reason,
+            peak_disk_pct,
+            promotion_ms,
+            gap_ms: gap.map(|g| g.as_micros() as u64),
+            ready_ms,
+            p2_stats,
+            p6_stats,
+            fill_errors_by_kind,
+        },
+    );
+    let summary_path = run_dir.join(format!("{SCEN}-summary.md"));
+    // Written before tear-down, not after: the deliverable is complete at this
+    // point, and every remaining step touches the cluster. Losing the summary
+    // to a wedged ssh is the failure mode that cost run 1787056102.
+    if let Err(e) = std::fs::write(&summary_path, &summary) {
+        eprintln!("[{SCEN}] writing {}: {e}", summary_path.display());
+    }
+    println!("\n{summary}");
+
+    let total_ok = fill_totals.writes_ok + p2_stats.ok + p6_stats.ok;
+    let total_err = fill_totals.write_errors + fill_totals.reheat_errors + p2_stats.errors + p6_stats.errors;
+    let mut all_latencies = fill_latencies;
+    all_latencies.extend(p2_latencies);
+    all_latencies.extend(p6_latencies);
+    let window_secs = (bench_window_end_ms.saturating_sub(bench_window_start_ms) / 1000).max(1);
+    let bench_result = benchmark_from(all_latencies, total_ok, total_err, params.tasks, window_secs);
+
+    let expectations = ScenarioExpectations {
+        // Phase 4 restarts both nodes and phase 6 kills one: three process
+        // starts and the elections they imply are the scenario, not a fault.
+        max_node_starts: 4,
+        max_leader_elections: 60,
+        max_s3_fallbacks: 2_000,
+        max_heartbeat_failures: 200,
+        max_bench_errors: 500_000,
+        max_bench_error_ratio: Some(0.75),
+        max_role_flips: 12,
+        max_split_brain_ticks: 20,
+        require_leader_retained: false,
+        assert_eventual_progress: true,
+        assert_no_divergent_tips: true,
+        // Promotion timing comes from the 10Hz window instead: the 2Hz
+        // `FailoverWithinBudget` cannot resolve a 1600ms budget, and asserting
+        // one with ±500ms of error asserts nothing.
+        max_failover_ms: None,
+        ..ScenarioExpectations::default()
+    };
+
+    let scen_params = ScenarioParams {
+        // The fill is rate-limited by the population model, so a throughput
+        // floor here would be asserting on the birth rate, not the database.
+        throughput_floor: 1.0,
+        duration_secs: window_secs,
+        ..params
+    };
+
+    let report = tear_down_and_evaluate_with_audit(
+        SCEN,
+        cfg,
+        up,
+        bench_result,
+        bench_window_start_ms,
+        bench_window_end_ms,
+        expectations,
+        scen_params,
+        extra_checks,
+        Some(integrity),
+        None,
+        deep,
+        run_dir,
+    )
+    .await
+    .map(|mut r| {
+        r.cardinality = Some(deliverable);
+        r
+    });
+    // The poller finishes its in-flight tick and exits; if an ssh in that tick
+    // is wedged, the join is not worth blocking the process on.
+    let _ = step(SCEN, "join host poller", TEARDOWN_STEP_BUDGET, poll_handle).await;
+
+    // Put the units back however the run ended. Not gated on success: a failed
+    // scenario is exactly when a leaked 20%-memory unit would go unnoticed and
+    // silently reshape the next run's numbers.
+    if let Some((mem, seg)) = baseline_cfg {
+        let restore = Action::UpdateServiceConfig { memory_percent: mem, segment_bytes: seg };
+        let deploy_dir = cfg.deploy_dir.clone();
+        let (target, vars) = (restore.make_target(), restore.make_vars());
+        let outcome = step_blocking(SCEN, "restore service config", TEARDOWN_STEP_BUDGET, move || {
+            crate::actions::run_make_in(&deploy_dir, target, &vars)
+        })
+        .await
+        .unwrap_or_else(|| Err("restore timed out".to_string()));
+        match outcome {
+            Ok(()) => println!("[{SCEN}] restored service config to {mem}% / {seg} bytes"),
+            Err(e) => println!("[{SCEN}] WARNING: could not restore service config ({e}) — \
+                                cs1/cs2 are still on {}% / {} bytes and later runs will inherit that",
+                               card.memory_percent, card.segment_bytes),
+        }
+    }
+    report
+}
+
+/// `MEMORY_CONSUMPTION_PERCENT` and `SHARD_LOG_PREALLOCATE_BYTES` as config.env
+/// declares them, so the scenario can hand the cluster back unchanged. `None`
+/// when either is absent — better to leave the units alone than to restore a
+/// guessed value.
+fn read_service_baseline(cfg: &ClusterConfig) -> Option<(u64, u64)> {
+    let raw = std::fs::read_to_string(cfg.deploy_dir.join("config.env")).ok()?;
+    parse_service_baseline(&raw)
+}
+
+/// Pure half of `read_service_baseline`, split out so it is testable without a
+/// deploy directory.
+pub fn parse_service_baseline(raw: &str) -> Option<(u64, u64)> {
+    Some((
+        env_u64(raw, "MEMORY_CONSUMPTION_PERCENT")?,
+        env_u64(raw, "SHARD_LOG_PREALLOCATE_BYTES")?,
+    ))
+}
+
+/// `KEY=<u64>` from a config.env body, tolerating a trailing `# comment`.
+/// Requires the `=` immediately after the key so `KEY_EXTRA=` cannot satisfy a
+/// lookup for `KEY` — restoring the wrong value is worse than not restoring.
+fn env_u64(raw: &str, key: &str) -> Option<u64> {
+    raw.lines()
+        .map(str::trim)
+        .find(|l| l.starts_with(key) && l[key.len()..].starts_with('='))
+        .and_then(|l| l.split_once('='))
+        .and_then(|(_, v)| v.split('#').next())
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// Timing figures from phase 6 and the deliverables that hang off them.
+/// Report-only until a calibration run pins thresholds.
+fn timing_check(name: &'static str, ms: Option<u64>, what: &str, missing: &str) -> CheckResult {
+    match ms {
+        Some(v) => CheckResult::pass_with_detail(name, format!("{v}ms — {what} (report-only)")),
+        None => CheckResult::inconclusive(name, missing.to_string()),
+    }
+}
+
+/// Even stride over the sampled ledger. The ledger is already a uniform
+/// reservoir, so a stride over it stays uniform while keeping the audit's
+/// round-trip count bounded.
+fn stride_sample(acks: &[TaskAckSummary], cap: usize) -> Vec<TaskAckSummary> {
+    if acks.len() <= cap {
+        return acks.to_vec();
+    }
+    let step = (acks.len() / cap).max(1);
+    acks.iter().step_by(step).take(cap).cloned().collect()
+}
+
+/// Run one read pass over the plan: one task per plan slice, so phases 3 and 5
+/// offer identical concurrency.
+async fn run_read_plan(
+    lane_pools: &[Arc<Pool>],
+    plan: &crate::cardinality_workload::ReadPlan,
+    curve: &Arc<std::sync::Mutex<celeriant_bench::read_workload::ReheatCostCurve>>,
+) {
+    // Slice `i` holds task `i`'s keys, which all sit in lane `i % lanes`, so
+    // routing it to that lane's pool keeps the connection on one shard instead
+    // of migrating the stream on nearly every read.
+    let mut handles = Vec::with_capacity(plan.len());
+    for (i, slice) in plan.iter().enumerate() {
+        if slice.is_empty() {
+            continue;
+        }
+        handles.push(tokio::spawn(crate::cardinality_workload::run_read_probe_task(
+            lane_pools[i % lane_pools.len()].clone(),
+            slice.clone(),
+            curve.clone(),
+        )));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+}
+
+/// Aggregate the phases' latency reservoirs into the report's bench summary.
+/// Percentiles are exact over the retained union; each task's reservoir is
+/// uniform over its own stream and the tasks are symmetric.
+fn benchmark_from(
+    mut latencies: Vec<u64>,
+    ok: u64,
+    errors: u64,
+    num_tasks: usize,
+    elapsed_secs: u64,
+) -> BenchmarkResult {
+    latencies.sort_unstable();
+    let n = latencies.len();
+    let at = |q: usize| if n == 0 { 0 } else { latencies[(n * q / 1000).min(n - 1)] };
+    BenchmarkResult {
+        num_tasks,
+        total_requests: ok,
+        errors,
+        throughput: ok as f64 / elapsed_secs.max(1) as f64,
+        avg_latency_ms: if n == 0 { 0.0 } else { latencies.iter().sum::<u64>() as f64 / n as f64 },
+        p50_ms: at(500),
+        p95_ms: at(950),
+        p99_ms: at(990),
+        p999_ms: at(999),
+        min_ms: latencies.first().copied().unwrap_or(0),
+        max_ms: latencies.last().copied().unwrap_or(0),
+    }
+}
+
+/// 10Hz role scrape for the failover window only.
+///
+/// The standard scraper runs at 2Hz, which is the right rate for a five-hour
+/// fill and useless for a sub-second promotion. This one is armed for the kill
+/// and torn down straight after.
+fn spawn_role_watch(
+    cfg: &ClusterConfig,
+    origin: Instant,
+) -> (
+    Arc<tokio::sync::Mutex<Vec<crate::cardinality_workload::RoleSample>>>,
+    Arc<tokio::sync::Notify>,
+) {
+    let samples = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let out = samples.clone();
+    let stop_rx = stop.clone();
+    let targets = vec![
+        (cfg.leader_host.clone(), cfg.metrics_url(&cfg.leader_host)),
+        (cfg.follower_host.clone(), cfg.metrics_url(&cfg.follower_host)),
+    ];
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(90))
+            .build()
+            .expect("reqwest client");
+        loop {
+            let t_ms = elapsed_ms(origin, Instant::now());
+            for (host, url) in &targets {
+                let sample = match client.get(url).send().await {
+                    Ok(r) => match r.text().await {
+                        Ok(body) => {
+                            let s = crate::sample::parse_metrics(host.clone(), t_ms, &body);
+                            crate::cardinality_workload::RoleSample {
+                                t_ms,
+                                host: host.clone(),
+                                node_role: s.node_role,
+                                ok: s.ok,
+                                shards_reporting: s.wal_seq_by_shard.len(),
+                            }
+                        }
+                        Err(_) => unreachable_role(host, t_ms),
+                    },
+                    Err(_) => unreachable_role(host, t_ms),
+                };
+                out.lock().await.push(sample);
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                _ = stop_rx.notified() => break,
+            }
+        }
+    });
+    (samples, stop)
+}
+
+fn unreachable_role(host: &str, t_ms: u64) -> crate::cardinality_workload::RoleSample {
+    crate::cardinality_workload::RoleSample {
+        t_ms,
+        host: host.to_string(),
+        node_role: 0.0,
+        ok: false,
+        shards_reporting: 0,
+    }
+}
+
+/// Register the banking schema for every major, then prove validation is
+/// actually on the measured path.
+///
+/// Registration succeeding is NOT evidence: a schema keyed on the wrong tuple,
+/// or an event carrying an IV, makes the server skip validation and return Ok.
+/// Only a rejected bad payload proves it, so that is what this asserts.
+async fn assert_account_schemas_enforced(pool: &Arc<Pool>) -> CheckResult {
+    use celeriant_bench::account_workload::{
+        ALL_MAJORS, MAJOR_DEPOSITED, WORKLOAD_AGG_TYPE, WORKLOAD_MINOR, WORKLOAD_ORG, account_event,
+        account_key, schema_for,
+    };
+    use celeriant_bench::{ClientError, RegisterSchemaRequest, SchemaError, SchemaKey, ServerError};
+
+    const NAME: &str = "SchemaEnforced";
+    const PROBE_CLIENT: u128 = 0x5CE1;
+
+    for major in ALL_MAJORS {
+        let req = RegisterSchemaRequest {
+            correlation_id: None,
+            client_id: PROBE_CLIENT,
+            user_id: None,
+            schema_key: SchemaKey::new(WORKLOAD_ORG, WORKLOAD_AGG_TYPE, major, WORKLOAD_MINOR),
+            schema_type: 0,
+            schema: schema_for(major).to_string(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match pool.register_schema(req.clone()).await {
+                Ok(_) => break,
+                Err(ClientError::Server(ServerError::Schema {
+                    kind: SchemaError::AlreadyExists, ..
+                })) => break,
+                Err(e) if Instant::now() < deadline => {
+                    println!("[schema] register major={major}: transient {e}, retrying");
+                    sleep(Duration::from_secs(2)).await;
+                }
+                Err(e) => {
+                    return CheckResult::fail(NAME, format!("register major={major} never succeeded: {e}"));
+                }
+            }
+        }
+    }
+
+    // The probe aggregate stays in one shard lane so the probe cannot trigger a
+    // client redirect on the pool's first connection.
+    let probe = account_key(u128::from(u32::MAX) * 3);
+    let mut bad = account_event(MAJOR_DEPOSITED, 1, 0, 0);
+    bad.event_value = Arc::new(br#"{"AmountCents":"not-an-integer"}"#.to_vec());
+    match pool.write_events(probe, vec![bad], PROBE_CLIENT).await {
+        Err(ClientError::Server(ServerError::Schema { .. })) => CheckResult::pass_with_detail(
+            NAME,
+            format!("{} majors registered; a payload violating the schema was rejected", ALL_MAJORS.len()),
+        ),
+        Ok(_) => CheckResult::fail(
+            NAME,
+            "a payload violating the registered schema was ACCEPTED — every number from this run \
+             would be measuring an unvalidated write path",
+        ),
+        Err(e) => CheckResult::fail(NAME, format!("schema enforcement probe failed for an unexpected reason: {e}")),
+    }
+}
+
+/// Physical RAM on a node, in bytes. `None` when the read failed — the memory
+/// check then reports inconclusive rather than dividing by a guess.
+async fn ssh_mem_total_bytes(host: &str) -> Option<u64> {
+    let host = host.to_string();
+    tokio::task::spawn_blocking(move || {
+        use std::process::{Command, Stdio};
+        let out = Command::new("ssh")
+            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", &host])
+            .arg("awk '/MemTotal/{print $2}' /proc/meminfo")
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().ok().map(|kb| kb * 1024)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Segment files per shard on one node. Best-effort: an ssh failure yields an
+/// empty list, and `RotationsReached` reports inconclusive rather than passing.
+async fn ssh_segments_per_shard(host: &str) -> Vec<(u32, u64)> {
+    let host = host.to_string();
+    tokio::task::spawn_blocking(move || {
+        use std::process::{Command, Stdio};
+        let script = format!(
+            "for d in {CARDINALITY_DATA_ROOT}/shard_*; do printf '%s %s\\n' \"$(basename $d)\" \"$(ls $d/log_*.wal 2>/dev/null | wc -l)\"; done"
+        );
+        let out = Command::new("ssh")
+            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", &host])
+            .arg(&script)
+            .stdin(Stdio::null())
+            .output();
+        match out {
+            Ok(o) if o.status.success() => crate::cardinality_workload::parse_shard_segment_counts(
+                &String::from_utf8_lossy(&o.stdout),
+            ),
+            _ => Vec::new(),
+        }
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// A poisoned reheat curve still holds every sample recorded before the panic,
+/// and dropping the whole deliverable over one panicked read task would lose
+/// hours of measurement.
+/// The parts of the summary table that are not the machine-readable
+/// deliverable: failover timings, disk high-water and the contention phase.
+struct CardinalityRun {
+    fill_stop_reason: crate::cardinality_workload::FillStop,
+    peak_disk_pct: u64,
+    promotion_ms: Option<u64>,
+    gap_ms: Option<u64>,
+    ready_ms: Option<u64>,
+    p2_stats: crate::cardinality_workload::HotWriterStats,
+    p6_stats: crate::cardinality_workload::HotWriterStats,
+    /// Fill write errors named by kind. Lives in the summary because a bare
+    /// error total is what made run 1787056102's 80.5% cliff unexplainable.
+    fill_errors_by_kind: String,
+}
+
+/// The deliverable. Every run reports what it *reached*, because cardinality is
+/// an output of this scenario rather than an input to it.
+///
+/// Rendered from `CardinalityDeliverable` wherever the two overlap: the same
+/// figure printed here and serialised into the run JSON is read once.
+fn render_cardinality_report(
+    card: &crate::cardinality_workload::CardinalityParams,
+    d: &crate::cardinality_deliverable::CardinalityDeliverable,
+    run: CardinalityRun,
+) -> String {
+    let mut md = String::from("# cardinality_pressure\n\n## What the run reached\n\n");
+    md.push_str("| Figure | Value |\n|---|---|\n");
+    md.push_str(&format!(
+        "| Preset / fill budget | {} / {}s |\n",
+        d.shape.preset, d.shape.fill_budget_secs
+    ));
+    md.push_str(&format!(
+        "| Fill elapsed | {}s ({}) |\n",
+        d.shape.fill_elapsed_secs,
+        run.fill_stop_reason.label()
+    ));
+    md.push_str(&format!("| Connections (tasks) | {} |\n", d.shape.tasks));
+    md.push_str(&format!("| Distinct aggregates | {} |\n", d.reached.distinct_aggregates));
+    md.push_str(&format!("| Distinct clients | {} |\n", d.reached.distinct_clients));
+    md.push_str(&format!(
+        "| Writes acked | fill {} (+{} contention, +{} failover) |\n",
+        d.reached.fill_writes_ok, run.p2_stats.ok, run.p6_stats.ok
+    ));
+    md.push_str(&format!(
+        "| Write errors | fill {} (+{} contention, +{} failover) |\n",
+        d.reached.fill_write_errors, run.p2_stats.errors, run.p6_stats.errors
+    ));
+    if !run.fill_errors_by_kind.is_empty() {
+        md.push_str(&format!("| Fill write errors by kind | {} |\n", run.fill_errors_by_kind));
+    }
+    md.push_str(&format!(
+        "| Reheat probes | {} ok, {} failed |\n",
+        d.reached.reheat_probes_ok, d.reached.reheat_probes_failed
+    ));
+    md.push_str(&format!("| Sampled ack ledger | {} entries |\n", d.reached.ledger_entries));
+    md.push_str(&format!(
+        "| Segment size / derived mix | {:.0}MB / {:.1}% large events |\n",
+        d.shape.segment_bytes as f64 / (1024.0 * 1024.0),
+        d.shape.large_event_fraction * 100.0
+    ));
+    // Model and observation side by side, never the model alone: the sizing
+    // formula run forward on its own inputs cannot disagree with the request,
+    // so quoting it as "achieved" makes the run unfalsifiable.
+    md.push_str(&format!(
+        "| Aggregates per segment | {} vs {} modelled vs {} design point |\n",
+        d.aggs_per_segment
+            .observed_lower_bound
+            .map(|v| format!("observed >= {v} ({} aggregates over {} segments; lower bound)",
+                d.reached.distinct_aggregates, d.aggs_per_segment.observed_total_segments))
+            .unwrap_or_else(|| "not observed — no segment rotated".into()),
+        d.aggs_per_segment.model,
+        d.aggs_per_segment.design_point,
+    ));
+    md.push_str(&format!(
+        "| Segments per data shard | {} |\n",
+        if d.segments_per_shard.is_empty() {
+            "not collected".to_string()
+        } else {
+            d.segments_per_shard
+                .iter()
+                .map(|s| format!("shard {}: {}", s.shard, s.segments))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    ));
+    // Preallocated, not written: segments are allocated to their full size up
+    // front, so this is the disk each node has committed rather than the bytes
+    // the workload put in them.
+    let segments = d.aggs_per_segment.observed_total_segments;
+    md.push_str(&format!(
+        "| WAL bytes per node | {:.2} GB preallocated across {segments} data segments |\n",
+        (segments * d.shape.segment_bytes) as f64 / 1e9,
+    ));
+    md.push_str(&format!(
+        "| Peak RSS | {:.2} GB{} |\n",
+        d.peak_rss.peak_bytes as f64 / 1e9,
+        match (d.peak_rss.declared_budget_bytes, d.peak_rss.node_ram_bytes) {
+            (Some(budget), Some(ram)) => format!(
+                " vs declared budget {:.2} GB ({}% of {:.2} GB RAM)",
+                budget as f64 / 1e9,
+                d.shape.memory_percent,
+                ram as f64 / 1e9
+            ),
+            _ => String::new(),
+        }
+    ));
+    for (host, bytes) in &d.peak_rss.by_host_bytes {
+        md.push_str(&format!("| Peak RSS — {host} | {:.2} GB |\n", *bytes as f64 / 1e9));
+    }
+    md.push_str(&format!(
+        "| Peak data filesystem | {}% (high-water {}%) |\n",
+        run.peak_disk_pct, card.disk_high_water_pct
+    ));
+    let ms = |v: Option<u64>| v.map(|x| format!("{x}ms")).unwrap_or_else(|| "not observed".into());
+    md.push_str(&format!("| Promotion latency (10Hz) | {} |\n", ms(run.promotion_ms)));
+    md.push_str(&format!(
+        "| Write-availability gap (client) | {} |\n",
+        run.gap_ms.map(|us| format!("{:.3}ms", us as f64 / 1000.0)).unwrap_or_else(|| "not observed".into())
+    ));
+    md.push_str(&format!("| Restart-to-ready | {} |\n", ms(run.ready_ms)));
+    md.push_str(&format!(
+        "| OCC retries (R={}) | {} across {} acked contended writes |\n",
+        card.contention_factor, run.p2_stats.occ_retries, run.p2_stats.ok
+    ));
+
+    md.push_str("\n## The deliverable — cost versus dormancy age\n\n");
+    md.push_str(
+        "A flat curve means cardinality scales. A curve rising with age means it does not. \
+         An empty bucket reads `—`, never `0ms`: the run did not reach that age.\n\n",
+    );
+    md.push_str(&d.fill_curve.to_markdown());
+    md.push('\n');
+    md.push_str(&d.warm_curve.to_markdown());
+    md.push('\n');
+    md.push_str(&d.cold_curve.to_markdown());
+    md.push('\n');
+    md.push_str(&celeriant_bench::read_workload::delta_markdown(
+        &d.cold_vs_warm,
+        d.warm_curve.request_timeouts(),
+        d.cold_curve.request_timeouts(),
+    ));
+    md.push_str(
+        "\nPhases 3 and 5 read identical keys at identical concurrency, so the delta isolates \
+         the empty cache. Bucket labels are the ages at draw time (end of fill) and stay fixed \
+         across both phases; re-bucketing by age at read time would move keys between rows and \
+         the two tables would no longer compare like with like. Each read task issues one \
+         untimed warm-up round trip first, so a post-restart TCP/TLS handshake does not land \
+         inside a measured sample.\n",
+    );
+    md
+}
+
+// ===========================================================================
+// Defect reproductions
+// ===========================================================================
+//
+// Two availability defects were observed live on the rig, both under the
+// cardinality fill and neither reproducible on demand. These two scenarios
+// reproduce one each, independently. Both are expected RED until the server is
+// fixed; each is the acceptance test for that fix.
+//
+// The load is the ingredient in both cases. `leader_sigkill` passes clean on
+// the same cluster with no load, and an unloaded cluster never wedged — so
+// both scenarios reuse `cardinality_workload`'s read-modify-write fill rather
+// than the opaque bench, at the shape the defects were seen at.
+
+/// Load and settle knobs for the two defect-reproduction scenarios. Defaults
+/// are the shape the defects were observed at on the rig — the wedge formed at
+/// 3000 tasks / 400 births per second inside 60 seconds, and did not clear 90
+/// seconds after every client disconnected.
+#[derive(Debug, Clone, Copy)]
+pub struct DefectParams {
+    /// Concurrent fill tasks. Must be a multiple of the data shard count.
+    pub tasks: usize,
+    /// New aggregates per second, CLUSTER-WIDE, divided across `tasks`.
+    pub birth_rate_per_sec: f64,
+    /// Seconds of fill before the load stops (`write_outage_selfheal`) or the
+    /// full observation window (`promotion_failure_survival`, floored at its
+    /// own timeline).
+    pub load_secs: u64,
+    /// Idle seconds observed after ALL load stops. Floored at
+    /// `SELFHEAL_MIN_SETTLE_SECS` — the field already disproved recovery over
+    /// 90 seconds, so a shorter window cannot say anything new.
+    pub settle_secs: u64,
+}
+
+impl Default for DefectParams {
+    fn default() -> Self {
+        Self { tasks: 3000, birth_rate_per_sec: 400.0, load_secs: 120, settle_secs: 120 }
+    }
+}
+
+/// The field observation is 90+ seconds of idle with the shards still fenced.
+/// A settle shorter than that cannot distinguish "never recovers" from "had not
+/// recovered yet", so the knob is floored rather than trusted.
+const SELFHEAL_MIN_SETTLE_SECS: u64 = 90;
+/// Probe writers carrying the availability clock through the kill.
+const PROMO_PROBE_WRITERS: usize = 24;
+/// Earliest the leader may be killed: enough fill for the follower to fall
+/// behind, which is the condition the failover matrix isolated as the only
+/// factor that mattered.
+const PROMO_KILL_AT_SECS: u64 = 45;
+/// Extra time granted for a non-zero follower lag to appear before the kill
+/// fires anyway. Firing anyway is deliberate — a run that killed a caught-up
+/// follower still reports its lag, so a non-reproduction is diagnosable.
+const PROMO_LAG_WAIT_SECS: u64 = 60;
+/// Delay before restarting the killed node. The field sequence has the
+/// restarted original leader winning epoch N+2 while the survivor is still in
+/// `Promoting`, so the restart is part of the trigger, not cleanup.
+const PROMO_RESTART_AFTER_SECS: u64 = 20;
+/// Observation window kept open after the restart.
+const PROMO_TAIL_SECS: u64 = 45;
+/// Grace granted to the restarted node before its process is required to be
+/// up. `ShardWal::open` rebuilds the active segment's chain tips before the
+/// node serves, which at these segment sizes is not instant.
+const PROMO_RESTART_GRACE_SECS: u64 = 120;
+/// Cap on waiting for the killed node to be observed ready.
+const PROMO_READY_DEADLINE: Duration = Duration::from_secs(180);
+
+/// The cardinality fill, running in the background of a defect scenario.
+struct DefectFill {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    counters: Arc<crate::cardinality_workload::FillCounters>,
+    handles: Vec<tokio::task::JoinHandle<crate::cardinality_workload::FillOutcome>>,
+    start: Instant,
+}
+
+impl DefectFill {
+    /// Stop the fill if the data filesystem crosses the high-water mark.
+    ///
+    /// `write_outage_selfheal` gets this from `watch_defect_fill`, but the
+    /// promotion scenario's fill runs unattended across the kill window — and
+    /// these boxes host a 24/7 production deployment, so an unwatched fill is
+    /// not something to leave running.
+    fn spawn_disk_watchdog(
+        &self,
+        store: crate::host_poll::HostPollStore,
+        high_water_pct: u64,
+    ) -> tokio::task::JoinHandle<()> {
+        let stop = self.stop.clone();
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(5)).await;
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let used = store.max_data_fs_used_pct();
+                if used >= high_water_pct {
+                    println!("[disk watchdog] data filesystem at {used}% — stopping the fill");
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            }
+        })
+    }
+
+    /// Stop every fill task and wait for it to exit.
+    ///
+    /// Load is not "stopped" until this returns: a task still inside a write
+    /// holds a connection open, and the settle window is only meaningful
+    /// against a genuinely idle cluster.
+    async fn stop_and_join(self) -> (crate::cardinality_workload::FillTotals, Vec<u64>) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut totals = crate::cardinality_workload::FillTotals::default();
+        let mut latencies = Vec::new();
+        for h in self.handles {
+            match h.await {
+                Ok(out) => {
+                    totals.writes_ok += out.totals.writes_ok;
+                    totals.write_errors += out.totals.write_errors;
+                    totals.occ_retries += out.totals.occ_retries;
+                    totals.reheats_ok += out.totals.reheats_ok;
+                    totals.reheat_errors += out.totals.reheat_errors;
+                    latencies.extend(out.latencies);
+                }
+                Err(e) => eprintln!("fill task join: {e}"),
+            }
+        }
+        (totals, latencies)
+    }
+}
+
+/// Spawn the fill across the lane pools at the defect load shape.
+fn start_defect_fill(
+    lane_pools: &[Arc<Pool>],
+    defect: DefectParams,
+    card: &crate::cardinality_workload::CardinalityParams,
+    seed: u64,
+    budget: Duration,
+) -> DefectFill {
+    use crate::cardinality_workload as cw;
+    use celeriant_bench::read_workload::ReheatCostCurve;
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let counters = Arc::new(cw::FillCounters::default());
+    // `run_fill_task` records reheat cost into a curve. Neither defect scenario
+    // reports one — they measure availability, not cost — but the fill's reheat
+    // traffic is part of the load shape, so it runs and the curve is discarded.
+    let curve = Arc::new(std::sync::Mutex::new(ReheatCostCurve::new("defect fill", seed)));
+    let start = Instant::now();
+    let mix = card.large_event_fraction();
+    let birth_interval = cw::per_task_interval(defect.birth_rate_per_sec, defect.tasks);
+    let reheat_interval = cw::per_task_interval(card.reheat_rate_per_sec, defect.tasks);
+
+    let handles = (0..defect.tasks)
+        .map(|task_id| {
+            tokio::spawn(cw::run_fill_task(
+                lane_pools[task_id % lane_pools.len()].clone(),
+                cw::FillConfig {
+                    task_id: task_id as u32,
+                    tasks: defect.tasks,
+                    seed,
+                    large_event_fraction: mix,
+                    budget,
+                    birth_interval,
+                    reheat_interval,
+                    // Neither scenario runs the ledger's integrity audit, so
+                    // the smallest useful reservoir keeps 3000 tasks' worth of
+                    // sampled acks out of memory.
+                    ledger_capacity: 8,
+                },
+                stop.clone(),
+                counters.clone(),
+                curve.clone(),
+                start,
+            ))
+        })
+        .collect();
+
+    DefectFill { stop, counters, handles, start }
+}
+
+/// Print fill progress every 5s and honour the disk watchdog.
+async fn watch_defect_fill(
+    scen: &str,
+    fill: &DefectFill,
+    budget: Duration,
+    poll_store: &crate::host_poll::HostPollStore,
+    high_water_pct: u64,
+) -> crate::cardinality_workload::FillStop {
+    use std::sync::atomic::Ordering;
+    let mut ticks = 0u64;
+    loop {
+        sleep(Duration::from_secs(5)).await;
+        ticks += 1;
+        let elapsed = fill.start.elapsed();
+        let used = poll_store.max_data_fs_used_pct();
+        if ticks.is_multiple_of(3) {
+            println!(
+                "[{scen}]   t={}s aggregates={} writes={} errors={} disk={used}%",
+                elapsed.as_secs(),
+                fill.counters.births.load(Ordering::Relaxed),
+                fill.counters.writes_ok.load(Ordering::Relaxed),
+                fill.counters.write_errors.load(Ordering::Relaxed),
+            );
+        }
+        if let Some(reason) =
+            crate::cardinality_workload::fill_stop(elapsed, budget, used, high_water_pct)
+        {
+            return reason;
+        }
+    }
+}
+
+/// A fresh client must be able to write after the settle window.
+///
+/// Deliberately independent of the metric verdict. The gauge and the write gate
+/// both read `effective_node_status()`, so they agree by construction — only an
+/// actual round trip proves a caller can get through.
+async fn post_settle_probe_write(
+    cfg: &ClusterConfig,
+    up: &ClusterUp,
+    params: ScenarioParams,
+) -> CheckResult {
+    const NAME: &str = "PostSettleProbeWrite";
+    const BUDGET: Duration = Duration::from_secs(30);
+    let pool = match build_bench_pool(cfg, up, ScenarioParams { tasks: 4, ..params }).await {
+        Ok(p) => p,
+        Err(e) => {
+            return CheckResult::fail(
+                NAME,
+                format!("a fresh client could not even connect after the settle window: {e}"),
+            );
+        }
+    };
+    match tokio::time::timeout(BUDGET, smoke_test(&pool)).await {
+        Ok(Ok(())) => CheckResult::pass_with_detail(
+            NAME,
+            "a fresh client wrote and read back after the settle window",
+        ),
+        Ok(Err(e)) => CheckResult::fail(
+            NAME,
+            format!("probe write REFUSED after the settle window: {e}"),
+        ),
+        Err(_) => CheckResult::fail(
+            NAME,
+            format!("probe write did not complete within {}s after the settle window", BUDGET.as_secs()),
+        ),
+    }
+}
+
+/// The forensics a red run has to carry, none of which the standard report
+/// holds. Written on every run so a green one is a usable baseline.
+fn render_wedge_diagnostics(samples: &[NodeSample], hosts: &[String], from_ms: u64) -> String {
+    let mut md = String::from("# Wedge diagnostics\n\n");
+    md.push_str(&format!("Window: scraper t_ms >= {from_ms}.\n\n"));
+    for host in hosts {
+        md.push_str(&format!("## {host}\n\n"));
+        let first = samples.iter().find(|s| s.host == *host && s.ok && s.t_ms >= from_ms);
+        let last = samples.iter().rev().find(|s| s.host == *host && s.ok && s.t_ms >= from_ms);
+        let (Some(first), Some(last)) = (first, last) else {
+            md.push_str("No healthy scrape in the window — nothing to diagnose from.\n\n");
+            continue;
+        };
+        let fmt_map = |m: &std::collections::BTreeMap<u32, u64>| {
+            if m.is_empty() {
+                "(absent)".to_string()
+            } else {
+                m.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")
+            }
+        };
+        md.push_str(&format!(
+            "- effective status (THE gauge): `{}`\n- raw status (do not diagnose from this): `{}`\n- node_role: {}\n",
+            fmt_map(&last.effective_status_by_shard),
+            fmt_map(&last.node_status_code_by_shard),
+            last.node_role,
+        ));
+        md.push_str(&format!(
+            "- lease_remaining_ms: {}\n",
+            if last.lease_remaining_ms_by_series.is_empty() {
+                "(absent)".to_string()
+            } else {
+                last.lease_remaining_ms_by_series
+                    .iter()
+                    .map(|(k, v)| format!("`{k}`={v}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ));
+        md.push_str(&format!(
+            "- write_errors_total by error_code: {}\n",
+            if last.write_errors_by_code.is_empty() {
+                "(none — the counter registers lazily, so absence is zero here)".to_string()
+            } else {
+                last.write_errors_by_code
+                    .iter()
+                    .map(|(code, v)| format!("{code}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ));
+        md.push_str(&format!(
+            "- heartbeat_failures_total: {}\n- intrashard_broadcast_dropped_total: {} (carries the lease-renewal StatusUpdate)\n- intrashard_status_broadcast_dropped_total: {}\n",
+            last.heartbeat_failures_total,
+            last.intrashard_broadcast_dropped_total,
+            last.intrashard_status_broadcast_dropped_total,
+        ));
+
+        let parked = crate::cardinality_checks::parked_handlers(samples, host, from_ms);
+        md.push_str(&format!(
+            "\n### Parked mesh handlers ({} of {} entered handlers never returned)\n\n",
+            parked.len(),
+            last.stuck_handlers.len()
+        ));
+        if parked.is_empty() {
+            md.push_str("None — every entered handler's start stamp advanced across the window.\n");
+        } else {
+            md.push_str("Same label set AND same start stamp at both ends of the window: the loop entered once and never came out. The label set names the arm.\n\n");
+            for entry in &parked {
+                md.push_str(&format!("- `{entry}`\n"));
+            }
+        }
+        md.push_str(&format!(
+            "\nAll entered handlers at the last scrape: {}\n",
+            if last.stuck_handlers.is_empty() {
+                "(none)".to_string()
+            } else {
+                last.stuck_handlers.iter().map(|e| format!("`{e}`")).collect::<Vec<_>>().join(", ")
+            }
+        ));
+
+        md.push_str("\n### Mesh dequeue per producer pair (delta over the window)\n\n");
+        if last.mesh_dequeued_by_pair.is_empty() {
+            md.push_str("`celeriant_intrashard_dequeued_total` absent.\n");
+        } else {
+            md.push_str("| pair | last | delta |\n|---|---|---|\n");
+            for (pair, v) in &last.mesh_dequeued_by_pair {
+                let before = first.mesh_dequeued_by_pair.get(pair).copied().unwrap_or(0);
+                md.push_str(&format!("| `{pair}` | {v} | {} |\n", v.saturating_sub(before)));
+            }
+        }
+        md.push('\n');
+    }
+    md
+}
+
+/// Leave the rig with a running cluster.
+///
+/// `tear_down_and_evaluate_*` stops both nodes, and the wedge does not
+/// self-clear, so a later scenario must not inherit either a stopped pair or a
+/// wedged one. Best-effort and loud: the verdict is already written by the time
+/// this runs, so a hygiene failure is reported rather than scored.
+async fn restart_cluster_for_next_scenario(scen: &str, cfg: &ClusterConfig) {
+    let executor = ActionExecutor::new(cfg);
+    println!("[{scen}] hygiene: restarting the chaos cluster");
+    for action in [Action::StartCs1, Action::StartCs2] {
+        if let Err(e) = executor.run(&action) {
+            println!("[{scen}] WARNING: hygiene {action:?} failed: {e}");
+        }
+        sleep(Duration::from_secs(5)).await;
+    }
+    let scraper = Scraper::start(cfg);
+    match wait_for_stable_leader(&scraper, Duration::from_secs(120)).await {
+        Ok(()) => println!("[{scen}] hygiene: cluster back with a stable leader"),
+        Err(e) => println!(
+            "[{scen}] WARNING: no stable leader within 120s of the hygiene restart ({e}) — \
+             check the rig before the next scenario"
+        ),
+    }
+    let _ = scraper.stop().await;
+}
+
+/// Restore the systemd units the defect scenarios rewrote on the way in.
+fn restore_service_baseline(scen: &str, cfg: &ClusterConfig, baseline: Option<(u64, u64)>) {
+    let Some((mem, seg)) = baseline else { return };
+    let executor = ActionExecutor::new(cfg);
+    match executor.run(&Action::UpdateServiceConfig { memory_percent: mem, segment_bytes: seg }) {
+        Ok(()) => println!("[{scen}] restored service config to {mem}% / {seg} bytes"),
+        Err(e) => println!(
+            "[{scen}] WARNING: could not restore service config ({e}) — later runs inherit this one's units"
+        ),
+    }
+}
+
+/// DEFECT 1 (P0) — the cluster wedges into a permanent write outage under
+/// ordinary client load, and never comes back.
+///
+/// Field observation: the cardinality fill at 3000 tasks / 400 births per
+/// second froze writes inside 60 seconds. `shard_cannot_accept_writes` climbed
+/// into the hundreds of thousands, `celeriant_node_status_effective_code` read
+/// 5 (Fenced) on data shards of BOTH nodes, and `node_status_code` / `node_role`
+/// went on reading healthy throughout. **Ninety seconds after every client
+/// disconnected the shards were still fenced.** Only a restart cleared it.
+///
+/// So the assertion here is not "writes failed" — that proves overload. It is
+/// the ABSENCE OF RECOVERY: stop all load, wait, and demand that no shard on
+/// either node is still `effective == Fenced`, plus a fresh client able to
+/// write. A run where the cluster never wedged passes that assertion trivially,
+/// which is why `WedgeFormedDuringLoad` annunciates a no-wedge run as
+/// INCONCLUSIVE rather than letting the green stand unqualified.
+pub async fn run_write_outage_selfheal(
+    cfg: &ClusterConfig,
+    params: ScenarioParams,
+    card: crate::cardinality_workload::CardinalityParams,
+    defect: DefectParams,
+    run_dir: &PathBuf,
+) -> Result<ScenarioReport, String> {
+    use crate::cardinality_workload as cw;
+
+    const SCEN: &str = "write_outage_selfheal";
+
+    cw::validate_tasks(defect.tasks)?;
+    let load_budget = Duration::from_secs(defect.load_secs);
+    let settle = Duration::from_secs(defect.settle_secs.max(SELFHEAL_MIN_SETTLE_SECS));
+    let load_params = ScenarioParams { tasks: defect.tasks, ..params };
+
+    println!("[{SCEN}] the assertion is the ABSENCE OF RECOVERY, not the write errors");
+    println!(
+        "[{SCEN}]   fill {} tasks at {:.0} births/s cluster-wide for {}s, then ZERO load for {}s",
+        defect.tasks,
+        defect.birth_rate_per_sec,
+        load_budget.as_secs(),
+        settle.as_secs(),
+    );
+
+    let executor = ActionExecutor::new(cfg);
+    executor.run(&Action::UpdateServiceConfig {
+        memory_percent: card.memory_percent,
+        segment_bytes: card.segment_bytes,
+    })?;
+    let baseline_cfg = read_service_baseline(cfg);
+
+    let up = bring_up_cluster(cfg, SCEN, run_dir).await?;
+    let poll_store = crate::host_poll::HostPollStore::new();
+    let poll_handle = crate::host_poll::spawn(
+        vec![cfg.leader_host.clone(), cfg.follower_host.clone()],
+        CARDINALITY_UNIT.to_string(),
+        CARDINALITY_DATA_ROOT.to_string(),
+        Duration::from_secs(1),
+        poll_store.clone(),
+    );
+
+    let mut extra_checks: Vec<CheckResult> = Vec::new();
+    let bench_window_start_ms = up.elapsed_ms();
+
+    // Pools live only for the load phase. Dropping them is what makes the
+    // settle window honest: the field wedge persisted with every client
+    // connection killed, so the scenario has to reach that same state.
+    let (totals, latencies, load_start_ms, load_end_ms, stop_reason) = {
+        let pool = build_bench_pool(cfg, &up, load_params).await?;
+        let lane_pools = build_lane_pools(cfg, &up, load_params).await?;
+        println!("[{SCEN}] smoke test");
+        smoke_test(&pool).await.map_err(|e| format!("smoke: {e}"))?;
+        extra_checks.push(assert_account_schemas_enforced(&pool).await);
+
+        let load_start_ms = up.elapsed_ms();
+        println!("[{SCEN}] load on");
+        let fill = start_defect_fill(&lane_pools, defect, &card, params.seed, load_budget);
+        let stop_reason =
+            watch_defect_fill(SCEN, &fill, load_budget, &poll_store, card.disk_high_water_pct).await;
+        let (totals, latencies) = fill.stop_and_join().await;
+        let load_end_ms = up.elapsed_ms();
+        (totals, latencies, load_start_ms, load_end_ms, stop_reason)
+    };
+
+    let load_stop = Instant::now();
+    let settle_start_ms = up.elapsed_ms();
+    println!(
+        "[{SCEN}] ALL load stopped ({}): {} writes, {} errors. Settling {}s with zero clients",
+        stop_reason.label(),
+        totals.writes_ok,
+        totals.write_errors,
+        settle.as_secs(),
+    );
+    sleep(settle).await;
+    let since_load_stop = load_stop.elapsed();
+    let bench_window_end_ms = up.elapsed_ms();
+
+    let samples = up.scraper.store().snapshot().await;
+    let hosts = vec![cfg.leader_host.clone(), cfg.follower_host.clone()];
+
+    extra_checks.push(crate::cardinality_checks::wedge_formed_during_load(
+        &samples,
+        load_start_ms,
+        load_end_ms,
+        totals.writes_ok,
+        totals.write_errors,
+    ));
+    extra_checks.push(crate::cardinality_checks::write_outage_self_healed(
+        &samples,
+        &hosts,
+        settle_start_ms,
+        since_load_stop,
+    ));
+    extra_checks.push(post_settle_probe_write(cfg, &up, params).await);
+
+    let diagnostics = render_wedge_diagnostics(&samples, &hosts, settle_start_ms);
+    let diag_path = run_dir.join(format!("{SCEN}-diagnostics.md"));
+    if let Err(e) = std::fs::write(&diag_path, &diagnostics) {
+        eprintln!("[{SCEN}] writing {}: {e}", diag_path.display());
+    }
+    if extra_checks.iter().any(|c| c.failed()) {
+        println!("\n{diagnostics}");
+    } else {
+        println!("[{SCEN}] diagnostics written to {}", diag_path.display());
+    }
+
+    poll_store.request_stop();
+
+    // Error volume IS the symptom under a wedge, so nothing here asserts on it;
+    // the verdict comes from the settle-window checks above. What stays strict
+    // is the counters that must be zero however the run went.
+    let expectations = ScenarioExpectations {
+        max_leader_elections: 60,
+        max_s3_fallbacks: 5_000,
+        max_heartbeat_failures: 500,
+        max_node_starts: 2,
+        max_bench_errors: u64::MAX,
+        max_bench_error_ratio: None,
+        max_role_flips: 20,
+        max_split_brain_ticks: 40,
+        require_leader_retained: false,
+        // A wedged cluster cannot converge or make progress, and asserting it
+        // must would fail this run for the symptom instead of the defect.
+        assert_eventual_progress: false,
+        ..ScenarioExpectations::default()
+    };
+
+    let window_secs = (bench_window_end_ms.saturating_sub(bench_window_start_ms) / 1000).max(1);
+    let bench_result = benchmark_from(
+        latencies,
+        totals.writes_ok,
+        totals.write_errors + totals.reheat_errors,
+        defect.tasks,
+        window_secs,
+    );
+    let scen_params = ScenarioParams {
+        tasks: defect.tasks,
+        duration_secs: window_secs,
+        // Throughput is the SYMPTOM here, not the assertion. A floor would fail
+        // the run for the outage it exists to observe, and the verdict would
+        // then be indistinguishable from an underpowered rig.
+        throughput_floor: 0.0,
+        ..params
+    };
+
+    let report = tear_down_and_evaluate_with_audit(
+        SCEN,
+        cfg,
+        up,
+        bench_result,
+        bench_window_start_ms,
+        bench_window_end_ms,
+        expectations,
+        scen_params,
+        extra_checks,
+        None,
+        None,
+        None,
+        run_dir,
+    )
+    .await;
+    let _ = poll_handle.await;
+
+    restore_service_baseline(SCEN, cfg, baseline_cfg);
+    restart_cluster_for_next_scenario(SCEN, cfg).await;
+    report
+}
+
+/// Hold until the current follower is measurably behind the current leader.
+///
+/// Returns the leader's host (if one was visible), the largest per-shard lag
+/// observed at the moment the gate cleared, and whether the gate was actually
+/// met. It fires anyway on the deadline: a run that killed a caught-up follower
+/// is a non-reproduction, and reporting its lag makes that diagnosable, whereas
+/// hanging forever makes it invisible.
+async fn wait_for_behind_follower(
+    scen: &str,
+    cfg: &ClusterConfig,
+    scraper: &Scraper,
+    min_lag: u64,
+    deadline: Instant,
+) -> (Option<String>, u64, bool) {
+    let mut leader_host = None;
+    let mut lag = 0;
+    loop {
+        let samples = scraper.store().snapshot().await;
+        let last = |h: &str| samples.iter().rev().find(|s| s.host == h && s.ok);
+        if let (Some(a), Some(b)) = (last(&cfg.leader_host), last(&cfg.follower_host)) {
+            let pair = if a.node_role >= 0.5 {
+                Some((a, b))
+            } else if b.node_role >= 0.5 {
+                Some((b, a))
+            } else {
+                None
+            };
+            if let Some((leader, follower)) = pair {
+                leader_host = Some(leader.host.clone());
+                lag = crate::cardinality_checks::follower_lag(leader, follower);
+                if lag >= min_lag {
+                    println!("[{scen}] follower is {lag} wal_seq(s) behind — killing the leader now");
+                    return (leader_host, lag, true);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            println!(
+                "[{scen}] lag gate timed out with lag={lag} (want >= {min_lag}) — killing anyway \
+                 so the run reports a diagnosable non-reproduction"
+            );
+            return (leader_host, lag, false);
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// DEFECT 2 (P1) — a failed leadership challenge panics the shard.
+///
+/// Field observation, twice, ~31s apart in outcome and within 2% of each other:
+/// under the cardinality fill the leader was killed, the follower auto-fenced,
+/// challenged, won lease epoch N+1, sat ~30s in `Promoting` on an S3 WAL
+/// catch-up, lost the race to the restarted original leader (epoch N+2), hit
+/// "S3 catchup completion barrier timed out", and then hit the unconditional
+/// `panic!("Election failed after retries: {e}")` in `shard.rs` — after which
+/// the process hung until systemd SIGKILLed it 90 seconds later.
+///
+/// `leader_sigkill` passes clean on the same cluster with no load, so **load is
+/// the ingredient**: sustained fill keeps the follower behind (19 wal_seqs at
+/// the kill in the field), forcing the S3 catch-up path during promotion. The
+/// kill is therefore gated on an observed non-zero lag, and the lag at kill is
+/// reported either way so a non-reproducing run can be told apart from a fix.
+pub async fn run_promotion_failure_survival(
+    cfg: &ClusterConfig,
+    params: ScenarioParams,
+    card: crate::cardinality_workload::CardinalityParams,
+    defect: DefectParams,
+    run_dir: &PathBuf,
+) -> Result<ScenarioReport, String> {
+    use crate::cardinality_workload as cw;
+    use celeriant_bench::population::{Member, Population};
+
+    const SCEN: &str = "promotion_failure_survival";
+
+    cw::validate_tasks(defect.tasks)?;
+    let window = Duration::from_secs(defect.load_secs.max(
+        PROMO_KILL_AT_SECS + PROMO_LAG_WAIT_SECS + PROMO_RESTART_AFTER_SECS + PROMO_TAIL_SECS,
+    ));
+    let load_params = ScenarioParams { tasks: defect.tasks, ..params };
+    let mix = card.large_event_fraction();
+
+    println!("[{SCEN}] red conditions: a panic in either journal, or a celeriant process found dead");
+    println!(
+        "[{SCEN}]   fill {} tasks at {:.0} births/s, kill the leader no earlier than {}s and only \
+         once the follower is behind, restart it {}s later, window {}s",
+        defect.tasks,
+        defect.birth_rate_per_sec,
+        PROMO_KILL_AT_SECS,
+        PROMO_RESTART_AFTER_SECS,
+        window.as_secs(),
+    );
+
+    let executor = ActionExecutor::new(cfg);
+    executor.run(&Action::UpdateServiceConfig {
+        memory_percent: card.memory_percent,
+        segment_bytes: card.segment_bytes,
+    })?;
+    let baseline_cfg = read_service_baseline(cfg);
+
+    let journal_from = std::time::SystemTime::now();
+    let up = bring_up_cluster(cfg, SCEN, run_dir).await?;
+    let poll_start = Instant::now();
+    let poll_store = crate::host_poll::HostPollStore::new();
+    let poll_handle = crate::host_poll::spawn(
+        vec![cfg.leader_host.clone(), cfg.follower_host.clone()],
+        CARDINALITY_UNIT.to_string(),
+        CARDINALITY_DATA_ROOT.to_string(),
+        Duration::from_secs(1),
+        poll_store.clone(),
+    );
+
+    let pool = build_bench_pool(cfg, &up, ScenarioParams { tasks: 8, ..params }).await?;
+    println!("[{SCEN}] smoke test");
+    smoke_test(&pool).await.map_err(|e| format!("smoke: {e}"))?;
+    let mut extra_checks: Vec<CheckResult> = vec![assert_account_schemas_enforced(&pool).await];
+    let lane_pools = build_lane_pools(cfg, &up, load_params).await?;
+
+    let bench_window_start_ms = up.elapsed_ms();
+    let fill = start_defect_fill(&lane_pools, defect, &card, params.seed, window);
+    let disk_watchdog = fill.spawn_disk_watchdog(poll_store.clone(), card.disk_high_water_pct);
+
+    // The availability probe: a small set of steady writers with their own
+    // microsecond clock. The fill's job is to keep the follower behind; this
+    // set's job is to say when a caller could not write. Members are minted
+    // through the real population path in task-id space above the fill's, so
+    // they land on shard lanes without colliding with it.
+    let origin = Instant::now();
+    let availability = Arc::new(cw::AvailabilityClock::new(origin));
+    let (role_samples, role_stop) = spawn_role_watch(cfg, origin);
+    let probe_pool =
+        build_bench_pool(cfg, &up, ScenarioParams { tasks: PROMO_PROBE_WRITERS, ..params }).await?;
+    let total_tasks = defect.tasks + PROMO_PROBE_WRITERS;
+    let probe_members: Vec<Member> = (0..PROMO_PROBE_WRITERS)
+        .map(|i| {
+            let task_id = (defect.tasks + i) as u32;
+            Population::new(cw::population_config(task_id, total_tasks, window, params.seed))
+                .birth(0)
+        })
+        .collect();
+    let mut probe_handles = Vec::with_capacity(PROMO_PROBE_WRITERS);
+    for (i, member) in probe_members.iter().enumerate() {
+        probe_handles.push(tokio::spawn(cw::run_hot_writer(
+            probe_pool.clone(),
+            cw::HotWriterConfig {
+                member: *member,
+                replica: 0,
+                process: i as u32,
+                duration: window,
+                seed: params.seed ^ 0xF0,
+                large_event_fraction: mix,
+            },
+            None,
+            Some(availability.clone()),
+        )));
+    }
+
+    sleep(Duration::from_secs(PROMO_KILL_AT_SECS)).await;
+    let pre_kill_ms = up.elapsed_ms();
+    let (leader_now, lag_at_kill, lag_gate_met) = wait_for_behind_follower(
+        SCEN,
+        cfg,
+        &up.scraper,
+        1,
+        Instant::now() + Duration::from_secs(PROMO_LAG_WAIT_SECS),
+    )
+    .await;
+
+    let killed_host = leader_now.unwrap_or_else(|| cfg.leader_host.clone());
+    let (kill, restart) = if killed_host == cfg.leader_host {
+        (Action::KillCs1, Action::StartCs1)
+    } else {
+        (Action::KillCs2, Action::StartCs2)
+    };
+    println!("[{SCEN}] SIGKILL {killed_host} mid-load ({:?})", kill);
+    executor.run(&kill)?;
+    // Marked after the kill returns, matching phase 6: writes acked while the
+    // ssh was in flight were served by a live leader.
+    availability.mark_kill();
+    let kill_poll_ms = poll_start.elapsed().as_millis() as u64;
+    let kill_ms = origin.elapsed().as_millis() as u64;
+
+    sleep(Duration::from_secs(PROMO_RESTART_AFTER_SECS)).await;
+    println!("[{SCEN}] restarting {killed_host} — the restarted leader winning the next epoch is part of the trigger");
+    executor.run(&restart)?;
+    let restart_ms = origin.elapsed().as_millis() as u64;
+    let restart_poll_ms = poll_start.elapsed().as_millis() as u64;
+
+    let mut probe_stats = cw::HotWriterStats::default();
+    let (totals, latencies) = {
+        let mut probe_latencies = Vec::new();
+        for h in probe_handles {
+            if let Ok((s, lat)) = h.await {
+                probe_stats.ok += s.ok;
+                probe_stats.errors += s.errors;
+                probe_stats.occ_retries += s.occ_retries;
+                probe_latencies.extend(lat);
+            }
+        }
+        let (totals, mut latencies) = fill.stop_and_join().await;
+        disk_watchdog.abort();
+        latencies.append(&mut probe_latencies);
+        (totals, latencies)
+    };
+
+    // Hold the 10Hz window open until the killed node is observed ready:
+    // reporting "not observed" for a node that had simply not finished opening
+    // its shards would hide the number this measurement exists for.
+    let ready_deadline = Instant::now() + PROMO_READY_DEADLINE;
+    let roles = loop {
+        let snapshot = role_samples.lock().await.clone();
+        if cw::restart_ready_ms(&snapshot, &killed_host, restart_ms).is_some()
+            || Instant::now() >= ready_deadline
+        {
+            break snapshot;
+        }
+        sleep(Duration::from_secs(1)).await;
+    };
+    role_stop.notify_one();
+    poll_store.request_stop();
+    let bench_window_end_ms = up.elapsed_ms();
+
+    // ---- scaffolding gates -------------------------------------------------
+    // Unmet scaffolding makes the run INCONCLUSIVE, never a pass: the contract
+    // assertions below are only meaningful if the cluster was healthy, taking
+    // writes, and actually lost its leader.
+    let samples = up.scraper.store().snapshot().await;
+    extra_checks.push(cluster_was_writing_before_kill(&samples, bench_window_start_ms, pre_kill_ms));
+    extra_checks.push(match cw::restart_ready_ms(&roles, &killed_host, restart_ms) {
+        Some(_) => CheckResult::pass_with_detail(
+            "KillLanded",
+            format!("{killed_host} was observed down and then ready again"),
+        ),
+        None => CheckResult::inconclusive(
+            "KillLanded",
+            format!(
+                "{killed_host} was never observed down in the 10Hz window — the SIGKILL may not \
+                 have landed, so nothing below tested a promotion"
+            ),
+        ),
+    });
+    extra_checks.push(if lag_gate_met {
+        CheckResult::pass_with_detail(
+            "FollowerBehindAtKill",
+            format!("follower was {lag_at_kill} wal_seq(s) behind at the kill (field trigger: 19)"),
+        )
+    } else {
+        CheckResult::inconclusive(
+            "FollowerBehindAtKill",
+            format!(
+                "follower lag was {lag_at_kill} at the kill after waiting {PROMO_LAG_WAIT_SECS}s — \
+                 a caught-up follower promotes off TCP and never reaches the S3 catch-up path, so \
+                 this run did not exercise the trigger"
+            ),
+        )
+    });
+
+    // ---- red conditions ----------------------------------------------------
+    extra_checks.extend(election_panic_checks(SCEN, cfg, journal_from, run_dir));
+    let host_samples = poll_store.snapshot().await;
+    extra_checks.push(crate::cardinality_checks::processes_stayed_up(
+        &host_samples,
+        &killed_host,
+        kill_poll_ms,
+        restart_poll_ms + PROMO_RESTART_GRACE_SECS * 1000,
+    ));
+
+    // ---- report-only -------------------------------------------------------
+    let promotion_ms = cw::promotion_latency_ms(&roles, &killed_host, kill_ms);
+    let ready_ms = cw::restart_ready_ms(&roles, &killed_host, restart_ms);
+    extra_checks.push(timing_check(
+        "PromotionLatency",
+        promotion_ms,
+        "survivor took leadership",
+        "no promotion observed in the 10Hz window",
+    ));
+    extra_checks.push(timing_check(
+        "RestartToReady",
+        ready_ms,
+        "killed node rejoined and its shards reported a WAL sequence",
+        "the killed node was not observed ready before the window closed",
+    ));
+    extra_checks.push(match availability.max_ack_gap() {
+        Some(g) => CheckResult::pass_with_detail(
+            "WriteUnavailabilityAroundKill",
+            format!(
+                "{:.0}ms largest silence between consecutive client acks (anchor-free). \
+                 The trivial no-load failover achieves ~1600ms; the field runs of this defect \
+                 showed ~31,000ms (report-only)",
+                g.as_secs_f64() * 1000.0,
+            ),
+        ),
+        None => CheckResult::inconclusive(
+            "WriteUnavailabilityAroundKill",
+            "fewer than two acks landed in the window — no unavailability to measure".to_string(),
+        ),
+    });
+
+    println!(
+        "[{SCEN}] lag at kill {lag_at_kill}, promotion {}, unavailability {}, restart-to-ready {}",
+        promotion_ms.map(|v| format!("{v}ms")).unwrap_or_else(|| "not observed".into()),
+        availability
+            .max_ack_gap()
+            .map(|g| format!("{:.0}ms", g.as_secs_f64() * 1000.0))
+            .unwrap_or_else(|| "not observed".into()),
+        ready_ms.map(|v| format!("{v}ms")).unwrap_or_else(|| "not observed".into()),
+    );
+
+    drop(probe_pool);
+    drop(lane_pools);
+    drop(pool);
+
+    let expectations = ScenarioExpectations {
+        // The killed node restarts once — by systemd's `Restart=on-failure`
+        // before this scenario's own `start-cs*` no-ops on top of it. The bound
+        // is headroom for that pair, not a defect check: a node that died and
+        // came back is named by `CeleriantProcessesStayedUp`, which knows which
+        // node was supposed to be down and when.
+        max_node_starts: 2,
+        max_leader_elections: 60,
+        max_s3_fallbacks: 5_000,
+        max_heartbeat_failures: 500,
+        max_bench_errors: u64::MAX,
+        max_bench_error_ratio: None,
+        max_role_flips: 20,
+        max_split_brain_ticks: 40,
+        require_leader_retained: false,
+        // A node that panicked will not converge, and asserting it must would
+        // fail the run for the consequence instead of the defect.
+        assert_eventual_progress: false,
+        max_failover_ms: None,
+        ..ScenarioExpectations::default()
+    };
+
+    let window_secs = (bench_window_end_ms.saturating_sub(bench_window_start_ms) / 1000).max(1);
+    let bench_result = benchmark_from(
+        latencies,
+        totals.writes_ok + probe_stats.ok,
+        totals.write_errors + totals.reheat_errors + probe_stats.errors,
+        defect.tasks,
+        window_secs,
+    );
+    let scen_params = ScenarioParams {
+        tasks: defect.tasks,
+        duration_secs: window_secs,
+        // Throughput is the SYMPTOM here, not the assertion. A floor would fail
+        // the run for the outage it exists to observe, and the verdict would
+        // then be indistinguishable from an underpowered rig.
+        throughput_floor: 0.0,
+        ..params
+    };
+
+    let report = tear_down_and_evaluate_with_audit(
+        SCEN,
+        cfg,
+        up,
+        bench_result,
+        bench_window_start_ms,
+        bench_window_end_ms,
+        expectations,
+        scen_params,
+        extra_checks,
+        None,
+        None,
+        None,
+        run_dir,
+    )
+    .await;
+    let _ = poll_handle.await;
+
+    restore_service_baseline(SCEN, cfg, baseline_cfg);
+    restart_cluster_for_next_scenario(SCEN, cfg).await;
+    report
+}
+
+/// Scaffolding: the cluster must have been serving writes before the kill, or
+/// nothing after it tested a promotion.
+fn cluster_was_writing_before_kill(
+    samples: &[NodeSample],
+    from_ms: u64,
+    to_ms: u64,
+) -> CheckResult {
+    const NAME: &str = "ClusterHealthyBeforeKill";
+    let in_window = |s: &&NodeSample| s.ok && s.t_ms >= from_ms && s.t_ms <= to_ms;
+    let first = samples.iter().filter(in_window).map(|s| s.writes_total).min();
+    let last = samples.iter().filter(in_window).map(|s| s.writes_total).max();
+    match (first, last) {
+        (Some(a), Some(b)) if b > a => CheckResult::pass_with_detail(
+            NAME,
+            format!("writes_total advanced {a} -> {b} before the kill"),
+        ),
+        (Some(a), Some(b)) => CheckResult::inconclusive(
+            NAME,
+            format!("writes_total did not advance before the kill ({a} -> {b}) — the run killed a cluster that was not serving"),
+        ),
+        _ => CheckResult::inconclusive(
+            NAME,
+            "no healthy scrape before the kill — cluster health at the kill is unknown".to_string(),
+        ),
+    }
+}
+
+/// Fetch both journals for the run window and match the election panic.
+///
+/// Separate from the teardown's own harvest because that one runs after the
+/// verdict inputs are assembled, and this check has to name the line verbatim.
+/// A journal that cannot be read fails closed: an unreadable journal is not
+/// evidence that no shard panicked.
+fn election_panic_checks(
+    scen: &str,
+    cfg: &ClusterConfig,
+    from: std::time::SystemTime,
+    run_dir: &std::path::Path,
+) -> Vec<CheckResult> {
+    let now = std::time::SystemTime::now();
+    let mut out = Vec::new();
+    for (label, host) in [("cs1", &cfg.leader_host), ("cs2", &cfg.follower_host)] {
+        let dest = run_dir.join(format!("{scen}.{label}.election.log"));
+        let fetched = crate::logs::fetch_journal(host, from, now, Duration::from_secs(5), &dest)
+            .and_then(|()| {
+                std::fs::read_to_string(&dest).map_err(|e| format!("read {}: {e}", dest.display()))
+            });
+        out.push(match fetched {
+            Ok(text) => crate::journal_assert::check_no_election_panic(label, &text),
+            Err(e) => CheckResult::fail(
+                "NoElectionPanic",
+                format!("{label}: journal unavailable ({e}) — a shard panic cannot be ruled out"),
+            ),
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod defect_scenario_tests {
+    use super::{DefectParams, cluster_was_writing_before_kill};
+    use crate::sample::NodeSample;
+
+    fn tick(host: &str, t_ms: u64, writes: u64) -> NodeSample {
+        NodeSample { host: host.into(), t_ms, ok: true, writes_total: writes, ..Default::default() }
+    }
+
+    /// The defaults ARE the reproduction. Inheriting `--tasks 4000 --birth-rate
+    /// 50` would run a scenario named after a defect at a load the defect has
+    /// never been seen at, and report its green as evidence.
+    #[test]
+    fn the_defaults_are_the_shape_the_defects_were_observed_at() {
+        let d = DefectParams::default();
+        assert_eq!(d.tasks, 3000);
+        assert_eq!(d.birth_rate_per_sec, 400.0);
+        assert_eq!(d.tasks % 3, 0, "must divide across the data shards");
+        assert!(d.settle_secs >= super::SELFHEAL_MIN_SETTLE_SECS);
+    }
+
+    #[test]
+    fn a_cluster_that_was_not_serving_writes_before_the_kill_is_inconclusive() {
+        // A frozen writes_total before the kill means the run killed a cluster
+        // that was already not serving — whatever happened after tested nothing.
+        let frozen = vec![tick("cs1", 1_000, 500), tick("cs1", 20_000, 500)];
+        assert!(cluster_was_writing_before_kill(&frozen, 0, 45_000).is_inconclusive());
+
+        let serving = vec![tick("cs1", 1_000, 500), tick("cs1", 20_000, 90_000)];
+        assert!(cluster_was_writing_before_kill(&serving, 0, 45_000).passed());
+
+        // Samples outside the pre-kill window must not stand in for one inside it.
+        assert!(cluster_was_writing_before_kill(&serving, 30_000, 45_000).is_inconclusive());
+    }
+}
+
+#[cfg(test)]
+mod teardown_step_tests {
+    use super::{step, step_blocking};
+    use std::time::Duration;
+
+    const BUDGET: Duration = Duration::from_millis(50);
+
+    #[tokio::test]
+    async fn a_step_that_never_finishes_yields_none_instead_of_hanging() {
+        // The whole point. `std::future::pending` is the await that phase 7 had
+        // somewhere in it for 37 minutes; under `step` the run continues.
+        assert_eq!(step("t", "pending", BUDGET, std::future::pending::<u8>()).await, None);
+        assert_eq!(step("t", "ready", BUDGET, async { 7u8 }).await, Some(7));
+    }
+
+    #[tokio::test]
+    async fn blocking_work_is_bounded_too() {
+        // A `timeout` around a future that blocks its own thread never fires,
+        // which is why every blocking step has to reach `spawn_blocking` first.
+        // The thread is not cancelled — it is simply no longer waited on.
+        let slept = step_blocking("t", "sleep", BUDGET, || {
+            std::thread::sleep(Duration::from_secs(1));
+            1u8
+        })
+        .await;
+        assert_eq!(slept, None);
+        assert_eq!(step_blocking("t", "quick", BUDGET, || 7u8).await, Some(7));
+    }
+}
+
+#[cfg(test)]
+mod cardinality_pressure_tests {
+    use super::{benchmark_from, stride_sample};
+    use celeriant_bench::{AggregateKey, TaskAckSummary};
+
+    fn ack(n: u64) -> TaskAckSummary {
+        TaskAckSummary {
+            aggregate_key: AggregateKey::new(1, 1, n as u128),
+            client_id: n as u128,
+            max_acked_client_seq: n,
+        }
+    }
+
+    #[test]
+    fn the_audit_sample_strides_the_ledger_rather_than_taking_its_head() {
+        // The ledger is a uniform reservoir; a head-take would bias the audit
+        // toward whichever tasks happened to be merged first.
+        let acks: Vec<TaskAckSummary> = (0..1000).map(ack).collect();
+        let sampled = stride_sample(&acks, 100);
+        assert_eq!(sampled.len(), 100);
+        assert_eq!(sampled[0].max_acked_client_seq, 0);
+        assert_eq!(sampled[1].max_acked_client_seq, 10);
+        assert_eq!(sampled[99].max_acked_client_seq, 990);
+        // Under the cap everything is audited.
+        assert_eq!(stride_sample(&acks[..40], 100).len(), 40);
+        assert!(stride_sample(&[], 100).is_empty());
+    }
+
+    #[test]
+    fn the_bench_summary_reports_percentiles_over_the_merged_reservoirs() {
+        let lat: Vec<u64> = (1..=1000).collect();
+        let b = benchmark_from(lat, 5_000, 7, 300, 10);
+        assert_eq!(b.total_requests, 5_000);
+        assert_eq!(b.errors, 7);
+        assert_eq!(b.throughput, 500.0);
+        assert_eq!(b.min_ms, 1);
+        assert_eq!(b.max_ms, 1000);
+        assert_eq!(b.p50_ms, 501);
+        assert_eq!(b.p99_ms, 991);
+        assert_eq!(b.p999_ms, 1000);
+    }
+
+    #[test]
+    fn an_empty_latency_set_reports_zeroes_rather_than_panicking() {
+        // A phase that never acked must not index off the end of an empty
+        // reservoir on the way to the report.
+        let b = benchmark_from(Vec::new(), 0, 0, 3, 60);
+        assert_eq!((b.p50_ms, b.p99_ms, b.max_ms, b.throughput), (0, 0, 0, 0.0));
     }
 }

@@ -12,6 +12,7 @@ use celeriant_client_tokio::pool::{CeleriantPool, PoolOptions};
 /// drives through the pool.
 pub use celeriant_client_tokio::pool::CeleriantPool as Pool;
 pub use celeriant_client_tokio::{ClientError, SchemaError, ServerError, WriteError, WriteEventsOptions};
+pub use celeriant_msg::request::read_filters::ReadFilters;
 pub use celeriant_msg::request::requests::RegisterSchemaRequest;
 pub use celeriant_wal::aggregate_key::AggregateKey;
 pub use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
@@ -21,9 +22,12 @@ use rustls_pki_types::ServerName;
 use tokio::sync::Barrier;
 use tokio::time::Instant;
 
+pub mod account_workload;
 pub mod cas_storm;
 pub mod delete_trim;
 pub mod history;
+pub mod population;
+pub mod read_workload;
 pub mod watch_flood;
 pub use cas_storm::{cas_storm_aggregate, run_cas_storm, CasStormOutcome};
 pub use delete_trim::{audit_delete_trim, audit_delete_trim_pinned, run_delete_trim_workload, DeleteTrimAuditReport, DeleteTrimCounters, DeleteTrimOutcome};
@@ -85,8 +89,29 @@ pub struct PoolBuilder<'a> {
     pub max_connections: usize,
 }
 
+/// The write-shaped deadline every bench pool gets unless it asks for another.
+///
+/// Well below `PoolOptions`' own 30s so a wedged write surfaces as an error
+/// rather than as a stall. Measurement pools that must not censor their latency
+/// distribution take `build_with_request_timeout` instead.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl<'a> PoolBuilder<'a> {
     pub async fn build(self) -> Result<Arc<CeleriantPool>, Box<dyn std::error::Error>> {
+        self.build_with_request_timeout(DEFAULT_REQUEST_TIMEOUT).await
+    }
+
+    /// A pool whose per-request deadline is chosen by the caller.
+    ///
+    /// A request timeout censors: the op that blew it records no latency, so a
+    /// deadline anywhere near the real distribution turns the surviving
+    /// percentiles into survivorship bias. Anything whose *output* is a latency
+    /// must set this from the cost it expects to measure, not inherit a deadline
+    /// picked for write liveness.
+    pub async fn build_with_request_timeout(
+        self,
+        request_timeout: Duration,
+    ) -> Result<Arc<CeleriantPool>, Box<dyn std::error::Error>> {
         let resolved1 = resolve_to_ip(self.address1).await?;
         let resolved2 = resolve_to_ip(self.address2).await?;
 
@@ -94,7 +119,7 @@ impl<'a> PoolBuilder<'a> {
             .with_seed_addresses(vec![resolved2])
             .with_max_connections(self.max_connections)
             .with_connection_timeout(Duration::from_secs(30))
-            .with_request_timeout(Duration::from_secs(5));
+            .with_request_timeout(request_timeout);
 
         if !self.plaintext {
             let server_name = self
@@ -1015,6 +1040,35 @@ pub async fn verify_no_seq_gaps_with_concurrency(
     const READ_BACKOFF_INITIAL_MS: u64 = 100;
     const READ_BACKOFF_MAX_MS: u64 = 2_000;
 
+    // Acked seqs summed per AGGREGATE, across every client writing to it.
+    //
+    // The comparison below is `aggregate_version < acked`, and the version
+    // counts writes from ALL clients while `max_acked_client_seq` is one
+    // client's high-water. Comparing them directly assumes one client per
+    // aggregate. Under a multi-writer workload the predicate goes vacuous:
+    // at R=8 with 740 acked each, version is ~5920 and `5920 < 740` stays
+    // false even if a client lost 739 of its 740 writes. Worse, a reheat by a
+    // brand-new client starts its seq at 1, so the test becomes
+    // `version < 1` — unfailable for any aggregate that exists.
+    //
+    // That matters beyond this one check: an empty `failing_task_acks` means
+    // the deep audit never runs, which means disk-truth verification never
+    // runs, which means the whole integrity chain reports clean without
+    // looking. Summing per aggregate restores a real bound, and every ack for
+    // a flagged aggregate is handed to the deep audit, which already resolves
+    // per-client correctly.
+    let mut acked_by_aggregate: std::collections::HashMap<(u128, u128, u128), u64> =
+        std::collections::HashMap::new();
+    for ack in acks {
+        let k = (
+            ack.aggregate_key.org_id,
+            ack.aggregate_key.aggregate_type_id,
+            ack.aggregate_key.aggregate_id,
+        );
+        *acked_by_aggregate.entry(k).or_insert(0) += ack.max_acked_client_seq;
+    }
+    let acked_by_aggregate = Arc::new(acked_by_aggregate);
+
     let semaphore = Arc::new(Semaphore::new(max_in_flight.max(1)));
     let mut handles = Vec::with_capacity(acks.len());
 
@@ -1022,6 +1076,7 @@ pub async fn verify_no_seq_gaps_with_concurrency(
         if ack.max_acked_client_seq == 0 {
             continue;
         }
+        let acked_by_aggregate = Arc::clone(&acked_by_aggregate);
         let pool = Arc::clone(pool);
         let ack = ack.clone();
         let permit = Arc::clone(&semaphore);
@@ -1049,7 +1104,15 @@ pub async fn verify_no_seq_gaps_with_concurrency(
                     }
                 }
             }
-            (ack, res)
+            let expected = acked_by_aggregate
+                .get(&(
+                    ack.aggregate_key.org_id,
+                    ack.aggregate_key.aggregate_type_id,
+                    ack.aggregate_key.aggregate_id,
+                ))
+                .copied()
+                .unwrap_or(ack.max_acked_client_seq);
+            (ack, res, expected)
         }));
     }
 
@@ -1057,7 +1120,7 @@ pub async fn verify_no_seq_gaps_with_concurrency(
     report.tasks_audited = handles.len() as u64;
 
     for handle in handles {
-        let (ack, res) = match handle.await {
+        let (ack, res, expected_acked) = match handle.await {
             Ok(t) => t,
             Err(_) => {
                 report.tasks_unreadable += 1;
@@ -1066,8 +1129,8 @@ pub async fn verify_no_seq_gaps_with_concurrency(
         };
         match res {
             Ok(details) => {
-                if details.max_aggregate_version < ack.max_acked_client_seq {
-                    let missing = ack.max_acked_client_seq - details.max_aggregate_version;
+                if details.max_aggregate_version < expected_acked {
+                    let missing = expected_acked - details.max_aggregate_version;
                     report.tasks_with_gaps += 1;
                     report.total_missing_acks = report.total_missing_acks.saturating_add(missing);
                     report.failing_task_acks.push(ack.clone());

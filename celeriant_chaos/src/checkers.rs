@@ -11,12 +11,14 @@
 //! record was dropped, rather than reporting an unearned pass; the others
 //! stay sound under drops.
 //!
-//! `aggregate_version` semantics: the idempotent bench writes 1-event
-//! batches with `client_seq` starting at 1, so a node's
-//! `max_aggregate_version` (committed batch count) equals the highest
-//! contiguous `client_seq` present. A version below the acked maximum is a
-//! lost acked write (no-gaps rule); nodes disagreeing post-quiesce is a
-//! convergence failure.
+//! `aggregate_version` semantics: a node's `max_aggregate_version` is the
+//! count of every batch ever committed to that aggregate — by every client,
+//! including writes made before the recorded window opened. It is never equal
+//! to one client's `client_seq`; the history only *bounds* it, from below by
+//! the writes the clients hold acks for and from above by the writes they
+//! could possibly be owed (see `check_wal_monotonicity`). Below that lower
+//! bound is a lost acked write (no-gaps rule); nodes disagreeing post-quiesce
+//! is a convergence failure.
 
 use celeriant_bench::history::{FinalReadRecord, HistoryLine, OpOutcome, OpRecord, RywRecord, WatchDeliveryRecord};
 use crate::invariants::CheckResult;
@@ -223,55 +225,92 @@ fn check_occ(ops: &[&OpRecord]) -> CheckResult {
     }
 }
 
-/// Every acked `client_seq` (Ok, or a 2002 the client took as an ack) must
-/// be covered by each node's final-read `max_aggregate_version`. A node
-/// reporting fewer committed batches than the client's acked maximum lost
-/// an acknowledged write.
+/// Each node's final `max_aggregate_version` must sit inside
+/// `baseline + accepted ..= baseline + accepted + ambiguous`.
 ///
-/// Upper bound: the workloads are single-writer-per-aggregate with 1-event
-/// batches and a sequential seq, so at most ONE write can ever be
-/// outstanding-ambiguous per aggregate. `version > acked + 1` therefore
-/// means the server committed a duplicate (same seq twice) or a write the
-/// client never issued.
+/// - `baseline` — the aggregate's version when the recorded window opened.
+///   The history covers one phase; a fill phase before it commits writes the
+///   node still counts but the history never saw. The earliest recorded write
+///   for an aggregate carries that opening version as its `expected_version`,
+///   so the minimum `expected_version` over its ops is the baseline (0 when
+///   the workload records none).
+/// - `accepted` — distinct acked `client_seq`s, counted per client and summed.
+///   Per client because each writer runs its own seq from 1 (`cardinality_pressure`
+///   puts R replica writers on one account). Distinct-count rather than max
+///   because a max only equals the count while a client's seqs are contiguous
+///   from 1 — true of a whole run, not of one recorded phase of it.
+/// - `ambiguous` — clients whose last recorded op was `info` (the connection
+///   died mid-write). Each such write may or may not have committed, so each
+///   buys exactly one version of upper-bound slack. R concurrent writers can
+///   leave R of them in flight; a fixed `+ 1` is single-writer arithmetic.
+///
+/// Under the lower bound a node lost an acknowledged write. Over the upper
+/// bound the server holds a batch no client is owed — a duplicate commit or a
+/// write nobody issued.
 fn check_wal_monotonicity(ops: &[&OpRecord], finals: &[&FinalReadRecord]) -> CheckResult {
     const NAME: &str = "HistoryWalMonotonicity";
     if finals.is_empty() {
         return CheckResult::pass_with_detail(NAME, "skipped: no final-read records");
     }
 
-    let mut max_acked: HashMap<(u128, u128, u128), u64> = HashMap::new();
+    type Agg = (u128, u128, u128);
+
+    let mut acked_seqs: HashMap<AggClient, HashSet<u64>> = HashMap::new();
+    let mut ended_ambiguous: HashMap<AggClient, bool> = HashMap::new();
+    let mut baselines: HashMap<Agg, u64> = HashMap::new();
     for op in ops {
+        let key = agg_client(op);
+        if let Some(ev) = op.expected_version {
+            let e = baselines.entry((op.org_id, op.type_id, op.agg_id)).or_insert(ev);
+            *e = (*e).min(ev);
+        }
         let acked = match op.outcome {
             OpOutcome::Ok => true,
             OpOutcome::Fail => op.error.as_deref() == Some("ClientIdempotencyViolation"),
             OpOutcome::Info => false,
         };
         if acked {
-            let e = max_acked.entry((op.org_id, op.type_id, op.agg_id)).or_insert(0);
-            *e = (*e).max(op.client_seq);
+            acked_seqs.entry(key).or_default().insert(op.client_seq);
         }
+        // File order is per-(agg, client) attempt order (see check_idempotency),
+        // so the last write wins and holds that client's final outcome.
+        ended_ambiguous.insert(key, op.outcome == OpOutcome::Info);
+    }
+
+    // (accepted, ambiguous) per aggregate. The `ended_ambiguous` pass also
+    // registers aggregates whose every op failed, so they are audited with
+    // accepted = 0 rather than skipped.
+    let mut bounds: HashMap<Agg, (u64, u64)> = HashMap::new();
+    for (key, seqs) in &acked_seqs {
+        bounds.entry((key.0, key.1, key.2)).or_default().0 += seqs.len() as u64;
+    }
+    for (key, ambiguous) in &ended_ambiguous {
+        let e = bounds.entry((key.0, key.1, key.2)).or_default();
+        e.1 += u64::from(*ambiguous);
     }
 
     let mut violations = Vec::new();
     let mut unreadable = 0u64;
     let mut audited = 0u64;
     for fr in finals {
-        let Some(&acked) = max_acked.get(&(fr.org_id, fr.type_id, fr.agg_id)) else {
+        let agg = (fr.org_id, fr.type_id, fr.agg_id);
+        let Some(&(accepted, ambiguous)) = bounds.get(&agg) else {
             continue;
         };
+        let baseline = baselines.get(&agg).copied().unwrap_or(0);
         match fr.max_aggregate_version {
             Some(version) => {
                 audited += 1;
-                if version < acked && violations.len() < SAMPLE_CAP {
+                if version < baseline + accepted && violations.len() < SAMPLE_CAP {
                     violations.push(format!(
-                        "agg={} node={}: final version {} < acked {} — acked write lost",
-                        fr.agg_id, fr.node, version, acked
+                        "agg={} node={}: final version {} < baseline {} + accepted {} — acked write lost",
+                        fr.agg_id, fr.node, version, baseline, accepted
                     ));
                 }
-                if version > acked + 1 && violations.len() < SAMPLE_CAP {
+                if version > baseline + accepted + ambiguous && violations.len() < SAMPLE_CAP {
                     violations.push(format!(
-                        "agg={} node={}: final version {} > acked {} + 1 — duplicate acceptance",
-                        fr.agg_id, fr.node, version, acked
+                        "agg={} node={}: final version {} > baseline {} + accepted {} + ambiguous {} — duplicate acceptance",
+                        fr.agg_id, fr.node, version, baseline, accepted, ambiguous
                     ));
                 }
             }
@@ -282,7 +321,9 @@ fn check_wal_monotonicity(ops: &[&OpRecord], finals: &[&FinalReadRecord]) -> Che
     if violations.is_empty() {
         CheckResult::pass_with_detail(
             NAME,
-            format!("{audited} node-aggregate reads within [acked, acked+1] ({unreadable} unreadable)"),
+            format!(
+                "{audited} node-aggregate reads within [baseline+accepted, +ambiguous] ({unreadable} unreadable)"
+            ),
         )
     } else {
         CheckResult::fail(NAME, violations.join("; "))
@@ -611,7 +652,7 @@ mod tests {
             final_read("cs2", 1, Some(2)),
         ];
         for (name, c) in results(&lines, 0) {
-            assert!(c.passed, "{name}: {}", c.detail);
+            assert!(c.passed(), "{name}: {}", c.detail);
         }
     }
 
@@ -623,7 +664,7 @@ mod tests {
             op(2, OpOutcome::Fail, Some("ClientIdempotencyViolation")), // retry sees 2002 — legal
         ];
         let r = results(&lines, 0);
-        assert!(r["HistoryIdempotency"].passed, "{}", r["HistoryIdempotency"].detail);
+        assert!(r["HistoryIdempotency"].passed(), "{}", r["HistoryIdempotency"].detail);
     }
 
     #[test]
@@ -634,7 +675,7 @@ mod tests {
             op(3, OpOutcome::Fail, Some("ClientIdempotencyViolation")),
         ];
         let r = results(&lines, 0);
-        assert!(!r["HistoryIdempotency"].passed);
+        assert!(!r["HistoryIdempotency"].passed());
     }
 
     #[test]
@@ -645,7 +686,7 @@ mod tests {
             op(2, OpOutcome::Ok, None), // server committed seq 2 twice
         ];
         let r = results(&lines, 0);
-        assert!(!r["HistoryIdempotency"].passed);
+        assert!(!r["HistoryIdempotency"].passed());
         assert!(r["HistoryIdempotency"].detail.contains("duplicate commit"));
     }
 
@@ -656,7 +697,7 @@ mod tests {
         // the checker must fail closed, not report a false verdict.
         let lines = vec![op(3, OpOutcome::Fail, Some("ClientIdempotencyViolation"))];
         let r = results(&lines, 5);
-        assert!(!r["HistoryIdempotency"].passed);
+        assert!(!r["HistoryIdempotency"].passed());
         assert!(r["HistoryIdempotency"].detail.contains("indeterminate"));
     }
 
@@ -668,7 +709,7 @@ mod tests {
             op_for(7, 2, OpOutcome::Ok, None, Some(4)), // second ack on same CAS token
         ];
         let r = results(&lines, 0);
-        assert!(!r["HistoryOcc"].passed);
+        assert!(!r["HistoryOcc"].passed());
     }
 
     #[test]
@@ -679,7 +720,7 @@ mod tests {
             op_for(7, 1, OpOutcome::Fail, Some("OccConflict"), Some(4)),
         ];
         let r = results(&lines, 0);
-        assert!(r["HistoryOcc"].passed, "{}", r["HistoryOcc"].detail);
+        assert!(r["HistoryOcc"].passed(), "{}", r["HistoryOcc"].detail);
     }
 
     #[test]
@@ -694,7 +735,7 @@ mod tests {
             }
         }
         let r = results(&[a, b], 0);
-        assert!(!r["HistoryOcc"].passed);
+        assert!(!r["HistoryOcc"].passed());
         assert!(r["HistoryOcc"].detail.contains("duplicate commit"), "{}", r["HistoryOcc"].detail);
     }
 
@@ -706,7 +747,7 @@ mod tests {
             op_for(8, 1, OpOutcome::Ok, None, None),     // same version, different aggregate
         ];
         let r = results(&lines, 0);
-        assert!(r["HistoryOcc"].passed, "{}", r["HistoryOcc"].detail);
+        assert!(r["HistoryOcc"].passed(), "{}", r["HistoryOcc"].detail);
     }
 
     #[test]
@@ -718,8 +759,8 @@ mod tests {
             final_read("cs2", 1, Some(2)),
         ];
         let r = results(&lines, 0);
-        assert!(!r["HistoryWalMonotonicity"].passed);
-        assert!(!r["HistoryFinalReadParity"].passed); // and the nodes disagree
+        assert!(!r["HistoryWalMonotonicity"].passed());
+        assert!(!r["HistoryFinalReadParity"].passed()); // and the nodes disagree
     }
 
     #[test]
@@ -731,8 +772,147 @@ mod tests {
             final_read("cs2", 1, Some(3)),
         ];
         let r = results(&lines, 0);
-        assert!(!r["HistoryWalMonotonicity"].passed);
+        assert!(!r["HistoryWalMonotonicity"].passed());
         assert!(r["HistoryWalMonotonicity"].detail.contains("duplicate acceptance"));
+    }
+
+    /// One acked op from a specific client, for the multi-writer case.
+    fn op_client(agg: u128, client: u128, seq: u64) -> HistoryLine {
+        op_client_at(agg, client, seq, OpOutcome::Ok, None)
+    }
+
+    fn op_client_at(
+        agg: u128,
+        client: u128,
+        seq: u64,
+        outcome: OpOutcome,
+        expected_version: Option<u64>,
+    ) -> HistoryLine {
+        HistoryLine::Op(OpRecord {
+            process: client as u32,
+            org_id: 1,
+            type_id: 1,
+            agg_id: agg,
+            client_id: client,
+            client_seq: seq,
+            expected_version,
+            outcome,
+            error: None,
+            acked_max_aggregate_version: (outcome == OpOutcome::Ok).then_some(seq),
+            t_start_ns: 0,
+            t_end_ns: 0,
+        })
+    }
+
+    /// The contention phase's shape: 8 clients x 10 acked seqs on aggregate 1,
+    /// recording opened with the aggregate already at `baseline` (the fill
+    /// phase's writes, which the history deliberately never saw). Each client's
+    /// first attempt carries the baseline as its `expected_version`.
+    fn contended_history(baseline: u64) -> Vec<HistoryLine> {
+        (2..=9u128)
+            .flat_map(|client| {
+                (1..=10u64).map(move |seq| {
+                    op_client_at(1, client, seq, OpOutcome::Ok, Some(baseline + seq - 1))
+                })
+            })
+            .collect()
+    }
+
+    fn monotonicity(lines: &[HistoryLine]) -> CheckResult {
+        results(lines, 0).remove("HistoryWalMonotonicity").unwrap()
+    }
+
+    #[test]
+    fn concurrent_clients_on_one_aggregate_are_not_duplicate_acceptance() {
+        // R replicas per account is the contention workload's whole shape. Each
+        // client runs its own client_seq from 1, so the aggregate's version is
+        // the SUM across clients while any single client's max is a fraction of
+        // it. Keying acked to the aggregate and taking a max reported healthy
+        // concurrency as duplicate acceptance — observed at version 3773 against
+        // a single-client max of 740 at R=8.
+        let mut lines: Vec<HistoryLine> = Vec::new();
+        for client in 2..=9u128 {
+            for seq in 1..=10u64 {
+                lines.push(op_client(1, client, seq));
+            }
+        }
+        // 8 clients x 10 acked writes each = 80 accepted writes.
+        lines.push(final_read("cs1", 1, Some(80)));
+        lines.push(final_read("cs2", 1, Some(80)));
+        let r = results(&lines, 0);
+        assert!(r["HistoryWalMonotonicity"].passed(), "{}", r["HistoryWalMonotonicity"].detail);
+    }
+
+    #[test]
+    fn version_is_bounded_from_the_baseline_the_recording_opened_at() {
+        // The history covers the contention phase only; the fill phase left the
+        // aggregate at version 2 without recording a single write. The node
+        // counts both phases, so `acked` alone is not the bound — 82 is exactly
+        // right, and the old `acked + 1` slack called it duplicate acceptance.
+        const CASES: [(u64, Option<&str>); 4] = [
+            (82, None),                         // baseline 2 + accepted 80
+            (95, Some("duplicate acceptance")), // 13 batches nobody is owed
+            (83, Some("duplicate acceptance")), // no ambiguous op buys slack
+            (81, Some("acked write lost")),     // one acked write missing
+        ];
+        for (version, expected) in CASES {
+            let mut lines = contended_history(2);
+            lines.push(final_read("cs1", 1, Some(version)));
+            let c = monotonicity(&lines);
+            match expected {
+                None => assert!(c.passed(), "version {version} must pass: {}", c.detail),
+                Some(fragment) => {
+                    assert!(!c.passed(), "version {version} must fail");
+                    assert!(c.detail.contains(fragment), "version {version}: {}", c.detail);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn each_client_left_mid_write_buys_exactly_one_version_of_slack() {
+        // Client 9's last op is `info` — that write may or may not have
+        // committed, so 83 is legal. 84 is not: only one client is ambiguous,
+        // and the second extra batch is a write nobody issued.
+        for (version, want_pass) in [(82u64, true), (83, true), (84, false)] {
+            let mut lines = contended_history(2);
+            lines.push(op_client_at(1, 9, 11, OpOutcome::Info, Some(12)));
+            lines.push(final_read("cs1", 1, Some(version)));
+            let c = monotonicity(&lines);
+            assert_eq!(c.passed(), want_pass, "version {version}: {}", c.detail);
+        }
+    }
+
+    #[test]
+    fn a_genuine_duplicate_still_fails_under_multiple_clients() {
+        // The upper arm must keep its teeth: more versions than accepted writes
+        // is duplicate acceptance whether one client wrote them or eight.
+        let mut lines: Vec<HistoryLine> = Vec::new();
+        for client in 2..=9u128 {
+            for seq in 1..=10u64 {
+                lines.push(op_client(1, client, seq));
+            }
+        }
+        lines.push(final_read("cs1", 1, Some(200)));
+        lines.push(final_read("cs2", 1, Some(200)));
+        let r = results(&lines, 0);
+        assert!(!r["HistoryWalMonotonicity"].passed());
+        assert!(r["HistoryWalMonotonicity"].detail.contains("duplicate acceptance"));
+    }
+
+    #[test]
+    fn a_lost_write_still_fails_under_multiple_clients() {
+        let mut lines: Vec<HistoryLine> = Vec::new();
+        for client in 2..=9u128 {
+            for seq in 1..=10u64 {
+                lines.push(op_client(1, client, seq));
+            }
+        }
+        lines.push(final_read("cs1", 1, Some(40)));
+        lines.push(final_read("cs2", 1, Some(40)));
+        let r = results(&lines, 0);
+        assert!(!r["HistoryWalMonotonicity"].passed());
+        assert!(r["HistoryWalMonotonicity"].detail.contains("acked write lost"));
     }
 
     #[test]
@@ -744,8 +924,8 @@ mod tests {
             final_read("cs2", 1, Some(2)),
         ];
         let r = results(&lines, 0);
-        assert!(r["HistoryFinalReadParity"].passed, "{}", r["HistoryFinalReadParity"].detail);
-        assert!(r["HistoryWalMonotonicity"].passed);
+        assert!(r["HistoryFinalReadParity"].passed(), "{}", r["HistoryFinalReadParity"].detail);
+        assert!(r["HistoryWalMonotonicity"].passed());
     }
 
     #[test]
@@ -757,7 +937,7 @@ mod tests {
             final_read("cs2", 1, Some(1)), // ...but not here: split outcome
         ];
         let r = results(&lines, 0);
-        assert!(!r["HistoryFinalReadParity"].passed);
+        assert!(!r["HistoryFinalReadParity"].passed());
     }
 
     #[test]
@@ -768,7 +948,7 @@ mod tests {
             final_read("cs2", 1, None),
         ];
         let r = results(&lines, 0);
-        assert!(r["HistoryFinalReadParity"].passed);
+        assert!(r["HistoryFinalReadParity"].passed());
         assert!(r["HistoryFinalReadParity"].detail.contains("1 incomplete"));
     }
 
@@ -777,7 +957,7 @@ mod tests {
     #[test]
     fn ryw_no_records_skips() {
         let r = results(&[], 0);
-        assert!(r["HistoryReadYourWrites"].passed);
+        assert!(r["HistoryReadYourWrites"].passed());
         assert!(r["HistoryReadYourWrites"].detail.contains("skipped"));
     }
 
@@ -790,7 +970,7 @@ mod tests {
             ryw_on(1, 6, Some(6), 2010, Some("cs2"), 6),
         ];
         let r = results(&lines, 0);
-        assert!(r["HistoryReadYourWrites"].passed, "{}", r["HistoryReadYourWrites"].detail);
+        assert!(r["HistoryReadYourWrites"].passed(), "{}", r["HistoryReadYourWrites"].detail);
         assert!(r["HistoryReadYourWrites"].detail.contains("2 full probe groups"), "{}", r["HistoryReadYourWrites"].detail);
     }
 
@@ -801,7 +981,7 @@ mod tests {
             ryw_on(1, 10, Some(8), 1010, Some("cs2"), 10), // cluster-wide invisible ack
         ];
         let r = results(&lines, 0);
-        assert!(!r["HistoryReadYourWrites"].passed);
+        assert!(!r["HistoryReadYourWrites"].passed());
         assert!(r["HistoryReadYourWrites"].detail.contains("acked write invisible cluster-wide"));
     }
 
@@ -812,7 +992,7 @@ mod tests {
             ryw_on(1, 10, Some(10), 1010, Some("cs2"), 10), // acking node visible
         ];
         let r = results(&lines, 0);
-        assert!(r["HistoryReadYourWrites"].passed, "{}", r["HistoryReadYourWrites"].detail);
+        assert!(r["HistoryReadYourWrites"].passed(), "{}", r["HistoryReadYourWrites"].detail);
     }
 
     #[test]
@@ -824,7 +1004,7 @@ mod tests {
             ryw_on(1, 10, None, 1010, Some("cs2"), 10),
         ];
         let r = results(&lines, 0);
-        assert!(r["HistoryReadYourWrites"].passed, "{}", r["HistoryReadYourWrites"].detail);
+        assert!(r["HistoryReadYourWrites"].passed(), "{}", r["HistoryReadYourWrites"].detail);
         assert!(r["HistoryReadYourWrites"].detail.contains("1 incomplete groups skipped"), "{}", r["HistoryReadYourWrites"].detail);
         assert!(r["HistoryReadYourWrites"].detail.contains("1 read errors"), "{}", r["HistoryReadYourWrites"].detail);
     }
@@ -837,7 +1017,7 @@ mod tests {
             ryw(1, 10, Some(9), 1000),
         ];
         let r = results(&lines, 0);
-        assert!(r["HistoryReadYourWrites"].passed, "{}", r["HistoryReadYourWrites"].detail);
+        assert!(r["HistoryReadYourWrites"].passed(), "{}", r["HistoryReadYourWrites"].detail);
         assert!(r["HistoryReadYourWrites"].detail.contains("1 incomplete groups skipped"), "{}", r["HistoryReadYourWrites"].detail);
     }
 
@@ -850,7 +1030,7 @@ mod tests {
         ];
         let checks = run_history_checks_with_windows(&lines, 0, &[(4000, 6000)]);
         let r: HashMap<String, CheckResult> = checks.into_iter().map(|c| (c.name.to_string(), c)).collect();
-        assert!(r["HistoryReadYourWrites"].passed, "{}", r["HistoryReadYourWrites"].detail);
+        assert!(r["HistoryReadYourWrites"].passed(), "{}", r["HistoryReadYourWrites"].detail);
         assert!(r["HistoryReadYourWrites"].detail.contains("2 in exclusion windows"));
     }
 
@@ -863,7 +1043,7 @@ mod tests {
         ];
         let checks = run_history_checks_with_windows(&lines, 0, &[(4000, 6000)]);
         let r: HashMap<String, CheckResult> = checks.into_iter().map(|c| (c.name.to_string(), c)).collect();
-        assert!(!r["HistoryReadYourWrites"].passed, "{}", r["HistoryReadYourWrites"].detail);
+        assert!(!r["HistoryReadYourWrites"].passed(), "{}", r["HistoryReadYourWrites"].detail);
     }
 
     #[test]
@@ -881,7 +1061,7 @@ mod tests {
     #[test]
     fn watch_ordered_no_records_skips() {
         let r = results(&[], 0);
-        assert!(r["WatchPerConnectionOrdered"].passed);
+        assert!(r["WatchPerConnectionOrdered"].passed());
         assert!(r["WatchPerConnectionOrdered"].detail.contains("skipped"));
     }
 
@@ -893,7 +1073,7 @@ mod tests {
             watch_delivery(0, 1, 11, 15, 300),
         ];
         let r = results(&lines, 0);
-        assert!(r["WatchPerConnectionOrdered"].passed, "{}", r["WatchPerConnectionOrdered"].detail);
+        assert!(r["WatchPerConnectionOrdered"].passed(), "{}", r["WatchPerConnectionOrdered"].detail);
     }
 
     #[test]
@@ -904,7 +1084,7 @@ mod tests {
             watch_delivery(0, 1, 5, 10, 200), // from_version 5 <= prev_to 5
         ];
         let r = results(&lines, 0);
-        assert!(!r["WatchPerConnectionOrdered"].passed);
+        assert!(!r["WatchPerConnectionOrdered"].passed());
         assert!(r["WatchPerConnectionOrdered"].detail.contains("overlap or duplicate"));
     }
 
@@ -918,7 +1098,7 @@ mod tests {
             watch_delivery(1, 1, 6, 10, 200),
         ];
         let r = results(&lines, 0);
-        assert!(r["WatchPerConnectionOrdered"].passed, "{}", r["WatchPerConnectionOrdered"].detail);
+        assert!(r["WatchPerConnectionOrdered"].passed(), "{}", r["WatchPerConnectionOrdered"].detail);
     }
 
     #[test]
@@ -929,7 +1109,7 @@ mod tests {
             watch_delivery(0, 2, 1, 5, 100),
         ];
         let r = results(&lines, 0);
-        assert!(r["WatchPerConnectionOrdered"].passed, "{}", r["WatchPerConnectionOrdered"].detail);
+        assert!(r["WatchPerConnectionOrdered"].passed(), "{}", r["WatchPerConnectionOrdered"].detail);
     }
 
     // --- Watch durable delivery tests ---
@@ -937,7 +1117,7 @@ mod tests {
     #[test]
     fn watch_durable_no_deliveries_skips() {
         let r = results(&[], 0);
-        assert!(r["WatchDeliveredDurable"].passed);
+        assert!(r["WatchDeliveredDurable"].passed());
         assert!(r["WatchDeliveredDurable"].detail.contains("skipped"));
     }
 
@@ -945,7 +1125,7 @@ mod tests {
     fn watch_durable_no_finals_skips() {
         let lines = vec![watch_delivery(0, 1, 1, 5, 100)];
         let r = results(&lines, 0);
-        assert!(r["WatchDeliveredDurable"].passed);
+        assert!(r["WatchDeliveredDurable"].passed());
         assert!(r["WatchDeliveredDurable"].detail.contains("skipped"));
     }
 
@@ -956,7 +1136,7 @@ mod tests {
             final_read("cs1", 1, Some(10)),
         ];
         let r = results(&lines, 0);
-        assert!(r["WatchDeliveredDurable"].passed, "{}", r["WatchDeliveredDurable"].detail);
+        assert!(r["WatchDeliveredDurable"].passed(), "{}", r["WatchDeliveredDurable"].detail);
     }
 
     #[test]
@@ -967,7 +1147,7 @@ mod tests {
             final_read("cs1", 1, Some(10)),
         ];
         let r = results(&lines, 0);
-        assert!(!r["WatchDeliveredDurable"].passed);
+        assert!(!r["WatchDeliveredDurable"].passed());
         assert!(r["WatchDeliveredDurable"].detail.contains("delivered before durable"));
     }
 
@@ -980,6 +1160,6 @@ mod tests {
             final_read("cs2", 1, Some(10)),
         ];
         let r = results(&lines, 0);
-        assert!(r["WatchDeliveredDurable"].passed, "{}", r["WatchDeliveredDurable"].detail);
+        assert!(r["WatchDeliveredDurable"].passed(), "{}", r["WatchDeliveredDurable"].detail);
     }
 }

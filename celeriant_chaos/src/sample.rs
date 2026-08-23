@@ -3,6 +3,10 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+/// Reheat age buckets the scenario stratifies by. Mirrors
+/// `celeriant_bench::population::AgeBucket::ALL`.
+pub const AGE_BUCKET_COUNT: usize = 4;
+
 /// One snapshot of metrics from one node, scraped at one instant.
 /// Deserialize + container default: the replay bin loads stored run JSONs
 /// back through the checks, including runs recorded before newer fields.
@@ -42,6 +46,24 @@ pub struct NodeSample {
     /// shard's read legitimately outruns the leader's scraped view.
     #[serde(default)]
     pub node_status_code_by_shard: BTreeMap<u32, u64>,
+    /// Per-shard EFFECTIVE status from `celeriant_node_status_effective_code{shard_id="N"}`:
+    /// `0=BootCatchup 1=Follower 2=FollowerCatchingUp 3=Promoting 4=Leader
+    /// 5=Fenced 6=Standalone`. THE gauge to diagnose a write outage from —
+    /// `node_status_code` publishes `raw()` and read Leader on every shard
+    /// through a total write freeze (F-37), and so did `node_role`.
+    #[serde(default)]
+    pub effective_status_by_shard: BTreeMap<u32, u64>,
+    /// `celeriant_lease_remaining_ms` keyed by its raw `{shard_id,role}` label
+    /// blob. Per-series rather than per-shard: a node that led and then demoted
+    /// carries both roles' series for one shard, and merging them hides which
+    /// view went stale. Signed — an expired lease reads below zero.
+    #[serde(default)]
+    pub lease_remaining_ms_by_series: BTreeMap<String, i64>,
+    /// `celeriant_write_errors_total` split by `error_code`. The summed
+    /// `write_errors_total` cannot tell `shard_cannot_accept_writes` — the
+    /// fencing signature — from an ordinary OCC conflict.
+    #[serde(default)]
+    pub write_errors_by_code: BTreeMap<String, u64>,
     /// Per-shard unix-ms stamp from `celeriant_shard_executor_heartbeat_ms{shard_id="N"}`,
     /// refreshed every 1s. A value that stops advancing across samples means the
     /// executor made no progress at all, not just one mesh loop.
@@ -120,6 +142,73 @@ pub struct NodeSample {
     pub truncate_divergence_advanced_wal_seqs_total: u64,
     /// Sealed-segment read skipped because the bloom filter said not-present.
     pub read_bloom_short_circuit_total: u64,
+
+    // ---- Read-path cost accounting (cardinality_pressure) ----
+    // `read_bloom_gate_total` counts every keyed visit that reached the bloom, so it is
+    // the denominator; `read_segments_walked_total` sits three gates further down and is
+    // the cost side. They are not two names for the same number and the gap between them
+    // is largest on the client dedup scan, which is the path this scenario leans on.
+    /// Sealed-segment read skipped because the client-id bloom said not-present.
+    pub read_client_bloom_short_circuit_total: u64,
+    /// Chain scans that seeked straight to a summary tip instead of reverse-hunting.
+    pub read_segment_hint_seek_total: u64,
+    /// Sealed segments skipped by a summary hint during the client dedup scan.
+    pub read_segment_hint_skip_total: u64,
+    /// Cross-shard connection redirects. A request landing on the wrong shard
+    /// migrates the whole TCP stream across the glommio mesh rather than
+    /// forwarding the request, so a high count against writes means the shard
+    /// affinity scheme is being defeated somewhere and every latency in the
+    /// report carries migration cost. Measured at 163k against 216k writes on
+    /// the first cardinality_pressure run.
+    pub connection_redirects_total: u64,
+    pub extension_redirects_total: u64,
+    /// A full mesh channel answers SERVER_BUSY with no retry.
+    pub mesh_channel_full_total: u64,
+    /// Keyed segment visits that consulted the aggregate bloom. THE denominator for
+    /// bloom effectiveness: `read_bloom_short_circuit_total / read_bloom_gate_total`.
+    pub read_bloom_gate_total: u64,
+    /// Segments a keyed reverse scan actually read metablocks from, having survived
+    /// the client bloom, the segment hint and the reader lock as well. This is the
+    /// cost side of the ledger and is NOT the bloom denominator — `gate` is.
+    pub read_segments_walked_total: u64,
+    /// Keyed visits where the aggregate bloom carried no information (missing or torn
+    /// sidecar), so every key read as maybe-present. These are the scans that escaped
+    /// bloom filtering entirely, and were indistinguishable from a bloom hit before.
+    pub read_bloom_absent_total: u64,
+    pub read_bytes_total: u64,
+    pub cache_log_file_hits_total: u64,
+    pub cache_log_file_misses_total: u64,
+
+    // ---- Rotation and segment inventory ----
+    pub log_rotations_total: u64,
+    pub log_segments_total: u64,
+    /// Rotation hit ENOSPC. The shard survives but every write needing rotation fails,
+    /// which otherwise reads as an unexplained throughput collapse late in a fill.
+    pub rotation_out_of_space_total: u64,
+
+    // ---- Segment summary sidecar (the unbounded-memory suspect) ----
+    /// Serialized size of the most recently sealed sidecar. The 4 MiB payload cap is
+    /// soft — `trim_out_client_sets` degrades client sets to Unknown but never drops
+    /// entries — so a value far above 4 MiB is the cap failing where anyone can see it.
+    pub segment_summary_last_bytes: u64,
+    pub segment_summary_last_aggregates: u64,
+    /// Per-aggregate client sets dropped to Unknown at seal. Non-zero means the cap
+    /// overflowed.
+    pub segment_summary_client_sets_dropped_total: u64,
+    /// Largest and widest sidecar since process start. The `last_*` pair above is
+    /// last-writer-wins across shards and sampled at 2 Hz, so it misses most seals
+    /// and is biased against exactly the outlier this scenario is hunting.
+    pub segment_summary_max_bytes: u64,
+    pub segment_summary_max_aggregates: u64,
+
+    // ---- Negative-lookup bloom (the reheat write path) ----
+    pub negative_lookup_short_circuit_total: u64,
+    pub negative_lookup_evictions_total: u64,
+    pub negative_lookup_false_positive_total: u64,
+    pub negative_lookup_builds_started_total: u64,
+    pub negative_lookup_builds_completed_total: u64,
+    pub negative_lookup_stale_finish_total: u64,
+    pub negative_lookup_build_refused_no_budget_total: u64,
     /// Header-only fsync at replication commit, persisting last_self_acked_wal_seq.
     pub barrier_sync_fsync_total: u64,
     pub barrier_sync_fsync_failed_total: u64,
@@ -158,6 +247,12 @@ pub struct NodeSample {
     /// shard that never learns a peer's status is one of the wedge causes.
     #[serde(default)]
     pub intrashard_status_broadcast_dropped_total: u64,
+    /// Mesh sends abandoned by shard 0's `broadcast_message_to_other_shards`
+    /// after retry exhaustion — the other broadcast-drop path, which
+    /// `intrashard_status_broadcast_dropped_total` does NOT cover. Carries the
+    /// lease-renewal StatusUpdate, so a drop here can strand a shard Fenced.
+    #[serde(default)]
+    pub intrashard_broadcast_dropped_total: u64,
     /// Catchup completions dropped instead of delivered. Non-zero means a shard
     /// finished catching up and nobody was told.
     #[serde(default)]
@@ -180,77 +275,19 @@ pub struct NodeSample {
     /// absent (renamed/removed) metric indistinguishable from a present-but-
     /// zero one; `check_counter` uses this set to fail closed on the former.
     #[serde(default)]
-    pub metric_keys_present: std::collections::BTreeSet<String>,
+    /// Counter names actually seen in this scrape. `Arc` because the set is
+    /// identical between consecutive scrapes in the overwhelming majority of
+    /// ticks, and a `deep` run retains ~74,000 samples (2 Hz x 2 hosts x 5h).
+    /// Rebuilding an owned 78-entry `BTreeSet<String>` per sample costs a few
+    /// hundred MB of orchestrator RSS before `snapshot()` clones the whole Vec,
+    /// two or three clones of which are live at once. The scraper interns the
+    /// set so unchanged ticks share one allocation.
+    pub metric_keys_present: std::sync::Arc<std::collections::BTreeSet<String>>,
 }
 
 impl NodeSample {
     pub fn unreachable(host: String, t_ms: u64, error: String) -> Self {
-        Self {
-            host,
-            t_ms,
-            ok: false,
-            error: Some(error),
-            node_role: 0.0,
-            wal_seq_max: 0,
-            wal_seq_by_shard: BTreeMap::new(),
-            read_wal_seq_by_shard: BTreeMap::new(),
-            parked_commit_depth_by_shard: BTreeMap::new(),
-            last_self_acked_by_shard: BTreeMap::new(),
-            node_status_code_by_shard: BTreeMap::new(),
-            executor_heartbeat_ms_by_shard: BTreeMap::new(),
-            writes_total: 0,
-            write_errors_total: 0,
-            leader_elections_total: 0,
-            heartbeat_failures_total: 0,
-            s3_fallbacks_total: 0,
-            s3_lease_on_demand_renewal_total: 0,
-            s3_fallback_lease_unconfirmed_total: 0,
-            shard_panics_total: 0,
-            node_starts_total: 0,
-            client_connections_active: 0,
-            watch_subscribers_active: 0,
-            capture_dropped_items_total: 0,
-            capture_dropped_bytes_total: 0,
-            writes_accepted_no_prior_client_seq_total: 0,
-            cache_client_scan_not_found_total: 0,
-            cache_client_scan_found_total: 0,
-            truncate_dropped_committed_events_total: 0,
-            truncate_dropped_committed_bytes_total: 0,
-            replication_rollback_deferred_total: 0,
-            truncate_dropped_self_acked_events_total: 0,
-            truncate_dropped_self_acked_wal_seqs_total: 0,
-            s3_catchup_self_uploads_seen_total: 0,
-            truncate_refused_due_to_ack_barrier_total: 0,
-            s3_catchup_same_epoch_divergence_total: 0,
-            cull_stale_client_seq_lru: 0,
-            cull_stale_agg_lru: 0,
-            client_idempotency_violations_total: 0,
-            client_idempotency_inflight_total: 0,
-            take_pending_replication_dropped_batches: 0,
-            truncate_divergence_advanced_total: 0,
-            truncate_divergence_advanced_wal_seqs_total: 0,
-            read_bloom_short_circuit_total: 0,
-            barrier_sync_fsync_total: 0,
-            barrier_sync_fsync_failed_total: 0,
-            probe_gap_detected_total: 0,
-            probe_gap_send_success_total: 0,
-            probe_gap_send_failed_total: 0,
-            catchup_empty_fetch_total: 0,
-            catchup_fallback_total: 0,
-            catchup_fetch_error_total: 0,
-            tombstone_snapshot_regression_total: 0,
-            position_snapshot_stale_commit_total: 0,
-            commit_notify_sent_total: 0,
-            commit_notify_received_total: 0,
-            s3_catchup_barrier_timeout_total: 0,
-            s3_catchup_stall_bail_total: 0,
-            s3_catchup_task_started_total: 0,
-            intrashard_status_broadcast_dropped_total: 0,
-            s3_catchup_completion_dropped_total: 0,
-            stuck_handlers: Vec::new(),
-            mesh_dequeued_by_pair: BTreeMap::new(),
-            metric_keys_present: std::collections::BTreeSet::new(),
-        }
+        Self { host, t_ms, ok: false, error: Some(error), ..Default::default() }
     }
 }
 
@@ -268,6 +305,9 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
     let mut parked_commit_depth_by_shard: BTreeMap<u32, u64> = BTreeMap::new();
     let mut last_self_acked_by_shard: BTreeMap<u32, u64> = BTreeMap::new();
     let mut node_status_code_by_shard: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut effective_status_by_shard: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut lease_remaining_ms_by_series: BTreeMap<String, i64> = BTreeMap::new();
+    let mut write_errors_by_code: BTreeMap<String, u64> = BTreeMap::new();
     let mut executor_heartbeat_ms_by_shard: BTreeMap<u32, u64> = BTreeMap::new();
     let mut stuck_handlers: Vec<String> = Vec::new();
     let mut mesh_dequeued: BTreeMap<String, u64> = BTreeMap::new();
@@ -305,6 +345,33 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         "celeriant_truncate_divergence_advanced_total",
         "celeriant_truncate_divergence_advanced_wal_seqs_total",
         "celeriant_read_bloom_short_circuit_total",
+        "celeriant_read_client_bloom_short_circuit_total",
+        "celeriant_read_segment_hint_seek_total",
+        "celeriant_read_segment_hint_skip_total",
+        "celeriant_connection_redirects_total",
+        "celeriant_extension_redirects_total",
+        "celeriant_mesh_channel_full_total",
+        "celeriant_read_bloom_gate_total",
+        "celeriant_read_segments_walked_total",
+        "celeriant_read_bloom_absent_total",
+        "celeriant_read_bytes_total",
+        "celeriant_cache_log_file_hits_total",
+        "celeriant_cache_log_file_misses_total",
+        "celeriant_log_rotations_total",
+        "celeriant_log_segments_total",
+        "celeriant_rotation_out_of_space_total",
+        "celeriant_segment_summary_last_bytes",
+        "celeriant_segment_summary_last_aggregates",
+        "celeriant_segment_summary_client_sets_dropped_total",
+        "celeriant_segment_summary_max_bytes",
+        "celeriant_segment_summary_max_aggregates",
+        "celeriant_negative_lookup_short_circuit_total",
+        "celeriant_negative_lookup_evictions_total",
+        "celeriant_negative_lookup_false_positive_total",
+        "celeriant_negative_lookup_builds_started_total",
+        "celeriant_negative_lookup_builds_completed_total",
+        "celeriant_negative_lookup_stale_finish_total",
+        "celeriant_negative_lookup_build_refused_no_budget_total",
         "celeriant_barrier_sync_fsync_total",
         "celeriant_barrier_sync_fsync_failed_total",
         "celeriant_probe_outcome_gap_detected_total",
@@ -321,6 +388,7 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         "celeriant_s3_catchup_stall_bail_total",
         "celeriant_s3_catchup_task_started_total",
         "celeriant_intrashard_status_broadcast_dropped_total",
+        "celeriant_intrashard_broadcast_dropped_total",
         "celeriant_s3_catchup_completion_dropped_total",
     ];
 
@@ -394,6 +462,31 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
             }
             continue;
         }
+        if name == "celeriant_node_status_effective_code" {
+            if let Ok(v) = value_str.parse::<f64>()
+                && let Some(shard_id) = extract_label(name_part, "shard_id")
+                && let Ok(id) = shard_id.parse::<u32>()
+            {
+                effective_status_by_shard.insert(id, v as u64);
+            }
+            continue;
+        }
+        if name == "celeriant_lease_remaining_ms" {
+            if let Ok(v) = value_str.parse::<f64>()
+                && let Some(labels) = name_part.find('{').map(|i| &name_part[i..])
+            {
+                lease_remaining_ms_by_series.insert(labels.to_string(), v as i64);
+            }
+            continue;
+        }
+        // No `continue`: the whitelist below still has to sum the same series
+        // into `write_errors_total`. This branch only adds the per-code split.
+        if name == "celeriant_write_errors_total"
+            && let Some(code) = extract_label(name_part, "error_code")
+            && let Ok(v) = value_str.parse::<f64>()
+        {
+            *write_errors_by_code.entry(code.to_string()).or_insert(0) += v as u64;
+        }
         if name == "celeriant_intrashard_dequeued_total" {
             if let Ok(v) = value_str.parse::<f64>()
                 && let Some(labels) = name_part.find('{').map(|i| &name_part[i..])
@@ -440,8 +533,8 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
     }
 
     let get = |k: &str| -> u64 { sums.get(k).copied().unwrap_or(0) };
-    let metric_keys_present: std::collections::BTreeSet<String> =
-        sums.keys().map(|k| k.to_string()).collect();
+    let metric_keys_present: std::sync::Arc<std::collections::BTreeSet<String>> =
+        std::sync::Arc::new(sums.keys().map(|k| k.to_string()).collect());
 
     NodeSample {
         host,
@@ -455,6 +548,9 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         parked_commit_depth_by_shard,
         last_self_acked_by_shard,
         node_status_code_by_shard,
+        effective_status_by_shard,
+        lease_remaining_ms_by_series,
+        write_errors_by_code,
         executor_heartbeat_ms_by_shard,
         stuck_handlers,
         mesh_dequeued_by_pair: mesh_dequeued,
@@ -490,6 +586,33 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         truncate_divergence_advanced_total: get("celeriant_truncate_divergence_advanced_total"),
         truncate_divergence_advanced_wal_seqs_total: get("celeriant_truncate_divergence_advanced_wal_seqs_total"),
         read_bloom_short_circuit_total: get("celeriant_read_bloom_short_circuit_total"),
+        read_client_bloom_short_circuit_total: get("celeriant_read_client_bloom_short_circuit_total"),
+        read_segment_hint_seek_total: get("celeriant_read_segment_hint_seek_total"),
+        read_segment_hint_skip_total: get("celeriant_read_segment_hint_skip_total"),
+        connection_redirects_total: get("celeriant_connection_redirects_total"),
+        extension_redirects_total: get("celeriant_extension_redirects_total"),
+        mesh_channel_full_total: get("celeriant_mesh_channel_full_total"),
+        read_bloom_gate_total: get("celeriant_read_bloom_gate_total"),
+        read_segments_walked_total: get("celeriant_read_segments_walked_total"),
+        read_bloom_absent_total: get("celeriant_read_bloom_absent_total"),
+        read_bytes_total: get("celeriant_read_bytes_total"),
+        cache_log_file_hits_total: get("celeriant_cache_log_file_hits_total"),
+        cache_log_file_misses_total: get("celeriant_cache_log_file_misses_total"),
+        log_rotations_total: get("celeriant_log_rotations_total"),
+        log_segments_total: get("celeriant_log_segments_total"),
+        rotation_out_of_space_total: get("celeriant_rotation_out_of_space_total"),
+        segment_summary_last_bytes: get("celeriant_segment_summary_last_bytes"),
+        segment_summary_last_aggregates: get("celeriant_segment_summary_last_aggregates"),
+        segment_summary_client_sets_dropped_total: get("celeriant_segment_summary_client_sets_dropped_total"),
+        segment_summary_max_bytes: get("celeriant_segment_summary_max_bytes"),
+        segment_summary_max_aggregates: get("celeriant_segment_summary_max_aggregates"),
+        negative_lookup_short_circuit_total: get("celeriant_negative_lookup_short_circuit_total"),
+        negative_lookup_evictions_total: get("celeriant_negative_lookup_evictions_total"),
+        negative_lookup_false_positive_total: get("celeriant_negative_lookup_false_positive_total"),
+        negative_lookup_builds_started_total: get("celeriant_negative_lookup_builds_started_total"),
+        negative_lookup_builds_completed_total: get("celeriant_negative_lookup_builds_completed_total"),
+        negative_lookup_stale_finish_total: get("celeriant_negative_lookup_stale_finish_total"),
+        negative_lookup_build_refused_no_budget_total: get("celeriant_negative_lookup_build_refused_no_budget_total"),
         probe_gap_detected_total: get("celeriant_probe_outcome_gap_detected_total"),
         probe_gap_send_success_total: get("celeriant_probe_gap_send_success_total"),
         probe_gap_send_failed_total: get("celeriant_probe_gap_send_failed_total"),
@@ -504,6 +627,7 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         s3_catchup_stall_bail_total: get("celeriant_s3_catchup_stall_bail_total"),
         s3_catchup_task_started_total: get("celeriant_s3_catchup_task_started_total"),
         intrashard_status_broadcast_dropped_total: get("celeriant_intrashard_status_broadcast_dropped_total"),
+        intrashard_broadcast_dropped_total: get("celeriant_intrashard_broadcast_dropped_total"),
         s3_catchup_completion_dropped_total: get("celeriant_s3_catchup_completion_dropped_total"),
         barrier_sync_fsync_total: get("celeriant_barrier_sync_fsync_total"),
         barrier_sync_fsync_failed_total: get("celeriant_barrier_sync_fsync_failed_total"),
@@ -605,5 +729,166 @@ mod tests {
         assert_eq!(s.s3_catchup_task_started_total, 9);
         assert_eq!(s.intrashard_status_broadcast_dropped_total, 0);
         assert!(!s.metric_keys_present.contains("celeriant_s3_catchup_completion_dropped_total"));
+    }
+
+    #[test]
+    fn effective_status_is_parsed_separately_from_the_raw_gauge() {
+        // The trap the whole wedge diagnosis turns on: raw reads Leader on
+        // every shard while effective reads Fenced and writes are rejected.
+        let s = sample(
+            "celeriant_node_status_code{shard_id=\"1\"} 4\n\
+             celeriant_node_status_code{shard_id=\"2\"} 4\n\
+             celeriant_node_status_effective_code{shard_id=\"1\"} 5\n\
+             celeriant_node_status_effective_code{shard_id=\"2\"} 5\n\
+             celeriant_node_status_effective_code{shard_id=\"0\"} 4\n",
+        );
+        assert_eq!(s.node_status_code_by_shard.get(&1), Some(&4));
+        assert_eq!(s.effective_status_by_shard.get(&1), Some(&5));
+        assert_eq!(s.effective_status_by_shard.get(&2), Some(&5));
+        assert_eq!(s.effective_status_by_shard.get(&0), Some(&4));
+    }
+
+    #[test]
+    fn lease_remaining_keeps_both_role_series_and_accepts_a_negative() {
+        let s = sample(
+            "celeriant_lease_remaining_ms{shard_id=\"1\",role=\"leader\"} 4200\n\
+             celeriant_lease_remaining_ms{shard_id=\"1\",role=\"follower\"} -1500\n",
+        );
+        assert_eq!(s.lease_remaining_ms_by_series.len(), 2, "{:?}", s.lease_remaining_ms_by_series);
+        assert_eq!(
+            s.lease_remaining_ms_by_series.get("{shard_id=\"1\",role=\"follower\"}"),
+            Some(&-1500)
+        );
+    }
+
+    #[test]
+    fn write_errors_split_by_code_without_losing_the_total() {
+        let s = sample(
+            "celeriant_write_errors_total{shard_id=\"1\",error_code=\"shard_cannot_accept_writes\"} 434679\n\
+             celeriant_write_errors_total{shard_id=\"2\",error_code=\"shard_cannot_accept_writes\"} 15352\n\
+             celeriant_write_errors_total{shard_id=\"1\",error_code=\"occ_conflict\"} 12\n",
+        );
+        assert_eq!(s.write_errors_by_code.get("shard_cannot_accept_writes"), Some(&450_031));
+        assert_eq!(s.write_errors_by_code.get("occ_conflict"), Some(&12));
+        assert_eq!(s.write_errors_total, 450_043);
+        assert!(s.metric_keys_present.contains("celeriant_write_errors_total"));
+    }
+
+    type Field = fn(&NodeSample) -> u64;
+
+    /// Read/segment/negative-lookup metrics the comparator needs, paired with the
+    /// field each must land in. Every table-driven test below walks this list.
+    const READ_PATH_COUNTERS: &[(&str, Field)] = &[
+        ("celeriant_read_client_bloom_short_circuit_total", |s| s.read_client_bloom_short_circuit_total),
+        ("celeriant_read_segment_hint_seek_total", |s| s.read_segment_hint_seek_total),
+        ("celeriant_read_segment_hint_skip_total", |s| s.read_segment_hint_skip_total),
+        ("celeriant_cache_log_file_hits_total", |s| s.cache_log_file_hits_total),
+        ("celeriant_cache_log_file_misses_total", |s| s.cache_log_file_misses_total),
+        ("celeriant_read_bytes_total", |s| s.read_bytes_total),
+        ("celeriant_log_rotations_total", |s| s.log_rotations_total),
+        ("celeriant_log_segments_total", |s| s.log_segments_total),
+        ("celeriant_rotation_out_of_space_total", |s| s.rotation_out_of_space_total),
+        ("celeriant_segment_summary_last_bytes", |s| s.segment_summary_last_bytes),
+        ("celeriant_segment_summary_last_aggregates", |s| s.segment_summary_last_aggregates),
+        ("celeriant_segment_summary_client_sets_dropped_total", |s| s.segment_summary_client_sets_dropped_total),
+        ("celeriant_read_segments_walked_total", |s| s.read_segments_walked_total),
+        ("celeriant_read_bloom_absent_total", |s| s.read_bloom_absent_total),
+        ("celeriant_negative_lookup_short_circuit_total", |s| s.negative_lookup_short_circuit_total),
+        ("celeriant_negative_lookup_evictions_total", |s| s.negative_lookup_evictions_total),
+        ("celeriant_negative_lookup_false_positive_total", |s| s.negative_lookup_false_positive_total),
+        ("celeriant_negative_lookup_builds_started_total", |s| s.negative_lookup_builds_started_total),
+        ("celeriant_negative_lookup_builds_completed_total", |s| s.negative_lookup_builds_completed_total),
+        ("celeriant_negative_lookup_stale_finish_total", |s| s.negative_lookup_stale_finish_total),
+        ("celeriant_negative_lookup_build_refused_no_budget_total", |s| s.negative_lookup_build_refused_no_budget_total),
+        ("celeriant_client_idempotency_violations_total", |s| s.client_idempotency_violations_total),
+    ];
+
+    #[test]
+    fn read_path_counters_sum_across_label_sets() {
+        let mut body = String::new();
+        for (i, (name, _)) in READ_PATH_COUNTERS.iter().enumerate() {
+            let v = i as u64 + 1;
+            body.push_str(&format!(
+                "{name}{{shard_id=\"1\"}} {v}\n{name}{{shard_id=\"2\"}} {}\n",
+                v * 10
+            ));
+        }
+        let s = sample(&body);
+        for (i, (name, get)) in READ_PATH_COUNTERS.iter().enumerate() {
+            assert_eq!(get(&s), (i as u64 + 1) * 11, "{name}");
+            if name.ends_with("_total") {
+                assert!(s.metric_keys_present.contains(*name), "{name} not marked present");
+            }
+        }
+    }
+
+    #[test]
+    fn absent_read_path_counters_are_zero() {
+        let s = sample("celeriant_wal_seq{shard_id=\"0\"} 7\n");
+        for (name, get) in READ_PATH_COUNTERS {
+            assert_eq!(get(&s), 0, "{name}");
+            assert!(!s.metric_keys_present.contains(*name), "{name} marked present while absent");
+        }
+    }
+
+    #[test]
+    fn read_path_counters_parse_float_exposition() {
+        for text in ["1024", "1024.0"] {
+            let body: String = READ_PATH_COUNTERS
+                .iter()
+                .map(|(name, _)| format!("{name} {text}\n"))
+                .collect();
+            let s = sample(&body);
+            for (name, get) in READ_PATH_COUNTERS {
+                assert_eq!(get(&s), 1024, "{name} written as {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn comments_and_histogram_suffixes_do_not_corrupt_read_path_counters() {
+        let mut body = String::from(
+            "# HELP celeriant_read_duration_seconds Read latency\n\
+             # TYPE celeriant_read_duration_seconds histogram\n\
+             celeriant_read_duration_seconds_bucket{le=\"0.1\"} 5\n\
+             celeriant_read_duration_seconds_bucket{le=\"+Inf\"} 9\n\
+             celeriant_read_duration_seconds_sum 0.42\n\
+             celeriant_read_duration_seconds_count 9\n",
+        );
+        for (name, _) in READ_PATH_COUNTERS {
+            body.push_str(&format!(
+                "# TYPE {name} counter\n{name} 3\n\
+                 {name}_bucket{{le=\"0.1\"}} 999\n{name}_sum 999\n{name}_count 999\n"
+            ));
+        }
+        let s = sample(&body);
+        for (name, get) in READ_PATH_COUNTERS {
+            assert_eq!(get(&s), 3, "{name}");
+        }
+    }
+
+    #[test]
+    fn legacy_json_without_read_path_counters_deserializes() {
+        let s: NodeSample =
+            serde_json::from_str(r#"{"host":"h1","t_ms":500,"ok":true,"wal_seq_max":42}"#).unwrap();
+        assert_eq!(s.wal_seq_max, 42);
+        for (name, get) in READ_PATH_COUNTERS {
+            assert_eq!(get(&s), 0, "{name}");
+        }
+    }
+
+    #[test]
+    fn read_path_counters_survive_serde_round_trip() {
+        let body: String = READ_PATH_COUNTERS
+            .iter()
+            .enumerate()
+            .map(|(i, (name, _))| format!("{name} {}\n", i + 1))
+            .collect();
+        let s = sample(&body);
+        let back: NodeSample = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        for (i, (name, get)) in READ_PATH_COUNTERS.iter().enumerate() {
+            assert_eq!(get(&back), i as u64 + 1, "{name}");
+        }
+        assert_eq!(back.metric_keys_present, s.metric_keys_present);
     }
 }

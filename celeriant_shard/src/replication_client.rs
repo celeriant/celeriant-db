@@ -352,10 +352,10 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
         let address = self.follower_address.borrow().clone();
         let hb_timeout = Some(self.heartbeat_timeout);
 
-        // Always reset: forces a fresh TCP connection on each heartbeat attempt.
-        // This avoids stale connections hanging for the full internode_request_timeout
-        // (10s) when the peer is unreachable, which would prevent timely self-fencing.
-        guard.ensure_connected(&address, true, hb_timeout, hb_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref(), self.tcp_user_timeout, self.dict_codec.clone()).await?;
+        // Warm connection: a fresh mTLS handshake per beat must also fit inside
+        // hb_timeout, and under load it doesn't — the overrun fences a healthy leader.
+        // A timed-out beat leaves the stream dirty, which ensure_connected reconnects.
+        guard.ensure_connected(&address, false, hb_timeout, hb_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref(), self.tcp_user_timeout, self.dict_codec.clone()).await?;
 
         let request = ClusterRequest::Heartbeat(HeartbeatRequest {
             correlation_id: None,
@@ -364,7 +364,20 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
             lease_epoch,
         });
 
-        let response = guard.client.as_mut().unwrap().send_cluster_request(&request).await?;
+        // A warm connection the follower has already closed fails on the first read,
+        // before any of the beat budget is spent — reconnect and retry inside the same
+        // beat. A timeout is different: the budget is gone, so returning lets the next
+        // beat reconnect off the dirty stream rather than overrunning the lease margin.
+        let sent = guard.client.as_mut().unwrap().send_cluster_request(&request).await;
+        let response = match sent {
+            Ok(r) => r,
+            Err(ClientError::RequestTimeout) => return Err(SendHeartbeatError::from(ClientError::RequestTimeout)),
+            Err(e) => {
+                debug!(shard_id = self.shard_id, error = ?e, "heartbeat on warm connection failed, reconnecting");
+                guard.ensure_connected(&address, true, hb_timeout, hb_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref(), self.tcp_user_timeout, self.dict_codec.clone()).await?;
+                guard.client.as_mut().unwrap().send_cluster_request(&request).await?
+            }
+        };
 
         match response {
             ClusterResponse::Heartbeat(resp) => Ok(resp.result),

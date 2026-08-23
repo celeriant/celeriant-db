@@ -698,20 +698,20 @@ mod tests {
     #[test]
     fn epoch_verdict_fails_closed_on_zero_shards_checked() {
         let r = epoch_verdict("EpochMonotonicPerChain", 0, &[], "0 shard(s) checked".into());
-        assert!(!r.passed);
+        assert!(!r.passed());
         assert!(r.detail.contains("oracle unattestable"), "{}", r.detail);
     }
 
     #[test]
     fn epoch_verdict_passes_when_shards_checked_and_clean() {
         let r = epoch_verdict("EpochMonotonicPerChain", 2, &[], "2 shard(s) checked".into());
-        assert!(r.passed, "{}", r.detail);
+        assert!(r.passed(), "{}", r.detail);
     }
 
     #[test]
     fn epoch_verdict_fails_on_real_issue() {
         let r = epoch_verdict("EpochUniquePerWalSeq", 1, &["shard_1: mismatch".to_string()], "1 shard(s) checked".into());
-        assert!(!r.passed);
+        assert!(!r.passed());
         assert!(r.detail.contains("mismatch"));
     }
 

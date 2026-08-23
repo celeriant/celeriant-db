@@ -84,13 +84,13 @@ fn replay(path: &str) -> Result<bool, String> {
         check_never_ahead(&data),
         check_read_converged_at_quiesce(&run.samples, &leader_host, &follower_host),
     ] {
-        let vacuous = check.passed
+        let vacuous = check.passed()
             && check.name == "NeverAhead"
             && check.detail.starts_with("0 stable ticks");
         let verdict = if vacuous {
             clean = false;
             "VACUOUS (0 audited ticks — not evidence)"
-        } else if check.passed {
+        } else if check.passed() {
             "PASS"
         } else {
             clean = false;

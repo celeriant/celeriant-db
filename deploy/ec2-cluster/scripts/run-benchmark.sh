@@ -133,7 +133,7 @@ cat > "$RESULT_FILE" <<EOF
 # fsync_delay_us:        ${FSYNC_DELAY_US:-(default: 1000)}
 # replication_delay_us:  ${REPLICATION_DELAY_US:-(default: 17000)}
 # reserve_coord_shard:   ${RESERVE_COORDINATOR_SHARD:-(default: false)}
-# mesh_channel_size:     ${MESH_CHANNEL_SIZE:-(default: 512)}
+# mesh_channel_size:     ${MESH_CHANNEL_SIZE:-(default: 8192)}
 # standalone:            ${STANDALONE:-(default: false)}
 # Total tasks: $TOTAL_TASKS
 # Tasks/client: $TASKS_PER_CLIENT
