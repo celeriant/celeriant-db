@@ -152,28 +152,18 @@ struct CatchupCandidate {
     end_wal_seq: u64,
 }
 
-// Bounded settle window for the catchup drain barrier.
-//
-// The barrier guards every would-be `Caught` reached with a non-empty S3 view:
-// the uploader's fallback queue drains through a throttled pipeline
-// (s3_replication_delay × bounded concurrency), so files covering our position
-// can become list-visible seconds AFTER we first look. The drain re-lists up
-// to this many times with a short sleep between each; any NEW peer file (any
-// range) proves the queue is still draining and re-opens the main loop.
-//
-// Production: DRAIN_MAX_ROUNDS × DRAIN_SETTLE_INTERVAL = 8 × 750ms = 6s of
-// stability required, sized above the per-shard upload lulls of a few seconds
-// observed under chaos load. Cold recovery path only, never hot.
-//
-// In tests the interval is collapsed to 1ms so the drain logic is exercised
-// without adding seconds to every test that applies a batch.
-#[cfg(not(test))]
-const DRAIN_MAX_ROUNDS: u32 = 8;
-#[cfg(test)]
-const DRAIN_MAX_ROUNDS: u32 = 3;
+// Raise it and promotion can overrun its lease, dropping to Fenced mid-catchup.
+// Zero it and an in-flight upload that was never acked gets missed.
+pub(crate) const DRAIN_MAX_ROUNDS_PROD: u32 = 2;
+pub(crate) const DRAIN_SETTLE_INTERVAL_PROD: Duration = Duration::from_millis(750);
 
 #[cfg(not(test))]
-const DRAIN_SETTLE_INTERVAL: Duration = Duration::from_millis(750);
+pub(crate) const DRAIN_MAX_ROUNDS: u32 = DRAIN_MAX_ROUNDS_PROD;
+#[cfg(test)]
+pub(crate) const DRAIN_MAX_ROUNDS: u32 = 3;
+
+#[cfg(not(test))]
+const DRAIN_SETTLE_INTERVAL: Duration = DRAIN_SETTLE_INTERVAL_PROD;
 #[cfg(test)]
 const DRAIN_SETTLE_INTERVAL: Duration = Duration::from_millis(1);
 
@@ -214,7 +204,7 @@ const LIVE_TAIL_EPSILON_ENTRIES: u64 = 5_000;
 /// the uploader's queue lands files in rough per-shard ascending order, so a
 /// new file strictly behind or ahead of us is evidence the drain is still in
 /// flight and the bridging file may be next.
-async fn drain_settle_barrier<D: S3Downloader + 'static>(
+pub(crate) async fn drain_settle_barrier<D: S3Downloader + 'static>(
     downloader: &Rc<D>,
     prefix: &str,
     shard_id: u32,

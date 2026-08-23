@@ -261,6 +261,7 @@ async fn dispatch_test(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         "edge_split_brain_s3_unavailable" => edge_split_brain_s3_unavailable::run().await,
         "edge_stale_cache_rotation" => edge_stale_cache_rotation::run().await,
         "edge_wal_tip_hash_divergence" => edge_wal_tip_hash_divergence::run().await,
+        "promotion_failure_process_survival" => promotion_failure_process_survival::run().await,
         "follower_notify_liveness" => follower_notify_liveness::run().await,
         "follower_read_snapshot" => follower_read_snapshot::run().await,
         "identity_test" => identity_test::run().await,

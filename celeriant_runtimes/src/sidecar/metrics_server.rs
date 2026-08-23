@@ -135,17 +135,27 @@ fn register_metric_descriptions() {
     describe_gauge!("celeriant_log_segments_total", "Active log segment count");
     describe_counter!("celeriant_log_rotations_total", "Log file rotations");
     describe_counter!("celeriant_log_segment_close_total", "Log segment file close events");
+    describe_counter!("celeriant_rotation_out_of_space_total", "Rotations that hit ENOSPC. The shard stays alive but every write needing rotation fails, which otherwise reads as an unexplained throughput collapse");
     describe_counter!("celeriant_orphan_segment_recovered_total", "Orphaned log segments cleaned up on boot");
     describe_gauge!("celeriant_segment_summary_last_bytes", "Serialized size of the most recently written segment summary sidecar");
     describe_gauge!("celeriant_segment_summary_last_aggregates", "Aggregate entry count of the most recently written segment summary sidecar");
     describe_counter!("celeriant_segment_summary_client_sets_dropped_total", "Per-aggregate client sets dropped to Unknown at seal — fires only when the 4 MiB payload cap overflows; a non-zero rate says the cap is wrong");
     describe_counter!("celeriant_read_segment_hint_skip_total", "Sealed segments skipped by a summary hint during the client dedup scan");
     describe_counter!("celeriant_read_segment_hint_seek_total", "Chain scans that seeked directly to a summary tip instead of reverse-hunting");
+    describe_counter!("celeriant_read_bloom_gate_total", "Keyed segment visits that consulted the aggregate bloom. The denominator for bloom effectiveness");
+    describe_counter!("celeriant_read_bloom_short_circuit_total", "Sealed segments skipped outright because the aggregate bloom said not-present");
+    describe_counter!("celeriant_read_client_bloom_short_circuit_total", "Sealed segments skipped outright because the client-id bloom said not-present");
+    describe_counter!("celeriant_read_segments_walked_total", "Segments a keyed reverse scan actually read metablocks from, having survived every skip gate and acquired the reader lock. The cost side of the ledger, not the bloom denominator");
+    describe_counter!("celeriant_read_bloom_absent_total", "Keyed segment visits where the aggregate bloom carried no information (typically a missing or torn sidecar), so every key read as maybe-present. Subset of the gate count, NOT of walked — a later gate may still skip the segment");
+    describe_counter!("celeriant_summary_cache_hits_total", "Decoded segment-summary lookups served from the 16-slot per-shard LRU");
+    describe_counter!("celeriant_summary_cache_misses_total", "Decoded segment-summary lookups that missed the LRU and went to disk. Against hits this is the churn rate: once a reverse scan's working set exceeds the 16 slots, cold lookups evict each other's sidecars and the miss rate is what turns a deeper scan into a superlinear one");
     describe_counter!("celeriant_negative_lookup_short_circuit_total", "First writes answered scan-free by a Complete per-aggregate negative-lookup bloom");
     describe_counter!("celeriant_negative_lookup_builds_started_total", "Negative-lookup bloom builds begun (install-empty-then-populate)");
     describe_counter!("celeriant_negative_lookup_builds_completed_total", "Negative-lookup bloom builds that reached Complete (exhaustive history walk, incl. eager open-scan installs)");
     describe_counter!("celeriant_negative_lookup_false_positive_total", "Complete negative-lookup bloom said maybe-present but the scan found nothing (bloom FP or delete/trim-only client)");
     describe_counter!("celeriant_negative_lookup_evictions_total", "Negative-lookup bloom entries evicted by the byte budget (rebuilt on next miss)");
+    describe_counter!("celeriant_negative_lookup_stale_finish_total", "Negative-lookup bloom builds that finished against a superseded generation and were discarded");
+    describe_counter!("celeriant_negative_lookup_build_refused_no_budget_total", "Negative-lookup bloom builds refused outright for lack of byte budget");
 
     describe_counter!("celeriant_schema_scan_started_total", "Schema-absence scans begun (write-path schema cache miss)");
     describe_counter!("celeriant_schema_scan_segments_walked_total", "Segments whose metablocks a schema-absence scan had to walk (Unknown/incomplete schema set)");
@@ -161,6 +171,7 @@ fn register_metric_descriptions() {
     describe_gauge!("celeriant_intrashard_handler_started_at_ms", "Unix ms when the in-flight mesh handler started, 0 when idle. Non-zero and stale names the handler a mesh loop is blocked in");
     describe_gauge!("celeriant_shard_executor_heartbeat_ms", "Unix ms refreshed every 1s per shard. Stale means the executor made no progress; it cannot say whether the cause is OS starvation or a spinning handler");
     describe_counter!("celeriant_intrashard_status_broadcast_dropped_total", "Status broadcasts abandoned after retries — the peer keeps a stale status");
+    describe_counter!("celeriant_intrashard_broadcast_dropped_total", "Shard-0 mesh broadcasts abandoned after retries, by kind and target shard. kind=\"status_update\" is a lease renewal a data shard never received, which fences it within heartbeat_lease_duration - max_clock_drift");
     describe_counter!("celeriant_s3_catchup_completion_dropped_total", "Catchup completions lost forwarding to shard 0 (receiver gone)");
     describe_counter!("celeriant_s3_catchup_task_started_total", "Spawned S3 catchup tasks that began running. Data shards only — shard 0 runs its catchup inline");
     describe_counter!("celeriant_s3_catchup_barrier_timeout_total", "Shards that missed the catchup completion barrier deadline");
@@ -182,6 +193,7 @@ fn register_metric_descriptions() {
     describe_histogram!("celeriant_heartbeat_duration_seconds", "Leader heartbeat send->conclusion latency (labels: shard_id). The failure mode is a LATE ack, not a failed one — the attempt/ack/failure counters cannot distinguish them, so this is what a fence shows up in first.");
     describe_counter!("celeriant_leader_self_fence_total", "Times the leader observed must_fence firing while raw status was still Leader (TTL exhausted before next renewal)");
     describe_counter!("celeriant_leader_elections_total", "Leadership transitions");
+    describe_counter!("celeriant_election_challenge_failed_total", "S3 election/renewal attempts that could not complete — never a process death (labels: path=challenge|leader_renewal). challenge: a follower's promotion aborted (S3 catchup unavailable); the node steps back to Fenced (or the winner's follower status) and retries on a backoff. leader_renewal: a sitting leader could not refresh its lease in S3; it keeps serving on the lease it holds until must_fence fires.");
     describe_counter!("celeriant_follower_auto_fence_total", "Follower self-fenced (lease ownership lost mid-flight)");
     describe_counter!("celeriant_lease_budget_exhausted_total", "Lease-bounded operation aborted: budget exhausted");
     describe_gauge!("celeriant_clock_drift_ms", "Observed clock drift between nodes");

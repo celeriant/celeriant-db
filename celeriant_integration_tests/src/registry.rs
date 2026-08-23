@@ -419,6 +419,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             distributed: true,
         },
         TestEntry {
+            name: "promotion_failure_process_survival",
+            description: "A node whose leadership challenge fails (won the CAS, then S3 goes away mid-catch-up) must step back, not terminate",
+            estimated_secs: 360,
+            categories: &[Election, Invariant],
+            distributed: true,
+        },
+        TestEntry {
             name: "s3_stale_lease",
             description: "Stale lease node rejoins as follower instead of attempting takeover",
             estimated_secs: 19,

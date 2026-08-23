@@ -51,6 +51,7 @@ pub mod edge_s3_missing_batches;
 pub mod edge_split_brain_s3_unavailable;
 pub mod edge_stale_cache_rotation;
 pub mod edge_wal_tip_hash_divergence;
+pub mod promotion_failure_process_survival;
 pub mod follower_notify_liveness;
 pub mod follower_read_snapshot;
 pub mod identity_test;
@@ -202,8 +203,16 @@ pub struct TestServer {
     child: Child,
     config: ServerConfig,
     label: String,
+    log_buf: LogBuf,
     _log_thread: Option<JoinHandle<()>>,
 }
+
+/// Bounded ring of the most recent server log lines, shared with the reader
+/// threads. Bounded because a long-running load test emits far more than any
+/// caller wants to hold.
+pub type LogBuf = Arc<std::sync::Mutex<std::collections::VecDeque<String>>>;
+
+const LOG_TAIL_LINES: usize = 400;
 
 impl TestServer {
     /// Resolve the path to the pre-built server binary.
@@ -308,7 +317,8 @@ impl TestServer {
             .stderr(Stdio::piped())
             .spawn()?;
 
-        let log_thread = spawn_log_reader(&label, &mut child);
+        let log_buf: LogBuf = Default::default();
+        let log_thread = spawn_log_reader(&label, &mut child, &log_buf);
 
         let ready_start = std::time::Instant::now();
         Self::poll_ready(&address, &mut child, &config).await?;
@@ -319,8 +329,17 @@ impl TestServer {
             child,
             config,
             label,
+            log_buf,
             _log_thread: log_thread,
         })
+    }
+
+    /// The most recent server log lines (both pipes, oldest first), capped at
+    /// `LOG_TAIL_LINES`. Use after `check_alive` reports an exit to recover the
+    /// reason the node died.
+    pub fn log_tail(&self, lines: usize) -> Vec<String> {
+        let Ok(buf) = self.log_buf.lock() else { return Vec::new() };
+        buf.iter().skip(buf.len().saturating_sub(lines)).cloned().collect()
     }
 
     /// Get the server address (host:port).
@@ -376,7 +395,7 @@ impl TestServer {
             .stderr(Stdio::piped())
             .spawn()?;
 
-        self._log_thread = spawn_log_reader(&self.label, &mut self.child);
+        self._log_thread = spawn_log_reader(&self.label, &mut self.child, &self.log_buf);
 
         let ready_start = std::time::Instant::now();
         Self::poll_ready(&self.address, &mut self.child, &self.config).await?;
@@ -407,7 +426,7 @@ impl TestServer {
             .stderr(Stdio::piped())
             .spawn()?;
 
-        self._log_thread = spawn_log_reader(&self.label, &mut self.child);
+        self._log_thread = spawn_log_reader(&self.label, &mut self.child, &self.log_buf);
 
         let ready_start = std::time::Instant::now();
         Self::poll_ready(&self.address, &mut self.child, &self.config).await?;
@@ -456,7 +475,8 @@ impl TestServer {
             .stderr(Stdio::piped())
             .spawn()?;
 
-        let log_thread = spawn_log_reader(&label, &mut child);
+        let log_buf: LogBuf = Default::default();
+        let log_thread = spawn_log_reader(&label, &mut child, &log_buf);
 
         let ready_start = std::time::Instant::now();
         Self::poll_ready(&address, &mut child, &config).await?;
@@ -467,6 +487,7 @@ impl TestServer {
             child,
             config,
             label,
+            log_buf,
             _log_thread: log_thread,
         })
     }
@@ -544,21 +565,34 @@ fn port_is_listening(port: u16) -> bool {
     })
 }
 
-/// Take stdout from a child process and spawn a thread that prints each line with a label prefix.
-/// The server uses `tracing_subscriber::fmt().init()` which writes to stdout, not stderr.
-/// Returns `None` if stdout is not available (already taken or not piped).
-fn spawn_log_reader(label: &str, child: &mut Child) -> Option<JoinHandle<()>> {
+/// Drain both child pipes, printing each line with a label prefix and retaining
+/// the tail in `buf`. The server logs via `tracing_subscriber::fmt().init()` on
+/// stdout, but a panic or a runtime abort writes to stderr — draining only
+/// stdout loses exactly the lines that explain why a node died.
+/// Returns the stdout thread handle, or `None` if stdout was already taken.
+fn spawn_log_reader(label: &str, child: &mut Child, buf: &LogBuf) -> Option<JoinHandle<()>> {
+    if let Some(stderr) = child.stderr.take() {
+        let label = label.to_string();
+        let buf = buf.clone();
+        std::thread::spawn(move || pump_log(stderr, &label, &buf));
+    }
     let stdout = child.stdout.take()?;
     let label = label.to_string();
-    Some(std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            match line {
-                Ok(line) => eprintln!("  [{}] {}", label, line),
-                Err(_) => break,
+    let buf = buf.clone();
+    Some(std::thread::spawn(move || pump_log(stdout, &label, &buf)))
+}
+
+fn pump_log<R: std::io::Read>(pipe: R, label: &str, buf: &LogBuf) {
+    for line in BufReader::new(pipe).lines() {
+        let Ok(line) = line else { break };
+        eprintln!("  [{}] {}", label, line);
+        if let Ok(mut b) = buf.lock() {
+            if b.len() == LOG_TAIL_LINES {
+                b.pop_front();
             }
+            b.push_back(line);
         }
-    }))
+    }
 }
 
 /// Extension trait for ServerConfig to convert to CLI arguments.

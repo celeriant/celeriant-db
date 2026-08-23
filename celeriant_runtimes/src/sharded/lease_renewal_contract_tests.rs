@@ -142,7 +142,9 @@ where
 
 static RECORDER: OnceLock<PrometheusHandle> = OnceLock::new();
 
-fn recorder() -> &'static PrometheusHandle {
+/// Process-global: `metrics` allows exactly one installed recorder, so every
+/// test in this crate that needs to read a counter goes through this one.
+pub(crate) fn recorder() -> &'static PrometheusHandle {
     RECORDER.get_or_init(|| {
         metrics_exporter_prometheus::PrometheusBuilder::new()
             .install_recorder()

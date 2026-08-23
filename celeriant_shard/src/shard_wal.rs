@@ -289,6 +289,10 @@ pub struct ShardWal<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
     /// NOT write this. Used by run_s3_fallback to gate uploads on a fresh lease.
     pub s3_cas_confirmed_at_ms: Rc<Cell<u64>>,
 
+    /// Used to prevent multiple in-flight elections from happening at the same time on shard 0.
+    /// It's thread per core, but tasks still interleave at a await boundaries.
+    pub s3_elections_in_flight: Rc<Cell<u32>>,
+
     /// Out-of-band hook for the replication path to nudge shard 0 to definitively
     /// renew the S3 lease (CAS `lease.json`) when an S3 fallback would otherwise be
     /// gated by a stale CAS confirmation. The heartbeat loop can stall in the kernel
@@ -717,6 +721,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             metrics_shard_label,
             commit_notify_obligation_gauge,
             s3_cas_confirmed_at_ms: Rc::new(Cell::new(0)),
+            s3_elections_in_flight: Rc::new(Cell::new(0)),
             lease_renewal_requester: OnceCell::new(),
             ack_barrier_rewind_armed: Cell::new(true),
             pending_notify_seq: Rc::new(Cell::new(0)),
@@ -981,8 +986,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     /// the sidecar later. Concurrent misses may decode twice: bounded and rare.
     async fn read_segment_summary_cached(&self, log_id: u64) -> Option<Rc<SegmentSummaryPayload>> {
         if let Some(payload) = self.summary_cache.borrow_mut().get(&log_id) {
+            metrics::counter!("celeriant_summary_cache_hits_total").increment(1);
             return Some(payload.clone());
         }
+        metrics::counter!("celeriant_summary_cache_misses_total").increment(1);
         let mut payload = read_segment_summary(self.log_segments_cache.shard_dir(), log_id).await?;
         payload.aggregates.sort_unstable_by_key(|e| (e.org_id, e.aggregate_type_id, e.aggregate_id));
         let payload = Rc::new(payload);

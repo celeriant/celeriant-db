@@ -131,6 +131,11 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn intrashard_sender(&self) -> Rc<Senders<IntrashardMessages>> {
+        self.ctx.intrashard_sender.clone()
+    }
+
     /// Read-only access to the per-shard WAL. Used by external runtime
     /// extensions (e.g. celeriant-queue) to wire additional listeners on
     /// the same executor as the storage engine, sharing the local
@@ -368,6 +373,8 @@ async fn broadcast_message_to_other_shards(current_shard_id: usize, message: Int
             continue;
         }
         if let Err(e) = try_send_with_retry(senders.as_ref(), peer, message.clone(), 10).await {
+            metrics::counter!("celeriant_intrashard_broadcast_dropped_total",
+                "kind" => message.kind(), "to_shard" => peer.to_string()).increment(1);
             error!("Failed to send message to shard {peer}: {e:?}");
         }
     }
@@ -645,7 +652,25 @@ fn spawn_self_renewal_handler<R: ReplicationClient + 'static, D: S3Downloader + 
     .detach();
 }
 
-async fn renew_s3_lease_on_demand<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+/// Counts an election against `cluster/lease.json`
+struct ElectionInFlight {
+    count: Rc<Cell<u32>>,
+}
+
+impl ElectionInFlight {
+    fn enter(count: &Rc<Cell<u32>>) -> Self {
+        count.set(count.get() + 1);
+        Self { count: count.clone() }
+    }
+}
+
+impl Drop for ElectionInFlight {
+    fn drop(&mut self) {
+        self.count.set(self.count.get().saturating_sub(1));
+    }
+}
+
+pub(crate) async fn renew_s3_lease_on_demand<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     ctx: &ConnectionContext<R, D, S>,
     requesting_shard: usize,
 ) {
@@ -663,6 +688,11 @@ async fn renew_s3_lease_on_demand<R: ReplicationClient + 'static, D: S3Downloade
         return; // gate disabled (tests / standalone)
     }
     
+    if ctx.shard_wal.s3_elections_in_flight.get() > 0 {
+        metrics::counter!("celeriant_s3_lease_renewal_handled_total", &[("result", "coalesced".to_string())]).increment(1);
+        return;
+    }
+
     let now_ms = validated_node_status::unix_epoch_now_ms();
     let cas_age_ms = now_ms.saturating_sub(ctx.shard_wal.s3_cas_confirmed_at_ms.get());
     if cas_age_ms < lease_duration_ms / 2 {
@@ -673,8 +703,11 @@ async fn renew_s3_lease_on_demand<R: ReplicationClient + 'static, D: S3Downloade
     let prior_lease_epoch = ctx.shard_wal.node_status.get().raw().lease_epoch_for_logging();
     metrics::counter!("celeriant_s3_lease_renewal_handled_total", &[("result", "attempted".to_string())]).increment(1);
     let cas_start = std::time::Instant::now();
-    let cas_outcome = retry_s3_operation(ctx.config.s3_retry_max_duration, "on_demand_lease_renewal",
-        || lease_manager.run_election_to_acquire_s3_lease()).await;
+    let cas_outcome = {
+        let _in_flight = ElectionInFlight::enter(&ctx.shard_wal.s3_elections_in_flight);
+        retry_s3_operation(ctx.config.s3_retry_max_duration, "on_demand_lease_renewal",
+            || lease_manager.run_election_to_acquire_s3_lease()).await
+    };
     metrics::histogram!("celeriant_s3_lease_cas_duration_seconds", &[("reason", "on_demand".to_string())])
         .record(cas_start.elapsed().as_secs_f64());
     match cas_outcome
@@ -730,6 +763,9 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
     rx: &LocalReceiver<CatchupCompletionMsg>,
     reason: &'static str,
 ) -> Result<ElectionOutcome, celeriant_distributed::lease_store::LeaseStoreError> {
+
+    // mark as an election in flight but don't skip this one as it's the `spawn_boot_orchestrator` election
+    let _in_flight = ElectionInFlight::enter(&ctx.shard_wal.s3_elections_in_flight);
 
     let previous_status = ctx.shard_wal.node_status.get();
     let is_currently_leader = previous_status.raw().is_leader();
@@ -1014,6 +1050,7 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
         let half_s3_lease = ctx.config.replication_config.as_ref().unwrap().s3_lease_duration / 2;
         let mut has_peer = false;
         let mut peer_discovery_backoff = Duration::from_secs(1);
+        let mut challenge_backoff = Duration::from_secs(1);
         let mut last_peer_discovery_attempt = std::time::Instant::now();
         let mut last_auto_fence_warn: Option<std::time::Instant> = None;
         let mut last_unhandled_status_warn: Option<std::time::Instant> = None;
@@ -1243,8 +1280,8 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                         }
                     }
                     Err(e) => {
-                        error!(error = %e, "S3 lease renewal/election failed, panic");
-                        panic!("Election failed after retries: {e}");
+                        error!(shard_id = ctx.current_shard_id, error = %e, "S3 lease renewal failed; continuing as leader on the existing lease");
+                        metrics::counter!("celeriant_election_challenge_failed_total", "path" => "leader_renewal").increment(1);
                     }
                 }
 
@@ -1293,8 +1330,23 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                     if ctx.shutdown_requested.get() {
                         continue;
                     }
-                    panic!("Election failed after retries: {e}");
+                    error!(shard_id = ctx.current_shard_id, error = %e, backoff_ms = challenge_backoff.as_millis() as u64, "Leadership challenge failed; stepping down and retrying");
+                    metrics::counter!("celeriant_election_challenge_failed_total", "path" => "challenge").increment(1);
+                    let prev = ctx.shard_wal.node_status.get();
+                    if prev.raw().is_promoting() || prev.raw().is_leader() {
+                        let fenced = ValidatedNodeStatus::create_fenced(prev.held_leadership());
+                        set_node_status_and_metric(&ctx.shard_wal.node_status, fenced, ctx.current_shard_id as u32);
+                        broadcast_message_to_other_shards(
+                            ctx.current_shard_id,
+                            IntrashardMessages::StatusUpdate { status: fenced, cas_confirmed_at_ms: None, leader_changed_hands: false },
+                            ctx.intrashard_sender.clone(),
+                        ).await;
+                    }
+                    glommio::timer::sleep(challenge_backoff).await;
+                    challenge_backoff = (challenge_backoff * 2).min(half_s3_lease);
+                    continue;
                 }
+                challenge_backoff = Duration::from_secs(1);
                 last_s3_lease_write_at_ms = Some(validated_node_status::unix_epoch_now_ms());
 
                 continue;

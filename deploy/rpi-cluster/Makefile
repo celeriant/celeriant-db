@@ -71,14 +71,26 @@ require-dangerous:
 # teardown-data only deletes inside REMOTE_DATA_ROOT, so the question it has to
 # answer is whether that still points at chaos. Allow-list, not deny-list: an
 # earlier version had no *) arm, so an empty REMOTE_DATA_ROOT passed the case
-# and produced rm -rf /*. realpath -m also closes ../celeriant-prod traversal.
+# and produced rm -rf /*.
+#
+# This used to normalise with `realpath -m` before comparing. That is a GNU
+# extension: BSD realpath (macOS) has no -m, so the substitution failed, $$r came
+# out EMPTY, and the guard refused every run from a Mac. Refusing is the safe
+# direction to fail, but it made the rig Linux-only by accident.
+#
+# Byte-exact comparison replaces it, which is strictly stronger than normalising:
+# it admits one literal string and nothing else, so `..`, a trailing slash, or a
+# doubled separator are all rejected rather than silently normalised into a pass.
+# The explicit `..` arm stays anyway, so the refusal names the real reason. No
+# external tool, and REMOTE_DATA_ROOT is a path on the *remote* nodes — resolving
+# it against the build machine's filesystem was never meaningful.
 guard-prod:
 	@[ -n "$(REMOTE_DATA_ROOT)" ] || { printf "$(RED)REFUSING: REMOTE_DATA_ROOT is empty$(RESET)\n"; exit 1; }
-	@r=$$(realpath -m "$(REMOTE_DATA_ROOT)"); \
-	 case "$$r" in \
-	   $(CHAOS_DATA_ROOT)) ;; \
-	   *) printf "$(RED)REFUSING: data root resolves to %s, not $(CHAOS_DATA_ROOT)$(RESET)\n" "$$r"; exit 1 ;; \
+	@case "$(REMOTE_DATA_ROOT)" in \
+	   *..*) printf "$(RED)REFUSING: REMOTE_DATA_ROOT contains '..': %s$(RESET)\n" "$(REMOTE_DATA_ROOT)"; exit 1 ;; \
 	 esac
+	@[ "$(REMOTE_DATA_ROOT)" = "$(CHAOS_DATA_ROOT)" ] || { \
+	   printf "$(RED)REFUSING: data root is %s, not $(CHAOS_DATA_ROOT)$(RESET)\n" "$(REMOTE_DATA_ROOT)"; exit 1; }
 	@printf "guard-prod: ok\n"
 
 # setup-nvme reformats the device, so the question is whether prod exists on it

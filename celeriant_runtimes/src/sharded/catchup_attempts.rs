@@ -22,8 +22,8 @@ pub(crate) fn role_for_status(status: NodeStatus) -> CatchupRole {
 }
 
 // Consecutive zero-progress catchup attempts tolerated before handing
-// recovery back to the TCP/kick path. Real settled-stall patience is ~39s:
-// 4 x ~6s drain barriers inside the invocations plus 3 x 5s inter-attempt
+// recovery back to the TCP/kick path. Real settled-stall patience is ~21s:
+// 4 x 1.5s drain barriers inside the invocations plus 3 x 5s inter-attempt
 // sleeps (the bailing 4th attempt returns before sleeping). Zero-progress
 // attempts always pay the sleep — the immediate re-attempt path requires
 // every shard progressing — so even barrier-less gap-escape churn paces at
