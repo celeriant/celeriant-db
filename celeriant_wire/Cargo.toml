@@ -14,7 +14,7 @@ default = []
 small-metablock = ["celeriant_wal/small-metablock"]
 
 [dependencies]
-celeriant_wal = { path = "../celeriant_wal", version = "0.1.0" }
+celeriant_wal = { path = "../celeriant_wal", version = "0.1.2" }
 bincode.workspace = true
 serde.workspace = true
 serde_json.workspace = true

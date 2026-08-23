@@ -14,8 +14,8 @@ default = []
 small-metablock = ["celeriant_wal/small-metablock", "celeriant_wire/small-metablock"]
 
 [dependencies]
-celeriant_wal = { path = "../celeriant_wal", version = "0.1.0" }
-celeriant_wire = { path = "../celeriant_wire", version = "0.1.0" }
+celeriant_wal = { path = "../celeriant_wal", version = "0.1.2" }
+celeriant_wire = { path = "../celeriant_wire", version = "0.1.2" }
 bincode.workspace = true
 futures-lite.workspace = true
 serde.workspace = true

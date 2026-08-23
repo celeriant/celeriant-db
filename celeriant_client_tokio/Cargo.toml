@@ -14,11 +14,11 @@ default = []
 small-metablock = ["celeriant_wal/small-metablock", "celeriant_msg/small-metablock", "celeriant_wire/small-metablock"]
 
 [dependencies]
-celeriant_crypto = { path = "../celeriant_crypto", version = "0.1.0" }
-celeriant_msg = { path = "../celeriant_msg", version = "0.1.0" }
-celeriant_wire = { path = "../celeriant_wire", version = "0.1.0" }
-celeriant_client_wire = { path = "../celeriant_client_wire", version = "0.1.0" }
-celeriant_wal = { path = "../celeriant_wal", version = "0.1.0" }
+celeriant_crypto = { path = "../celeriant_crypto", version = "0.1.2" }
+celeriant_msg = { path = "../celeriant_msg", version = "0.1.2" }
+celeriant_wire = { path = "../celeriant_wire", version = "0.1.2" }
+celeriant_client_wire = { path = "../celeriant_client_wire", version = "0.1.2" }
+celeriant_wal = { path = "../celeriant_wal", version = "0.1.2" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

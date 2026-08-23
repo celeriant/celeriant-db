@@ -10,6 +10,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-celeriant_wire = { path = "../celeriant_wire", version = "0.1.0" }
-celeriant_wal = { path = "../celeriant_wal", version = "0.1.0" }
+celeriant_wire = { path = "../celeriant_wire", version = "0.1.2" }
+celeriant_wal = { path = "../celeriant_wal", version = "0.1.2" }
 futures-lite.workspace = true
