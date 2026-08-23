@@ -31,15 +31,39 @@ pub(crate) async fn read_from_header<R>(
 where
     R: AsyncReadExt + Unpin,
 {
+    read_from_header_with(header, reader, dict_bytes, || {}).await
+}
+
+/// Like `read_from_header`, but fires `on_body_consumed` once the whole frame
+/// has been read off the socket — before decompression and deserialisation.
+///
+/// At that point the stream is back on a message boundary. If decompression or
+/// deserialisation fails afterwards, that's a bad frame, not a desynced stream,
+/// so a caller tracking stream position can mark the stream clean here and keep
+/// the connection.
+pub(crate) async fn read_from_header_with<R>(
+    header: WireHeader,
+    reader: &mut R,
+    dict_bytes: Option<&[u8]>,
+    on_body_consumed: impl FnOnce(),
+) -> Result<ClientResponse, ReadWireDataError>
+where
+    R: AsyncReadExt + Unpin,
+{
     if ClientResponse::is_fixed_size_variant(header.message_type) {
         // Fixed-size frames are never compressed regardless of `dict_bytes`.
-        return ClientResponse::read_from_header(header, reader).await;
+        let response = ClientResponse::read_from_header(header, reader).await;
+        if response.is_ok() {
+            on_body_consumed();
+        }
+        return response;
     }
 
     let raw = header
         .read_variable_body_raw(reader)
         .await
         .map_err(ReadWireDataError::ReadBodyFailure)?;
+    on_body_consumed();
 
     let body = match header.compression_type {
         CompressionType::None => raw,

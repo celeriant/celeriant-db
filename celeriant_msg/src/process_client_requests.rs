@@ -8,6 +8,7 @@ use celeriant_wire::network::{
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
+    process_client_responses::ClientResponseType,
     read_wire_data_error::ReadWireDataError,
     request::requests::{
         AggregateDetailsRequest, DeleteRequest, ListAggregateTypesRequest, ListAggregatesRequest,
@@ -31,6 +32,22 @@ pub enum ClientRequestType {
 }
 
 impl ClientRequestType {
+    #[inline]
+    pub fn expected_response_type(self) -> ClientResponseType {
+        match self {
+            ClientRequestType::AggregateDetails => ClientResponseType::AggregateDetails,
+            ClientRequestType::Read => ClientResponseType::Read,
+            ClientRequestType::Write => ClientResponseType::Write,
+            ClientRequestType::TrimStart => ClientResponseType::TrimStart,
+            ClientRequestType::Delete => ClientResponseType::Delete,
+            ClientRequestType::Watch => ClientResponseType::Watch,
+            ClientRequestType::ListOrgs => ClientResponseType::ListOrgs,
+            ClientRequestType::ListAggregateTypes => ClientResponseType::ListAggregateTypes,
+            ClientRequestType::ListAggregates => ClientResponseType::ListAggregates,
+            ClientRequestType::RegisterSchema => ClientResponseType::RegisterSchema,
+        }
+    }
+
     #[inline]
     pub fn from_u32(value: u32) -> Result<Self, ReadWireDataError> {
         match value {
@@ -94,6 +111,23 @@ impl ClientRequest {
             ClientRequest::ListAggregates(req) => req.correlation_id,
             ClientRequest::RegisterSchema(req) => req.correlation_id,
         }
+    }
+
+    #[inline]
+    pub fn set_correlation_id_if_absent(&mut self, id: u128) {
+        let slot = match self {
+            ClientRequest::AggregateDetails(req) => &mut req.correlation_id,
+            ClientRequest::Read(req) => &mut req.correlation_id,
+            ClientRequest::Write(req) => &mut req.correlation_id,
+            ClientRequest::TrimStart(req) => &mut req.correlation_id,
+            ClientRequest::Delete(req) => &mut req.correlation_id,
+            ClientRequest::Watch(req) => &mut req.correlation_id,
+            ClientRequest::ListOrgs(req) => &mut req.correlation_id,
+            ClientRequest::ListAggregateTypes(req) => &mut req.correlation_id,
+            ClientRequest::ListAggregates(req) => &mut req.correlation_id,
+            ClientRequest::RegisterSchema(req) => &mut req.correlation_id,
+        };
+        slot.get_or_insert(id);
     }
 
     #[inline]
@@ -604,5 +638,37 @@ mod tests {
             let parsed = read_back(&bytes).await;
             assert_eq!(parsed.correlation_id(), req.correlation_id());
         });
+    }
+
+    /// The two enums share discriminants only up to 5. Past that the response
+    /// side carries `ProtocolError = 6` and `GenericError = 7`, which have no
+    /// request counterpart, so every later pair is offset by two. A response-type
+    /// check written as `request_type as u32 == response_type as u32` would pass
+    /// this test for the first five and quietly mismatch the rest.
+    #[test]
+    fn expected_response_type_is_not_discriminant_equality() {
+        use crate::process_client_responses::ClientResponseType;
+
+        let pairs = [
+            (ClientRequestType::AggregateDetails, ClientResponseType::AggregateDetails),
+            (ClientRequestType::Read, ClientResponseType::Read),
+            (ClientRequestType::Write, ClientResponseType::Write),
+            (ClientRequestType::TrimStart, ClientResponseType::TrimStart),
+            (ClientRequestType::Delete, ClientResponseType::Delete),
+            (ClientRequestType::Watch, ClientResponseType::Watch),
+            (ClientRequestType::ListOrgs, ClientResponseType::ListOrgs),
+            (ClientRequestType::ListAggregateTypes, ClientResponseType::ListAggregateTypes),
+            (ClientRequestType::ListAggregates, ClientResponseType::ListAggregates),
+            (ClientRequestType::RegisterSchema, ClientResponseType::RegisterSchema),
+        ];
+
+        let mut diverged = 0;
+        for (req, resp) in pairs {
+            assert_eq!(req.expected_response_type(), resp, "{req:?}");
+            if req as u32 != resp as u32 {
+                diverged += 1;
+            }
+        }
+        assert_eq!(diverged, 5, "Watch onwards must be where discriminant equality breaks");
     }
 }

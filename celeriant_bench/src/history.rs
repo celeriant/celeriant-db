@@ -378,6 +378,11 @@ pub fn classify_error(e: &ClientError) -> (OpOutcome, Option<String>) {
         ClientError::WireError(_) => (OpOutcome::Info, "WireError".to_string()),
         ClientError::ReadError(_) => (OpOutcome::Info, "ReadError".to_string()),
         ClientError::ProtocolError => (OpOutcome::Info, "ProtocolError".to_string()),
+        // Info because our own request's commit status really is unknowable, the
+        // server may well have processed it, we just read someone else's reply.
+        ClientError::CorrelationMismatch { .. } => {
+            (OpOutcome::Info, "CorrelationMismatch".to_string())
+        }
         ClientError::ConnectionTimeout => (OpOutcome::Info, "ConnectionTimeout".to_string()),
         ClientError::RequestTimeout => (OpOutcome::Info, "RequestTimeout".to_string()),
         ClientError::IdentityError(_) => (OpOutcome::Info, "IdentityError".to_string()),

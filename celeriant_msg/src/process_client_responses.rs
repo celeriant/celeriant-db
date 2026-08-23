@@ -90,6 +90,28 @@ impl ClientResponse {
         }
     }
 
+    #[inline]
+    pub fn correlation_id(&self) -> Option<u128> {
+        match self {
+            ClientResponse::AggregateDetails(r) => r.correlation_id,
+            ClientResponse::Read(r) => r.correlation_id,
+            ClientResponse::Write(r) => r.correlation_id,
+            ClientResponse::TrimStart(r) => r.correlation_id,
+            ClientResponse::Delete(r) => r.correlation_id,
+            ClientResponse::GenericError(r) => r.correlation_id,
+            ClientResponse::ListOrgs(r) => r.correlation_id,
+            ClientResponse::ListAggregateTypes(r) => r.correlation_id,
+            ClientResponse::ListAggregates(r) => r.correlation_id,
+            ClientResponse::RegisterSchema(r) => r.correlation_id,
+            ClientResponse::Watch(_) | ClientResponse::ProtocolError(_) => None,
+        }
+    }
+
+    #[inline]
+    pub fn carries_correlation_id(&self) -> bool {
+        !matches!(self, ClientResponse::Watch(_) | ClientResponse::ProtocolError(_))
+    }
+
     pub async fn read_response<R>(reader: &mut R, max_response_size: u64) -> Result<ClientResponse, ReadWireDataError>
     where
         R: AsyncReadExt + Unpin,

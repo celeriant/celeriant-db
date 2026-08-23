@@ -38,28 +38,28 @@ impl Default for WriteEventsOptions {
 
 impl CeleriantClient {
     pub async fn read(&mut self, request: ReadRequest) -> Result<ReadResponse, ClientError> {
-        match self.send_request(&ClientRequest::Read(request)).await? {
+        match self.send_owned(ClientRequest::Read(request)).await? {
             ClientResponse::Read(r) => Ok(r),
             _ => Err(ClientError::ProtocolError),
         }
     }
 
     pub async fn write(&mut self, request: WriteRequest) -> Result<WriteResponse, ClientError> {
-        match self.send_request(&ClientRequest::Write(request)).await? {
+        match self.send_owned(ClientRequest::Write(request)).await? {
             ClientResponse::Write(r) => Ok(r),
             _ => Err(ClientError::ProtocolError),
         }
     }
 
     pub async fn delete(&mut self, request: DeleteRequest) -> Result<DeleteResponse, ClientError> {
-        match self.send_request(&ClientRequest::Delete(request)).await? {
+        match self.send_owned(ClientRequest::Delete(request)).await? {
             ClientResponse::Delete(r) => Ok(r),
             _ => Err(ClientError::ProtocolError),
         }
     }
 
     pub async fn trim_start(&mut self, request: TrimStartRequest) -> Result<TrimStartResponse, ClientError> {
-        match self.send_request(&ClientRequest::TrimStart(request)).await? {
+        match self.send_owned(ClientRequest::TrimStart(request)).await? {
             ClientResponse::TrimStart(r) => Ok(r),
             _ => Err(ClientError::ProtocolError),
         }
@@ -69,7 +69,7 @@ impl CeleriantClient {
         &mut self,
         request: AggregateDetailsRequest,
     ) -> Result<AggregateDetailsResponse, ClientError> {
-        match self.send_request(&ClientRequest::AggregateDetails(request)).await? {
+        match self.send_owned(ClientRequest::AggregateDetails(request)).await? {
             ClientResponse::AggregateDetails(r) => Ok(r),
             _ => Err(ClientError::ProtocolError),
         }
@@ -116,7 +116,7 @@ impl CeleriantClient {
         &mut self,
         request: RegisterSchemaRequest,
     ) -> Result<RegisterSchemaResponse, ClientError> {
-        match self.send_request(&ClientRequest::RegisterSchema(request)).await? {
+        match self.send_owned(ClientRequest::RegisterSchema(request)).await? {
             ClientResponse::RegisterSchema(r) => Ok(r),
             _ => Err(ClientError::ProtocolError),
         }

@@ -57,8 +57,14 @@ fn pass(name: &str) {
     println!("  PASS: {}", name);
 }
 
+/// Every `fail()` is counted so `run()` can exit non-zero. The runner decides
+/// pass/fail purely on child exit status, so a printed FAIL that does not reach
+/// here is a test that cannot go red.
+static FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn fail(name: &str, err: impl std::fmt::Debug) {
     println!("  FAIL: {} — {:?}", name, err);
+    FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 // ─── Test 1: typed write() ────────────────────────────────────────────────────
@@ -521,6 +527,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     test_write_error_optimistic_concurrency(&mut client).await;
     test_write_error_empty_events(&mut client).await;
     test_delete_error_aggregate_not_exists(&mut client).await;
+
+    let failures = FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+    if failures > 0 {
+        println!("\n=== {} test(s) FAILED ===", failures);
+        return Err(format!("{} typed operation test(s) failed", failures).into());
+    }
 
     println!("\n=== All tests completed ===");
     Ok(())

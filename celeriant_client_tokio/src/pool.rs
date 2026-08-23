@@ -336,6 +336,17 @@ const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(2);
 /// trips), while still allowing parallel connections to healthy nodes.
 const MAX_CONCURRENT_CONNECTS: usize = 32;
 
+fn pop_fresh_from<T>(q: &mut VecDeque<(T, Instant)>, idle_timeout: Duration) -> Option<T> {
+    while let Some((_, ts)) = q.front() {
+        if ts.elapsed() >= idle_timeout {
+            q.pop_front();
+        } else {
+            break;
+        }
+    }
+    q.pop_front().map(|(c, _)| c)
+}
+
 struct NodePool {
     address: String,
     connections: Mutex<VecDeque<(CeleriantClient, Instant)>>,
@@ -390,18 +401,7 @@ impl NodePool {
         .expect("semaphore closed unexpectedly");
 
         // Evict stale connections and pop the first fresh one.
-        let reuse = {
-            let mut guard = self.connections.lock().unwrap();
-            let idle_timeout = self.options.idle_timeout;
-            while let Some((_, ts)) = guard.front() {
-                if ts.elapsed() >= idle_timeout {
-                    guard.pop_front();
-                } else {
-                    break;
-                }
-            }
-            guard.pop_front().map(|(c, _)| c)
-        };
+        let reuse = self.pop_fresh();
 
         if let Some(client) = reuse {
             return Ok(PooledConnection {
@@ -430,17 +430,13 @@ impl NodePool {
             )));
         }
 
-        // Re-check pool — someone ahead of us may have returned a connection.
-        {
-            let mut guard = self.connections.lock().unwrap();
-            if let Some((client, _)) = guard.pop_front() {
-                return Ok(PooledConnection {
-                    client: Some(client),
-                    broken: false,
-                    return_to: Arc::clone(self),
-                    _permit: permit,
-                });
-            }
+        if let Some(client) = self.pop_fresh() {
+            return Ok(PooledConnection {
+                client: Some(client),
+                broken: false,
+                return_to: Arc::clone(self),
+                _permit: permit,
+            });
         }
 
         match Self::create_client(&self.address, &self.options, &self.dict_cache).await {
@@ -458,6 +454,11 @@ impl NodePool {
                 Err(e)
             }
         }
+    }
+
+    /// Drop every entry idle for at least `idle_timeout` and take the next
+    fn pop_fresh(&self) -> Option<CeleriantClient> {
+        pop_fresh_from(&mut self.connections.lock().unwrap(), self.options.idle_timeout)
     }
 
     fn return_connection(&self, client: CeleriantClient) {
@@ -510,7 +511,8 @@ impl NodePool {
 // ---------------------------------------------------------------------------
 
 /// A borrowed connection from the pool. Returns to the pool on drop unless
-/// `mark_broken()` was called, in which case it is discarded.
+/// `mark_broken()` was called or the client's stream is dirty, in which case it
+/// is discarded.
 pub struct PooledConnection {
     client: Option<CeleriantClient>,
     broken: bool,
@@ -535,7 +537,7 @@ impl PooledConnection {
 impl Drop for PooledConnection {
     fn drop(&mut self) {
         if let Some(client) = self.client.take() {
-            if !self.broken {
+            if !self.broken && !client.is_stream_dirty() {
                 self.return_to.return_connection(client);
             }
         }
@@ -591,6 +593,10 @@ impl CeleriantPool {
             read_counter: AtomicU64::new(0),
             dict_cache: Arc::new(Mutex::new(PoolDictCache::new())),
         }
+    }
+
+    pub fn options(&self) -> &PoolOptions {
+        &self.options
     }
 
     /// Returns the cached dict bytes for `sha`, or `None` if not yet cached.
@@ -1071,7 +1077,16 @@ impl PooledReadAllIterator {
             aggregate_key: self.aggregate_key.clone(),
             filters: self.filters.clone(),
         };
-        let response = self.conn.client().read(request).await?;
+        let response = match self.conn.client().read(request).await {
+            Ok(r) => r,
+            Err(e) => {
+                if leaves_connection_dirty(&e) {
+                    self.conn.mark_broken();
+                    self.exhausted = true;
+                }
+                return Err(e);
+            }
+        };
         self.buffer.extend(response.event_batches);
         match response.next_aggregate_version {
             Some(next_index) => {
@@ -1097,6 +1112,20 @@ impl PooledReadAllIterator {
 
 fn is_shard_routing_error(error: &ClientError) -> bool {
     matches!(error, ClientError::Server(crate::server_error::ServerError::ShardRouting { .. }))
+}
+
+/// Whether an error leaves the connection desynchronised and unusable
+fn leaves_connection_dirty(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::ConnectionFailed(_)
+            | ClientError::ConnectionTimeout
+            | ClientError::RequestTimeout
+            | ClientError::WireError(_)
+            | ClientError::ReadError(_)
+            | ClientError::ProtocolError
+            | ClientError::CorrelationMismatch { .. }
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1182,7 +1211,10 @@ impl PooledListOrgsIterator {
                 self.try_add_next_shard();
                 Ok(true)
             }
-            Ok(_) => Err(ClientError::ProtocolError),
+            Ok(_) => {
+                self.conn.mark_broken();
+                Err(ClientError::ProtocolError)
+            }
             Err(e) => {
                 if cursor.is_none() && self.max_shard.is_none() && is_shard_routing_error(&e) {
                     self.max_shard = Some(shard_id.saturating_sub(1));
@@ -1191,6 +1223,10 @@ impl PooledListOrgsIterator {
                     self.active_shards.retain(|s| *s <= last_shard);
                     self.shard_cursors.retain(|s, _| *s <= last_shard);
                     return Ok(!self.active_shards.is_empty() || !self.buffer.is_empty());
+                }
+                if leaves_connection_dirty(&e) {
+                    self.conn.mark_broken();
+                    self.exhausted = true;
                 }
                 Err(e)
             }
@@ -1313,7 +1349,10 @@ impl PooledListAggregateTypesIterator {
                 self.try_add_next_shard();
                 Ok(true)
             }
-            Ok(_) => Err(ClientError::ProtocolError),
+            Ok(_) => {
+                self.conn.mark_broken();
+                Err(ClientError::ProtocolError)
+            }
             Err(e) => {
                 if cursor.is_none() && self.max_shard.is_none() && is_shard_routing_error(&e) {
                     self.max_shard = Some(shard_id.saturating_sub(1));
@@ -1322,6 +1361,10 @@ impl PooledListAggregateTypesIterator {
                     self.active_shards.retain(|s| *s <= last_shard);
                     self.shard_cursors.retain(|s, _| *s <= last_shard);
                     return Ok(!self.active_shards.is_empty() || !self.buffer.is_empty());
+                }
+                if leaves_connection_dirty(&e) {
+                    self.conn.mark_broken();
+                    self.exhausted = true;
                 }
                 Err(e)
             }
@@ -1482,7 +1525,10 @@ impl PooledListAggregatesIterator {
                 self.try_add_next_shard();
                 Ok(true)
             }
-            Ok(_) => Err(ClientError::ProtocolError),
+            Ok(_) => {
+                self.conn.mark_broken();
+                Err(ClientError::ProtocolError)
+            }
             Err(e) => {
                 if cursor.is_none() && self.max_shard.is_none() && is_shard_routing_error(&e) {
                     self.max_shard = Some(shard_id.saturating_sub(1));
@@ -1491,6 +1537,10 @@ impl PooledListAggregatesIterator {
                     self.active_shards.retain(|s| *s <= last_shard);
                     self.shard_cursors.retain(|s, _| *s <= last_shard);
                     return Ok(!self.active_shards.is_empty() || !self.buffer.is_empty());
+                }
+                if leaves_connection_dirty(&e) {
+                    self.conn.mark_broken();
+                    self.exhausted = true;
                 }
                 Err(e)
             }
@@ -1524,6 +1574,421 @@ impl PooledListAggregatesIterator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Accepts and never answers, so a request future parked on the response
+    /// read stays parked.
+    async fn silent_server() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_connection_abandoned_mid_request_is_discarded_not_pooled() {
+        use celeriant_msg::request::requests::AggregateDetailsRequest;
+        use celeriant_wal::aggregate_key::AggregateKey;
+        use futures_util::FutureExt;
+
+        let addr = silent_server().await;
+        let mut opts = PoolOptions::new(addr.to_string());
+        opts.max_connections_per_node = 1;
+        let pool = CeleriantPool::new(opts);
+        let node = pool.get_or_create_node(&addr.to_string());
+
+        {
+            let mut conn = node.get().await.expect("silent server still accepts TCP");
+            let req = ClientRequest::AggregateDetails(AggregateDetailsRequest {
+                correlation_id: None,
+                aggregate_key: AggregateKey::new(1, 1, 1),
+            });
+            // One poll: the request reaches the socket, the response read parks.
+            // Then the guard is dropped without any error path ever running —
+            // nothing calls mark_broken, which is the whole bug.
+            let polled = conn.client().send_request(&req).now_or_never();
+            assert!(polled.is_none(), "one poll must park on the response read");
+            assert!(!conn.broken, "cancellation raises no error, so nothing marks it broken");
+        }
+
+        assert_eq!(
+            node.connections.lock().unwrap().len(),
+            0,
+            "a connection with an undrained response must never reach the free list"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_was_never_used_is_returned_to_the_pool() {
+        let addr = silent_server().await;
+        let pool = CeleriantPool::new(PoolOptions::new(addr.to_string()));
+        let node = pool.get_or_create_node(&addr.to_string());
+
+        drop(node.get().await.expect("silent server still accepts TCP"));
+
+        assert_eq!(
+            node.connections.lock().unwrap().len(),
+            1,
+            "the dirty guard must not retire clean connections"
+        );
+    }
+
+    /// How the mock server fills the correlation id of the frame it answers with.
+    #[derive(Clone, Copy)]
+    enum Answer {
+        /// What a real server does: the request's own id, echoed back.
+        Echo,
+        /// Someone else's id, made deterministic — the production desync.
+        WrongId,
+        /// A server *error* frame carrying someone else's id: the stale
+        /// rejection that walked through as a real answer in production.
+        WrongIdError,
+        /// A `Watch` reply, which carries no correlation id and never will.
+        Watch,
+        /// A correctly-typed `Read` reply carrying someone else's id, so the
+        /// correlation check fires without the response-type check masking it.
+        WrongIdRead,
+    }
+
+    fn details_response(correlation_id: Option<u128>) -> celeriant_msg::process_client_responses::ClientResponse {
+        use celeriant_msg::process_client_responses::ClientResponse;
+        use celeriant_msg::response::responses::AggregateDetailsResponse;
+        ClientResponse::AggregateDetails(AggregateDetailsResponse {
+            correlation_id,
+            min_aggregate_version: 0,
+            max_aggregate_version: 42,
+            max_event_seq: 100,
+            is_deleted: false,
+            allow_recreate: false,
+            allow_sequence_continuation: true,
+            last_server_timestamp: 1234,
+            last_client_id: 5678,
+            last_user_id: None,
+        })
+    }
+
+    /// Answers every request frame with a scripted response, so a request can
+    /// actually run to completion. `silent_server` can only ever show the
+    /// cancelled half of the flag's life. The receiver reports the correlation
+    /// id seen on each request frame, which is the only black-box view of what
+    /// the transport actually put on the wire.
+    async fn correlating_server(
+        answer: Answer,
+    ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<Option<u128>>) {
+        use celeriant_msg::process_client_responses::ClientResponse;
+        use celeriant_msg::response::responses::{ErrorResponse, WatchResponse};
+        use celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES;
+        use celeriant_wire::codec::compression::DictCodec;
+        use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V2, WireHeader};
+        use tokio_util::compat::TokioAsyncReadCompatExt;
+
+        const MAX: u64 = 64 * 1024 * 1024;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        // `DictCodec` holds a `RefCell`, so it is `!Sync` and cannot cross a
+        // `tokio::spawn`. Own thread, own current-thread runtime.
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                while let Ok((socket, _)) = listener.accept().await {
+                    let seen_tx = seen_tx.clone();
+                    tokio::task::spawn_local(async move {
+                    let mut stream = socket.compat();
+                    let codec = DictCodec::new(BUILTIN_DICT_BYTES, 3).unwrap();
+                    loop {
+                        let Ok(header) = WireHeader::from_reader(&mut stream, MAX).await else {
+                            return;
+                        };
+                        let Ok(request) =
+                            ClientRequest::read_from_header(header, &mut stream, &codec).await
+                        else {
+                            return;
+                        };
+                        let asked = request.correlation_id();
+                        // Callers may have dropped the receiver; the answer still matters.
+                        let _ = seen_tx.send(asked);
+                        // Never equal to `asked`, whether or not the client filled one in.
+                        let wrong = Some(asked.unwrap_or(0).wrapping_add(0xDEAD));
+                        let resp = match answer {
+                            Answer::Echo => details_response(asked),
+                            Answer::WrongId => details_response(wrong),
+                            Answer::WrongIdError => ClientResponse::GenericError(ErrorResponse {
+                                correlation_id: wrong,
+                                error_code: celeriant_msg::error_codes::SERVER_BUSY,
+                                error_message: "server busy".to_string(),
+                            }),
+                            Answer::Watch => ClientResponse::Watch(WatchResponse { events: Vec::new() }),
+                            Answer::WrongIdRead => ClientResponse::Read(
+                                celeriant_msg::response::responses::ReadResponse {
+                                    correlation_id: wrong,
+                                    event_batches: Vec::new(),
+                                    next_aggregate_version: None,
+                                },
+                            ),
+                        };
+                        if ClientResponse::write_response(
+                            &mut stream, &resp, false, &codec, MAX, PROTOCOL_VERSION_V2,
+                        ).await.is_err() {
+                            return;
+                        }
+                    }
+                    });
+                }
+            });
+        });
+        (addr, seen_rx)
+    }
+
+    /// A server that answers correctly, which now means echoing the correlation
+    /// id back the way the real server does.
+    async fn responding_server() -> std::net::SocketAddr {
+        correlating_server(Answer::Echo).await.0
+    }
+
+    fn details_request_with(correlation_id: Option<u128>) -> ClientRequest {
+        use celeriant_msg::request::requests::AggregateDetailsRequest;
+        use celeriant_wal::aggregate_key::AggregateKey;
+        ClientRequest::AggregateDetails(AggregateDetailsRequest {
+            correlation_id,
+            aggregate_key: AggregateKey::new(1, 1, 1),
+        })
+    }
+
+    fn details_request() -> ClientRequest {
+        details_request_with(None)
+    }
+
+    /// Pins the *clear* site. Without it every request retires its connection and
+    /// the pool silently degrades to connect-per-request — which no behavioural
+    /// test notices, because the answers stay correct.
+    #[tokio::test]
+    async fn a_completed_request_leaves_the_connection_poolable() {
+        let addr = responding_server().await;
+        let pool = CeleriantPool::new(PoolOptions::new(addr.to_string()));
+        let node = pool.get_or_create_node(&addr.to_string());
+
+        {
+            let mut conn = node.get().await.unwrap();
+            conn.client().send_request(&details_request()).await.expect("mock server answers");
+            assert!(!conn.client().is_stream_dirty(), "a fully read response leaves the stream clean");
+        }
+
+        assert_eq!(
+            node.connections.lock().unwrap().len(),
+            1,
+            "a completed request must leave the connection in the free list"
+        );
+    }
+
+    /// The free list must hand back the same connection, not a fresh one.
+    #[tokio::test]
+    async fn sequential_requests_reuse_one_connection() {
+        let addr = responding_server().await;
+        let pool = CeleriantPool::new(PoolOptions::new(addr.to_string()));
+        let node = pool.get_or_create_node(&addr.to_string());
+
+        for _ in 0..5 {
+            let mut conn = node.get().await.unwrap();
+            conn.client().send_request(&details_request()).await.expect("mock server answers");
+        }
+
+        assert_eq!(
+            node.connections.lock().unwrap().len(),
+            1,
+            "five sequential requests must share one pooled connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_refuses_to_send_on_a_stream_it_knows_is_dirty() {
+        use celeriant_msg::request::requests::AggregateDetailsRequest;
+        use celeriant_wal::aggregate_key::AggregateKey;
+        use futures_util::FutureExt;
+
+        let req = ClientRequest::AggregateDetails(AggregateDetailsRequest {
+            correlation_id: None,
+            aggregate_key: AggregateKey::new(1, 1, 1),
+        });
+        let addr = silent_server().await;
+        let mut client = CeleriantClient::connect(&addr.to_string()).await.unwrap();
+
+        assert!(client.send_request(&req).now_or_never().is_none());
+        assert!(client.is_stream_dirty());
+
+        // `Drop` on the pooled guard is not enough on its own: the pooled
+        // iterators and `pool.get_connection()` hold one lease across many
+        // requests, so the refusal has to happen here too.
+        let second = client.send_request(&req).now_or_never();
+        assert!(
+            matches!(second, Some(Err(ClientError::ProtocolError))),
+            "expected a refusal without touching the socket, got {second:?}"
+        );
+        // The refusal must not clear the flag. A guard that resets on the way out
+        // looks like recovery and hands a still-desynced connection back.
+        assert!(client.is_stream_dirty(), "the refusal cleared the flag; the connection would be pooled");
+    }
+
+    /// A failure that writes zero bytes leaves the stream clean, so the client
+    /// must stay usable. Arming the flag before the size check turned a local
+    /// rejection into a permanent refusal on a pristine connection.
+    #[tokio::test]
+    async fn a_request_rejected_before_it_is_written_leaves_the_client_usable() {
+        use celeriant_msg::request::requests::{SingleAggregateWrite, WriteRequest};
+        use celeriant_wal::aggregate_key::AggregateKey;
+        use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
+
+        let addr = responding_server().await;
+        let mut client = CeleriantClient::connect(&addr.to_string())
+            .await
+            .unwrap()
+            .with_max_request_size(1024);
+        client.send_request(&details_request()).await.expect("baseline request");
+
+        let mut writes = HashMap::new();
+        writes.insert(
+            AggregateKey::new(1, 1, 1),
+            SingleAggregateWrite {
+                events: vec![DatablockAggregateEvent {
+                    client_seq: 0,
+                    event_seq: 0,
+                    event_id: None,
+                    event_timestamp: 0,
+                    event_type_major: 1,
+                    event_type_minor: 0,
+                    event_value: Arc::new(vec![7u8; 8 * 1024]),
+                    iv: None,
+                }],
+                allow_create: true,
+                expected_version: Some(0),
+                enforce_client_idempotency: false,
+            },
+        );
+        let too_big = ClientRequest::Write(WriteRequest {
+            correlation_id: None,
+            client_id: 1,
+            user_id: None,
+            writes,
+        });
+
+        let err = client.send_request(&too_big).await.unwrap_err();
+        assert!(matches!(err, ClientError::WireError(_)), "expected a local size rejection, got {err:?}");
+        assert!(!client.is_stream_dirty(), "zero bytes were written, so the stream is still clean");
+        assert!(
+            client.send_request(&details_request()).await.is_ok(),
+            "a local rejection must not brick the connection"
+        );
+    }
+
+    /// A pooled iterator whose connection is unusable must terminate. Returning
+    /// the same error for ever gives a log-and-continue caller an I/O-free spin.
+    #[tokio::test]
+    async fn a_pooled_iterator_terminates_once_its_connection_is_unusable() {
+        use celeriant_wal::aggregate_key::AggregateKey;
+        use futures_util::FutureExt;
+
+        let addr = silent_server().await;
+        let pool = CeleriantPool::new(PoolOptions::new(addr.to_string()));
+        let node = pool.get_or_create_node(&addr.to_string());
+        let mut conn = node.get().await.unwrap();
+
+        // Cancel one request mid-flight on the lease the iterator will own.
+        assert!(conn.client().send_request(&details_request()).now_or_never().is_none());
+
+        let mut iter = PooledReadAllIterator::new(conn, AggregateKey::new(1, 1, 1), None);
+        assert!(
+            matches!(iter.next().await, Some(Err(ClientError::ProtocolError))),
+            "the first poll must surface the refusal"
+        );
+        assert!(iter.next().await.is_none(), "the iterator must then terminate");
+    }
+
+
+    /// The response-type check's only new behaviour is retiring the connection —
+    /// the `ProtocolError` value itself is already produced by the `_ =>` arms in
+    /// `client_operations`. So the retire half is the half worth pinning.
+    #[tokio::test]
+    async fn a_wrong_variant_response_retires_the_stream() {
+        use celeriant_msg::request::read_filters::ReadFilters;
+        use celeriant_msg::request::requests::ReadRequest;
+        use celeriant_wal::aggregate_key::AggregateKey;
+        use futures_util::FutureExt;
+
+        let (addr, _seen) = correlating_server(Answer::Watch).await;
+        let mut client = CeleriantClient::connect(&addr.to_string()).await.unwrap();
+
+        let first = client
+            .read(ReadRequest {
+                correlation_id: None,
+                aggregate_key: AggregateKey::new(1, 1, 1),
+                filters: ReadFilters::new(0),
+            })
+            .await;
+        assert!(first.is_err(), "a Watch frame cannot answer a Read: {first:?}");
+
+        // A refusal completes in one poll; a real send would park on the read.
+        let second = client.send_request(&details_request()).now_or_never();
+        assert!(
+            matches!(second, Some(Err(ClientError::ProtocolError))),
+            "another request went out on a stream that answered with the wrong variant: {second:?}"
+        );
+    }
+
+    /// `CorrelationMismatch` is in `leaves_connection_dirty` so one mismatch ends
+    /// the iteration. Without it the iterator needs a second round trip through
+    /// the dirty-stream refusal to work out that it is finished.
+    #[tokio::test]
+    async fn a_pooled_iterator_terminates_on_the_first_correlation_mismatch() {
+        use celeriant_wal::aggregate_key::AggregateKey;
+
+        let (addr, _seen) = correlating_server(Answer::WrongIdRead).await;
+        let pool = CeleriantPool::new(PoolOptions::new(addr.to_string()));
+        let mut iter = pool.read_all(AggregateKey::new(1, 1, 1), None).await.unwrap();
+
+        assert!(
+            matches!(iter.next().await, Some(Err(ClientError::CorrelationMismatch { .. }))),
+            "the first page must surface the mismatch"
+        );
+        assert!(
+            iter.next().await.is_none(),
+            "the iterator must terminate on the mismatch, not spin through a second error"
+        );
+    }
+
+    /// `send_request` short-circuits its fill when an id is already present, so
+    /// only the typed helpers actually exercise `set_correlation_id_if_absent`
+    /// against a supplied value — which is the path `celeriant_cli
+    /// --correlation-id` depends on.
+    #[tokio::test]
+    async fn a_typed_helper_never_rewrites_a_caller_supplied_correlation_id() {
+        use celeriant_msg::request::requests::AggregateDetailsRequest;
+        use celeriant_wal::aggregate_key::AggregateKey;
+        const SUPPLIED: u128 = 0xC0FF_EE00_1234_5678;
+
+        let (addr, seen) = correlating_server(Answer::Echo).await;
+        let mut client = CeleriantClient::connect(&addr.to_string()).await.unwrap();
+
+        client
+            .aggregate_details(AggregateDetailsRequest {
+                correlation_id: Some(SUPPLIED),
+                aggregate_key: AggregateKey::new(1, 1, 1),
+            })
+            .await
+            .expect("echoing server answers");
+
+        assert_eq!(
+            seen.recv_timeout(std::time::Duration::from_secs(5)).expect("server saw the request"),
+            Some(SUPPLIED),
+            "the caller's own id was clobbered on the wire"
+        );
+    }
 
     #[test]
     fn pool_dict_cache_insert_and_lookup() {
@@ -1824,5 +2289,210 @@ mod tests {
             assert!(addrs[0] == "b:1" || addrs[0] == "c:1", "got {addrs:?}");
             assert_eq!(addrs.last().map(String::as_str), Some("p:1"));
         }
+    }
+
+    #[test]
+    fn a_timed_out_or_broken_connection_is_never_returned_to_the_free_list() {
+        // The phase-5 cardinality_pressure failure: `read_all` timed out on a
+        // cold read, the desynchronised connection went back into the FIFO
+        // free list, and the next task read the late response as its own reply.
+        // A 99.2% error rate over 12,000 reads followed.
+        for e in [
+            ClientError::RequestTimeout,
+            ClientError::ConnectionTimeout,
+            ClientError::ProtocolError,
+            ClientError::ConnectionFailed(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+        ] {
+            assert!(leaves_connection_dirty(&e), "{e} must retire the connection");
+        }
+
+        // A server error response was read off the wire in full. Retiring the
+        // connection for it would churn the pool on ordinary rejections.
+        assert!(!leaves_connection_dirty(&ClientError::ServerBusy));
+        assert!(!leaves_connection_dirty(&ClientError::IdentityRequired));
+        assert!(!leaves_connection_dirty(&ClientError::NotLeader {
+            leader_address: None,
+            error_message: String::new(),
+        }));
+    }
+
+    #[test]
+    fn checkout_never_returns_a_connection_past_its_idle_timeout() {
+        const IDLE: Duration = Duration::from_secs(25);
+        let aged = |secs: u64| Instant::now() - Duration::from_secs(secs);
+
+        // Named by what each row proves, so a failure says which rule broke.
+        // The second `pop_front` in `NodePool::get` — the one taken after
+        // queueing on the connect semaphore — used to skip the age check
+        // entirely, which is row "all stale".
+        let cases: [(&str, Vec<(u32, Instant)>, Option<u32>); 5] = [
+            ("empty", vec![], None),
+            ("all fresh", vec![(1, aged(1)), (2, aged(2))], Some(1)),
+            ("all stale", vec![(1, aged(30)), (2, aged(26))], None),
+            ("stale prefix", vec![(1, aged(30)), (2, aged(1))], Some(2)),
+            // The list is return-ordered, so `idle_timeout` exactly reached is
+            // stale: the server's own close is only 5s behind it.
+            ("boundary", vec![(1, aged(25)), (2, aged(1))], Some(2)),
+        ];
+
+        for (name, entries, expected) in cases {
+            let mut q: VecDeque<(u32, Instant)> = entries.into_iter().collect();
+            assert_eq!(pop_fresh_from(&mut q, IDLE), expected, "{name}");
+            assert!(
+                q.iter().all(|(_, ts)| ts.elapsed() < IDLE),
+                "{name}: a stale entry survived in the free list"
+            );
+        }
+    }
+
+    // Blind-oracle correlation-id tests (contract authored unseen).
+    //
+    // Nothing but stream ordering binds a response to its request. When that
+    // ordering slips, the client hands back a plausible answer that belongs to
+    // someone else. These pin the second line of defence: every response must
+    // be checked against the id of the request that was actually sent.
+
+    const RECV: Duration = Duration::from_secs(5);
+
+    /// Both halves of the fill rule. `None` must be filled, because otherwise
+    /// nothing binds the response. A supplied id is an application tag —
+    /// `celeriant_cli --correlation-id` prints it back — so it must survive
+    /// the transport byte for byte.
+    #[tokio::test]
+    async fn the_transport_fills_a_missing_correlation_id_and_never_rewrites_a_supplied_one() {
+        const SUPPLIED: u128 = 0xC0FF_EE00_1234_5678;
+
+        let (addr, seen) = correlating_server(Answer::Echo).await;
+        let mut client = CeleriantClient::connect(&addr.to_string()).await.unwrap();
+
+        client.send_request(&details_request_with(None)).await.expect("echoing server answers");
+        let filled = seen.recv_timeout(RECV).expect("server saw the first request");
+        assert!(
+            filled.is_some(),
+            "the request went out with no correlation id, so nothing binds its response to it"
+        );
+
+        client.send_request(&details_request_with(Some(SUPPLIED))).await.expect("echoing server answers");
+        assert_eq!(
+            seen.recv_timeout(RECV).expect("server saw the second request"),
+            Some(SUPPLIED),
+            "the caller's own id was clobbered on the wire"
+        );
+    }
+
+    /// A constant filler would satisfy every echo check and bind nothing: the
+    /// stale frame from the *previous* request carries the same id.
+    #[tokio::test]
+    async fn each_filled_correlation_id_is_distinct() {
+        let (addr, seen) = correlating_server(Answer::Echo).await;
+        let mut client = CeleriantClient::connect(&addr.to_string()).await.unwrap();
+
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..5 {
+            client.send_request(&details_request()).await.expect("echoing server answers");
+            ids.insert(seen.recv_timeout(RECV).expect("server saw the request"));
+        }
+
+        assert_eq!(ids.len(), 5, "filled ids repeat, so a stale frame still matches: {ids:?}");
+    }
+
+    /// The production case. A frame answering somebody else's request must
+    /// never be returned as this request's answer.
+    #[tokio::test]
+    async fn a_response_carrying_another_requests_correlation_id_is_an_error() {
+        let (addr, _seen) = correlating_server(Answer::WrongId).await;
+        let mut client = CeleriantClient::connect(&addr.to_string()).await.unwrap();
+
+        let result = client.send_request(&details_request()).await;
+
+        assert!(
+            result.is_err(),
+            "someone else's response was handed back as this request's answer: {result:?}"
+        );
+    }
+
+    /// The check has to run *ahead of* the point where an error frame becomes a
+    /// Rust `Err`. A stale rejection reported as this caller's rejection is the
+    /// exact production symptom, and it is indistinguishable from a real one.
+    #[tokio::test]
+    async fn a_stale_error_frame_is_not_reported_as_this_requests_rejection() {
+        let (addr, _seen) = correlating_server(Answer::WrongIdError).await;
+        let mut client = CeleriantClient::connect(&addr.to_string()).await.unwrap();
+
+        let err = client.send_request(&details_request()).await.expect_err("never Ok");
+
+        assert!(
+            !matches!(
+                err,
+                ClientError::ServerBusy
+                    | ClientError::IdentityRequired
+                    | ClientError::NotLeader { .. }
+                    | ClientError::Server(_)
+            ),
+            "an error frame belonging to a different request was decoded as this one's: {err:?}"
+        );
+    }
+
+    /// Detecting the desync and then pooling the connection anyway is strictly
+    /// worse than not detecting it: the next borrower reads the leftover frame.
+    #[tokio::test]
+    async fn a_correlation_mismatch_retires_the_connection() {
+        use futures_util::FutureExt;
+
+        let (addr, _seen) = correlating_server(Answer::WrongId).await;
+        let pool = CeleriantPool::new(PoolOptions::new(addr.to_string()));
+        let node = pool.get_or_create_node(&addr.to_string());
+
+        {
+            let mut conn = node.get().await.unwrap();
+            let result = conn.client().send_request(&details_request()).await;
+            assert!(result.is_err(), "the mismatch must surface as an error: {result:?}");
+
+            // A local refusal completes in one poll; a real send parks on the
+            // response read. So `Some(Err(_))` is the only outcome that proves
+            // nothing else went out on a stream we no longer trust.
+            let second = conn.client().send_request(&details_request()).now_or_never();
+            assert!(
+                matches!(second, Some(Err(_))),
+                "another request went out on a desynchronised stream: {second:?}"
+            );
+        }
+
+        assert_eq!(
+            node.connections.lock().unwrap().len(),
+            0,
+            "a connection that answered with the wrong correlation id must never be pooled"
+        );
+    }
+
+    /// `WatchResponse` carries no correlation id and never will, so the check
+    /// must let it through — while the request itself still carries one.
+    #[tokio::test]
+    async fn a_watch_request_works_though_its_response_carries_no_correlation_id() {
+        use celeriant_msg::process_client_responses::ClientResponse;
+        use celeriant_msg::request::requests::WatchRequest;
+
+        let (addr, seen) = correlating_server(Answer::Watch).await;
+        let mut client = CeleriantClient::connect(&addr.to_string()).await.unwrap();
+
+        let request = ClientRequest::Watch(WatchRequest {
+            correlation_id: None,
+            requested_latency_ms: None,
+            shard_id: None,
+            orgs: None,
+            aggregate_types: None,
+            aggregates: None,
+            operation_types: None,
+        });
+        let response = client.send_request(&request).await;
+
+        assert!(
+            matches!(response, Ok(ClientResponse::Watch(_))),
+            "an id-less Watch response must still be delivered: {response:?}"
+        );
+        assert!(
+            seen.recv_timeout(RECV).expect("server saw the watch request").is_some(),
+            "a Watch request must still carry a filled correlation id"
+        );
     }
 }

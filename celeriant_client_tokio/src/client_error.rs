@@ -11,6 +11,8 @@ pub enum ClientError {
     WireError(WireError),
     ReadError(ReadWireDataError),
     ProtocolError,
+    /// A response arrived bearing a different correlation id than the request that was sent
+    CorrelationMismatch { sent: Option<u128>, received: Option<u128> },
     /// Node is not the leader for this shard — writes must go to the leader.
     /// `leader_address` is provided when the follower knows who the current leader is.
     NotLeader { leader_address: Option<String>, error_message: String },
@@ -50,6 +52,10 @@ impl std::fmt::Display for ClientError {
             ClientError::WireError(e) => write!(f, "Wire error: {:?}", e),
             ClientError::ReadError(e) => write!(f, "Read error: {:?}", e),
             ClientError::ProtocolError => write!(f, "Protocol error"),
+            ClientError::CorrelationMismatch { sent, received } => write!(
+                f,
+                "Correlation id mismatch: sent {sent:?}, received {received:?} — the connection returned another request's response"
+            ),
             ClientError::NotLeader { leader_address: Some(addr), .. } => write!(f, "Not leader, redirect to {}", addr),
             ClientError::NotLeader { leader_address: None, .. } => write!(f, "Not leader, leader address unknown"),
             ClientError::Server(e) => write!(f, "{}", e),

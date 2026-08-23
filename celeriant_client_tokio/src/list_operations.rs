@@ -117,7 +117,7 @@ impl<'a> ListOrgsIterator<'a> {
             cursor,
         });
 
-        match self.client.send_request(&request).await {
+        match self.client.send_owned(request).await {
             Ok(ClientResponse::ListOrgs(response)) => {
                 self.buffer.extend(response.orgs);
 
@@ -256,7 +256,7 @@ impl<'a> ListAggregateTypesIterator<'a> {
             cursor,
         });
 
-        match self.client.send_request(&request).await {
+        match self.client.send_owned(request).await {
             Ok(ClientResponse::ListAggregateTypes(response)) => {
                 self.buffer.extend(response.aggregate_types);
 
@@ -512,7 +512,7 @@ impl<'a> ListAggregatesIterator<'a> {
             cursor,
         });
 
-        match self.client.send_request(&request).await {
+        match self.client.send_owned(request).await {
             Ok(ClientResponse::ListAggregates(response)) => {
                 self.buffer.extend(response.aggregates);
 

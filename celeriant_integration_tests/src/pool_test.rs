@@ -9,9 +9,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use celeriant_client_tokio::{
-    CeleriantPool, PoolOptions,
+    CeleriantPool, ClientError, PoolOptions,
     list_operations::ListOptions,
 };
+use futures::FutureExt;
 use crate::TestServer;
 use celeriant_msg::request::{
     read_filters::ReadFilters,
@@ -46,8 +47,14 @@ fn pass(name: &str) {
     println!("  PASS: {}", name);
 }
 
+/// Every `fail()` is counted so `run()` can exit non-zero. The runner decides
+/// pass/fail purely on child exit status, so a printed FAIL that does not reach
+/// here is a test that cannot go red.
+static FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn fail(name: &str, err: impl std::fmt::Debug) {
     println!("  FAIL: {} -- {:?}", name, err);
+    FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 // ─── Test 1: pool.write() ─────────────────────────────────────────────────────
@@ -344,6 +351,220 @@ async fn test_pool_list_aggregates(pool: &CeleriantPool) {
     }
 }
 
+// ─── Cancellation Safety ──────────────────────────────────────────────────────
+//
+// A request future dropped after its bytes are written but before its response
+// frame is read leaves an undrained frame on the socket. Contract: a connection
+// whose request/response exchange did not complete must never be reused, so the
+// next borrower can never receive the cancelled request's answer.
+//
+// Cancellation is modelled with a single synchronous poll, not a wall-clock
+// timeout: one poll drives the client through write_frame and parks it on the
+// response read, and no server can round-trip inside that poll.
+
+/// Writes `versions` single-event batches so the aggregate ends up at
+/// `max_aggregate_version == versions`.
+async fn seed_versions(
+    pool: &CeleriantPool,
+    agg: &AggregateKey,
+    versions: u64,
+) -> Result<(), ClientError> {
+    use celeriant_client_tokio::WriteEventsOptions;
+    for i in 0..versions {
+        let opts = WriteEventsOptions {
+            allow_create: i == 0,
+            expected_version: Some(i),
+            enforce_client_idempotency: false,
+        };
+        let events = vec![make_event(i, "cancellation seed")];
+        pool.write_events_with(agg.clone(), events, 2, opts).await?;
+    }
+    Ok(())
+}
+
+fn details_req(agg: &AggregateKey) -> AggregateDetailsRequest {
+    AggregateDetailsRequest { correlation_id: None, aggregate_key: agg.clone() }
+}
+
+/// Polls an `aggregate_details` for `agg` exactly once on a pooled lease, then
+/// drops the lease. Returns false if the caller's assertion would be vacuous:
+/// either the poll resolved (nothing was cancelled) or the request never
+/// actually reached the socket.
+async fn cancel_after_one_poll(pool: &CeleriantPool, agg: &AggregateKey) -> Result<(), String> {
+    let mut conn = pool.get_connection().await.map_err(|e| format!("no lease: {e:?}"))?;
+    if conn.client().aggregate_details(details_req(agg)).now_or_never().is_some() {
+        return Err("request resolved inside one poll -- nothing was cancelled".into());
+    }
+    // The client refuses to write on a stream it knows is one frame behind, so
+    // this Err is proof the request went out and was abandoned mid-flight —
+    // without it, a poll that parked before writing would pass silently.
+    match conn.client().aggregate_details(details_req(agg)).await {
+        Err(ClientError::ProtocolError) => Ok(()),
+        other => Err(format!(
+            "the cancelled request never reached the socket -- reuse gave {other:?}"
+        )),
+    }
+}
+
+// ─── Test 15: a cancelled request must not leak its response to the next borrower ───
+
+async fn test_cancelled_request_does_not_leak_response(address: &str) {
+    let name = "cancelled request -- next borrower gets its own response";
+    let pool = CeleriantPool::new(PoolOptions::new(address).with_max_connections(1));
+
+    let cancelled_agg = AggregateKey::new(21, 1, 3001);
+    let next_agg = AggregateKey::new(21, 1, 3002);
+    if let Err(e) = seed_versions(&pool, &cancelled_agg, 5).await {
+        fail(name, e);
+        return;
+    }
+    if let Err(e) = seed_versions(&pool, &next_agg, 1).await {
+        fail(name, e);
+        return;
+    }
+
+    // Warm the pool: a completed request leaves a connection in the free list so
+    // the single poll below starts at write_frame, not at connect.
+    if let Err(e) = pool.aggregate_details(details_req(&cancelled_agg)).await {
+        fail(name, e);
+        return;
+    }
+
+    if let Err(why) = cancel_after_one_poll(&pool, &cancelled_agg).await {
+        fail(name, why);
+        return;
+    }
+
+    match pool.aggregate_details(details_req(&next_agg)).await {
+        Ok(d) if d.max_aggregate_version == 1 => pass(name),
+        Ok(d) => fail(
+            name,
+            format!(
+                "asked for aggregate 3002 (version 1), got version {} -- the cancelled request's aggregate 3001 is version 5",
+                d.max_aggregate_version
+            ),
+        ),
+        Err(e) => fail(name, e),
+    }
+}
+
+// ─── Test 16: the pool keeps working after a cancellation ────────────────────
+
+async fn test_pool_usable_after_cancellation(address: &str) {
+    let name = "pool serves correct responses to every borrower after a cancellation";
+    let pool = CeleriantPool::new(PoolOptions::new(address).with_max_connections(1));
+
+    let cancelled_agg = AggregateKey::new(21, 1, 3010);
+    let expected: [(AggregateKey, u64); 4] = [
+        (AggregateKey::new(21, 1, 3011), 1),
+        (AggregateKey::new(21, 1, 3012), 2),
+        (AggregateKey::new(21, 1, 3013), 3),
+        (AggregateKey::new(21, 1, 3014), 4),
+    ];
+
+    if let Err(e) = seed_versions(&pool, &cancelled_agg, 9).await {
+        fail(name, e);
+        return;
+    }
+    for (agg, versions) in &expected {
+        if let Err(e) = seed_versions(&pool, agg, *versions).await {
+            fail(name, e);
+            return;
+        }
+    }
+
+    if let Err(e) = pool.aggregate_details(details_req(&cancelled_agg)).await {
+        fail(name, e);
+        return;
+    }
+
+    if let Err(why) = cancel_after_one_poll(&pool, &cancelled_agg).await {
+        fail(name, why);
+        return;
+    }
+
+    // The bug cascades: every borrower after the first inherits the offset.
+    for (agg, versions) in &expected {
+        match pool.aggregate_details(details_req(agg)).await {
+            Ok(d) if d.max_aggregate_version == *versions => {}
+            Ok(d) => {
+                fail(
+                    name,
+                    format!(
+                        "asked for aggregate {} (version {}), got version {}",
+                        agg.aggregate_id, versions, d.max_aggregate_version
+                    ),
+                );
+                return;
+            }
+            Err(e) => {
+                fail(name, e);
+                return;
+            }
+        }
+    }
+    pass(name);
+}
+
+// ─── Test 17: a cancelled request must not crosstalk within its own lease ────
+//
+// `PooledConnection::drop` is not enough on its own. `PooledReadAllIterator` and
+// the pooled list iterators own one lease across an entire pagination, so a
+// cancellation there is never seen by the drop guard.
+
+async fn test_same_lease_reuse_after_cancellation(address: &str) {
+    let name = "same-lease reuse after cancellation";
+    let pool = CeleriantPool::new(PoolOptions::new(address).with_max_connections(1));
+
+    let cancelled_agg = AggregateKey::new(21, 1, 3101);
+    let next_agg = AggregateKey::new(21, 1, 3102);
+    if let Err(e) = seed_versions(&pool, &cancelled_agg, 7).await {
+        fail(name, e);
+        return;
+    }
+    if let Err(e) = seed_versions(&pool, &next_agg, 1).await {
+        fail(name, e);
+        return;
+    }
+
+    let mut conn = match pool.get_connection().await {
+        Ok(c) => c,
+        Err(e) => { fail(name, e); return; }
+    };
+    if let Err(e) = conn.client().aggregate_details(details_req(&cancelled_agg)).await {
+        fail(name, e);
+        return;
+    }
+
+    let polled = conn.client().aggregate_details(details_req(&cancelled_agg)).now_or_never();
+    if polled.is_some() {
+        fail(name, "request resolved inside one poll -- nothing was cancelled");
+        return;
+    }
+
+    // A refusal, not an answer. Answering at all means reading 3101's response.
+    // Twice: a guard that clears the flag on its way out would answer the first
+    // refusal and then silently crosstalk on the second.
+    if !matches!(
+        conn.client().aggregate_details(details_req(&next_agg)).await,
+        Err(ClientError::ProtocolError)
+    ) {
+        fail(name, "first reuse after cancellation was not refused");
+        return;
+    }
+    match conn.client().aggregate_details(details_req(&next_agg)).await {
+        Err(ClientError::ProtocolError) => pass(name),
+        Ok(d) => fail(
+            name,
+            format!(
+                "same-lease crosstalk: asked for 3102 (version 1), got version {} -- 3101 is version 7",
+                d.max_aggregate_version
+            ),
+        ),
+        Err(e) => fail(name, format!("expected ProtocolError, got {:?}", e)),
+    }
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 
@@ -379,6 +600,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     test_pool_list_orgs(&pool).await;
     test_pool_list_aggregate_types(&pool).await;
     test_pool_list_aggregates(&pool).await;
+
+    println!("\n--- Cancellation Safety ---");
+    test_cancelled_request_does_not_leak_response(server.address()).await;
+    test_pool_usable_after_cancellation(server.address()).await;
+    test_same_lease_reuse_after_cancellation(server.address()).await;
+
+
+    let failures = FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+    if failures > 0 {
+        println!("\n=== {} test(s) FAILED ===", failures);
+        return Err(format!("{} pool test(s) failed", failures).into());
+    }
 
     println!("\n=== All tests completed ===");
     Ok(())

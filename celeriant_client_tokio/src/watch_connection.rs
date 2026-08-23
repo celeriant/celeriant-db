@@ -35,17 +35,59 @@ impl Default for WatchOptions {
     }
 }
 
+struct CountingRead<'a, R> {
+    inner: &'a mut R,
+    consumed: &'a std::sync::atomic::AtomicUsize,
+}
+
+impl<R: futures_util::io::AsyncRead + Unpin> futures_util::io::AsyncRead for CountingRead<'_, R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let me = self.get_mut();
+        let polled = std::pin::Pin::new(&mut *me.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &polled {
+            me.consumed.fetch_add(*n, std::sync::atomic::Ordering::Relaxed);
+        }
+        polled
+    }
+}
+
 struct ShardStream {
     stream: crate::celeriant_client::ClientStream,
     max_request_size: u64,
     current_dict: Option<CachedDict>,
+    partial_frame_bytes: std::sync::atomic::AtomicUsize,
 }
 
 impl ShardStream {
     async fn read_next(&mut self) -> Result<WatchResponse, ClientError> {
-        let dict = self.current_dict.as_ref().map(|d| d.bytes.as_ref());
-        let response = crate::tokio_wire::read_response(&mut self.stream, self.max_request_size, dict).await?;
-        match response {
+        let ShardStream { stream, max_request_size, current_dict, partial_frame_bytes } = self;
+        if partial_frame_bytes.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            return Err(ClientError::ProtocolError);
+        }
+        let dict = current_dict.as_ref().map(|d| d.bytes.as_ref());
+        let response = {
+            let mut counting = CountingRead { inner: stream, consumed: partial_frame_bytes };
+            let header = celeriant_wire::network::wire_header::WireHeader::from_reader(
+                &mut counting,
+                *max_request_size,
+            )
+            .await
+            .map_err(celeriant_msg::read_wire_data_error::ReadWireDataError::ReadHeaderFailure);
+            match header {
+                Err(e) => Err(e),
+                Ok(header) => {
+                    crate::tokio_wire::read_from_header_with(header, &mut counting, dict, || {
+                        partial_frame_bytes.store(0, std::sync::atomic::Ordering::Relaxed)
+                    })
+                    .await
+                }
+            }
+        };
+        match response? {
             ClientResponse::Watch(watch_resp) => Ok(watch_resp),
             ClientResponse::ProtocolError(_) => Err(ClientError::ProtocolError),
             ClientResponse::GenericError(error) => Err(ClientError::from_error_response(error)),
@@ -57,6 +99,7 @@ impl ShardStream {
 /// Watch connection that handles single-shard and multi-shard watches transparently
 pub struct WatchConnection {
     mode: WatchMode,
+    address: String,
 }
 
 enum WatchMode {
@@ -67,6 +110,16 @@ enum WatchMode {
 struct MultiShardState {
     receiver: tokio::sync::mpsc::UnboundedReceiver<Result<WatchResponse, ClientError>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    poisoned: bool,
+}
+
+impl MultiShardState {
+    fn poison(&mut self) {
+        self.poisoned = true;
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
 }
 
 impl Drop for MultiShardState {
@@ -157,7 +210,7 @@ fn spawn_shard_readers(streams: Vec<ShardStream>) -> MultiShardState {
     }
     drop(tx);
 
-    MultiShardState { receiver, tasks }
+    MultiShardState { receiver, tasks, poisoned: false }
 }
 
 impl WatchConnection {
@@ -228,13 +281,15 @@ impl WatchConnection {
         let response = crate::tokio_wire::read_response(&mut stream, max_request_size, current_dict.as_ref().map(|d| d.bytes.as_ref())).await?;
 
         match response {
-            ClientResponse::Watch(_) => Ok(Self {
-                mode: WatchMode::SingleShard(ShardStream {
+            ClientResponse::Watch(_) => Ok(Self::new(
+                WatchMode::SingleShard(ShardStream {
                     stream,
                     max_request_size,
                     current_dict,
+                    partial_frame_bytes: std::sync::atomic::AtomicUsize::new(0),
                 }),
-            }),
+                address,
+            )),
             ClientResponse::GenericError(error)
                 if error.error_code == error_codes::SHARD_ROUTING_MULTIPLE_SHARDS
                     || error.error_code == error_codes::SHARD_ROUTING_INCOMPATIBLE_FILTERS =>
@@ -266,6 +321,7 @@ impl WatchConnection {
                     stream,
                     max_request_size,
                     current_dict,
+                    partial_frame_bytes: std::sync::atomic::AtomicUsize::new(0),
                 };
 
                 // Open connections for shards 1..N-1 in parallel
@@ -288,9 +344,10 @@ impl WatchConnection {
                     all_streams.push(result?);
                 }
 
-                Ok(Self {
-                    mode: WatchMode::MultiShard(spawn_shard_readers(all_streams)),
-                })
+                Ok(Self::new(
+                    WatchMode::MultiShard(spawn_shard_readers(all_streams)),
+                    address,
+                ))
             }
             ClientResponse::GenericError(error) => Err(ClientError::from_error_response(error)),
             ClientResponse::ProtocolError(_) => Err(ClientError::ProtocolError),
@@ -298,15 +355,43 @@ impl WatchConnection {
         }
     }
 
+    fn new(mode: WatchMode, address: &str) -> Self {
+        Self { mode, address: address.to_string() }
+    }
+
+    /// The node this subscription is attached to.
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
     /// Read the next response from the watch stream
     pub async fn next(&mut self) -> Result<WatchResponse, ClientError> {
         match &mut self.mode {
             WatchMode::SingleShard(stream) => stream.read_next().await,
-            WatchMode::MultiShard(state) => state
-                .receiver
-                .recv()
-                .await
-                .ok_or(ClientError::ProtocolError)?,
+            WatchMode::MultiShard(state) => {
+                if state.poisoned {
+                    return Err(ClientError::ProtocolError);
+                }
+                match state.receiver.recv().await {
+                    Some(Ok(response)) => Ok(response),
+                    Some(Err(e)) => {
+                        state.poison();
+                        Err(e)
+                    }
+                    None => {
+                        state.poison();
+                        Err(ClientError::ProtocolError)
+                    }
+                }
+            }
+        }
+    }
+
+    /// True when a read was abandoned part-way through a frame, leaving the stream mid-message
+    pub fn is_desynchronised(&self) -> bool {
+        match &self.mode {
+            WatchMode::SingleShard(stream) => stream.partial_frame_bytes.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            WatchMode::MultiShard(_) => false,
         }
     }
 
@@ -363,6 +448,7 @@ impl WatchConnection {
                 stream,
                 max_request_size,
                 current_dict,
+                partial_frame_bytes: std::sync::atomic::AtomicUsize::new(0),
             }),
             ClientResponse::GenericError(error) => Err(ClientError::from_error_response(error)),
             _ => Err(ClientError::ProtocolError),
@@ -400,9 +486,10 @@ impl WatchConnection {
             streams.push(result?);
         }
 
-        Ok(Self {
-            mode: WatchMode::MultiShard(spawn_shard_readers(streams)),
-        })
+        Ok(Self::new(
+            WatchMode::MultiShard(spawn_shard_readers(streams)),
+            address,
+        ))
     }
 
     fn parse_num_shards(error_message: &str) -> Result<u64, ClientError> {
@@ -503,6 +590,266 @@ mod tests {
                 assert_eq!(parsed.events.len(), expected.events.len());
             }
             other => panic!("expected Watch, got {:?}", other.response_type()),
+        }
+    }
+
+    // ---- Cancellation of a watch read ----
+    //
+    // `next_timeout` is `timeout(duration, self.next())`. When the deadline
+    // lands inside a partially-read frame the bytes already consumed are gone,
+    // and `Ok(None)` reports "nothing arrived" for a stream that is now offset.
+
+    use crate::watch_connection::{WatchConnection, WatchOptions};
+    use celeriant_msg::request::requests::WatchRequest;
+    use std::time::Duration;
+
+    const WATCH_MAX: u64 = 10_000_000;
+
+    /// Uncompressed, because the test connection carries no identity and so has
+    /// no dict to decompress with.
+    fn watch_frame(response: &WatchResponse) -> Vec<u8> {
+        let codec = test_codec();
+        futures_lite::future::block_on(async {
+            let mut buf = Vec::new();
+            ClientResponse::write_response(
+                &mut buf,
+                &ClientResponse::Watch(response.clone()),
+                false,
+                &codec,
+                64 * 1024 * 1024,
+                PROTOCOL_VERSION_V2,
+            )
+            .await
+            .expect("write_response");
+            buf
+        })
+    }
+
+    fn watch_events(count: u64) -> WatchResponse {
+        WatchResponse {
+            events: (0..count)
+                .map(|i| WatchResponseEvent {
+                    org_id: i as u128,
+                    aggregate_type_id: 1,
+                    aggregate_id: i as u128,
+                    operation: 1,
+                    from_aggregate_version: Some(i),
+                    to_aggregate_version: Some(i + 1),
+                    keep_from_aggregate_version: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn watch_request() -> WatchRequest {
+        WatchRequest {
+            correlation_id: None,
+            requested_latency_ms: None,
+            shard_id: None,
+            orgs: None,
+            aggregate_types: None,
+            aggregates: None,
+            operation_types: None,
+        }
+    }
+
+    /// A watch peer that hands the test byte-level control of the push stream.
+    /// Everything after the connect handshake comes from the channel, so a
+    /// frame can be cut anywhere and left unfinished for as long as the test
+    /// likes.
+    async fn scripted_watch_server() -> (std::net::SocketAddr, tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
+        use celeriant_wire::network::wire_header::WireHeader;
+        use futures_lite::{AsyncReadExt, AsyncWriteExt};
+        use tokio_util::compat::TokioAsyncReadCompatExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (script, mut pending) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let ack = watch_frame(&WatchResponse { events: Vec::new() });
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = socket.compat();
+            // Drain the client's WatchRequest and acknowledge it, which is all
+            // `connect` needs to settle on the single-shard path.
+            let header = WireHeader::from_reader(&mut stream, WATCH_MAX).await.unwrap();
+            let mut body = vec![0u8; header.compressed_length as usize];
+            stream.read_exact(&mut body).await.unwrap();
+            stream.write_all(&ack).await.unwrap();
+            stream.flush().await.unwrap();
+            while let Some(bytes) = pending.recv().await {
+                if stream.write_all(&bytes).await.is_err() || stream.flush().await.is_err() {
+                    return;
+                }
+            }
+        });
+        (addr, script)
+    }
+
+    #[tokio::test]
+    async fn a_watch_read_cancelled_mid_frame_must_not_hand_back_the_next_frame() {
+        let (addr, wire) = scripted_watch_server().await;
+        let mut watch = WatchConnection::connect(&addr.to_string(), watch_request(), WatchOptions::default())
+            .await
+            .expect("the scripted peer completes the watch handshake");
+
+        let split = watch_frame(&watch_events(4000));
+        let marker = watch_frame(&watch_events(3));
+        assert!(
+            split.len() > WIRE_HEADER_SIZE + 64 + marker.len(),
+            "the split frame must stay outstanding by more than everything sent after it"
+        );
+
+        // A whole header and 64 body bytes, then silence. Nothing further is
+        // ever sent for this frame, so the read below parks having consumed
+        // exactly those bytes: the deadline decides when the cancel happens,
+        // never what was consumed by then.
+        wire.send(split[..WIRE_HEADER_SIZE + 64].to_vec()).unwrap();
+
+        assert!(
+            matches!(watch.next_timeout(Duration::from_millis(300)).await, Ok(None)),
+            "a deadline that expires with no complete frame must report that nothing arrived"
+        );
+
+        // The remainder of the split frame is abandoned. What follows is a
+        // complete, valid frame beginning exactly where the cancelled read
+        // stopped, so the desync never announces itself as a bad header.
+        wire.send(marker).unwrap();
+
+        match watch.next_timeout(Duration::from_secs(5)).await {
+            Err(_) => {}
+            Ok(None) => panic!(
+                "test premise not met: the timed-out read consumed nothing, so no frame was split"
+            ),
+            Ok(Some(response)) => panic!(
+                "a stream desynchronised by a cancelled read returned {} events as if they were \
+                 the next ones on the watch",
+                response.events.len()
+            ),
+        }
+    }
+
+    use super::{MultiShardState, WatchMode};
+
+    /// The address is how a caller notices its subscription moved node — a watch
+    /// that moved restarted from the new node's tip and may have missed
+    /// notifications in between.
+    #[test]
+    fn the_connected_address_is_reported() {
+        let w = WatchConnection::new(
+            WatchMode::MultiShard(MultiShardState {
+                receiver: tokio::sync::mpsc::unbounded_channel().1,
+                tasks: Vec::new(),
+                poisoned: false,
+            }),
+            "10.0.0.1:12000",
+        );
+        assert_eq!(w.address(), "10.0.0.1:12000");
+    }
+
+    /// One shard reader dying must kill the whole watch. Without this, events
+    /// from the surviving shards keep flowing after the error and a caller that
+    /// treats it as transient reads on, silently blind to one shard.
+    #[tokio::test]
+    async fn a_multi_shard_watch_is_poisoned_by_the_first_shard_error() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut w = WatchConnection::new(
+            WatchMode::MultiShard(MultiShardState { receiver: rx, tasks: Vec::new(), poisoned: false }),
+            "10.0.0.1:12000",
+        );
+        tx.send(Ok(watch_events(1))).unwrap();
+        tx.send(Err(crate::client_error::ClientError::ProtocolError)).unwrap();
+        // A healthy shard's event, already queued behind the failure.
+        tx.send(Ok(watch_events(2))).unwrap();
+
+        assert!(w.next().await.is_ok(), "events received before the failure are genuine");
+        assert!(w.next().await.is_err(), "the shard failure must surface");
+        assert!(
+            w.next().await.is_err(),
+            "the queued healthy event must not be delivered: the watch is half-blind and must stay dead"
+        );
+    }
+
+    /// `is_desynchronised()` is the only way a caller can ask, since
+    /// `next_timeout` deliberately keeps returning `Ok(None)` on a mid-frame
+    /// cancel. A version that always answered `false` would pass every other
+    /// test in this file.
+    #[tokio::test]
+    async fn is_desynchronised_reports_the_mid_frame_cancel_it_exists_for() {
+        let (addr, wire) = scripted_watch_server().await;
+        let mut watch = WatchConnection::connect(&addr.to_string(), watch_request(), WatchOptions::default())
+            .await
+            .expect("the scripted peer completes the watch handshake");
+        assert!(!watch.is_desynchronised(), "a fresh watch is on a message boundary");
+
+        let split = watch_frame(&watch_events(4000));
+        wire.send(split[..WIRE_HEADER_SIZE + 64].to_vec()).unwrap();
+        assert!(
+            matches!(watch.next_timeout(Duration::from_millis(300)).await, Ok(None)),
+            "test premise: the deadline must expire with the frame incomplete"
+        );
+
+        assert!(
+            watch.is_desynchronised(),
+            "the read stopped part-way through a frame and nothing else reports it"
+        );
+    }
+
+    /// Decompression and deserialisation happen after the frame is off the
+    /// socket, so failing there leaves the reader on a message boundary. Arming
+    /// the counter on those errors refuses a connection that is perfectly
+    /// usable — the same shape as arming the pooled client's dirty flag on a
+    /// zero-byte local failure.
+    #[tokio::test]
+    async fn a_decode_error_on_a_fully_consumed_frame_leaves_the_watch_usable() {
+        let (addr, wire) = scripted_watch_server().await;
+        let mut watch = WatchConnection::connect(&addr.to_string(), watch_request(), WatchOptions::default())
+            .await
+            .expect("the scripted peer completes the watch handshake");
+
+        // A complete, correctly-framed message whose compression byte says
+        // ZstdDict. `read_variable_body_raw` consumes every byte of the body
+        // before `read_from_header` discovers this client has no cached dict,
+        // so the socket ends up exactly on the next message boundary.
+        let mut undecodable = watch_frame(&watch_events(3));
+        undecodable[16] = celeriant_wal::compression_type::CompressionType::ZstdDict.to_byte();
+        wire.send(undecodable).unwrap();
+
+        assert!(
+            watch.next_timeout(Duration::from_secs(5)).await.is_err(),
+            "test premise: the frame must fail to decode"
+        );
+
+        // The stream is clean. Before phase 3 this frame was delivered.
+        wire.send(watch_frame(&watch_events(3))).unwrap();
+        match watch.next_timeout(Duration::from_secs(5)).await {
+            Ok(Some(r)) => assert_eq!(r.events.len(), 3),
+            other => panic!(
+                "a decode error consumed the whole frame, leaving the stream on a message \
+                 boundary, yet the connection is permanently unusable: {other:?}"
+            ),
+        }
+    }
+
+    /// Guard against a fix that retires every timed-out watch. This one PASSES
+    /// today; it exists so that "mark the connection unusable" cannot be
+    /// implemented as "mark the connection unusable on every expiry".
+    #[tokio::test]
+    async fn a_watch_timeout_with_nothing_on_the_wire_leaves_the_connection_usable() {
+        let (addr, wire) = scripted_watch_server().await;
+        let mut watch = WatchConnection::connect(&addr.to_string(), watch_request(), WatchOptions::default())
+            .await
+            .expect("the scripted peer completes the watch handshake");
+
+        assert!(
+            matches!(watch.next_timeout(Duration::from_millis(50)).await, Ok(None)),
+            "nothing was sent, so the deadline must expire empty"
+        );
+
+        wire.send(watch_frame(&watch_events(3))).unwrap();
+
+        match watch.next_timeout(Duration::from_secs(5)).await {
+            Ok(Some(response)) => assert_eq!(response.events.len(), 3),
+            other => panic!("a clean timeout must not cost the connection: {other:?}"),
         }
     }
 }

@@ -9,6 +9,7 @@ use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_msg::request::requests::IdentifyRequest;
 use celeriant_client_wire::{build_frame, decompress_body, write_frame};
 use celeriant_wal::compression_type::CompressionType;
+use celeriant_wire::network::wire_error::WireError;
 use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V2, WireHeader};
 use rustls_pki_types::ServerName;
 use tokio::net::TcpStream;
@@ -169,6 +170,8 @@ pub struct CeleriantClient {
     max_response_size: u64,
     timeout: Option<Duration>,
     pub(crate) current_dict: Option<CachedDict>,
+    stream_dirty: bool,
+    next_correlation_id: u128,
 }
 
 impl CeleriantClient {
@@ -199,6 +202,8 @@ impl CeleriantClient {
             max_response_size: 64 * 1024 * 1024, // 64 MB; matches server default
             timeout: connection_timeout,
             current_dict: None,
+            stream_dirty: false,
+            next_correlation_id: 1,
         })
     }
 
@@ -214,6 +219,26 @@ impl CeleriantClient {
         self
     }
 
+    fn take_correlation_id(&mut self) -> u128 {
+        let id = self.next_correlation_id;
+        self.next_correlation_id = self.next_correlation_id.wrapping_add(1);
+        id
+    }
+
+    pub(crate) async fn send_owned(
+        &mut self,
+        mut request: ClientRequest,
+    ) -> Result<ClientResponse, ClientError> {
+        let id = self.take_correlation_id();
+        request.set_correlation_id_if_absent(id);
+        self.send_request(&request).await
+    }
+
+    /// See `stream_dirty`. A dirty connection must be closed, never reused.
+    pub(crate) fn is_stream_dirty(&self) -> bool {
+        self.stream_dirty
+    }
+
     /// Set request timeout (default: none)
     pub fn with_timeout(mut self, duration: Duration) -> Self {
         self.timeout = Some(duration);
@@ -227,6 +252,19 @@ impl CeleriantClient {
         &mut self,
         request: &ClientRequest,
     ) -> Result<ClientResponse, ClientError> {
+        let filled;
+        let request = if request.correlation_id().is_none() {
+            let id = self.take_correlation_id();
+            filled = {
+                let mut owned = request.clone();
+                owned.set_correlation_id_if_absent(id);
+                owned
+            };
+            &filled
+        } else {
+            request
+        };
+
         // Apply timeout if configured
         if let Some(duration) = self.timeout {
             timeout(duration, self.send_request_inner(request))
@@ -260,32 +298,71 @@ impl CeleriantClient {
         &mut self,
         request: &ClientRequest,
     ) -> Result<ClientResponse, ClientError> {
+        // An earlier request was abandoned before its response was read, so the
+        // next frame off this stream belongs to that request, not this one.
+        if self.stream_dirty {
+            return Err(ClientError::ProtocolError);
+        }
         // Compress variable-size bodies up front with celeriant_client_wire's stateless dict
         // helper (raw `&[u8]` dict, not a `!Sync` DictCodec), so this request future stays `Send`.
-        // Fixed-size requests are never compressed.
-        if request.is_variable_size() {
+        // Fixed-size requests are never compressed. Nothing here touches the socket.
+        let frame = if request.is_variable_size() {
             let body = request.serialize_body(PROTOCOL_VERSION_V2)?;
             let type_id = request.request_type() as u32;
             let compress = self.choose_compression(request) == CompressionType::ZstdDict;
             let dict = self.current_dict.as_ref().map(|d| d.bytes.as_ref());
-            let frame = build_frame(type_id, body, dict, compress)?;
-            write_frame(&mut self.stream, &frame, self.max_request_size, PROTOCOL_VERSION_V2).await?;
+            Some(build_frame(type_id, body, dict, compress)?)
         } else {
-            ClientRequest::write_request(&mut self.stream, request, self.max_request_size, PROTOCOL_VERSION_V2)
-                .await?;
+            None
+        };
+
+        self.stream_dirty = true;
+        let written = match &frame {
+            Some(frame) => {
+                write_frame(&mut self.stream, frame, self.max_request_size, PROTOCOL_VERSION_V2).await
+            }
+            None => {
+                ClientRequest::write_request(&mut self.stream, request, self.max_request_size, PROTOCOL_VERSION_V2)
+                    .await
+            }
+        };
+        if let Err(e) = written {
+            self.stream_dirty = matches!(e, WireError::NetworkError(_));
+            return Err(e.into());
         }
 
         // Fixed-size responses read straight from the header; variable-size bodies are decompressed
         // with the same stateless dict helper once the body is in hand.
         let header = WireHeader::from_reader(&mut self.stream, self.max_response_size).await?;
         let response = if ClientResponse::is_fixed_size_variant(header.message_type) {
-            ClientResponse::read_from_header(header, &mut self.stream).await?
+            let response = ClientResponse::read_from_header(header, &mut self.stream).await?;
+            self.stream_dirty = false;
+            response
         } else {
             let raw = header.read_variable_body_raw(&mut self.stream).await?;
+            self.stream_dirty = false;
             let dict = self.current_dict.as_ref().map(|d| d.bytes.as_ref());
             let plain = decompress_body(header.compression_type, header.uncompressed_length, &raw, dict)?;
             ClientResponse::deserialize_body(header.message_type, &plain, header.version)?
         };
+
+        let sent = request.correlation_id();
+        if response.carries_correlation_id() && response.correlation_id() != sent {
+            self.stream_dirty = true;
+            return Err(ClientError::CorrelationMismatch {
+                sent,
+                received: response.correlation_id(),
+            });
+        }
+        if response.response_type() != request.request_type().expected_response_type()
+            && !matches!(
+                response,
+                ClientResponse::GenericError(_) | ClientResponse::ProtocolError(_)
+            )
+        {
+            self.stream_dirty = true;
+            return Err(ClientError::ProtocolError);
+        }
 
         match response {
             ClientResponse::ProtocolError(_) => Err(ClientError::ProtocolError),
@@ -349,6 +426,7 @@ impl CeleriantClient {
             known_dict_sha256: known_dict_sha,
         };
 
+        self.stream_dirty = true;
         let stream = &mut self.stream;
         let max_response_size = self.max_response_size;
         let identify_inner = async move {
@@ -375,6 +453,7 @@ impl CeleriantClient {
         } else {
             identify_inner.await?
         };
+        self.stream_dirty = false;
 
         // Resolve the dict for this connection:
         //   - If server shipped bytes -> store them (new or refreshed dict).
@@ -559,6 +638,111 @@ mod tests {
         let decompressed = compression::decompress_with_dict(&compressed, original.len(), &d.bytes).unwrap();
         assert_eq!(decompressed.as_slice(), original.as_slice());
         let _ = block_on(async {}); // ensure async context is tested
+    }
+
+    // --- stream_dirty: the cancellation guard ---
+
+    fn details_request(aggregate_id: u128) -> ClientRequest {
+        ClientRequest::AggregateDetails(
+            celeriant_msg::request::requests::AggregateDetailsRequest {
+                correlation_id: None,
+                aggregate_key: celeriant_wal::aggregate_key::AggregateKey::new(1, 1, aggregate_id),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn a_fresh_client_has_a_clean_stream() {
+        let addr = silent_server().await;
+        let client = CeleriantClient::connect(&addr.to_string()).await.unwrap();
+        assert!(!client.is_stream_dirty());
+    }
+
+    #[tokio::test]
+    async fn a_request_future_dropped_before_its_response_leaves_the_stream_dirty() {
+        use futures_util::FutureExt;
+
+        let addr = silent_server().await;
+        let mut client = CeleriantClient::connect(&addr.to_string()).await.unwrap();
+
+        // One poll drives write_frame to completion and parks on the response
+        // read — the request bytes are in the kernel send buffer whether or not
+        // anyone waits for the reply. A wall-clock timeout would race the
+        // server here and flake; this cannot.
+        let polled = client.send_request(&details_request(1)).now_or_never();
+        assert!(polled.is_none(), "one poll must park on the response read, not complete");
+
+        assert!(
+            client.is_stream_dirty(),
+            "a request went out with no response read — the stream is one frame behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_dirty_flag_survives_an_outer_timeout_cancelling_the_request() {
+        let addr = silent_server().await;
+        let mut client = CeleriantClient::connect(&addr.to_string()).await.unwrap();
+
+        let outcome = timeout(
+            Duration::from_millis(50),
+            client.send_request(&details_request(2)),
+        )
+        .await;
+
+        assert!(outcome.is_err(), "silent server cannot answer inside 50ms");
+        assert!(client.is_stream_dirty());
+    }
+
+    /// Pins the arm site to *before* the write. A request too large for the
+    /// socket buffers parks inside `write_frame`, so cancelling here abandons a
+    /// half-written request frame — worse than the undrained-response case,
+    /// and invisible to any test that cancels after the write completes.
+    #[tokio::test]
+    async fn a_request_cancelled_part_way_through_the_write_leaves_the_stream_dirty() {
+        use celeriant_msg::request::requests::{SingleAggregateWrite, WriteRequest};
+        use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
+        use futures_util::FutureExt;
+
+        // The silent server never reads, so its receive buffer fills and this
+        // never fits in the socket buffers.
+        let addr = silent_server().await;
+        let mut client = CeleriantClient::connect(&addr.to_string())
+            .await
+            .unwrap()
+            .with_max_request_size(64 * 1024 * 1024);
+
+        let mut writes = std::collections::HashMap::new();
+        writes.insert(
+            celeriant_wal::aggregate_key::AggregateKey::new(1, 1, 1),
+            SingleAggregateWrite {
+                events: vec![DatablockAggregateEvent {
+                    client_seq: 0,
+                    event_seq: 0,
+                    event_id: None,
+                    event_timestamp: 0,
+                    event_type_major: 1,
+                    event_type_minor: 0,
+                    event_value: Arc::new(vec![7u8; 32 * 1024 * 1024]),
+                    iv: None,
+                }],
+                allow_create: true,
+                expected_version: Some(0),
+                enforce_client_idempotency: false,
+            },
+        );
+        let request = ClientRequest::Write(WriteRequest {
+            correlation_id: None,
+            client_id: 1,
+            user_id: None,
+            writes,
+        });
+
+        let polled = client.send_request(&request).now_or_never();
+        assert!(polled.is_none(), "32MB cannot fit in the socket buffers of an unreading peer");
+        assert!(
+            client.is_stream_dirty(),
+            "a partially written request frame leaves the stream desynchronised"
+        );
     }
 
     #[test]

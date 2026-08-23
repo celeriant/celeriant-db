@@ -75,6 +75,13 @@ impl ConnState {
         Self { client: None, connected_to: None }
     }
 
+    async fn reset(&mut self) {
+        if let Some(client) = self.client.take() {
+            let _ = client.close().await;
+        }
+        self.connected_to = None;
+    }
+
     async fn ensure_connected(
         &mut self,
         address: &Option<String>,
@@ -91,7 +98,9 @@ impl ConnState {
             self.client = None;
             self.connected_to = None;
         }
-        if reset {
+        // Can be dirty due to previous client usage that got cancelled
+        let dirty = self.client.as_ref().is_some_and(|c| c.is_stream_dirty());
+        if reset || dirty {
             if let Some(client) = self.client.take() {
                 client.close().await?;
             }
@@ -263,7 +272,10 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
                 ReplicationResult::Success { .. } => Ok(()),
                 ReplicationResult::Rejected(rejection) => Err(ReplicateToFollowerError::FollowerRejected(rejection)),
             },
-            _ => Err(ReplicateToFollowerError::FollowerUnexpectedResponse),
+            _ => {
+                guard.reset().await;
+                Err(ReplicateToFollowerError::FollowerUnexpectedResponse)
+            }
         }
     }
 
@@ -356,7 +368,10 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
 
         match response {
             ClusterResponse::Heartbeat(resp) => Ok(resp.result),
-            _ => Err(SendHeartbeatError::UnexpectedResponse),
+            _ => {
+                guard.reset().await;
+                Err(SendHeartbeatError::UnexpectedResponse)
+            }
         }
     }
 
@@ -382,7 +397,10 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
 
         match response {
             ClusterResponse::KickFollower(resp) => Ok(resp.acknowledged),
-            _ => Err(SendHeartbeatError::UnexpectedResponse),
+            _ => {
+                guard.reset().await;
+                Err(SendHeartbeatError::UnexpectedResponse)
+            }
         }
     }
 }
@@ -745,5 +763,370 @@ mod tests {
         let client = test_follower_conn();
         client.release_kick();
         assert!(client.try_acquire_kick(), "latch still usable after spurious release");
+    }
+
+    // ---- Cancellation and misalignment of the shared replication connection ----
+    //
+    // `send_kick` and `replicate_to_follower` share one `ConnState`. A kick whose
+    // future is dropped between the write and the read leaves its response in the
+    // socket, and the next batch down that socket reads it. A reply of the wrong
+    // variant means the same thing has already happened.
+
+    use celeriant_msg::process_cluster_requests::ClusterRequestType;
+    use celeriant_msg::response::responses::{HeartbeatResponse, KickFollowerResponse, ReplicationBatchResponse};
+    use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V2, WireHeader};
+    use futures_lite::AsyncWriteExt;
+    use futures_lite::future::poll_once;
+    use glommio::{LocalExecutorBuilder, Placement};
+
+    const MOCK_MAX: u64 = 4 * 1024 * 1024;
+
+    macro_rules! glommio_test {
+        ($body:expr) => {
+            LocalExecutorBuilder::new(Placement::Fixed(0))
+                .spawn(|| async move { $body })
+                .unwrap()
+                .join()
+                .unwrap()
+        };
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FollowerScript {
+        /// Every request gets the reply a real follower would send.
+        Correct,
+        /// The first connection always replies with the wrong variant; every
+        /// connection after it replies correctly. That is what separates
+        /// "the client retired the misaligned connection" from "the client
+        /// kept using it".
+        WrongVariantOnFirstConnection,
+    }
+
+    /// A stand-in follower on the test's own executor.
+    ///
+    /// `gate` holds every answer back until the test opens it, so a request can
+    /// be abandoned at a point where the write has provably landed — the
+    /// follower read the whole frame — and not one byte of the response exists
+    /// yet. Nothing here depends on the wall clock.
+    #[derive(Clone)]
+    struct MockFollower {
+        /// One entry per accepted connection, holding the requests read on it.
+        conns: Rc<RefCell<Vec<Vec<ClusterRequestType>>>>,
+        /// The connection index of every request read, in arrival order.
+        arrivals: Rc<RefCell<Vec<usize>>>,
+        answered: Rc<Cell<usize>>,
+        gate: Rc<Cell<bool>>,
+    }
+
+    impl MockFollower {
+        fn requests_on(&self, connection: usize) -> usize {
+            self.conns.borrow().get(connection).map_or(0, |c| c.len())
+        }
+
+        fn requests_read(&self) -> usize {
+            self.arrivals.borrow().len()
+        }
+
+        fn last_connection_used(&self) -> usize {
+            *self.arrivals.borrow().last().expect("the follower has read at least one request")
+        }
+    }
+
+    fn matching_response(request: &ClusterRequest) -> ClusterResponse {
+        match request {
+            ClusterRequest::KickFollower(r) => ClusterResponse::KickFollower(KickFollowerResponse {
+                correlation_id: r.correlation_id,
+                acknowledged: true,
+            }),
+            ClusterRequest::Heartbeat(r) => ClusterResponse::Heartbeat(HeartbeatResponse {
+                correlation_id: r.correlation_id,
+                result: HeartbeatResult::Ack {
+                    follower_timestamp_ms: 1,
+                    follower_can_accept_tcp_replication: true,
+                },
+            }),
+            ClusterRequest::ReplicationBatch(r) => ClusterResponse::ReplicationBatch(ReplicationBatchResponse {
+                correlation_id: r.correlation_id,
+                follower_timestamp_ms: 1,
+                result: ReplicationResult::Success { last_follower_metablock: None },
+            }),
+        }
+    }
+
+    /// What an offset stream hands back: a well-formed reply to somebody else's
+    /// request.
+    fn wrong_variant_response(request: &ClusterRequest) -> ClusterResponse {
+        match request {
+            ClusterRequest::KickFollower(r) => ClusterResponse::Heartbeat(HeartbeatResponse {
+                correlation_id: r.correlation_id,
+                result: HeartbeatResult::Ack {
+                    follower_timestamp_ms: 1,
+                    follower_can_accept_tcp_replication: true,
+                },
+            }),
+            _ => ClusterResponse::KickFollower(KickFollowerResponse {
+                correlation_id: request.correlation_id(),
+                acknowledged: true,
+            }),
+        }
+    }
+
+    fn spawn_follower(script: FollowerScript, codec: Rc<DictCodec>) -> (String, MockFollower) {
+        let listener = glommio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let follower = MockFollower {
+            conns: Rc::new(RefCell::new(Vec::new())),
+            arrivals: Rc::new(RefCell::new(Vec::new())),
+            answered: Rc::new(Cell::new(0)),
+            gate: Rc::new(Cell::new(true)),
+        };
+        let acceptor = follower.clone();
+        glommio::spawn_local(async move {
+            while let Ok(mut stream) = listener.accept().await {
+                let index = {
+                    let mut conns = acceptor.conns.borrow_mut();
+                    conns.push(Vec::new());
+                    conns.len() - 1
+                };
+                let wrong = script == FollowerScript::WrongVariantOnFirstConnection && index == 0;
+                let server = acceptor.clone();
+                let codec = codec.clone();
+                glommio::spawn_local(async move {
+                    loop {
+                        let Ok(header) = WireHeader::from_reader(&mut stream, MOCK_MAX).await else { break };
+                        let Ok(request) = ClusterRequest::read_from_header(header, &mut stream, &codec).await else { break };
+                        server.conns.borrow_mut()[index].push(request.request_type());
+                        server.arrivals.borrow_mut().push(index);
+                        let response = if wrong { wrong_variant_response(&request) } else { matching_response(&request) };
+                        while !server.gate.get() {
+                            park_briefly().await;
+                        }
+                        if ClusterResponse::write_response(&mut stream, &response, MOCK_MAX, PROTOCOL_VERSION_V2).await.is_err() {
+                            break;
+                        }
+                        let _ = stream.flush().await;
+                        server.answered.set(server.answered.get() + 1);
+                    }
+                })
+                .detach();
+            }
+        })
+        .detach();
+        (address, follower)
+    }
+
+    /// A real park, short enough to be irrelevant to any assertion. A task that
+    /// re-wakes itself with `yield_now` never empties glommio's run queue, and
+    /// the reactor only drains its io_uring completions when it does.
+    async fn park_briefly() {
+        glommio::timer::sleep(Duration::from_micros(50)).await;
+    }
+
+    fn follower_conn_to(address: &str, codec: Rc<DictCodec>) -> FollowerConnection<MockS3Uploader> {
+        let conn = FollowerConnection::new(
+            Some(address.to_string()),
+            None,
+            None,
+            Duration::from_millis(500),
+            None,
+            MOCK_MAX,
+            MOCK_MAX,
+            7,
+            1,
+            None,
+            codec,
+            None,
+        );
+        conn.set_follower_reachable(true);
+        conn
+    }
+
+    fn test_batches() -> Vec<ReplicationBatchItem> {
+        vec![ReplicationBatchItem { metablock: create_test_metablock(1), datablock: None }]
+    }
+
+    /// Write the kick, then abandon it parked on the response read.
+    ///
+    /// The follower is gated shut first, so the only thing that can end the
+    /// polling loop is the follower reporting it read the whole request frame.
+    /// That is the write completing, observed from the far end. The gate then
+    /// opens and the `KickFollowerResponse` lands in a socket nobody is reading.
+    async fn abandon_send_kick(conn: &FollowerConnection<MockS3Uploader>, follower: &MockFollower) -> usize {
+        let read_before = follower.requests_read();
+        let answered_before = follower.answered.get();
+        follower.gate.set(false);
+        {
+            let mut kick = std::pin::pin!(conn.send_kick());
+            for _ in 0..20_000 {
+                if follower.requests_read() > read_before {
+                    break;
+                }
+                assert!(
+                    poll_once(kick.as_mut()).await.is_none(),
+                    "the kick ended before it could be abandoned"
+                );
+                park_briefly().await;
+            }
+            assert!(
+                follower.requests_read() > read_before,
+                "the kick frame never reached the follower, so nothing was abandoned mid-flight"
+            );
+        }
+        follower.gate.set(true);
+        for _ in 0..20_000 {
+            if follower.answered.get() > answered_before {
+                break;
+            }
+            park_briefly().await;
+        }
+        assert!(
+            follower.answered.get() > answered_before,
+            "the follower never wrote the answer to the abandoned kick"
+        );
+        follower.last_connection_used()
+    }
+
+    /// `with_budget(b, rc.send_kick())` drops the kick future on budget expiry.
+    /// The replication batch that follows must not go down that socket.
+    #[test]
+    fn a_cancelled_kick_does_not_leave_the_next_batch_reading_its_response() {
+        glommio_test!({
+            let codec = test_dict_codec();
+            let (address, follower) = spawn_follower(FollowerScript::Correct, codec.clone());
+            let conn = follower_conn_to(&address, codec);
+
+            // Warm the connection so the abandoned poll starts at the write.
+            assert!(conn.send_kick().await.is_ok(), "the mock follower acknowledges kicks");
+
+            let poisoned = abandon_send_kick(&conn, &follower).await;
+            let delivered = follower.requests_on(poisoned);
+
+            let _ = conn.replicate_to_follower(test_batches(), 1, 5).await;
+
+            // A batch written to the poisoned socket is read by the follower
+            // within microseconds — both tasks are on this executor — so waiting
+            // far past that is the whole of the timing dependency, and a wait
+            // that is too short can only make this test pass, never fail.
+            for _ in 0..400 {
+                if follower.requests_on(poisoned) > delivered {
+                    break;
+                }
+                park_briefly().await;
+            }
+
+            assert_eq!(
+                follower.requests_on(poisoned),
+                delivered,
+                "the batch was written down the socket that still held the abandoned kick's response"
+            );
+        });
+    }
+
+    /// The only end-to-end pin of the live cancellation source. The test above
+    /// abandons the kick with a hand-rolled `poll_once` loop; production drops it
+    /// via `with_budget(b, rc.send_kick())` at shard_wal_replicate.rs:503 and
+    /// :899, which is `or(fut, Timer)`. This drives that exact wrapper, so the
+    /// cancellation arises the way production makes it arise.
+    #[test]
+    fn a_kick_dropped_by_with_budget_does_not_poison_the_next_batch() {
+        glommio_test!({
+            let codec = test_dict_codec();
+            let (address, follower) = spawn_follower(FollowerScript::Correct, codec.clone());
+            let conn = follower_conn_to(&address, codec);
+
+            assert!(conn.send_kick().await.is_ok(), "warm the connection so the drop lands after the write");
+
+            let read_before = follower.requests_read();
+            let answered_before = follower.answered.get();
+            follower.gate.set(false);
+
+            let outcome = celeriant_disk::files::rwlock_timeout::with_budget(
+                Duration::from_millis(100),
+                conn.send_kick(),
+            )
+            .await;
+            assert!(outcome.is_none(), "test premise: the budget must expire while the follower is gated");
+            assert!(
+                follower.requests_read() > read_before,
+                "test premise: the kick frame never reached the follower, so nothing was abandoned"
+            );
+            let poisoned = follower.last_connection_used();
+
+            follower.gate.set(true);
+            for _ in 0..20_000 {
+                if follower.answered.get() > answered_before {
+                    break;
+                }
+                park_briefly().await;
+            }
+            assert!(
+                follower.answered.get() > answered_before,
+                "the abandoned kick's response never landed in the socket"
+            );
+
+            let delivered = follower.requests_on(poisoned);
+            let batch = conn.replicate_to_follower(test_batches(), 1, 5).await;
+            for _ in 0..400 {
+                if follower.requests_on(poisoned) > delivered {
+                    break;
+                }
+                park_briefly().await;
+            }
+            assert_eq!(
+                follower.requests_on(poisoned),
+                delivered,
+                "the batch was written down the socket that still held the abandoned kick's response"
+            );
+            assert!(batch.is_ok(), "and the batch must still land, on a fresh connection: {batch:?}");
+        });
+    }
+
+    /// A batch answered with the wrong variant proves the stream is already
+    /// offset. Leaving it connected keeps it offset forever.
+    #[test]
+    fn a_wrong_variant_reply_retires_the_replication_connection() {
+        glommio_test!({
+            let codec = test_dict_codec();
+            let (address, follower) = spawn_follower(FollowerScript::WrongVariantOnFirstConnection, codec.clone());
+            let conn = follower_conn_to(&address, codec);
+
+            let first = conn.replicate_to_follower(test_batches(), 1, 5).await;
+            assert!(
+                matches!(first, Err(ReplicateToFollowerError::FollowerUnexpectedResponse)),
+                "test premise: the first batch must hit the wrong-variant arm, got {first:?}"
+            );
+
+            let second = conn.replicate_to_follower(test_batches(), 2, 5).await;
+            assert!(
+                second.is_ok(),
+                "the follower answers correctly on every connection after the first, so this can \
+                 only fail if the misaligned connection was reused: {second:?}"
+            );
+            assert_eq!(follower.requests_on(0), 1, "the misaligned connection took a second request");
+        });
+    }
+
+    /// Same contract on the kick's own wrong-variant arm.
+    #[test]
+    fn a_wrong_variant_reply_retires_the_kick_connection() {
+        glommio_test!({
+            let codec = test_dict_codec();
+            let (address, follower) = spawn_follower(FollowerScript::WrongVariantOnFirstConnection, codec.clone());
+            let conn = follower_conn_to(&address, codec);
+
+            let first = conn.send_kick().await;
+            assert!(
+                matches!(first, Err(SendHeartbeatError::UnexpectedResponse)),
+                "test premise: the first kick must hit the wrong-variant arm, got {first:?}"
+            );
+
+            let second = conn.send_kick().await;
+            assert!(
+                matches!(second, Ok(true)),
+                "the follower acknowledges kicks on every connection after the first, so this can \
+                 only fail if the misaligned connection was reused: {second:?}"
+            );
+            assert_eq!(follower.requests_on(0), 1, "the misaligned connection took a second request");
+        });
     }
 }
