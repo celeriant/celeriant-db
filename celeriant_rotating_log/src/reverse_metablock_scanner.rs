@@ -238,6 +238,10 @@ impl<'a> ReverseMetablockScanner<'a> {
                     source: source.to_string(),
                 })
             }
+            Err(ReadVisitError::ShortRead { pos, requested, got }) => {
+                tracing::error!(log_id, pos, requested, got, "short read during metablock scan");
+                Err(ScanError::ShortRead { log_id, pos, requested, got })
+            }
             Err(ReadVisitError::Visitor(scan_err)) => Err(scan_err),
         }
     }
@@ -324,7 +328,15 @@ impl<'a> ReverseMetablockScanner<'a> {
                     log_id,
                     source: e.to_string(),
                 })?;
-                let block: &[u8; FIXED_BLOCK_SIZE_BYTES] = buf[..FIXED_BLOCK_SIZE_BYTES].try_into().unwrap();
+                let block: &[u8; FIXED_BLOCK_SIZE_BYTES] = buf
+                    .get(..FIXED_BLOCK_SIZE_BYTES)
+                    .and_then(|b| b.try_into().ok())
+                    .ok_or(ScanError::ShortRead {
+                        log_id,
+                        pos: hint_pos,
+                        requested: FIXED_BLOCK_SIZE_BYTES,
+                        got: buf.len(),
+                    })?;
                 if metablock_bytes::read_chain_aggregate_key(block).as_ref() == Some(key) {
                     metrics::counter!("celeriant_read_segment_hint_seek_total").increment(1);
                     win_start = hint_pos;
@@ -359,11 +371,22 @@ impl<'a> ReverseMetablockScanner<'a> {
                     log_id,
                     source: e.to_string(),
                 })?;
+                if buf.len() < len {
+                    return Err(ScanError::ShortRead { log_id, pos: win_start, requested: len, got: buf.len() });
+                }
                 win = Some(buf);
             }
             let buf = win.as_ref().unwrap();
             let off = (pos - win_start) as usize;
-            let block: &[u8; FIXED_BLOCK_SIZE_BYTES] = buf[off..off + FIXED_BLOCK_SIZE_BYTES].try_into().unwrap();
+            let block: &[u8; FIXED_BLOCK_SIZE_BYTES] = buf
+                .get(off..off + FIXED_BLOCK_SIZE_BYTES)
+                .and_then(|b| b.try_into().ok())
+                .ok_or(ScanError::ShortRead {
+                    log_id,
+                    pos,
+                    requested: FIXED_BLOCK_SIZE_BYTES,
+                    got: buf.len().saturating_sub(off),
+                })?;
 
             // Only this aggregate's metablocks carry a backlink we may follow.
             if metablock_bytes::read_chain_aggregate_key(block).as_ref() != Some(key) {
@@ -410,6 +433,9 @@ impl<'a> ReverseMetablockScanner<'a> {
                 log_id,
                 source: source.to_string(),
             }),
+            Err(ReadVisitError::ShortRead { pos, requested, got }) => {
+                Err(ScanError::ShortRead { log_id, pos, requested, got })
+            }
             Err(ReadVisitError::Visitor(())) => Ok(found),
         }
     }

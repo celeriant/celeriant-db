@@ -49,6 +49,7 @@ fn batch_counts() -> Vec<(&'static str, u64)> {
 
 fn config(shard_dir: PathBuf, warmup: Duration) -> InternalShardConfig {
     InternalShardConfig {
+        wal_join_data_meta_writes: true,
         node_id: 1,
         shard_id: 1,
         max_open_files: 4096,

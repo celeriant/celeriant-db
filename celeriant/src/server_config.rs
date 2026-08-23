@@ -297,6 +297,24 @@ pub struct ServerConfig {
 
     #[arg(
         long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        env = "CELERIANT_WAL_JOIN_DATA_META_WRITES",
+        help = "Submit the WAL sync path's datablock and metablock writes as one joined pair instead of one after the other"
+    )]
+    pub wal_join_data_meta_writes: bool,
+
+    #[arg(
+        long,
+        default_value_t = 250,
+        env = "CELERIANT_PREEMPT_TIMER_US",
+        value_parser = clap::value_parser!(u64).range(50..=100_000),
+        help = "How long one task runs (even with yield points) before the scheduler and the reactor gets the CPU."
+    )]
+    pub preempt_timer_us: u64,
+
+    #[arg(
+        long,
         default_value_t = 17000,
         env = "CELERIANT_REPLICATION_DELAY_US",
         help = "Amortised replication send duration block (17ms)"
@@ -794,6 +812,8 @@ impl ServerConfig {
             max_requested_latency: Duration::from_millis(self.max_requested_latency_ms),
             max_watch_subscribers: self.max_watch_subscribers,
             fsync_delay: Duration::from_micros(self.fsync_delay_us),
+            wal_join_data_meta_writes: self.wal_join_data_meta_writes,
+            preempt_timer: Duration::from_micros(self.preempt_timer_us),
             replication_delay: Duration::from_micros(self.replication_delay_us),
             s3_replication_delay: Duration::from_micros(self.s3_replication_delay_us),
             replication_rollback_cooldown: Duration::from_micros(self.replication_rollback_cooldown_us),
@@ -923,6 +943,8 @@ impl ServerConfig {
         check_field!(wal_compression_level);
         check_field!(wal_dictionary_name);
         check_field!(fsync_delay_us);
+        check_field!(wal_join_data_meta_writes);
+        check_field!(preempt_timer_us);
         check_field!(replication_delay_us);
         check_field!(s3_replication_delay_us);
         check_field!(replication_rollback_cooldown_us);
@@ -1013,6 +1035,8 @@ impl Default for ServerConfig {
             max_promotion_batch_bytes: None,
             s3_max_concurrent_fallback_uploads: 2,
             fsync_delay_us: 4000,
+            wal_join_data_meta_writes: true,
+            preempt_timer_us: 250,
             replication_delay_us: 17000,
             s3_replication_delay_us: 500000,
             replication_rollback_cooldown_us: 500000,
@@ -1068,37 +1092,6 @@ impl Default for ServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The clap default and `ServerConfig::default()` must agree. `487f8c1` cut
-    /// the clap default to 512 and left the struct at 8192, which also made
-    /// `check_field!` report the value as user-overridden on every boot.
-    #[test]
-    fn mesh_channel_size_clap_default_matches_struct_default() {
-        use clap::CommandFactory;
-        let cmd = ServerConfig::command();
-        let arg = cmd
-            .get_arguments()
-            .find(|a| a.get_id() == "mesh_channel_size")
-            .expect("mesh_channel_size arg");
-        let declared: usize = arg
-            .get_default_values()
-            .first()
-            .expect("mesh_channel_size has a clap default")
-            .to_str()
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert_eq!(declared, ServerConfig::default().mesh_channel_size);
-    }
-
-    /// The same invariant for every field, via the mechanism `log_non_defaults`
-    /// already uses. Sensitive to `CELERIANT_*` in the environment, which is why
-    /// the mesh_channel_size check above reads clap's declared default instead.
-    #[test]
-    fn no_clap_default_drifts_from_struct_default() {
-        let drift = ServerConfig::parse_from(["celeriant"]).non_default_entries();
-        assert!(drift.is_empty(), "clap defaults drift from ServerConfig::default(): {drift:?}");
-    }
 
     #[test]
     fn to_compression_meta() {

@@ -44,6 +44,7 @@ pub mod edge_heartbeat_lock_contention;
 pub mod edge_wal_divergence_and_recovery;
 pub mod edge_list_pagination_cache_eviction;
 pub mod regression_list_iterator_truncation;
+pub mod edge_fd_limit_preflight;
 pub mod edge_log_eviction_before_s3;
 pub mod edge_log_rotation_mid_replication;
 pub mod edge_s3_batch_ordering;
@@ -217,7 +218,7 @@ const LOG_TAIL_LINES: usize = 400;
 impl TestServer {
     /// Resolve the path to the pre-built server binary.
     /// Uses the release binary next to the running test binary, falling back to cargo run.
-    fn server_binary_path() -> std::path::PathBuf {
+    pub(crate) fn server_binary_path() -> std::path::PathBuf {
         let mut path = std::env::current_exe().unwrap();
         path.pop(); // remove test binary name
         // In release mode, binary is in target/release/

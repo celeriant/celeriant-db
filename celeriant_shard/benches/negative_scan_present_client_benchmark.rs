@@ -75,6 +75,7 @@ fn length_configs() -> Vec<(&'static str, u64)> {
 
 fn base_config(shard_dir: PathBuf) -> InternalShardConfig {
     InternalShardConfig {
+        wal_join_data_meta_writes: true,
         node_id: 1,
         shard_id: 1,
         max_open_files: 4096,

@@ -9,6 +9,7 @@ pub struct InternalShardConfig {
     pub max_open_files: u64,
     pub shard_log_preallocate_bytes: u64,
     pub fsync_delay: Duration,
+    pub wal_join_data_meta_writes: bool,
     pub replication_delay: Duration,
     pub s3_replication_delay: Duration,
     pub recent_write_cache_bytes: u64,

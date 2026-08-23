@@ -1669,6 +1669,7 @@ mod tests {
 
     fn test_config(num_shards: u32, routing_rule: crate::RoutingRule) -> ShardConfig {
         ShardConfig {
+            wal_join_data_meta_writes: true,
             node_id: 1,
             num_shards,
             replication_config: None,
@@ -1695,6 +1696,7 @@ mod tests {
             max_watch_subscribers: 10_000,
             shard_log_preallocate_bytes: 1024,
             fsync_delay: Duration::from_millis(10),
+            preempt_timer: Duration::from_millis(100),
             recent_write_cache_bytes: 1024,
             routing_rule,
             aggregate_client_snapshots_cache_bytes: 1024,

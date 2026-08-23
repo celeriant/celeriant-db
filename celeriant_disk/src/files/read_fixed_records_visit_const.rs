@@ -3,6 +3,7 @@ use glommio::{GlommioError, io::DmaFile};
 #[derive(Debug)]
 pub enum ReadVisitError<E> {
     Io(GlommioError<()>),
+    ShortRead { pos: u64, requested: usize, got: usize },
     Visitor(E),
 }
 
@@ -68,6 +69,9 @@ async fn read_forward_aligned<const N: usize, E>(
             Ok(c) => c,
             Err(e) => return Err(ReadVisitError::Io(e)),
         };
+        if chunk.len() < read_len {
+            return Err(ReadVisitError::ShortRead { pos, requested: read_len, got: chunk.len() });
+        }
 
         let (full, _) = chunk.as_chunks::<N>();
         for (i, rec) in full.iter().enumerate() {
@@ -115,6 +119,9 @@ async fn read_reverse_aligned<const N: usize, E>(
             Ok(c) => c,
             Err(e) => return Err(ReadVisitError::Io(e)),
         };
+        if chunk.len() < read_len {
+            return Err(ReadVisitError::ShortRead { pos: read_start, requested: read_len, got: chunk.len() });
+        }
 
         let (full, _) = chunk.as_chunks::<N>();
         for (i, rec) in full.iter().enumerate().rev() {

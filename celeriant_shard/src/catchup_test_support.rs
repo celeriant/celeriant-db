@@ -198,6 +198,7 @@ pub(crate) struct TestComponents {
     pub(crate) fsync_coordinator: Rc<Coordinator<ShardFsyncError>>,
     pub(crate) watched_aggregates: Rc<AggregateWatchers>,
     pub(crate) summary_cache: RefCell<crate::shard_wal::SummaryCache>,
+    pub(crate) join_data_meta_writes: bool,
 }
 
 impl TestComponents {
@@ -220,6 +221,7 @@ impl TestComponents {
             fsync_coordinator: Rc::new(Coordinator::new()),
             watched_aggregates: Rc::new(AggregateWatchers::new()),
             summary_cache: RefCell::new(lru::LruCache::new(std::num::NonZeroUsize::new(16).unwrap())),
+            join_data_meta_writes: true,
         }
     }
 
@@ -333,6 +335,7 @@ impl TestComponents {
             role,
             catchup_target_wal_seq,
             live_tail_yielded_wal_seq,
+            self.join_data_meta_writes,
         )
         .await
     }

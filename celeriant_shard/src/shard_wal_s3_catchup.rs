@@ -295,6 +295,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
     role: CatchupRole,
     catchup_target_wal_seq: u64,
     live_tail_yielded_wal_seq: &Cell<u64>,
+    join_data_meta_writes: bool,
 ) -> Result<S3CatchupResult, S3CatchupError> {
     let mut result = S3CatchupResult {
         batches_applied: 0,
@@ -643,7 +644,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
             // Apply the winner to the WAL
             apply_external_batch(log_segments_cache, shard_mem_cache, items, &dict_codec).map_err(S3CatchupError::ApplyFailed)?;
 
-            sync_applied_batch(log_segments_cache, shard_mem_cache, fsync_coordinator, watched_aggregates, shard_id, dict_codec.clone())
+            sync_applied_batch(log_segments_cache, shard_mem_cache, fsync_coordinator, watched_aggregates, shard_id, dict_codec.clone(), join_data_meta_writes)
                 .await
                 .map_err(S3CatchupError::FsyncFailed)?;
 
@@ -824,6 +825,7 @@ async fn sync_applied_batch(
     watched_aggregates: &Rc<AggregateWatchers>,
     shard_id: u32,
     dict_codec: Rc<DictCodec>,
+    join_data_meta_writes: bool,
 ) -> Result<(), ShardFsyncError> {
     // Catchup full-commits on apply, so its read cursor jumps to the new write
     // tip. Any live-TCP commits still parked cover entries below that tip on the
@@ -851,7 +853,7 @@ async fn sync_applied_batch(
             None,
             ShardFsyncError::WriteLockTimeout,
             move || capture_fsync_snapshot(&mc_capture),
-            move |captured| commit_fsync_with_rollback(NodeStatus::Standalone, CommitTarget::FullCommit, lsc, smc, wa, captured, shard_id, dict_codec),
+            move |captured| commit_fsync_with_rollback(NodeStatus::Standalone, CommitTarget::FullCommit, lsc, smc, wa, captured, shard_id, dict_codec, join_data_meta_writes),
         )
         .await
 }
@@ -1644,6 +1646,7 @@ use glommio::{LocalExecutorBuilder, Placement};
                 &tc.watched_aggregates,
                 0,
                 test_codec(),
+                tc.join_data_meta_writes,
             )
             .await
             .unwrap();
@@ -1684,6 +1687,7 @@ use glommio::{LocalExecutorBuilder, Placement};
                 &tc.watched_aggregates,
                 0,
                 test_codec(),
+                tc.join_data_meta_writes,
             )
             .await
             .unwrap();
@@ -3282,7 +3286,7 @@ use glommio::{LocalExecutorBuilder, Placement};
                 move |captured| commit_fsync_with_rollback(
                     NodeStatus::Follower { leader_lease_epoch: 0 },
                     CommitTarget::DeferToLeaderConfirmed,
-                    lsc, smc, wa, captured, 0, test_codec(),
+                    lsc, smc, wa, captured, 0, test_codec(), tc.join_data_meta_writes,
                 ),
             )
             .await

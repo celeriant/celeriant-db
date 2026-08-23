@@ -619,6 +619,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             distributed: true,
         },
         TestEntry {
+            name: "edge_fd_limit_preflight",
+            description: "Startup fd pre-flight: fails fast under low hard NOFILE, raises low soft in-process",
+            estimated_secs: 45,
+            categories: &[Edge, Operations],
+            distributed: false,
+        },
+        TestEntry {
             name: "edge_log_eviction_before_s3",
             description: "Evicted log files re-opened transparently for S3 upload",
             estimated_secs: 40,

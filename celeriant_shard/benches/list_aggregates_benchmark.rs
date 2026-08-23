@@ -64,6 +64,7 @@ fn page_size_configs() -> Vec<(&'static str, usize)> {
 
 fn create_config(shard_dir: PathBuf, list_page_size: usize) -> InternalShardConfig {
     InternalShardConfig {
+        wal_join_data_meta_writes: true,
         node_id: 1,
         max_open_files: 256,
         shard_log_preallocate_bytes: 128 * 1024 * 1024,

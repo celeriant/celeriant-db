@@ -254,6 +254,7 @@ async fn dispatch_test(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         "edge_wal_divergence_and_recovery" => edge_wal_divergence_and_recovery::run().await,
         "edge_list_pagination_cache_eviction" => edge_list_pagination_cache_eviction::run().await,
         "regression_list_iterator_truncation" => regression_list_iterator_truncation::run().await,
+        "edge_fd_limit_preflight" => edge_fd_limit_preflight::run().await,
         "edge_log_eviction_before_s3" => edge_log_eviction_before_s3::run().await,
         "edge_log_rotation_mid_replication" => edge_log_rotation_mid_replication::run().await,
         "edge_s3_batch_ordering" => edge_s3_batch_ordering::run().await,

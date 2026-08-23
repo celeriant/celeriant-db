@@ -33,6 +33,7 @@ celeriant_ktls = { path = "../celeriant_ktls" }
 futures-lite.workspace = true
 glommio.workspace = true
 libc.workspace = true
+rlimit.workspace = true
 tracing.workspace = true
 flume.workspace = true
 bytes.workspace = true

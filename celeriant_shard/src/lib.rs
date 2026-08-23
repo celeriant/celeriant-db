@@ -27,4 +27,5 @@ pub mod replicate_follower_catchup;
 #[cfg(test)] mod role_transition_contract_tests;
 #[cfg(test)] mod commit_notify_contract_tests;
 #[cfg(test)] mod drain_settle_contract_tests;
+#[cfg(test)] mod wal_recovery_contract_tests;
 #[cfg(test)] mod promotion_dedup_contract_tests;

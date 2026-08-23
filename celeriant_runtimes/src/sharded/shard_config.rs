@@ -77,6 +77,8 @@ pub struct ShardConfig {
     pub max_watch_subscribers: usize,
     pub shard_log_preallocate_bytes: u64,
     pub fsync_delay: Duration,
+    pub wal_join_data_meta_writes: bool,
+    pub preempt_timer: Duration,
     pub replication_delay: Duration,
     pub s3_replication_delay: Duration,
     pub replication_rollback_cooldown: Duration,

@@ -309,6 +309,10 @@ fn fsync_message(e: ShardFsyncError) -> String {
         ShardFsyncError::BudgetExhausted => r#"{"detail":"BudgetExhausted"}"#.into(),
         ShardFsyncError::TruncateRefusedByAckBarrier { divergent_wal_seq, barrier } =>
             format!(r#"{{"divergent_wal_seq":{},"barrier":{}}}"#, divergent_wal_seq, barrier),
+        ShardFsyncError::OverlappingWriteRanges { data_start, data_end, meta_start, meta_end } =>
+            format!(r#"{{"data_start":{},"data_end":{},"meta_start":{},"meta_end":{}}}"#, data_start, data_end, meta_start, meta_end),
+        ShardFsyncError::ShortWrite { stage, offset, expected, got } =>
+            format!(r#"{{"stage":{},"offset":{},"expected":{},"got":{}}}"#, json_string(stage), offset, expected, got),
     }
 }
 

@@ -8,6 +8,7 @@ pub enum ScanError<E> {
     LockTimeout(LockTimeoutError),
     NoFileHandle { log_id: u64 },
     Io { log_id: u64, source: String },
+    ShortRead { log_id: u64, pos: u64, requested: usize, got: usize },
     Visitor(E),
 }
 

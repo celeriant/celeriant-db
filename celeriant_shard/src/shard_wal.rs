@@ -424,6 +424,12 @@ pub(crate) async fn rebuild_active_segment_chain_tips(
             Err(ReadVisitError::Io(e)) => {
                 return Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()));
             }
+            Err(ReadVisitError::ShortRead { pos, requested, got }) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("short read at {pos} during chain-tip rebuild: requested {requested}, got {got}"),
+                ));
+            }
             Err(ReadVisitError::Visitor(())) => {
                 return Err(std::io::Error::new(std::io::ErrorKind::Other, "rebuild visitor aborted"));
             }
@@ -923,6 +929,13 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 ScanError::NoFileHandle { log_id } => ReadyUpError::UnableToAccessDirectory {
                     directory: format!("log segment {log_id}"),
                     source: std::io::Error::new(std::io::ErrorKind::NotFound, "no file handle"),
+                },
+                ScanError::ShortRead { log_id, pos, requested, got } => ReadyUpError::UnableToAccessDirectory {
+                    directory: format!("log segment {log_id}"),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("short read at {pos}: requested {requested}, got {got}"),
+                    ),
                 },
             })?;
 
@@ -2974,6 +2987,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let watched_aggregates = self.watched_aggregates.clone();
         let shard_id = self.config.shard_id;
         let dict_codec = self.dict_codec.clone();
+        let join_writes = self.config.wal_join_data_meta_writes;
 
         // Node status still feeds fsync (lease epoch etc.); the commit target is the
         // provenance-derived read-side commit rule. We already pass lease status
@@ -2991,7 +3005,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 Some(self.config.fsync_delay),
                 ShardFsyncError::WriteLockTimeout,
                 move || capture_fsync_snapshot(&mc_capture),
-                move |captured| commit_fsync_with_rollback(node_status, commit_target, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, shard_id, dict_codec),
+                move |captured| commit_fsync_with_rollback(node_status, commit_target, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, shard_id, dict_codec, join_writes),
             )
             .await
     }
@@ -4555,6 +4569,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             role,
             self.observed_leader_target.target_for(known_leader_epoch),
             &self.live_tail_yielded_wal_seq,
+            self.config.wal_join_data_meta_writes,
         ).await
 
     }
@@ -4749,6 +4764,7 @@ use celeriant_wal::segment_summary::segment_aggregate_entry::SegmentAggregateEnt
 
     fn test_config(dir: &std::path::Path) -> InternalShardConfig {
         InternalShardConfig {
+            wal_join_data_meta_writes: true,
             node_id: 1,
             shard_id: 1,
             max_open_files: 4,
@@ -11635,6 +11651,9 @@ use celeriant_wal::segment_summary::segment_aggregate_entry::SegmentAggregateEnt
                 Err(ReadVisitError::Io(e)) => {
                     panic!("io error during metablock scan: {e:?}");
                 }
+                Err(e @ ReadVisitError::ShortRead { .. }) => {
+                    panic!("short read during metablock scan: {e:?}");
+                }
             }
 
             assert!(!datablock_refs.is_empty(), "expected at least one Block-type datablock after compaction");
@@ -11737,6 +11756,9 @@ use celeriant_wal::segment_summary::segment_aggregate_entry::SegmentAggregateEnt
                     }
                     Err(ReadVisitError::Io(e)) => {
                         panic!("io error during wal_seq scan: {e:?}");
+                    }
+                    Err(e @ ReadVisitError::ShortRead { .. }) => {
+                        panic!("short read during wal_seq scan: {e:?}");
                     }
                 }
 

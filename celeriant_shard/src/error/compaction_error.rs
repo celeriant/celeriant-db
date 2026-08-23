@@ -19,6 +19,8 @@ pub enum CompactionError {
     WriteFailed { step: &'static str, source: String },
     ReadDatablock { log_id: u64, position: u64, source: String },
     MetablockSerialise(String),
+    LayoutArithmetic { kept_metablock_count: u64, kept_datablock_bytes: u64, alignment: u64 },
+    ShortRead { log_id: u64, pos: u64, requested: usize, got: usize },
     AtomicSwap { temp_path: String, target_path: String, source: String },
     CleanupFailed { path: String, source: String },
 }

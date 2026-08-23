@@ -17,8 +17,12 @@ use tracing::{debug, error, info, warn};
 
 use crate::{sharded::{intrashard_messages::IntrashardMessages, shard::Shard}, sidecar::{sidecar_channels::{SidecarSenders, create_sidecar_channel}, sidecar_lease_storage::SidecarLeaseStorage, sidecar_runtime::SidecarRuntime}};
 
+pub(crate) mod fd_limits;
 mod sharded;
 mod sidecar;
+
+#[cfg(test)]
+mod fd_limits_contract_tests;
 
 pub use {sharded::shard_config::{ApiKeyHashes, ShardConfig, TlsCertPaths}, sidecar::sidecar_config::SidecarConfig, sharded::routing_rule::RoutingRule, sharded::tls_config::{TlsConfig, TlsMode}};
 
@@ -87,6 +91,20 @@ pub fn run_executors_and_sidecar_with_extension<S: SidecarStoreTrait>(
 ) {
     info!("Starting {} shard executors on node {}", shard_config.num_shards, node_id);
 
+    match fd_limits::ensure_fd_headroom(shard_config.num_shards as u64, shard_config.max_open_files) {
+        Ok(headroom) => {
+            if headroom.soft != headroom.soft_before {
+                info!("Raised soft RLIMIT_NOFILE {} -> {} (required {})", headroom.soft_before, headroom.soft, headroom.required);
+            } else {
+                info!("RLIMIT_NOFILE headroom ok: soft {} >= required {}", headroom.soft, headroom.required);
+            }
+        }
+        Err(e) => {
+            error!("Resource limit pre-flight failed: {}", e);
+            panic!("Cannot start server: {e}");
+        }
+    }
+
     let (sidecar_senders, _sidecar_runtime) = match new_sidecar(sidecar_config, sidecar_store) {
         Ok(sidecar_handle) => sidecar_handle,
         Err(e) => {
@@ -129,6 +147,7 @@ pub fn run_executors_and_sidecar_with_extension<S: SidecarStoreTrait>(
 
         let extension = extension.clone();
         let results = LocalExecutorPoolBuilder::new(placement)
+            .preempt_timer(shard_config.preempt_timer)
             .on_all_shards(enclose!((mesh, shard_config, sidecar_senders, shard_failed, s3_upload_inflight, extension) move || async move {
 
                 let (sender, receivers) = mesh.join().await
@@ -154,6 +173,7 @@ pub fn run_executors_and_sidecar_with_extension<S: SidecarStoreTrait>(
                     node_id,
                     shard_id: current_shard_id as u32,
                     fsync_delay: shard_config.fsync_delay,
+                    wal_join_data_meta_writes: shard_config.wal_join_data_meta_writes,
                     replication_delay: shard_config.replication_delay,
                     s3_replication_delay: shard_config.s3_replication_delay,
                     replication_rollback_cooldown: shard_config.replication_rollback_cooldown,

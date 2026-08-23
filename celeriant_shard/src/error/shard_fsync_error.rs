@@ -48,6 +48,12 @@ pub enum ShardFsyncError {
     /// Failed trying to write batch of datablocks to the active file
     WriteDatablocksError(String),
 
+    /// Got the math wrong and datablock and metablock ranges overlap. Critical failure
+    OverlappingWriteRanges { data_start: u64, data_end: u64, meta_start: u64, meta_end: u64 },
+
+    /// DMA write workded but didn't write the full buffer
+    ShortWrite { stage: &'static str, offset: u64, expected: usize, got: usize },
+
     /// Failed to write the segment summary sidecar file at rotation time
     SegmentSummarySidecarWriteError(String),
 

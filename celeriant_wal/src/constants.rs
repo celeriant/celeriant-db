@@ -34,12 +34,30 @@ pub const STRUCT_TO_MEMORY_REAL_SIZE: usize = 3;
 pub const MIN_WRITE_ALIGNMENT: u64 = 4096;
 
 /// Round `pos` up to the next multiple of `alignment`. Alignment must be a power of two.
+/// No wrapping protection. Use at own risk! Consider `checked_align_up`
+/// `write_at(u64::MAX)` is not rejected by io_uring.
 pub const fn align_up(pos: u64, alignment: u64) -> u64 {
-    (pos + alignment - 1) & !(alignment - 1)
+    debug_assert!(alignment.is_power_of_two());
+    debug_assert!(pos.checked_add(alignment - 1).is_some());
+    // Parenthesised! Do subtraction first
+    (pos + (alignment - 1)) & !(alignment - 1)
+}
+
+/// [`align_up`] for untrusted offsets: `None` when `alignment` is not a power of two or
+/// the rounding would wrap past `u64::MAX`.
+pub const fn checked_align_up(pos: u64, alignment: u64) -> Option<u64> {
+    if !alignment.is_power_of_two() {
+        return None;
+    }
+    match pos.checked_add(alignment - 1) {
+        Some(sum) => Some(sum & !(alignment - 1)),
+        None => None,
+    }
 }
 
 /// Round `pos` down to the previous multiple of `alignment`. Alignment must be a power of two.
 pub const fn align_down(pos: u64, alignment: u64) -> u64 {
+    debug_assert!(alignment.is_power_of_two());
     pos & !(alignment - 1)
 }
 
@@ -66,6 +84,36 @@ mod tests {
         assert_eq!(align_up(2048, 4096), 4096);
         assert_eq!(align_up(3072, 4096), 4096);
         assert_eq!(align_up(4097, 4096), 8192);
+    }
+
+    #[test]
+    fn align_up_alignment_one_is_identity() {
+        assert_eq!(align_up(0, 1), 0);
+        assert_eq!(align_up(4097, 1), 4097);
+        assert_eq!(align_up(u64::MAX, 1), u64::MAX);
+        assert_eq!(align_down(u64::MAX, 1), u64::MAX);
+    }
+
+    #[test]
+    fn checked_align_up_matches_align_up_when_in_range() {
+        for pos in [0u64, 1, 4095, 4096, 4097, u64::MAX - 4096] {
+            assert_eq!(checked_align_up(pos, 4096), Some(align_up(pos, 4096)));
+        }
+    }
+
+    #[test]
+    fn checked_align_up_last_representable_boundary() {
+        let last = u64::MAX - 4095;
+        assert_eq!(checked_align_up(last, 4096), Some(last));
+        assert_eq!(checked_align_up(last + 1, 4096), None);
+        assert_eq!(checked_align_up(u64::MAX, 4096), None);
+    }
+
+    #[test]
+    fn checked_align_up_rejects_non_power_of_two() {
+        assert_eq!(checked_align_up(4096, 0), None);
+        assert_eq!(checked_align_up(4096, 3), None);
+        assert_eq!(checked_align_up(4096, 6144), None);
     }
 
     #[test]

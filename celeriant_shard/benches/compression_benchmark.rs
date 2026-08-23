@@ -132,6 +132,7 @@ fn create_config(
     dict_bytes: Arc<[u8]>,
 ) -> InternalShardConfig {
     InternalShardConfig {
+        wal_join_data_meta_writes: true,
         node_id: 1,
         max_open_files: 256,
         shard_log_preallocate_bytes: SEGMENT_SIZE_BYTES,

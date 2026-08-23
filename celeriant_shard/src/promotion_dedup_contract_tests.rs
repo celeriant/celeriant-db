@@ -82,6 +82,7 @@ fn test_dirs() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
 
 fn test_config(dir: &std::path::Path, node_id: u128) -> InternalShardConfig {
     InternalShardConfig {
+        wal_join_data_meta_writes: true,
         node_id,
         shard_id: SHARD_ID,
         max_open_files: 4,

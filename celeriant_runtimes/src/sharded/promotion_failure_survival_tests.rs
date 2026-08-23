@@ -316,6 +316,7 @@ fn scratch_dir(tag: &str) -> PathBuf {
 
 fn internal_config(dir: &std::path::Path) -> InternalShardConfig {
     InternalShardConfig {
+        wal_join_data_meta_writes: true,
         node_id: NODE_ID,
         shard_id: 0,
         max_open_files: 4,
@@ -357,6 +358,7 @@ fn internal_config(dir: &std::path::Path) -> InternalShardConfig {
 
 fn shard_config(dir: &std::path::Path) -> ShardConfig {
     ShardConfig {
+        wal_join_data_meta_writes: true,
         node_id: NODE_ID,
         num_shards: 1,
         replication_config: Some(S3LeaseConfig {
@@ -390,6 +392,7 @@ fn shard_config(dir: &std::path::Path) -> ShardConfig {
         max_watch_subscribers: 8,
         shard_log_preallocate_bytes: 4 * 1024 * 1024,
         fsync_delay: Duration::ZERO,
+        preempt_timer: Duration::from_millis(100),
         replication_delay: Duration::ZERO,
         s3_replication_delay: Duration::from_millis(500),
         replication_rollback_cooldown: Duration::ZERO,

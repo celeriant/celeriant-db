@@ -844,6 +844,7 @@ dependencies = [
  "libc",
  "metrics",
  "metrics-exporter-prometheus",
+ "rlimit",
  "rustls",
  "serde",
  "serde_json",
@@ -1749,7 +1750,7 @@ checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 [[package]]
 name = "glommio"
 version = "0.10.0"
-source = "git+https://github.com/glommio/glommio#1981af43ea67771d88cc7a049943f84d6ec5cc54"
+source = "git+https://github.com/glommio/glommio?rev=1981af4#1981af43ea67771d88cc7a049943f84d6ec5cc54"
 dependencies = [
  "ahash",
  "backtrace",

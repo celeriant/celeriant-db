@@ -74,6 +74,14 @@ pub async fn read_objects_absolute(
 
         let read_len = (chunk_end - chunk_start) as usize;
         let chunk = file.read_at(chunk_start, read_len).await?;
+        // read doesn't error if it got truncated! Here we intentionally error before it'd panic below
+        if chunk.len() < read_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("short read at {chunk_start}: requested {read_len}, got {}", chunk.len()),
+            )
+            .into());
+        }
 
         // Start copying within this chunk at the current object's start if it lies in the chunk,
         // otherwise from the beginning of the chunk (for objects spanning across chunks).

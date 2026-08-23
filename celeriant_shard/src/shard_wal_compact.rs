@@ -116,6 +116,14 @@ async fn resolve_aggregate_states(
                         source: e.to_string(),
                     });
                 }
+                Err(ReadVisitError::ShortRead { pos, requested, got }) => {
+                    return Err(CompactionError::ShortRead {
+                        log_id: target_log_id,
+                        pos,
+                        requested,
+                        got,
+                    });
+                }
             }
         }
     }
@@ -253,6 +261,9 @@ async fn resolve_aggregate_states(
                             log_id: scan_log_id,
                             source: e.to_string(),
                         }));
+                    }
+                    Err(ReadVisitError::ShortRead { pos, requested, got }) => {
+                        return Err(CompactionError::ShortRead { log_id: scan_log_id, pos, requested, got });
                     }
                 }
             }
@@ -393,6 +404,9 @@ async fn estimate_reclaimable_space(
                 source: e.to_string(),
             });
         }
+        Err(ReadVisitError::ShortRead { pos, requested, got }) => {
+            return Err(CompactionError::ShortRead { log_id: target_log_id, pos, requested, got });
+        }
     }
 
     let total = reclaimable_bytes + kept_bytes;
@@ -409,6 +423,55 @@ async fn estimate_reclaimable_space(
         kept_metablock_count,
         kept_datablock_bytes,
     }))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CompactedLayout {
+    /// Includes the extra DMA alignment buffer
+    padded_metablocks_end: u64,
+    tail_header_pos: u64,
+    file_size: u64,
+    datablocks_region_start: u64,
+}
+
+/// Size the compacted file from a scan estimate.
+fn compaction_layout(
+    kept_metablock_count: u64,
+    kept_datablock_bytes: u64,
+    alignment: u64,
+) -> Result<CompactedLayout, CompactionError> {
+    let wrapped = || CompactionError::LayoutArithmetic {
+        kept_metablock_count,
+        kept_datablock_bytes,
+        alignment,
+    };
+
+    let metablocks_content = kept_metablock_count
+        .checked_mul(FIXED_BLOCK_SIZE_BYTES as u64)
+        .ok_or_else(wrapped)?;
+    let metablocks_end = (HEADER_BLOCK_SIZE_BYTES as u64)
+        .checked_add(metablocks_content)
+        .ok_or_else(wrapped)?;
+    let padded_metablocks_end =
+        constants::checked_align_up(metablocks_end, alignment).ok_or_else(wrapped)?;
+    let data_end = padded_metablocks_end
+        .checked_add(kept_datablock_bytes)
+        .ok_or_else(wrapped)?;
+    let tail_header_pos = constants::checked_align_up(data_end, alignment).ok_or_else(wrapped)?;
+    let file_size = tail_header_pos
+        .checked_add(HEADER_BLOCK_SIZE_BYTES as u64)
+        .ok_or_else(wrapped)?;
+    // The chokepoint: a wrap upstream lands here as an underflow.
+    let datablocks_region_start = tail_header_pos
+        .checked_sub(kept_datablock_bytes)
+        .ok_or_else(wrapped)?;
+
+    Ok(CompactedLayout {
+        padded_metablocks_end,
+        tail_header_pos,
+        file_size,
+        datablocks_region_start,
+    })
 }
 
 /// Lightweight record of a datablock that must be copied from source to destination.
@@ -470,15 +533,13 @@ async fn build_compacted_file(
     // not necessarily 4096), consistent with shard_wal_sync.rs.
     // -------------------------------------------------------------------------
     let alignment = (src_file.alignment() as u64).max(MIN_WRITE_ALIGNMENT);
-    // Pad metablock region up to alignment so the datablock DMA write (which
-    // align_down's its start) can never reach back into metablock content.
-    let padded_metablocks_end = constants::align_up(
-        HEADER_BLOCK_SIZE_BYTES as u64 + estimate.kept_metablock_count * FIXED_BLOCK_SIZE_BYTES as u64,
+    let layout = compaction_layout(
+        estimate.kept_metablock_count,
+        estimate.kept_datablock_bytes,
         alignment,
-    );
-    let data_end = padded_metablocks_end + estimate.kept_datablock_bytes;
-    let tail_header_pos = constants::align_up(data_end, alignment);
-    let new_file_size = tail_header_pos + HEADER_BLOCK_SIZE_BYTES as u64;
+    )?;
+    let tail_header_pos = layout.tail_header_pos;
+    let new_file_size = layout.file_size;
 
     let temp_path = temp_dir.join(format!("log_{target_log_id}.compacting"));
 
@@ -500,13 +561,11 @@ async fn build_compacted_file(
     //    the buffer start is aligned (alloc_dma_buffer guarantees this) and the
     //    size is rounded up, so every write within the buffer lands correctly.
     // -------------------------------------------------------------------------
-    let metablocks_content_size = estimate.kept_metablock_count as usize * FIXED_BLOCK_SIZE_BYTES;
-    let metablocks_buf_size = constants::align_up(metablocks_content_size as u64, alignment) as usize;
+    let metablocks_buf_size = (layout.padded_metablocks_end - HEADER_BLOCK_SIZE_BYTES as u64) as usize;
 
     // Datablock region: datablocks grow backward from the tail header position.
-    // The region starts at `tail_header_pos - kept_datablock_bytes` and ends at `tail_header_pos`.
     let datablocks_region_end = tail_header_pos;
-    let datablocks_region_start = datablocks_region_end - estimate.kept_datablock_bytes;
+    let datablocks_region_start = layout.datablocks_region_start;
 
     // Align the write start down and the write end up so the single write_at is DMA-aligned.
     let new_file_alignment = (new_file.alignment() as u64).max(MIN_WRITE_ALIGNMENT);
@@ -517,7 +576,10 @@ async fn build_compacted_file(
     // Only allocate metablock buffer when there are kept metablocks.
     // Datablock buffer allocated only when there are kept datablocks.
     let mut mb_buf = if metablocks_buf_size > 0 {
-        Some(new_file.alloc_dma_buffer(metablocks_buf_size))
+        let mut buf = new_file.alloc_dma_buffer(metablocks_buf_size);
+        // DMA buffers are recycled, always zero out the slice we got allocated
+        buf.as_bytes_mut().fill(0);
+        Some(buf)
     } else {
         None
     };
@@ -564,7 +626,14 @@ async fn build_compacted_file(
                 let src_db_pos = metablock.datablock_position;
 
                 if db_bytes > 0 {
-                    new_datablocks_cursor -= db_bytes;
+                    new_datablocks_cursor = new_datablocks_cursor
+                        .checked_sub(db_bytes)
+                        .filter(|cursor| *cursor >= datablocks_region_start)
+                        .ok_or(CompactionError::LayoutArithmetic {
+                            kept_metablock_count: estimate.kept_metablock_count,
+                            kept_datablock_bytes: estimate.kept_datablock_bytes,
+                            alignment,
+                        })?;
                     metablock.datablock_position = new_datablocks_cursor;
                     datablock_refs.push(DatablockRef {
                         src_pos: src_db_pos,
@@ -587,10 +656,19 @@ async fn build_compacted_file(
                 }
 
                 // Serialize directly into the metablock DMA buffer at the current offset.
-                let mb_slice = mb_buf
-                    .as_mut()
-                    .expect("mb_buf absent despite kept metablock count > 0");
-                let slot = &mut mb_slice.as_bytes_mut()[mb_offset..mb_offset + FIXED_BLOCK_SIZE_BYTES];
+                let mb_slice = mb_buf.as_mut().ok_or(CompactionError::LayoutArithmetic {
+                    kept_metablock_count: estimate.kept_metablock_count,
+                    kept_datablock_bytes: estimate.kept_datablock_bytes,
+                    alignment,
+                })?;
+                let slot = mb_slice
+                    .as_bytes_mut()
+                    .get_mut(mb_offset..mb_offset + FIXED_BLOCK_SIZE_BYTES)
+                    .ok_or(CompactionError::LayoutArithmetic {
+                        kept_metablock_count: estimate.kept_metablock_count,
+                        kept_datablock_bytes: estimate.kept_datablock_bytes,
+                        alignment,
+                    })?;
 
                 serialize_versioned_message(&metablock, WIRE_VERSION_WAL_METABLOCK, slot)
                     .map_err(|e| CompactionError::MetablockSerialise(e.to_string()))?;
@@ -610,6 +688,9 @@ async fn build_compacted_file(
                     source: e.to_string(),
                 });
             }
+            Err(ReadVisitError::ShortRead { pos, requested, got }) => {
+                return Err(CompactionError::ShortRead { log_id: target_log_id, pos, requested, got });
+            }
         }
     }
 
@@ -626,15 +707,26 @@ async fn build_compacted_file(
                 position: dr.src_pos,
                 source: e.to_string(),
             })?;
+        // reads truncate silently so check
+        if data.len() < dr.size as usize {
+            return Err(CompactionError::ShortRead {
+                log_id: target_log_id,
+                pos: dr.src_pos,
+                requested: dr.size as usize,
+                got: data.len(),
+            });
+        }
 
         // Copy into the correct offset within the DMA buffer.
-        // `dr.new_pos` is the absolute file position; subtract the aligned write start
-        // to get the buffer-relative offset.
         let buf_offset = (dr.new_pos - aligned_db_write_start) as usize;
         db_buf
             .as_mut()
-            .expect("db_buf absent despite datablock_refs non-empty")
-            .as_bytes_mut()[buf_offset..buf_offset + dr.size as usize]
+            .and_then(|buf| buf.as_bytes_mut().get_mut(buf_offset..buf_offset + dr.size as usize))
+            .ok_or(CompactionError::LayoutArithmetic {
+                kept_metablock_count: estimate.kept_metablock_count,
+                kept_datablock_bytes: estimate.kept_datablock_bytes,
+                alignment,
+            })?
             .copy_from_slice(&data);
 
         glommio::yield_if_needed().await;
@@ -939,4 +1031,75 @@ pub fn cleanup_orphaned_compacting_files(temp_dir: &Path) -> Result<(), Compacti
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    const ALIGN: u64 = MIN_WRITE_ALIGNMENT;
+
+    fn wrapped(layout: Result<CompactedLayout, CompactionError>) -> bool {
+        matches!(layout, Err(CompactionError::LayoutArithmetic { .. }))
+    }
+
+    #[test]
+    fn empty_segment_layout_is_two_header_blocks() {
+        let layout = compaction_layout(0, 0, ALIGN).unwrap();
+        assert_eq!(layout.padded_metablocks_end, HEADER_BLOCK_SIZE_BYTES as u64);
+        assert_eq!(layout.tail_header_pos, HEADER_BLOCK_SIZE_BYTES as u64);
+        assert_eq!(layout.file_size, HEADER_BLOCK_SIZE_BYTES as u64 * 2);
+        assert_eq!(layout.datablocks_region_start, layout.tail_header_pos);
+    }
+
+    #[test]
+    fn regions_never_overlap_and_datablocks_fill_the_tail() {
+        for metablocks in [1u64, 3, 4, 5, 64] {
+            for datablocks in [0u64, 1, 4095, 4096, 1_000_000] {
+                let layout = compaction_layout(metablocks, datablocks, ALIGN).unwrap();
+                assert!(layout.datablocks_region_start >= layout.padded_metablocks_end);
+                assert_eq!(layout.tail_header_pos - layout.datablocks_region_start, datablocks);
+                assert_eq!(layout.tail_header_pos % ALIGN, 0);
+                assert_eq!(layout.padded_metablocks_end % ALIGN, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn metablock_count_overflow_is_reported() {
+        assert!(wrapped(compaction_layout(u64::MAX, 0, ALIGN)));
+        assert!(wrapped(compaction_layout(u64::MAX / FIXED_BLOCK_SIZE_BYTES as u64, 0, ALIGN)));
+    }
+
+    #[test]
+    fn datablock_bytes_overflow_is_reported() {
+        assert!(wrapped(compaction_layout(1, u64::MAX, ALIGN)));
+        // data_end lands inside the last alignment window: align_up then wraps.
+        assert!(wrapped(compaction_layout(1, u64::MAX - HEADER_BLOCK_SIZE_BYTES as u64 * 2, ALIGN)));
+    }
+
+    #[test]
+    fn file_size_overflow_is_reported() {
+        // tail_header_pos is representable but adding the tail header block is not.
+        let datablocks = u64::MAX - 4095 - HEADER_BLOCK_SIZE_BYTES as u64 * 2;
+        assert!(wrapped(compaction_layout(1, datablocks, ALIGN)));
+    }
+
+    #[test]
+    fn non_power_of_two_alignment_is_reported() {
+        assert!(wrapped(compaction_layout(4, 4096, 6144)));
+        assert!(wrapped(compaction_layout(4, 4096, 0)));
+    }
+
+    #[test]
+    fn error_carries_the_estimate_inputs() {
+        match compaction_layout(u64::MAX, 7, ALIGN) {
+            Err(CompactionError::LayoutArithmetic { kept_metablock_count, kept_datablock_bytes, alignment }) => {
+                assert_eq!(kept_metablock_count, u64::MAX);
+                assert_eq!(kept_datablock_bytes, 7);
+                assert_eq!(alignment, ALIGN);
+            }
+            other => panic!("expected LayoutArithmetic, got {other:?}"),
+        }
+    }
 }
