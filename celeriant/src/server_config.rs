@@ -159,13 +159,13 @@ pub struct ServerConfig {
     )]
     pub routing_rule: RoutingRule,
 
-    #[arg(long, default_value_t = 1024 * 1024 * 16, env = "CELERIANT_MAX_REQUEST_SIZE", help = "Maximum client request message size (16 MiB)")]
+    #[arg(long, default_value_t = 1024 * 1024 * 16, env = "CELERIANT_MAX_REQUEST_SIZE", help = "Maximum client request message size, compressed and uncompressed (16 MiB)")]
     pub max_request_size: u64,
 
-    #[arg(long, default_value_t = 1024 * 1024 * 64, env = "CELERIANT_INTERNODE_MAX_REQUEST_SIZE", help = "Maximum inter-node request message size; also bounds a single PCD on the replication path (64 MiB)")]
+    #[arg(long, default_value_t = 1024 * 1024 * 64, env = "CELERIANT_INTERNODE_MAX_REQUEST_SIZE", help = "Maximum inter-node request message size, compressed and uncompressed (64 MiB)")]
     pub internode_max_request_size: u64,
 
-    #[arg(long, default_value_t = 1024 * 1024 * 64, env = "CELERIANT_MAX_RESPONSE_SIZE", help = "Maximum response message size (64 MiB)")]
+    #[arg(long, default_value_t = 1024 * 1024 * 64, env = "CELERIANT_MAX_RESPONSE_SIZE", help = "Maximum response message size, compressed and uncompressed (64 MiB)")]
     pub max_response_size: u64,
 
     #[arg(

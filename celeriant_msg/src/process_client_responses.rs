@@ -284,7 +284,10 @@ where
 {
     use celeriant_wire::{
         codec::{bincode as wire_bincode, msgpack as wire_msgpack},
-        network::wire_header::{WIRE_HEADER_SIZE, WIRE_FIXED_BODY_SIZE, PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3},
+        network::wire_header::{
+            WIRE_HEADER_SIZE, WIRE_FIXED_BODY_SIZE, PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3,
+            checked_u32_len,
+        },
     };
 
     let uncompressed: Vec<u8> = match version {
@@ -302,13 +305,19 @@ where
         CompressionType::ZstdDict => dict_codec.compress(&uncompressed).map_err(WireError::from)?,
     };
 
-    let compressed_size = data.len() as u32;
-    let uncompressed_size = payload_size as u32;
+    let compressed_size = checked_u32_len(data.len())?;
+    let uncompressed_size = checked_u32_len(payload_size)?;
     let compression_type_id = compression_type.to_byte();
 
     if compressed_size as u64 > max_message_size {
         return Err(WireError::MessageTooLarge {
             message_length: compressed_size as u64,
+            max_size_bytes: max_message_size,
+        });
+    }
+    if uncompressed_size as u64 > max_message_size {
+        return Err(WireError::MessageTooLarge {
+            message_length: uncompressed_size as u64,
             max_size_bytes: max_message_size,
         });
     }

@@ -16,7 +16,9 @@ use std::borrow::Cow;
 use celeriant_wal::compression_type::CompressionType;
 use celeriant_wire::codec::compression::{compress_with_dict, decompress_with_dict};
 use celeriant_wire::network::wire_error::WireError;
-use celeriant_wire::network::wire_header::{WireHeader, wire_header_write_variable_size_raw};
+use celeriant_wire::network::wire_header::{
+    WireHeader, checked_u32_len, wire_header_write_variable_size_raw,
+};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 
 /// zstd level for dictionary compression. Affects compressed size only, not decompressibility;
@@ -41,7 +43,7 @@ pub fn build_frame(
     dict: Option<&[u8]>,
     compress: bool,
 ) -> Result<OutFrame, WireError> {
-    let uncompressed_size = uncompressed.len() as u32;
+    let uncompressed_size = checked_u32_len(uncompressed.len())?;
     let (compression, body) = match (compress, dict) {
         (true, Some(dict)) => (
             CompressionType::ZstdDict,

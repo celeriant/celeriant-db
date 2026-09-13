@@ -8,12 +8,23 @@ pub fn read_u128_le(buf: &[u8], offset: usize) -> u128 {
     u128::from_le_bytes(buf[offset..offset + 16].try_into().unwrap())
 }
 
-/// Read an Option<u128> from a byte slice at the given offset (little-endian)
-/// Assumes 1-byte discriminant followed by 16-byte value
-pub fn read_option_u128_le(buf: &[u8], offset: usize) -> Option<u128> {
+/// handles and invalid discriminant byte marker
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidOptionDiscriminant {
+    pub offset: usize,
+    pub byte: u8,
+}
+
+/// reads the discriminant from the buffer, and then reads the u128 if present
+pub fn read_option_u128_le(
+    buf: &[u8],
+    offset: usize,
+) -> Result<Option<u128>, InvalidOptionDiscriminant> {
     match buf[offset] {
-        0 => None,
-        1 => Some(u128::from_le_bytes(buf[offset + 1..offset + 17].try_into().unwrap())),
-        _ => None, // Invalid discriminant
+        0 => Ok(None),
+        1 => Ok(Some(u128::from_le_bytes(
+            buf[offset + 1..offset + 17].try_into().unwrap(),
+        ))),
+        byte => Err(InvalidOptionDiscriminant { offset, byte }),
     }
 }

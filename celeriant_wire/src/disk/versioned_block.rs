@@ -228,7 +228,7 @@ mod tests {
 
         // Get the user_id
         let user_id_offset = batch_base + MetablockEventBatch::OFFSET_USER_ID;
-        assert_eq!(read_option_u128_le(&buffer, user_id_offset), Some(342352352));
+        assert_eq!(read_option_u128_le(&buffer, user_id_offset), Ok(Some(342352352)));
 
     }
 

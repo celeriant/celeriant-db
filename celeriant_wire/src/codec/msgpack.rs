@@ -12,6 +12,15 @@ where
 }
 
 #[inline]
+pub fn serialise_writer<T, W>(message: &T, writer: &mut W) -> Result<(), rmp_serde::encode::Error>
+where
+    T: Serialize,
+    W: std::io::Write,
+{
+    rmp_serde::encode::write(writer, message)
+}
+
+#[inline]
 pub fn deserialise<T>(buffer: &[u8]) -> Result<T, rmp_serde::decode::Error>
 where
     T: DeserializeOwned,

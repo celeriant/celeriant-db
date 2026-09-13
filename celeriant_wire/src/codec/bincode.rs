@@ -24,6 +24,15 @@ where
 }
 
 #[inline]
+pub fn fixed_serialise_writer<T, W>(message: &T, writer: W) -> Result<(), error::EncodeError>
+where
+    T: Encode,
+    W: bincode::enc::write::Writer,
+{
+    bincode::encode_into_writer(message, writer, CONFIG_FIXED)
+}
+
+#[inline]
 pub fn fixed_deserialise<T>(buffer: &[u8]) -> Result<T, error::DecodeError>
 where
     T: Decode<()>,

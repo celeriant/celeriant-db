@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 /// Filters and pagination options for reading event batches
 #[derive(Default, Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct ReadFilters {
-    /// Starting server ID to begin reading from (inclusive). Will error if not found in stream.
+    /// Starting server ID to begin reading from (inclusive). A version past the tip returns an empty result, not an error.
     pub from_aggregate_version: u64,
-    /// End reading event batches at this server id (inclusive). Will error if reached end of stream before this ID.
+    /// End reading event batches at this server id (inclusive). A version past the tip returns the available events, not an error.
     pub to_aggregate_version: Option<u64>,
     /// Optional whitelist of event types to include in results
     pub include_event_types: Option<Vec<u64>>,

@@ -298,7 +298,7 @@ async fn handle_client_pipelining<R: ReplicationClient + 'static, D: S3Downloade
     mut tcp_stream: TcpStream,
     request: Option<ClientRequest>,
     max_response_size: u64,
-    mut message_version: u32,
+    message_version: u32,
     ctx: ConnectionContext<R, D, S>,
     conn_state: ConnectionState,
 ) {
@@ -339,8 +339,17 @@ async fn handle_client_pipelining<R: ReplicationClient + 'static, D: S3Downloade
 
         match read_client_request(&mut tcp_stream, &ctx).await {
             Some((next_request, next_version)) => {
+                // don't allow protocol version switching on the same connection.
+                if next_version != message_version {
+                    debug!(
+                        shard_id = ctx.current_shard_id,
+                        pinned = message_version,
+                        attempted = next_version,
+                        "Dropping connection: mid-connection protocol version switch"
+                    );
+                    return;
+                }
                 optional_request = Some(next_request);
-                message_version = next_version;
             }
             None => return,
         }
@@ -369,7 +378,7 @@ async fn handle_cluster_pipelining<R: ReplicationClient + 'static, D: S3Download
     mut tcp_stream: TcpStream,
     request: Option<ClusterRequest>,
     max_response_size: u64,
-    mut message_version: u32,
+    message_version: u32,
     ctx: ConnectionContext<R, D, S>,
 ) {
     let mut optional_request = request;
@@ -389,8 +398,16 @@ async fn handle_cluster_pipelining<R: ReplicationClient + 'static, D: S3Download
 
         match read_cluster_request(&mut tcp_stream, &ctx).await {
             Some((next_request, next_version)) => {
+                if next_version != message_version {
+                    debug!(
+                        shard_id = ctx.current_shard_id,
+                        pinned = message_version,
+                        attempted = next_version,
+                        "Dropping cluster connection: mid-connection protocol version switch"
+                    );
+                    return;
+                }
                 optional_request = Some(next_request);
-                message_version = next_version;
             }
             None => return,
         }

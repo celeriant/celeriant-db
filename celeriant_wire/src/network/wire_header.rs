@@ -19,6 +19,16 @@ pub struct WireHeader {
     pub compression_type: CompressionType,
 }
 
+/// usize can be 64-bit, so we need a safe downcast
+/// We don't expect data payloads greater than 4GB
+#[inline]
+pub fn checked_u32_len(len: usize) -> Result<u32, WireError> {
+    u32::try_from(len).map_err(|_| WireError::MessageTooLarge {
+        message_length: len as u64,
+        max_size_bytes: u32::MAX as u64,
+    })
+}
+
 impl WireHeader {
     pub async fn from_reader<R>(reader: &mut R, max_size_bytes: u64) -> Result<Self, WireError>
     where
@@ -68,10 +78,13 @@ impl WireHeader {
         })
     }
 
-    pub async fn read_fixed_size<R, T>(&self, reader: &mut R) -> Result<T, WireError>
+    /// Read a fixed-size frame's body off the wire without deserialising it
+    pub async fn read_fixed_body_raw<R>(
+        &self,
+        reader: &mut R,
+    ) -> Result<[u8; WIRE_FIXED_BODY_SIZE], WireError>
     where
         R: AsyncReadExt + Unpin,
-        T: Decode<()> + serde::de::DeserializeOwned,
     {
         if self.compression_type != CompressionType::None {
             return Err(WireError::MalformedFrame(
@@ -88,6 +101,15 @@ impl WireHeader {
         reader
             .read_exact(&mut buffer[..self.compressed_length as usize])
             .await?;
+        Ok(buffer)
+    }
+
+    pub async fn read_fixed_size<R, T>(&self, reader: &mut R) -> Result<T, WireError>
+    where
+        R: AsyncReadExt + Unpin,
+        T: Decode<()> + serde::de::DeserializeOwned,
+    {
+        let buffer = self.read_fixed_body_raw(reader).await?;
         deserialise_versioned(&buffer, self.version)
     }
 
@@ -156,6 +178,41 @@ where
     }
 }
 
+/// writes bytes but also keeps track of the overflowing length
+/// so we can send it back in the error.
+struct OverflowCountingSlice<'a> {
+    buffer: &'a mut [u8],
+    written: usize,
+}
+
+impl OverflowCountingSlice<'_> {
+    fn push(&mut self, bytes: &[u8]) {
+        if self.written < self.buffer.len() {
+            let take = bytes.len().min(self.buffer.len() - self.written);
+            self.buffer[self.written..self.written + take].copy_from_slice(&bytes[..take]);
+        }
+        self.written += bytes.len();
+    }
+}
+
+impl bincode::enc::write::Writer for OverflowCountingSlice<'_> {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), bincode::error::EncodeError> {
+        self.push(bytes);
+        Ok(())
+    }
+}
+
+impl std::io::Write for OverflowCountingSlice<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.push(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Writes a fixed-size message (always uncompressed, body ≤ `WIRE_FIXED_BODY_SIZE`).
 pub async fn wire_header_write_fixed_size<W, T>(
     writer: &mut W,
@@ -168,15 +225,22 @@ where
     T: Encode + Serialize,
 {
     let mut buffer = [0u8; WIRE_HEADER_SIZE + WIRE_FIXED_BODY_SIZE];
-    let body_size = match protocol_version {
-        PROTOCOL_VERSION_V2 => {
-            codec::bincode::fixed_serialise_stack(message, &mut buffer[WIRE_HEADER_SIZE..])?
-        }
-        PROTOCOL_VERSION_V3 => {
-            codec::msgpack::serialise_stack(message, &mut buffer[WIRE_HEADER_SIZE..])?
-        }
-        _ => return Err(WireError::UnsupportedProtocol(protocol_version)),
+    let mut body = OverflowCountingSlice {
+        buffer: &mut buffer[WIRE_HEADER_SIZE..],
+        written: 0,
     };
+    match protocol_version {
+        PROTOCOL_VERSION_V2 => codec::bincode::fixed_serialise_writer(message, &mut body)?,
+        PROTOCOL_VERSION_V3 => codec::msgpack::serialise_writer(message, &mut body)?,
+        _ => return Err(WireError::UnsupportedProtocol(protocol_version)),
+    }
+    let body_size = body.written;
+    if body_size > WIRE_FIXED_BODY_SIZE {
+        return Err(WireError::MessageTooLarge {
+            message_length: body_size as u64,
+            max_size_bytes: WIRE_FIXED_BODY_SIZE as u64,
+        });
+    }
 
     buffer[0..4].copy_from_slice(&protocol_version.to_le_bytes());
     buffer[4..8].copy_from_slice(&request_response_type.to_le_bytes());
@@ -201,12 +265,13 @@ where
     T: Encode + Serialize,
 {
     let data = serialise_heap_versioned(message, protocol_version)?;
+    let uncompressed_size = checked_u32_len(data.len())?;
     write_variable_frame(
         writer,
         request_response_type,
         protocol_version,
         CompressionType::None,
-        data.len() as u32,
+        uncompressed_size,
         &data,
         max_size_bytes,
     )
@@ -228,7 +293,7 @@ where
     T: Encode + Serialize,
 {
     let uncompressed = serialise_heap_versioned(message, protocol_version)?;
-    let uncompressed_size = uncompressed.len() as u32;
+    let uncompressed_size = checked_u32_len(uncompressed.len())?;
     let data = match compression_type {
         CompressionType::None => uncompressed,
         CompressionType::ZstdDict => codec.compress(&uncompressed)?,
@@ -284,12 +349,18 @@ async fn write_variable_frame<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    let compressed_size = data.len() as u32;
+    let compressed_size = checked_u32_len(data.len())?;
     let compression_type_id = compression_type.to_byte();
 
     if compressed_size as u64 > max_size_bytes {
         return Err(WireError::MessageTooLarge {
             message_length: compressed_size as u64,
+            max_size_bytes,
+        });
+    }
+    if uncompressed_size as u64 > max_size_bytes {
+        return Err(WireError::MessageTooLarge {
+            message_length: uncompressed_size as u64,
             max_size_bytes,
         });
     }
@@ -383,6 +454,20 @@ mod tests {
         let mut reader = Cursor::new(buf);
         let header = WireHeader::from_reader(&mut reader, MAX_SIZE).await.expect("from_reader");
         header.read_variable_size_with_codec(&mut reader, &codec).await.expect("read_with_codec")
+    }
+
+    // ==================== length conversion ====================
+
+    #[test]
+    fn checked_u32_len_rejects_over_u32_max() {
+        let len = u32::MAX as usize + 1;
+        let err = checked_u32_len(len).expect_err("must reject");
+        assert!(matches!(err, WireError::MessageTooLarge { message_length, .. } if message_length == len as u64));
+    }
+
+    #[test]
+    fn checked_u32_len_accepts_u32_max() {
+        assert_eq!(checked_u32_len(u32::MAX as usize).unwrap(), u32::MAX);
     }
 
     // ==================== version validation ====================
@@ -645,6 +730,44 @@ mod tests {
                 &mut buf, &raw_body, 1, CompressionType::None, raw_body.len() as u32, TINY_MAX, PROTOCOL_VERSION_V2,
             ).await.expect_err("raw must reject");
             assert!(matches!(err, WireError::MessageTooLarge { .. }));
+        });
+    }
+
+    #[test]
+    fn variable_size_writers_reject_oversized_uncompressed_body() {
+        block_on(async {
+            const TINY_MAX: u64 = 4096;
+            let compressible = vec![0u8; 1_048_584];
+
+            let codec = test_codec();
+            let mut buf = Vec::new();
+            let err = wire_header_write_variable_size_with_codec(
+                &mut buf, &compressible, 1, CompressionType::ZstdDict, TINY_MAX, PROTOCOL_VERSION_V2, &codec,
+            ).await.expect_err("with_codec(ZstdDict) must reject");
+            assert!(matches!(err, WireError::MessageTooLarge { message_length, .. } if message_length > TINY_MAX));
+
+            let mut buf = Vec::new();
+            let err = wire_header_write_variable_size_raw(
+                &mut buf, &[0u8; 60], 1, CompressionType::ZstdDict, 1_048_584, TINY_MAX, PROTOCOL_VERSION_V2,
+            ).await.expect_err("raw must reject");
+            assert!(matches!(err, WireError::MessageTooLarge { message_length, .. } if message_length > TINY_MAX));
+        });
+    }
+
+    #[test]
+    fn write_fixed_size_rejects_oversized_body() {
+        block_on(async {
+            let big = vec![7u8; WIRE_FIXED_BODY_SIZE + 1];
+            for &version in &[PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3] {
+                let mut buf = Vec::new();
+                let err = wire_header_write_fixed_size(&mut buf, &big, 1, version)
+                    .await
+                    .expect_err("oversized fixed-size body must be rejected");
+                assert!(
+                    matches!(err, WireError::MessageTooLarge { message_length, max_size_bytes } if message_length > max_size_bytes),
+                    "v{version} must return MessageTooLarge, got {err:?}"
+                );
+            }
         });
     }
 

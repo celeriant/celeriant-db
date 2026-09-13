@@ -4,11 +4,12 @@ use std::sync::OnceLock;
 
 /// `BuildHasher` for keys that already carry a strong precomputed hash.
 ///
-/// `AggregateKey`, `AggregateClientKey`, `SchemaKey` and `AggregateTypeKey` each compute an
-/// xxh3-64 once at construction and store it, and each one's `Hash` impl writes exactly that
-/// single `u64`. Putting them in a map with std's default `RandomState` therefore runs
-/// SipHash-1-3 over eight bytes of an already well-distributed hash — the work is real and the
-/// distribution it buys has already been paid for.
+/// `AggregateKey` and `SchemaKey` compute an xxh3-64 once at construction and store it;
+/// `AggregateTypeKey` and `AggregateClientKey` compute a `DefaultHasher` (SipHash-1-3) value the
+/// same way. Each one's `Hash` impl writes exactly that single `u64`. Putting them in a map with
+/// std's default `RandomState` therefore runs SipHash-1-3 over eight bytes of an already
+/// well-distributed hash — the work is real and the distribution it buys has already been paid
+/// for.
 ///
 /// This applies one splitmix64 finalising round instead: four instructions against SipHash's
 /// forty-odd.
