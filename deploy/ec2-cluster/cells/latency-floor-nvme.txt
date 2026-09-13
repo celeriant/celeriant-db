@@ -1,0 +1,21 @@
+# Quiet-path latency floor on local NVMe. Separate small cluster, ONE client so TASKS maps 1:1.
+#
+# Same hypothesis as latency-floor-gp3.txt; see that file for the mechanism and the 2ms/21ms
+# decision split. The pair of numbers is the point: gp3 floor against NVMe floor isolates storage
+# latency on the quiet path with everything else identical.
+#
+# Cluster: 2x i4i.2xlarge data + 1x c7i.2xlarge client, instance store, ap-southeast-2a
+# (i4i.2xlarge scores 2 there, 1 in the other two).
+#
+# Assumption, stated not smuggled: a quiet single 4k write uses one core and one stripe, so it
+# does not exploit 64 vCPU or a 4-drive RAID0, and this small box should sit within noise of a
+# 16xlarge. Verifying that needs a third deploy and is not worth it inside this budget.
+#
+#   make infra CDK_ARGS="-c keyPair=<key> -c instanceType=i4i.2xlarge \
+#     -c clientInstanceType=c7i.2xlarge -c clientCount=1 -c az=ap-southeast-2a"
+#   CELLS_FILE=cells/latency-floor-nvme.txt REPS=3 SWEEP_TLS_MODE=strict bash scripts/run-cell-sweep.sh
+
+floor_1     TASKS=1
+floor_4     TASKS=4
+floor_16    TASKS=16
+floor_64    TASKS=64

@@ -45,10 +45,17 @@ DATA_NODES ?= 2
 # NOTE: profile names count *vCPUs*, not physical cores. i4i.16xlarge is 64 vCPU / 32
 # physical cores; only i4i.metal has 64 physical cores.
 # Override individual flags with CDK_ARGS for one-offs (e.g. CDK_ARGS="-c keyPair=my-key").
+#
+# PRECEDENCE: profile flags are placed BEFORE $(CDK_ARGS), and `cdk -c` is last-wins, so a
+# -c passed on the command line beats the profile. This was the other way round until it was
+# checked with `cdk synth`: `override CDK_ARGS += ...` appends, which put the profile last and
+# made every command-line -c a silent no-op. The README's
+#   make infra PROFILE=i4i-metal CDK_ARGS="-c clientInstanceType=c6i.8xlarge"
+# example therefore deployed c6i.4xlarge and said nothing.
 PROFILE ?= default
 
 ifeq ($(PROFILE),i4i-32c)
-  override CDK_ARGS += -c instanceType=i4i.8xlarge -c clientInstanceType=c7i.4xlarge -c clientCount=3
+  override CDK_ARGS := -c instanceType=i4i.8xlarge -c clientInstanceType=c7i.4xlarge -c clientCount=3 $(CDK_ARGS)
   # Measured on this hardware 2026-08-16, one factor at a time, at 24,000 connections.
   #
   #   fsync 4,000 us       swept 100-17,000 on a REPLICATED pair (the first such sweep — the
@@ -68,9 +75,9 @@ ifeq ($(PROFILE),i4i-32c)
   FSYNC_DELAY_US ?= 4000
   REPLICATION_DELAY_US ?= 8000
 else ifeq ($(PROFILE),i4i-64c)
-  override CDK_ARGS += -c instanceType=i4i.16xlarge -c clientInstanceType=c7i.4xlarge -c clientCount=4
+  override CDK_ARGS := -c instanceType=i4i.16xlarge -c clientInstanceType=c7i.4xlarge -c clientCount=4 $(CDK_ARGS)
 else ifeq ($(PROFILE),i4g-32c)
-  override CDK_ARGS += -c instanceType=i4g.8xlarge -c clientInstanceType=c7g.4xlarge -c clientCount=3
+  override CDK_ARGS := -c instanceType=i4g.8xlarge -c clientInstanceType=c7g.4xlarge -c clientCount=3 $(CDK_ARGS)
 else ifeq ($(PROFILE),i4i-metal)
   # The publish target: 64 physical cores / 128 vCPU, bare metal, full PMU.
   # 128 + 4x16 = 192 vCPU, exactly the Standard Spot quota in ap-southeast-2 — a follower
@@ -85,7 +92,7 @@ else ifeq ($(PROFILE),i4i-metal)
   # 2c is the only AZ scoring 3 for both halves. Re-check before re-running, scores move:
   #   aws ec2 get-spot-placement-scores --instance-types i4i.metal --target-capacity 1 \
   #     --single-availability-zone --region-names ap-southeast-2
-  override CDK_ARGS += -c instanceType=i4i.metal -c clientInstanceType=c6i.4xlarge -c clientCount=4 -c az=ap-southeast-2c
+  override CDK_ARGS := -c instanceType=i4i.metal -c clientInstanceType=c6i.4xlarge -c clientCount=8 -c az=ap-southeast-2c $(CDK_ARGS)
   # Measured amortisation windows for THIS hardware. Both were swept on the box; neither is a
   # guess, and they are NOT interchangeable defaults for other instance types:
   #
@@ -130,7 +137,7 @@ else ifeq ($(PROFILE),gp3-16c)
   # SMALLER box than the i4i.metal arm, so the two are not directly comparable on throughput —
   # each arm is internally consistent for the delay question, which is what rung 2 asks.
   # It also matches the cheap-EBS-node shape the cost-floor story wants.
-  override CDK_ARGS += -c instanceType=c6i.4xlarge -c clientInstanceType=c5.2xlarge -c clientCount=3 -c storageType=ebs -c az=ap-southeast-2c
+  override CDK_ARGS := -c instanceType=c6i.4xlarge -c clientInstanceType=c5.2xlarge -c clientCount=3 -c storageType=ebs -c az=ap-southeast-2c $(CDK_ARGS)
 else ifneq ($(PROFILE),default)
   $(error Unknown PROFILE '$(PROFILE)'. Valid: default, i4i-32c, i4i-64c, i4i-metal, gp3-16c, i4g-32c)
 endif

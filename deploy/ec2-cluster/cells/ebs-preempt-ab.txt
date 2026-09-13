@@ -1,0 +1,40 @@
+# Does the glommio preempt quantum cause the gp3 decline?
+#
+# Mechanism (session/goal.md, and ~/sandbox/glommio-celeriant-fixes/session/design-need-preempt.md):
+# Reactor::need_preempt reads the LATENCY ring's CQ head/tail only. A main-ring completion cannot
+# set it. The indirect path arms with min_events = ring_depth() = 128 and re-submits every reactor
+# pass, so at low queue depth it never fires. Submission is not late; NOTIFICATION is. A finished
+# I/O sits in the main ring's CQ, invisible, until this timer drags the executor back into wait().
+#
+# The 2026-08-10 gp3 sweep measured aqu-sz 7.7 and w_await 1.11ms flat while client p50 went
+# 60ms -> 263ms. Device fine, notification late. That is the hypothesis.
+#
+# THREE arms, not two. If latency is quantised in preempt periods the effect must scale
+# MONOTONICALLY with the period, and the mid arm tests that. A two-arm A/B cannot separate "the
+# timer did it" from "something else differed between two configs".
+#   250 us     the shipped default since 370d13e
+#   10000 us   mid
+#   100000 us  the old glommio default, and the top of clap's 50..=100_000 range
+#
+# Levels: 48k is the published EBS peak, 96k is deep in the decline (61% behind NVMe). 24k is
+# omitted deliberately - the published data already supplies the negative control there
+# (EBS 253,362 vs NVMe 249,393, no gap to explain).
+#
+# Arms INTERLEAVED per level. Boustrophedon equalises mean position, but the driver reports
+# worse-of-N, and min-of-N over adjacent reps runs optimistic against min-of-N over reps an hour
+# apart. Grouping an arm together parks it at the run extremes and confounds arm with spread.
+#
+# REPS=3 is not optional: 16xl-nvme-pinned records 5.4/5.6/5.0% run-to-run spread on the QUIETER
+# storage, so a 2-rep ladder trips the >5% noise rule on its own before the knob is considered.
+#
+# fsync/replication windows left unset on purpose - server defaults, matching how the 2026-08-10
+# baseline ran.
+#
+#   CELLS_FILE=cells/ebs-preempt-ab.txt REPS=3 SWEEP_TLS_MODE=strict bash scripts/run-cell-sweep.sh
+
+p250_48k    TASKS=48000  PREEMPT_TIMER_US=250
+p10k_48k    TASKS=48000  PREEMPT_TIMER_US=10000
+p100k_48k   TASKS=48000  PREEMPT_TIMER_US=100000
+p250_96k    TASKS=96000  PREEMPT_TIMER_US=250
+p10k_96k    TASKS=96000  PREEMPT_TIMER_US=10000
+p100k_96k   TASKS=96000  PREEMPT_TIMER_US=100000

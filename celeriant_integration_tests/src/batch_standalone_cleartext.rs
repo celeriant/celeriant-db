@@ -31,6 +31,18 @@ const NUM_AGGREGATES: usize = 1024;
 const USE_MICRO_PAYLOAD: bool = true;
 const CLIENTSIDE_TIMEOUT_S: u64 = 5;
 
+const MACBETH: &str = "She should have died hereafter;
+            There would have been a time for such a word.
+            Tomorrow, and tomorrow, and tomorrow,
+            Creeps in this petty pace from day to day
+            To the last syllable of recorded time,
+            And all our yesterdays have lighted fools
+            The way to dusty death. Out, out, brief candle!
+            Life's but a walking shadow, a poor player
+            That struts and frets his hour upon the stage
+            And then is heard no more. It is a tale
+            Told by an idiot, full of sound and fury, Signifying nothing. ";
+
 const STANDALONE_THROUGHPUT_MIN: f64 = 361_000.0; // ~425k * 0.85
 const STANDALONE_LATENCY_AVG_MAX_MS: f64 = 25.0; // ~21ms * 1.15
 const STANDALONE_LATENCY_P99_MAX_MS: u64 = 33; // ~28ms * 1.15
@@ -167,6 +179,19 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
     let addr = server.address().to_string();
 
+    // Bench override: one scenario at the given connection count, no latency
+    // phase, no thresholds. Default path below is unchanged when unset.
+    let override_conns: Option<usize> = std::env::var("CELERIANT_BENCH_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    if let Some(n) = override_conns {
+        println!("\n--- Throughput ({} connections) ---", n);
+        let r = run_benchmark_iteration(&addr, n, Some(identity_config.clone())).await?;
+        print_result(&r);
+        drop(server);
+        return Ok(());
+    }
+
     // --- Throughput ---
     println!(
         "\n--- Throughput ({} connections) ---",
@@ -239,8 +264,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn print_result(r: &BenchmarkResult) {
     println!(
-        "  Throughput: {:.0} req/s | Avg: {:.1}ms | P50: {}ms | P95: {}ms | P99: {}ms | P99.9: {}ms",
-        r.throughput, r.avg_latency_ms, r.p50_ms, r.p95_ms, r.p99_ms, r.p999_ms
+        "  Throughput: {:.0} req/s | Avg: {:.1}ms | P50: {}ms | P95: {}ms | P99: {}ms | P99.9: {}ms | Total: {}",
+        r.throughput, r.avg_latency_ms, r.p50_ms, r.p95_ms, r.p99_ms, r.p999_ms, r.total_requests
     );
 }
 
@@ -374,87 +399,67 @@ async fn run_connection_benchmark(
     let mut request_count = 0u64;
     let mut latencies = Vec::new();
 
+    // Request built once per connection; per request only the seq digits are
+    // rewritten in place over the preallocated value buffer. The load generator
+    // must not do per-request work beyond a memcpy and the socket call.
+    let aggregate_id = connection_id % NUM_AGGREGATES;
+    let key = AggregateKey::new(1, 1, aggregate_id as u128);
+    let mut value_buf: Vec<u8> = Vec::with_capacity(if USE_MICRO_PAYLOAD { 128 } else { 1024 });
+    let mut event = DatablockAggregateEvent {
+        client_seq: 3,
+        event_seq: 0,
+        event_id: Some(1234567890),
+        event_timestamp: 0,
+        event_type_major: 2,
+        event_type_minor: 3,
+        event_value: std::sync::Arc::new(Vec::new()),
+        iv: None,
+    };
+    let mut writes = HashMap::new();
+    writes.insert(
+        key.clone(),
+        SingleAggregateWrite {
+            events: Vec::with_capacity(2),
+            allow_create: true,
+            expected_version: None,
+            enforce_client_idempotency: false,
+        },
+    );
+    let mut request = ClientRequest::Write(WriteRequest {
+        correlation_id: None,
+        client_id: verified_client_id.unwrap_or(connection_id as u128),
+        user_id: None,
+        writes,
+    });
+
     barrier.wait().await;
 
     let deadline = Instant::now() + Duration::from_secs(TEST_DURATION_SECS);
 
     while Instant::now() < deadline {
-        let prefix = format!("[connection-{}-event-{}] ", connection_id, request_count);
-
-        let event_1 = DatablockAggregateEvent {
-            client_seq: 3,
-            event_seq: 0,
-            event_id: Some(1234567890),
-            event_timestamp: 0,
-            event_type_major: 2,
-            event_type_minor: 3,
-            event_value: std::sync::Arc::new(format!("{}Hello World!", prefix).into_bytes()),
-            iv: None,
-        };
-
-        let event_2 = DatablockAggregateEvent {
-            client_seq: 3,
-            event_seq: 0,
-            event_id: Some(1234567890),
-            event_timestamp: 0,
-            event_type_major: 2,
-            event_type_minor: 3,
-            event_value: std::sync::Arc::new(
-                format!(
-                    "{}She should have died hereafter;
-            There would have been a time for such a word.
-            Tomorrow, and tomorrow, and tomorrow,
-            Creeps in this petty pace from day to day
-            To the last syllable of recorded time,
-            And all our yesterdays have lighted fools
-            The way to dusty death. Out, out, brief candle!
-            Life's but a walking shadow, a poor player
-            That struts and frets his hour upon the stage
-            And then is heard no more. It is a tale
-            Told by an idiot, full of sound and fury, Signifying nothing. ",
-                    prefix
-                )
-                .into_bytes(),
-            ),
-            iv: None,
-        };
-
-        // One aggregate per connection, fixed for its lifetime. The previous expression
-        // advanced the aggregate by 1 every request, which advances the target shard by 1
-        // (mod num_shards) every request — so the target was NEVER the shard currently
-        // holding the connection, and check_client_redirect migrated the whole TCP stream
-        // across the intrashard mesh on literally every write. Measured: 0.17% of requests
-        // routed locally at 4 shards, where ~25% is expected.
-        let aggregate_id = connection_id % NUM_AGGREGATES;
-
-        let mut writes = HashMap::new();
-        writes.insert(
-            AggregateKey::new(1, 1, aggregate_id as u128),
-            SingleAggregateWrite {
-                events: if USE_MICRO_PAYLOAD {
-                    vec![event_1]
-                } else {
-                    vec![event_1, event_2]
-                },
-                allow_create: true,
-                expected_version: None,
-                enforce_client_idempotency: false,
-            },
-        );
-
-        let request = ClientRequest::Write(WriteRequest {
-            correlation_id: None,
-            client_id: verified_client_id.unwrap_or(connection_id as u128),
-            user_id: None,
-            writes,
-        });
+        use std::io::Write as _;
+        value_buf.clear();
+        let _ = write!(value_buf, "[connection-{}-event-{}] Hello World!", connection_id, request_count);
+        if !USE_MICRO_PAYLOAD {
+            let _ = write!(value_buf, "{}", MACBETH);
+        }
+        // The previous request was dropped, so the Arc is unique again and the
+        // buffer is swapped in without a copy of the event or the map.
+        let ClientRequest::Write(w) = &mut request else { unreachable!() };
+        let sw = w.writes.get_mut(&key).expect("key present");
+        sw.events.clear();
+        std::mem::swap(std::sync::Arc::get_mut(&mut event.event_value).expect("unique arc"), &mut value_buf);
+        sw.events.push(event.clone());
 
         let req_start = Instant::now();
 
-        match client
-            .send_request(&request)
-            .await
+        let outcome = client.send_request(&request).await;
         {
+            let ClientRequest::Write(w) = &mut request else { unreachable!() };
+            w.writes.get_mut(&key).expect("key present").events.clear();
+            std::mem::swap(std::sync::Arc::get_mut(&mut event.event_value).expect("unique arc"), &mut value_buf);
+        }
+        match outcome {
             Ok(_) => {
                 let latency_us = req_start.elapsed().as_millis() as u64;
                 latencies.push(latency_us);

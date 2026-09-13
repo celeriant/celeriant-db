@@ -28,7 +28,12 @@ export class Ec2ClusterStack extends cdk.Stack {
     // --- Context values (override with -c key=value) ---
     const instanceType = this.node.tryGetContext('instanceType') ?? 'c6id.2xlarge';
     const clientInstanceType = this.node.tryGetContext('clientInstanceType') ?? instanceType;
-    const clientCount = Math.min(parseInt(this.node.tryGetContext('clientCount') ?? '1', 10), 4);
+    // Cap raised 4 -> 8. The old cap was sized to a 192 vCPU Standard Spot quota; that quota
+    // is now 300, and on i4i.metal (128 vCPU) a 4-client fleet of c6i.4xlarge is only 64
+    // client vCPU against 128 server vCPU — the load generator, not the server, sets the
+    // ceiling. 8 x c6i.4xlarge = 128 client vCPU, 1:1, for 256 total against the 300 quota.
+    // Client outputs are emitted per-instance below, so nothing downstream assumes 4.
+    const clientCount = Math.min(parseInt(this.node.tryGetContext('clientCount') ?? '1', 10), 8);
     // Data nodes: 2 (leader + follower) for replicated runs, 1 for standalone.
     //
     // Standalone is not "deploy two and only start one". Both nodes get the same env file,

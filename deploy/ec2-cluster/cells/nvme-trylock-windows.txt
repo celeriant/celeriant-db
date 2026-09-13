@@ -1,0 +1,14 @@
+# Post-fix window sweep on local NVMe at 96k, try-lock on, one factor at a time. On Aug 13 the
+# 16xlarge NVMe pair preferred the 17,000 us fsync window over metal's 1,000 (466,640 vs 463,718
+# at 60k; 511k vs 481k at 100k+). A short fsync window means many more batches and many more
+# parks, which pre-fix meant many more membarriers even on NVMe. If the optimum moves toward
+# short windows with the try-lock, that is the same bug showing up on the fast tier.
+#
+#   CELLS_FILE=cells/nvme-trylock-windows.txt REPS=2 BENCH_DURATION=15 SWEEP_TLS_MODE=strict bash scripts/run-cell-sweep.sh
+
+w_f17000_r17000_96k  TASKS=96000 FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000
+w_f4000_r17000_96k   TASKS=96000 FSYNC_DELAY_US=4000  REPLICATION_DELAY_US=17000
+w_f1000_r17000_96k   TASKS=96000 FSYNC_DELAY_US=1000  REPLICATION_DELAY_US=17000
+w_f1000_r15000_96k   TASKS=96000 FSYNC_DELAY_US=1000  REPLICATION_DELAY_US=15000
+w_f17000_r8000_96k   TASKS=96000 FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=8000
+w_f4000_r8000_96k    TASKS=96000 FSYNC_DELAY_US=4000  REPLICATION_DELAY_US=8000

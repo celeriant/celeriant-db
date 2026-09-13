@@ -32,6 +32,21 @@
 
 set -euo pipefail
 
+# An aborted sweep leaves every instance running and billing. Deliberately does NOT auto-destroy:
+# a transient error or a Ctrl-C during investigation should not take the cluster with it. It makes
+# the leak loud instead, with the command to hand.
+SWEEP_COMPLETE=0
+on_exit() {
+  local rc=$?
+  if (( rc != 0 )) || (( SWEEP_COMPLETE == 0 )); then
+    echo "" >&2
+    echo "!!! SWEEP DID NOT COMPLETE (exit $rc). THE CLUSTER IS STILL RUNNING AND BILLING." >&2
+    echo "!!!   cd $(dirname "$(cd "$(dirname "$0")" && pwd)") && make s3-fallback && make teardown" >&2
+    echo "" >&2
+  fi
+}
+trap on_exit EXIT
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CDK_DIR="$(dirname "$SCRIPT_DIR")"
 CLUSTER_ENV="$CDK_DIR/.cluster-env"
@@ -100,7 +115,8 @@ apply_cell() {   # $1 = knob assignments, space separated
   # the previous cell's value. Leaking state across cells is how a sweep silently measures
   # the wrong thing.
   unset NUM_SHARDS FSYNC_DELAY_US REPLICATION_DELAY_US RESERVE_COORDINATOR_SHARD \
-        MESH_CHANNEL_SIZE S3_ENABLED CPU_LIST TASKS
+        MESH_CHANNEL_SIZE S3_ENABLED CPU_LIST TASKS \
+        PREEMPT_TIMER_US WAL_JOIN_DATA_META_WRITES
   CELL_TASKS=""
   STANDALONE="${SWEEP_STANDALONE:-}"
   TLS_MODE="${SWEEP_TLS_MODE:-strict}"
@@ -330,7 +346,11 @@ for k in "${!ORDER_IDX[@]}"; do
     fi
     run_bench "$WARMUP" warmup
     if [[ -n "${FOLLOWER_PUB:-}" ]]; then
-      rep_after=$($SSH ec2-user@"$FOLLOWER_PUB" 'curl -s localhost:9090/metrics 2>/dev/null | grep "^celeriant_replication_applied_events_total" | awk "{s+=\$2} END{print s+0}"' 2>/dev/null || echo 0)
+      # Both sides of the comparison must aggregate the same way. rep_before sums BOTH nodes
+      # (roles invert routinely, see replication_applied_total); probing FOLLOWER_PUB alone here
+      # made rep_after ~0 whenever the lease put the leader on that host, tripping the guard on a
+      # perfectly healthy cell.
+      rep_after=$(replication_applied_total)
       if (( rep_after <= rep_before )); then
         echo "        ERROR: follower applied 0 events during warm-up — replication not established." >&2
         echo "               The cell would measure standalone or a wedged cluster, not replication." >&2
@@ -343,7 +363,16 @@ for k in "${!ORDER_IDX[@]}"; do
 
   CPU_PREFIX="/tmp/cpu_${name}_${pass}_${rep}"
   cpu_start "$CPU_PREFIX"
-  read -r tp p50 p95 p99 errs < <(run_bench "$DURATION")
+  # `|| true` is load-bearing. run_bench returns 1 on the clients-lost guard, and under
+  # `set -e` a bare `read` from a process substitution that yields no line exits the SCRIPT,
+  # not the cell — leaving the whole cluster running and billing with no teardown. The error
+  # row is already recorded by the guard; this just lets the loop continue to the next cell.
+  tp=""; p50=""; p95=""; p99=""; errs=""
+  read -r tp p50 p95 p99 errs < <(run_bench "$DURATION") || true
+  if [[ -z "$tp" ]]; then
+    echo "        cell produced no measurement — moving on" >&2
+    continue
+  fi
   cpu_stop "$CPU_PREFIX" > /dev/null 2>&1 || true
   cpustats=$(cpu_summarise "${CPU_PREFIX}_${LEADER_PUB}.txt" "$LEADER_PUB" 2>/dev/null || echo "")
   busy_mean=$(echo "$cpustats" | grep -oP 'busy mean\s+\K[0-9.]+' || echo "")
@@ -395,6 +424,7 @@ awk -F, 'NR>1 && $6 != "" {
     }
   }' "$CSV" | sort
 
+SWEEP_COMPLETE=1
 echo ""
 echo "==> CSV: $CSV"
 echo "    Compare cells on the WORST column. A spread wider than the difference between two"

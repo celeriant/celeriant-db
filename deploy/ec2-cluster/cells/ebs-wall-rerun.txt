@@ -1,0 +1,65 @@
+# Re-run of the 2026-08-10 "EBS wall" ladder on current main (007bbfd, v0.1.2).
+#
+# The published line (results/20260810-083215_celeriant-sweep_i4i-16xlarge_ebs_pinned.csv,
+# chart p99-2026/assets/ebs-wall-light.svg) was measured on 487f8c1 with the glommio preempt
+# timer at its 100 ms default and fsync/replication windows at their then-defaults of
+# 17,000 us each. Since then 370d13e moved the preempt timer to 250 us and joined the
+# metablock/datablock writes, and the fsync default moved to 4,000 us.
+#
+# The join flag is INERT on this workload: rpi_cluster_pool_bench payloads are ~22 bytes and
+# inline under MINIBATCH_SIZE_BYTES = 718, so no out-of-line datablock is ever written. Only the
+# preempt timer (and the other commits between 487f8c1 and HEAD) are under test here.
+#
+# Same hardware and load shape as 2026-08-10: 2x i4i.16xlarge, 4x c6i.4xlarge clients, gp3
+# 100 GB at 16,000 IOPS with throughput raised to 1,000 MB/s post-deploy, replicated, mTLS,
+# pinned connections, 15 s per level, same nine concurrency levels.
+#
+# Three arms, interleaved per level so any drift across the run hits each arm equally:
+#
+#   p250_f17   new binary, preempt 250 us (default), fsync/replication pinned to the Aug 10
+#              values (17,000 / 17,000). Same windows as the published line: the only thing
+#              that differs from Aug 10 is the code.
+#   p100k_f17  new binary, preempt forced back to 100,000 us, same pinned windows. Isolates
+#              the preempt timer: if this arm reproduces the decline and p250_f17 does not, the
+#              timer is the cause.
+#   defaults   new binary, every knob at its shipped default (preempt 250, fsync 4,000,
+#              replication 17,000). What a user gets today.
+#
+#   CELLS_FILE=cells/ebs-wall-rerun.txt REPS=1 BENCH_DURATION=15 SWEEP_TLS_MODE=strict \
+#     bash scripts/run-cell-sweep.sh
+
+p250_f17_24k    TASKS=24000  FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000
+p100k_f17_24k   TASKS=24000  FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000 PREEMPT_TIMER_US=100000
+defaults_24k    TASKS=24000
+
+p250_f17_36k    TASKS=36000  FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000
+p100k_f17_36k   TASKS=36000  FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000 PREEMPT_TIMER_US=100000
+defaults_36k    TASKS=36000
+
+p250_f17_48k    TASKS=48000  FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000
+p100k_f17_48k   TASKS=48000  FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000 PREEMPT_TIMER_US=100000
+defaults_48k    TASKS=48000
+
+p250_f17_60k    TASKS=60000  FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000
+p100k_f17_60k   TASKS=60000  FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000 PREEMPT_TIMER_US=100000
+defaults_60k    TASKS=60000
+
+p250_f17_72k    TASKS=72000  FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000
+p100k_f17_72k   TASKS=72000  FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000 PREEMPT_TIMER_US=100000
+defaults_72k    TASKS=72000
+
+p250_f17_96k    TASKS=96000  FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000
+p100k_f17_96k   TASKS=96000  FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000 PREEMPT_TIMER_US=100000
+defaults_96k    TASKS=96000
+
+p250_f17_108k   TASKS=108000 FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000
+p100k_f17_108k  TASKS=108000 FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000 PREEMPT_TIMER_US=100000
+defaults_108k   TASKS=108000
+
+p250_f17_120k   TASKS=120000 FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000
+p100k_f17_120k  TASKS=120000 FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000 PREEMPT_TIMER_US=100000
+defaults_120k   TASKS=120000
+
+p250_f17_132k   TASKS=132000 FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000
+p100k_f17_132k  TASKS=132000 FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000 PREEMPT_TIMER_US=100000
+defaults_132k   TASKS=132000

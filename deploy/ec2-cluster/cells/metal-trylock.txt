@@ -1,0 +1,21 @@
+# Flagship rerun with the glommio try-lock: 2x i4i.metal (128 vCPU each, 8x NVMe RAID0),
+# 8x c6i.4xlarge on-demand clients, published configuration (128 shards, fsync 1,000 us,
+# replication 15,000 us, mTLS). Published headline: 1,057,417 at 60k (2026-08-13, worst-of-3).
+# Two arms on one binary: try-lock on (patch) and off (base, the pre-change path).
+#
+# Floor cells: the quiet-server latency, one to eight writers per client (TASKS must be a
+# multiple of the 8 clients). This is the coordinator idle fast path, expected ~2 ms p50. Both
+# windows are still set so the cell measures the shipped-config floor, not a tuned one.
+#
+#   CELLS_FILE=cells/metal-trylock.txt REPS=2 BENCH_DURATION=15 SWEEP_TLS_MODE=strict bash scripts/run-cell-sweep.sh
+
+patch_60k    TASKS=60000  NUM_SHARDS=128 FSYNC_DELAY_US=1000 REPLICATION_DELAY_US=15000
+base_60k     TASKS=60000  NUM_SHARDS=128 FSYNC_DELAY_US=1000 REPLICATION_DELAY_US=15000 SLEEP_BARRIER_TRYLOCK=0
+patch_100k   TASKS=100000 NUM_SHARDS=128 FSYNC_DELAY_US=1000 REPLICATION_DELAY_US=15000
+base_100k    TASKS=100000 NUM_SHARDS=128 FSYNC_DELAY_US=1000 REPLICATION_DELAY_US=15000 SLEEP_BARRIER_TRYLOCK=0
+patch_132k   TASKS=132000 NUM_SHARDS=128 FSYNC_DELAY_US=1000 REPLICATION_DELAY_US=15000
+base_132k    TASKS=132000 NUM_SHARDS=128 FSYNC_DELAY_US=1000 REPLICATION_DELAY_US=15000 SLEEP_BARRIER_TRYLOCK=0
+floor_8      TASKS=8      NUM_SHARDS=128 FSYNC_DELAY_US=1000 REPLICATION_DELAY_US=15000
+floor_16     TASKS=16     NUM_SHARDS=128 FSYNC_DELAY_US=1000 REPLICATION_DELAY_US=15000
+floor_64     TASKS=64     NUM_SHARDS=128 FSYNC_DELAY_US=1000 REPLICATION_DELAY_US=15000
+floor_8_base TASKS=8      NUM_SHARDS=128 FSYNC_DELAY_US=1000 REPLICATION_DELAY_US=15000 SLEEP_BARRIER_TRYLOCK=0

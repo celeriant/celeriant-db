@@ -1,0 +1,27 @@
+# Quiet-path latency floor on the gp3 wall cluster. Append to the wall run, same cluster hour.
+#
+# Under shipped defaults a lone write would pay fsync_delay (4,000us) + replication_delay
+# (17,000us) = 21ms if it sat out both amortisation windows. It should not: Coordinator has an
+# idle fast path (celeriant_shard/src/amortisation/coordinator.rs:296-306) that skips the delay
+# when the sync gate is free AND the previous cycle did not coalesce followers. Both the fsync
+# and replication paths go through the same request_sync_two_phase.
+#
+#   ~2ms   fast path fires end to end. Floor = client mTLS RTT + leader fsync + kTLS replication
+#          RTT + follower fsync + ack.
+#   ~21ms  fast path fires only in the unit test (two_phase_fast_path_fires_when_idle,
+#          coordinator.rs:1416). Bigger finding than the wall - every lightly loaded deployment
+#          pays both windows per write.
+#
+# TASKS MUST BE A MULTIPLE OF THE CLIENT COUNT. run_bench does tasks_per=$((total/CLIENT_COUNT))
+# with integer division, so TASKS=1 on this 4-client stack is 0 tasks per client. This file is
+# for the 4-client wall cluster; use latency-floor-nvme.txt on the 1-client floor cluster.
+#
+# Do NOT drop the wipe-and-restart between cells. last_two_phase_batched lives in the Coordinator
+# and resets only with the process; a fresh process per cell is what makes the cell genuinely idle.
+#
+#   CELLS_FILE=cells/latency-floor-gp3.txt REPS=1 SWEEP_TLS_MODE=strict bash scripts/run-cell-sweep.sh
+
+floor_4     TASKS=4
+floor_8     TASKS=8
+floor_16    TASKS=16
+floor_64    TASKS=64

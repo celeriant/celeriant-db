@@ -1,0 +1,21 @@
+# Fills in the post-fix gp3 curve below 72k (ebs-membarrier-fix.txt covered 72k/96k/132k).
+# Same cluster shape and windows. base at 24k/48k is the same-day pre-change reference.
+#
+#   CELLS_FILE=cells/ebs-trylock-fill.txt REPS=2 BENCH_DURATION=15 SWEEP_TLS_MODE=strict bash scripts/run-cell-sweep.sh
+
+patch_24k   TASKS=24000  FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000
+base_24k    TASKS=24000  FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000 SLEEP_BARRIER_TRYLOCK=0
+patch_36k   TASKS=36000  FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000
+patch_48k   TASKS=48000  FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000
+base_48k    TASKS=48000  FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000 SLEEP_BARRIER_TRYLOCK=0
+patch_60k   TASKS=60000  FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=17000
+
+# Window sweep on the FIXED binary at 96k, one factor at a time from the 17,000/17,000 anchor
+# (the shipped defaults are fsync 4,000 / replication 17,000). Pre-fix, a shorter fsync window
+# was the worst arm on gp3 because every extra batch was an extra park; post-fix that trade may
+# have flipped. Answers "what are the optimals on this tier" with data rather than the Aug 16
+# NVMe result (defaults matched or beat metal's 1,000/15,000 on the 16xlarge).
+w_f4000_r17000_96k   TASKS=96000 FSYNC_DELAY_US=4000  REPLICATION_DELAY_US=17000
+w_f1000_r17000_96k   TASKS=96000 FSYNC_DELAY_US=1000  REPLICATION_DELAY_US=17000
+w_f17000_r8000_96k   TASKS=96000 FSYNC_DELAY_US=17000 REPLICATION_DELAY_US=8000
+w_f4000_r8000_96k    TASKS=96000 FSYNC_DELAY_US=4000  REPLICATION_DELAY_US=8000

@@ -35,12 +35,23 @@ init_campaign_knobs() {
   RESERVE_COORDINATOR_SHARD="${RESERVE_COORDINATOR_SHARD:-}"
   MESH_CHANNEL_SIZE="${MESH_CHANNEL_SIZE:-}"
   STANDALONE="${STANDALONE:-}"
+  # Glommio scheduler quantum. A completion in the MAIN ring cannot set need_preempt (it reads
+  # the latency ring only), and the throughput escape hatch needs ring_depth()=128 completions
+  # inside one reactor pass, so at low queue depth an I/O is invisible to the app until this
+  # timer fires. Measured gp3 queue depth in the 2026-08-10 sweep was 7.7.
+  PREEMPT_TIMER_US="${PREEMPT_TIMER_US:-}"
+  # Only reaches the code when the fsync batch carries OUT-OF-LINE datablock bytes. Payloads
+  # that serialise (after zstd-dict) to <= MINIBATCH_SIZE_BYTES = 718 inline, and inline blocks
+  # set external_data: None — so on a small-event workload both settings run identical code.
+  WAL_JOIN_DATA_META_WRITES="${WAL_JOIN_DATA_META_WRITES:-}"
   # Campaign numbers are cleartext; the stack default is strict mTLS. F-43 prices mTLS at
   # -4.6% throughput / +16.7% p99, so the two are not interchangeable — set this per run.
   TLS_MODE="${TLS_MODE:-strict}"
 
   check_bool RESERVE_COORDINATOR_SHARD "$RESERVE_COORDINATOR_SHARD"
   check_bool STANDALONE "$STANDALONE"
+  check_bool WAL_JOIN_DATA_META_WRITES "$WAL_JOIN_DATA_META_WRITES"
+  check_range PREEMPT_TIMER_US "$PREEMPT_TIMER_US" 50 100000
 
   if [[ "$TLS_MODE" != "strict" && "$TLS_MODE" != "disabled" ]]; then
     echo "ERROR: TLS_MODE must be 'strict' or 'disabled' (got '$TLS_MODE')." >&2
@@ -67,6 +78,18 @@ check_bool() {
     echo "ERROR: $name must be 'true' or 'false' (got '$val'). The server rejects 0/1." >&2
     exit 1
   fi
+}
+
+# clap declares preempt_timer_us with value_parser range 50..=100_000. Out of range is a hard
+# startup failure, so catch it here rather than after the cluster is up.
+check_range() {
+  local name=$1 val=${2:-} lo=$3 hi=$4
+  [[ -z "$val" ]] && return 0
+  if ! [[ "$val" =~ ^[0-9]+$ ]] || (( val < lo || val > hi )); then
+    echo "ERROR: $name must be an integer in [$lo, $hi] (got '$val')." >&2
+    exit 1
+  fi
+  return 0
 }
 
 # Emit "NAME=value" only when value is non-empty. `return 0` keeps the empty case from
@@ -115,4 +138,6 @@ EOF
   emit CELERIANT_RESERVE_COORDINATOR_SHARD "$RESERVE_COORDINATOR_SHARD"
   emit CELERIANT_MESH_CHANNEL_SIZE "$MESH_CHANNEL_SIZE"
   emit CELERIANT_STANDALONE "$STANDALONE"
+  emit CELERIANT_PREEMPT_TIMER_US "$PREEMPT_TIMER_US"
+  emit CELERIANT_WAL_JOIN_DATA_META_WRITES "$WAL_JOIN_DATA_META_WRITES"
 }
