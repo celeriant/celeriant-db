@@ -169,7 +169,7 @@ This runs four steps in sequence:
 | Step | What it does |
 |------|-------------|
 | `setup-nodes` | Updates packages, sets file descriptor and memlock limits, installs xfsprogs, deploys the `celeriant` systemd service and Promtail (log shipper) to both data nodes. Runs in parallel on both Pis. |
-| `setup-nvme-DESTRUCTIVE` | Partitions and formats the NVMe drive as XFS, mounts it at `/var/lib/celeriant`, adds an fstab entry. **Destructive** — prompts for confirmation per node. Sequential. |
+| `setup-nvme-DESTRUCTIVE` | Partitions and formats the NVMe drive as XFS, mounts it at `/var/lib/nvme` (`NVME_MOUNT`), creates the data root `/var/lib/nvme/celeriant-data` on it with its `.instance` marker, adds an fstab entry. **Destructive** — prompts for confirmation per node. Sequential. |
 | `certs` | Generates two CA keypairs (client CA + intracluster CA), node certs, a client-facing server cert, and a benchmark client cert. Distributes to both data nodes. |
 | `setup-infra` | In remote mode: installs Docker on the infra node (via SSH), deploys the compose stack. In local mode: runs `docker compose` on the build machine. Provisions Grafana dashboards in both cases. |
 

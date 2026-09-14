@@ -3,11 +3,26 @@
 # Usage: setup-nvme.sh <hostname>
 #
 # DESTRUCTIVE: Wipes the NVMe drive. Prompts for confirmation.
+#
+# Layout: the partition mounts at NVME_MOUNT (/var/lib/nvme) and this rig's
+# data root REMOTE_DATA_ROOT is a directory on it. A drive already mounted
+# at NVME_MOUNT is left alone and only the directory and marker are ensured.
 set -euo pipefail
 
 source config.env
 
 HOST="$1"
+
+case "$REMOTE_DATA_ROOT" in
+    "$NVME_MOUNT"/*) ;;
+    *) printf "ERROR: REMOTE_DATA_ROOT (%s) must be a directory under NVME_MOUNT (%s)\n" "$REMOTE_DATA_ROOT" "$NVME_MOUNT"; exit 1 ;;
+esac
+
+# The data root and its instance marker, on an already-mounted drive too.
+ensure_data_root() {
+    ssh "$HOST" "sudo mkdir -p ${REMOTE_DATA_ROOT} \
+        && { test -f ${REMOTE_DATA_ROOT}/.instance || echo chaos | sudo tee ${REMOTE_DATA_ROOT}/.instance >/dev/null; }"
+}
 
 RED='\033[0;31m'
 YELLOW='\033[0;33m'
@@ -31,8 +46,9 @@ ssh "$HOST" "lsblk ${NVME_DEVICE}"
 # Check if already mounted at correct location
 MOUNT_POINT=$(ssh "$HOST" "findmnt -n -o TARGET ${NVME_PARTITION} 2>/dev/null || true")
 if [ -n "$MOUNT_POINT" ]; then
-    if [ "$MOUNT_POINT" = "$REMOTE_DATA_ROOT" ]; then
-        printf "${GREEN}Already mounted at the correct location. Skipping.${RESET}\n"
+    if [ "$MOUNT_POINT" = "$NVME_MOUNT" ]; then
+        ensure_data_root
+        printf "${GREEN}Already mounted at %s; data root %s ensured. Skipping format.${RESET}\n" "$NVME_MOUNT" "$REMOTE_DATA_ROOT"
         exit 0
     fi
     printf "\n${YELLOW}WARNING:${RESET} ${NVME_PARTITION} is currently mounted at ${MOUNT_POINT} on %s.\n" "$HOST"
@@ -64,16 +80,17 @@ sudo wipefs -a ${NVME_DEVICE}
 sudo parted ${NVME_DEVICE} --script mklabel gpt mkpart primary xfs 0% 100%
 sleep 1
 sudo mkfs.xfs -f ${NVME_PARTITION}
-sudo mkdir -p ${REMOTE_DATA_ROOT}
-sudo mount ${NVME_PARTITION} ${REMOTE_DATA_ROOT}
+sudo mkdir -p ${NVME_MOUNT}
+sudo mount ${NVME_PARTITION} ${NVME_MOUNT}
 
 # Persist across reboots (idempotent)
 if ! grep -q "${NVME_PARTITION}" /etc/fstab; then
-    echo '${NVME_PARTITION} ${REMOTE_DATA_ROOT} xfs defaults,noatime 0 2' | sudo tee -a /etc/fstab
+    echo '${NVME_PARTITION} ${NVME_MOUNT} xfs defaults,noatime 0 2' | sudo tee -a /etc/fstab
 fi
 REMOTE_FORMAT
+ensure_data_root
 
-printf "${GREEN}NVMe formatted and mounted at %s on %s.${RESET}\n" "$REMOTE_DATA_ROOT" "$HOST"
+printf "${GREEN}NVMe formatted and mounted at %s on %s; data root %s created.${RESET}\n" "$NVME_MOUNT" "$HOST" "$REMOTE_DATA_ROOT"
 
 # Verify
 printf "\n>>> Verifying mount:\n"
