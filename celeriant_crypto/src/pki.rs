@@ -1,7 +1,7 @@
 use std::fs;
-use std::io::BufReader;
+use std::io::{BufReader, Write};
 use std::net::IpAddr;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -313,8 +313,20 @@ fn write_pem_pair(
     key_pem: &str,
 ) -> Result<(), PkiError> {
     fs::write(cert_path, cert_pem)?;
-    fs::write(key_path, key_pem)?;
-    set_key_permissions(key_path)
+    write_key_pem(key_path, key_pem)
+}
+
+/// Write a key PEM, created 0600 rather than chmod'ed to 0600 after the fact.
+fn write_key_pem(path: &Path, key_pem: &str) -> Result<(), PkiError> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(key_pem.as_bytes())?;
+    // .mode() applies only on creation; tighten a key file that already existed.
+    set_key_permissions(path)
 }
 
 /// Parse PEM file at `path` into a vector of DER certificates.
@@ -381,6 +393,19 @@ mod tests {
 
     fn temp_dir() -> TempDir {
         tempfile::tempdir().expect("failed to create temp dir")
+    }
+
+    #[test]
+    fn existing_key_file_is_tightened_to_0600() {
+        let dir = temp_dir();
+        let key_path = dir.path().join("ca.key");
+        fs::write(&key_path, "stale").unwrap();
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        PkiManager::create_ca(dir.path(), 3650).expect("create_ca failed");
+
+        let mode = fs::metadata(&key_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "mode was {:#o}", mode & 0o777);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use rsa::{
 };
 use sha2::{Digest, Sha256};
 use tracing::info;
-use std::{fs, io::{Read, Write}, time::{SystemTime, UNIX_EPOCH}};
+use std::{fs, io::{Read, Write}, os::unix::fs::OpenOptionsExt, time::{SystemTime, UNIX_EPOCH}};
 
 const MAX_NONCE_TIME_MINUTES: f64 = 2.0;
 const DEFAULT_KEY_SIZE: usize = 2048;
@@ -43,68 +43,75 @@ pub struct Crypto;
 
 impl Crypto {
 
-    /// Load existing keys from disk or generate and persist a new keypair.
-    /// Returns the node ID derived from the public key.
+    /// Load the node's keypair from disk, generating one if the data root is empty.
     pub fn load_or_generate_node_id(data_root: &std::path::Path) -> Result<u128, String> {
         let private_key_path = data_root.join("private_key");
-        let public_key_path = data_root.join("public_key");
 
-        // Try to load existing keys
-        if private_key_path.exists() && public_key_path.exists() {
-            let mut public_key_file = fs::File::open(&public_key_path)
-                .map_err(|e| format!("Failed to open public_key file: {}", e))?;
-            
-            let mut public_key_base64 = String::new();
-            public_key_file.read_to_string(&mut public_key_base64)
-                .map_err(|e| format!("Failed to read public_key file: {}", e))?;
-            
-            let public_key_base64 = public_key_base64.trim();
-            
-            // Decode public key from base64 to get raw bytes for identity generation
-            let public_key_bytes = general_purpose::STANDARD
-                .decode(public_key_base64)
-                .map_err(|e| format!("Failed to decode public key: {}", e))?;
-            
-            let node_id = Crypto::generate_short_client_identity(&public_key_bytes);
-            
-            info!("Loaded existing keypair from {:?}", data_root);
-            return Ok(node_id);
-        }
+        let private_key_base64 = if private_key_path.exists() {
+            let existing = Self::read_key_file(&private_key_path)?;
+            info!("Loaded node identity from private_key in {:?}", data_root);
+            existing
+        } else {
+            let keypair = Crypto::generate_keypair(None)
+                .map_err(|e| format!("Failed to generate keypair: {}", e))?;
 
-        // Generate new keypair
-        let keypair = Crypto::generate_keypair(None)
-            .map_err(|e| format!("Failed to generate keypair: {}", e))?;
+            fs::create_dir_all(data_root)
+                .map_err(|e| format!("Failed to create data root directory: {}", e))?;
+            Self::write_key_file(&private_key_path, &keypair.private_key_base64)?;
 
-        // Ensure data_root exists
-        fs::create_dir_all(data_root)
-            .map_err(|e| format!("Failed to create data root directory: {}", e))?;
+            info!("Generated and saved new private_key to {:?}", data_root);
+            keypair.private_key_base64
+        };
 
-        // Save private key
-        let mut private_key_file = fs::File::create(&private_key_path)
-            .map_err(|e| format!("Failed to create private_key file: {}", e))?;
-        private_key_file.write_all(keypair.private_key_base64.as_bytes())
-            .map_err(|e| format!("Failed to write private_key file: {}", e))?;
-        private_key_file.sync_all()
-            .map_err(|e| format!("Failed to sync private_key file: {}", e))?;
-
-        // Save public key
-        let mut public_key_file = fs::File::create(&public_key_path)
-            .map_err(|e| format!("Failed to create public_key file: {}", e))?;
-        public_key_file.write_all(keypair.public_key_base64.as_bytes())
-            .map_err(|e| format!("Failed to write public_key file: {}", e))?;
-        public_key_file.sync_all()
-            .map_err(|e| format!("Failed to sync public_key file: {}", e))?;
-
-        // Decode public key from base64 to get raw bytes for identity generation
-        let public_key_bytes = general_purpose::STANDARD
-            .decode(&keypair.public_key_base64)
-            .map_err(|e| format!("Failed to decode public key: {}", e))?;
-
-        let node_id = Crypto::generate_short_client_identity(&public_key_bytes);
-
-        info!("Generated and saved new keypair to {:?}", data_root);
-        Ok(node_id)
+        let public_key_base64 = Self::public_key_base64_from_private(&private_key_base64)?;
+        Self::node_id_from_public_key_base64(&public_key_base64)
     }
+
+    fn read_key_file(path: &std::path::Path) -> Result<String, String> {
+        let mut file = fs::File::open(path)
+            .map_err(|e| format!("Failed to open {:?}: {}", path, e))?;
+        let mut base64 = String::new();
+        file.read_to_string(&mut base64)
+            .map_err(|e| format!("Failed to read {:?}: {}", path, e))?;
+        Ok(base64.trim().to_string())
+    }
+
+    fn write_key_file(path: &std::path::Path, base64: &str) -> Result<(), String> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("Failed to create {:?}: {}", path, e))?;
+        file.write_all(base64.as_bytes())
+            .map_err(|e| format!("Failed to write {:?}: {}", path, e))?;
+        file.sync_all()
+            .map_err(|e| format!("Failed to sync {:?}: {}", path, e))
+    }
+
+    fn node_id_from_public_key_base64(public_key_base64: &str) -> Result<u128, String> {
+        let public_key_bytes = general_purpose::STANDARD
+            .decode(public_key_base64)
+            .map_err(|e| format!("Failed to decode public key: {}", e))?;
+        Ok(Crypto::generate_short_client_identity(&public_key_bytes))
+    }
+
+    /// Re-derive the base64 public key a private key belongs to
+    pub fn public_key_base64_from_private(private_key_base64: &str) -> Result<String, String> {
+        let private_key_bytes = general_purpose::STANDARD
+            .decode(private_key_base64)
+            .map_err(|e| format!("Failed to decode private key: {}", e))?;
+        let private_key = RsaPrivateKey::from_pkcs8_der(&private_key_bytes)
+            .map_err(|e| format!("Failed to parse private key: {}", e))?;
+        let public_key_der = private_key
+            .to_public_key()
+            .to_public_key_der()
+            .map_err(|e| format!("Failed to encode public key: {}", e))?;
+        Ok(general_purpose::STANDARD.encode(public_key_der.as_bytes()))
+    }
+
+    
 
     // Helper function to decode the client ID from URL-safe base64
     pub fn decode_base64_u128_from_path(client_id_b64: &str) -> Result<u128, CryptoError> {

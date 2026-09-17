@@ -24,8 +24,8 @@ Client Authentication Flow
 Node ID Derivation
 ┌──────────────────────────────────────────────┐
 │ load_or_generate_node_id(data_root)          │
-│   if keys on disk → read public_key file     │
-│   else → generate_keypair(), fsync both      │
+│   private_key on disk → derive id from it    │
+│   else → generate_keypair(), fsync private   │
 │   SHA-256(DER public key bytes)[..16] → u128 │
 └──────────────────────────────────────────────┘
 
@@ -63,7 +63,7 @@ PKI / TLS Certificate Management
 - Client identity is `SHA-256(DER public key bytes)[0..16]` as little-endian u128. Deterministic and reproducible — same keypair always produces the same u128.
 - Nonces expire after 2 minutes with 60-second forward clock-skew tolerance.
 - Key files are written with mode `0600` (owner read/write only).
-- `load_or_generate_node_id` calls `sync_all()` on both key files before returning. Partial writes are never observable.
+- `load_or_generate_node_id` stores only `private_key`, `sync_all()`ed before returning. The public key and node ID are derived from it on every start, so no partial keypair is representable.
 
 ## Key Types
 
@@ -94,7 +94,7 @@ Keys are encoded as DER (standard binary format) then base64-encoded for storage
 
 ### fsync on key write
 
-`load_or_generate_node_id` calls `sync_all()` on both key files before returning. A node restart after a partial write would find inconsistent key files and fail to load, rather than silently deriving a different identity.
+`private_key` is the only file `load_or_generate_node_id` stores. The public key and the node ID are derived from it on every start, so there is no second file to corrupt, swap or leave half-written, and no partial-keypair state to recover from. The write is `sync_all()`ed before the function returns. An unreadable `private_key` fails startup rather than regenerating, which would silently give the node a new cluster identity.
 
 ### All Crypto methods are static
 

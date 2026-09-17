@@ -705,22 +705,21 @@ impl App {
                 }))
             }
             IdentityMode::Auto => {
-                let pub_path = self.data_root.join("public_key");
                 let priv_path = self.data_root.join("private_key");
-                if !pub_path.exists() || !priv_path.exists() {
+                if !priv_path.exists() {
                     return Ok(api_key.map(|key| ClientIdentityConfig {
                         public_key: None,
                         private_key: None,
                         api_key: Some(key),
                     }));
                 }
-                let pub_key = fs::read_to_string(&pub_path)
-                    .map_err(|e| format!("Failed to read auto public key: {e}"))?;
                 let priv_key = fs::read_to_string(&priv_path)
                     .map_err(|e| format!("Failed to read auto private key: {e}"))?;
+                let priv_key = priv_key.trim().to_string();
+                let pub_key = Crypto::public_key_base64_from_private(&priv_key)?;
                 Ok(Some(ClientIdentityConfig {
-                    public_key: Some(pub_key.trim().to_string()),
-                    private_key: Some(priv_key.trim().to_string()),
+                    public_key: Some(pub_key),
+                    private_key: Some(priv_key),
                     api_key,
                 }))
             }
