@@ -732,4 +732,26 @@ mod tests {
             }
         });
     }
+
+    #[test]
+    fn threshold_writer_rejects_oversized_uncompressed_body() {
+        block_on(async {
+            const TINY_MAX: u64 = 4096;
+            let compressible = ClientResponse::ListOrgs(ListOrgsResponse {
+                correlation_id: Some(9),
+                orgs: (0u128..2000).map(|_| OrgListItem { org_id: 0 }).collect(),
+                next_cursor: None,
+            });
+            let mut buf = Vec::new();
+            let err = ClientResponse::write_response(
+                &mut buf, &compressible, true, &test_codec(), TINY_MAX, PROTOCOL_VERSION_V2,
+            )
+            .await
+            .expect_err("a compressible body past max_message_size must be rejected");
+            assert!(
+                matches!(err, WireError::MessageTooLarge { message_length, .. } if message_length > TINY_MAX),
+                "expected MessageTooLarge on the uncompressed length, got {err:?}"
+            );
+        });
+    }
 }

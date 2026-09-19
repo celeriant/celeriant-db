@@ -124,7 +124,13 @@ pub struct ErrorResponse {
 impl ErrorResponse {
     pub fn is_not_leader(&self) -> bool {
         use crate::error_codes::*;
-        matches!(self.error_code, WRITE_NOT_LEADER | TRIM_NOT_LEADER | DELETE_NOT_LEADER)
+        matches!(
+            self.error_code,
+            WRITE_NOT_LEADER
+                | TRIM_NOT_LEADER
+                | DELETE_NOT_LEADER
+                | REGISTER_SCHEMA_CANNOT_ACCEPT_WRITES
+        )
     }
 
     pub fn is_identity_required(&self) -> bool {

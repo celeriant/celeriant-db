@@ -152,9 +152,20 @@ impl CeleriantClient {
         let stream = match tls_config {
             None => stream,
             Some(cfg) => {
-                let (stream, trailing) = ktls_connect(stream, cfg.client_config, cfg.server_name)
-                    .await
-                    .map_err(ClientError::KtlsError)?;
+                // don't hang forever on ktls connect, timeout important
+                let handshake = ktls_connect(stream, cfg.client_config, cfg.server_name);
+                let handshake_result = match connection_timeout {
+                    Some(duration) => {
+                        or(async { Some(handshake.await) }, async {
+                            Timer::new(duration).await;
+                            None
+                        })
+                        .await
+                        .ok_or(ClientError::ConnectionTimeout)?
+                    }
+                    None => handshake.await,
+                };
+                let (stream, trailing) = handshake_result.map_err(ClientError::KtlsError)?;
                 debug_assert!(
                     trailing.is_empty(),
                     "server sent {} bytes before the client's first request; they are being dropped",
@@ -514,4 +525,99 @@ mod cluster_cancellation_tests {
             }
         });
     }
+}
+
+#[cfg(test)]
+mod tls_handshake_timeout_tests {
+    use super::*;
+    use celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES;
+    use glommio::{LocalExecutorBuilder, Placement};
+    use rustls_pki_types::ServerName;
+    use std::time::Instant;
+
+    const MAX: u64 = 4 * 1024 * 1024;
+
+    macro_rules! glommio_test {
+        ($body:expr) => {
+            LocalExecutorBuilder::new(Placement::Fixed(0))
+                .spawn(|| async move { $body })
+                .unwrap()
+                .join()
+                .unwrap()
+        };
+    }
+
+    fn test_codec() -> Rc<DictCodec> {
+        Rc::new(DictCodec::new(BUILTIN_DICT_BYTES, 3).expect("builtin dict must compile"))
+    }
+
+    fn test_client_config() -> Arc<rustls::ClientConfig> {
+        use rcgen::{CertificateParams, KeyPair};
+        let key = KeyPair::generate().unwrap();
+        let params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        Arc::new(
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
+    }
+
+    #[test]
+    fn a_stalled_tls_handshake_is_bounded_by_connection_timeout() {
+        glommio_test!({
+            let codec = test_codec();
+
+            // Black hole: accept the socket, then hold it open without ever
+            // reading. The kernel ACKs the ClientHello; no ServerHello is sent.
+            let listener = glommio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            glommio::spawn_local(async move {
+                let _stream = listener.accept().await.unwrap();
+                glommio::timer::sleep(Duration::from_secs(60)).await;
+            })
+            .detach();
+
+            let tls = GlommioTlsConfig::new(
+                test_client_config(),
+                ServerName::try_from("localhost").unwrap(),
+            );
+
+            let start = Instant::now();
+            let result = glommio::timer::timeout(Duration::from_secs(5), async {
+                Ok::<_, glommio::GlommioError<()>>(
+                    CeleriantClient::connect_with_timeout_tls(
+                        &address,
+                        Some(Duration::from_millis(200)),
+                        MAX,
+                        MAX,
+                        Some(tls),
+                        None,
+                        codec,
+                    )
+                    .await,
+                )
+            })
+            .await;
+
+            match result {
+                Ok(Err(ClientError::ConnectionTimeout)) => {}
+                Ok(Ok(_)) => panic!("connected to a black hole that never completes the handshake"),
+                Ok(Err(e)) => panic!("expected ConnectionTimeout, got {e:?}"),
+                Err(_) => panic!("the 5s outer bound fired: the handshake was not bounded by connection_timeout"),
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "handshake took {:?}, the 200ms connection_timeout did not bound it",
+                start.elapsed()
+            );
+        });
+    }
+
 }

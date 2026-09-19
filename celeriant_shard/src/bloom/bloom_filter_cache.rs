@@ -45,3 +45,14 @@ impl BloomFilterCache {
         words
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Frozen check here as hash is persisted to disk
+    #[test]
+    fn event_type_hash_value_is_pinned() {
+        assert_eq!(event_type_hash(1), 3439722301264460078);
+    }
+}

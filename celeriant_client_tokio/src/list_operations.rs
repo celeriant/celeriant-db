@@ -66,7 +66,7 @@ impl<'a> ListOrgsIterator<'a> {
             shard_cursors,
             active_shards,
             max_shard: options.max_shard_hint,
-            next_shard_to_try: options.start_shard + 1,
+            next_shard_to_try: options.start_shard.saturating_add(1),
             seen: HashSet::new(),
             buffer: VecDeque::new(),
             exhausted: false,
@@ -157,7 +157,7 @@ impl<'a> ListOrgsIterator<'a> {
         if !self.shard_cursors.contains_key(&self.next_shard_to_try) {
             self.shard_cursors.insert(self.next_shard_to_try, None);
             self.active_shards.push_back(self.next_shard_to_try);
-            self.next_shard_to_try += 1;
+            self.next_shard_to_try = self.next_shard_to_try.saturating_add(1);
             return true;
         }
 
@@ -204,7 +204,7 @@ impl<'a> ListAggregateTypesIterator<'a> {
             shard_cursors,
             active_shards,
             max_shard: options.max_shard_hint,
-            next_shard_to_try: options.start_shard + 1,
+            next_shard_to_try: options.start_shard.saturating_add(1),
             seen: HashSet::new(),
             buffer: VecDeque::new(),
             exhausted: false,
@@ -294,7 +294,7 @@ impl<'a> ListAggregateTypesIterator<'a> {
         if !self.shard_cursors.contains_key(&self.next_shard_to_try) {
             self.shard_cursors.insert(self.next_shard_to_try, None);
             self.active_shards.push_back(self.next_shard_to_try);
-            self.next_shard_to_try += 1;
+            self.next_shard_to_try = self.next_shard_to_try.saturating_add(1);
             return true;
         }
         false
@@ -352,7 +352,7 @@ impl AggregateStats {
 
     pub(crate) fn merge(&mut self, item: &AggregateListItem) {
         self.is_deleted = self.is_deleted || item.is_deleted;
-        self.event_batch_count += item.event_batch_count;
+        self.event_batch_count = self.event_batch_count.saturating_add(item.event_batch_count);
         if item.min_event_timestamp > 0 {
             self.min_event_timestamp = if self.min_event_timestamp == 0 {
                 item.min_event_timestamp
@@ -385,8 +385,8 @@ impl AggregateStats {
         self.max_server_timestamp = self.max_server_timestamp.max(item.max_server_timestamp);
         self.max_aggregate_version = self.max_aggregate_version.max(item.max_aggregate_version);
         self.max_event_seq = self.max_event_seq.max(item.max_event_seq);
-        self.compressed_size += item.compressed_size;
-        self.uncompressed_size += item.uncompressed_size;
+        self.compressed_size = self.compressed_size.saturating_add(item.compressed_size);
+        self.uncompressed_size = self.uncompressed_size.saturating_add(item.uncompressed_size);
     }
 }
 
@@ -428,7 +428,7 @@ impl<'a> ListAggregatesIterator<'a> {
             shard_cursors,
             active_shards,
             max_shard: options.max_shard_hint,
-            next_shard_to_try: options.start_shard + 1,
+            next_shard_to_try: options.start_shard.saturating_add(1),
             stats: HashMap::new(),
             deleted: HashSet::new(),
             order: Vec::new(),
@@ -550,7 +550,7 @@ impl<'a> ListAggregatesIterator<'a> {
         if !self.shard_cursors.contains_key(&self.next_shard_to_try) {
             self.shard_cursors.insert(self.next_shard_to_try, None);
             self.active_shards.push_back(self.next_shard_to_try);
-            self.next_shard_to_try += 1;
+            self.next_shard_to_try = self.next_shard_to_try.saturating_add(1);
             return true;
         }
         false
@@ -563,5 +563,80 @@ impl<'a> ListAggregatesIterator<'a> {
             results.push(item?);
         }
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn max_item(org: u128, aggregate_id: u128) -> AggregateListItem {
+        AggregateListItem {
+            is_deleted: false,
+            org_id: org,
+            aggregate_type_id: 1,
+            aggregate_id,
+            event_batch_count: u64::MAX,
+            min_event_timestamp: 0,
+            max_event_timestamp: 0,
+            min_aggregate_version: 1,
+            max_aggregate_version: 1,
+            min_event_seq: 0,
+            max_event_seq: 0,
+            min_server_timestamp: 0,
+            max_server_timestamp: 0,
+            compressed_size: u64::MAX,
+            uncompressed_size: u64::MAX,
+        }
+    }
+
+    #[test]
+    fn merge_saturates_accumulated_fields() {
+        let mut stats = AggregateStats::from_item(&max_item(1, 1));
+        stats.merge(&max_item(1, 1));
+        assert_eq!(stats.event_batch_count, u64::MAX);
+        assert_eq!(stats.compressed_size, u64::MAX);
+        assert_eq!(stats.uncompressed_size, u64::MAX);
+    }
+
+    /// Constructing an iterator at the top of the shard range must not
+    /// overflow the shard cursor (start_shard + 1 panicked in debug builds).
+    #[tokio::test]
+    async fn list_iterators_accept_max_start_shard_without_overflow() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _held = listener.accept().await;
+        });
+        let mut client = crate::celeriant_client::CeleriantClient::connect(&addr.to_string())
+            .await
+            .unwrap();
+
+        // At MAX-1 the last shard (MAX) is still discoverable exactly once; at
+        // MAX the cursor is already at the top and discovery must stop.
+        for (start_shard, adds_before_stop) in [(u64::MAX - 1, 1), (u64::MAX, 0)] {
+            let opts = ListOptions { start_shard, ..Default::default() };
+            {
+                let mut it = ListOrgsIterator::new(&mut client, opts.clone());
+                for _ in 0..adds_before_stop {
+                    assert!(it.try_add_next_shard());
+                }
+                assert!(!it.try_add_next_shard(), "the cursor must saturate, not wrap");
+            }
+            {
+                let mut it = ListAggregateTypesIterator::new(&mut client, Some(1), opts.clone());
+                for _ in 0..adds_before_stop {
+                    assert!(it.try_add_next_shard());
+                }
+                assert!(!it.try_add_next_shard(), "the cursor must saturate, not wrap");
+            }
+            {
+                let mut it = ListAggregatesIterator::new(&mut client, Some(1), Some(1), opts.clone());
+                for _ in 0..adds_before_stop {
+                    assert!(it.try_add_next_shard());
+                }
+                assert!(!it.try_add_next_shard(), "the cursor must saturate, not wrap");
+            }
+        }
     }
 }

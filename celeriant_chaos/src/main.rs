@@ -21,7 +21,7 @@ use celeriant_chaos::scenario::{
     run_partition_leader_follower_replication, run_partition_leader_minio,
     run_watch_storm, run_watch_storm_failover,
     run_cold_segment_reads, run_nemesis_composition, run_schema_under_partition,
-    run_cardinality_pressure,
+    run_cardinality_pressure, run_cold_connect_herd,
 };
 use celeriant_chaos::cardinality_workload::{CardinalityParams, Preset};
 
@@ -277,6 +277,11 @@ async fn main() -> Result<(), String> {
         // several minutes restarting a cluster they deliberately broke.
         Some("write_outage_selfheal") => vec!["write_outage_selfheal"],
         Some("promotion_failure_survival") => vec!["promotion_failure_survival"],
+        // Red-banked, --scenario-only (never in --full): the aspirational SLA tier
+        // is a documented red, and a 20k cold herd is too heavy for every --full
+        // run. Regression tier is green today. See the campaign findings on the
+        // cold-connect envelope (MAX_CONCURRENT_CONNECTS=32, default pool limits).
+        Some("cold_connect_herd") => vec!["cold_connect_herd"],
         Some(other) => return Err(format!("unknown scenario: {other}")),
         None if args.full => vec![
             "baseline",
@@ -386,6 +391,7 @@ async fn run_one_iteration(
             "cardinality_pressure" => run_cardinality_pressure(cfg, params, card, &dir.root).await?,
             "write_outage_selfheal" => run_write_outage_selfheal(cfg, params, card, defect, &dir.root).await?,
             "promotion_failure_survival" => run_promotion_failure_survival(cfg, params, card, defect, &dir.root).await?,
+            "cold_connect_herd" => run_cold_connect_herd(cfg, params, &dir.root).await?,
             _ => unreachable!(),
         };
         write_scenario(&dir, &report)?;

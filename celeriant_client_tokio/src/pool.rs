@@ -4,11 +4,15 @@
 /// `$try_addr` must be a locally-defined `macro_rules!` that accepts a `&str`
 /// expression and evaluates to `Result<T, ClientError>` (the single-attempt).
 ///
-/// Pattern:
-/// 1. Try the cached leader / primary address.
-/// 2. On `NotLeader { Some(addr) }` → update cache, retry once.
-/// 3. On `NotLeader { None }` / `ConnectionFailed` → iterate seeds up to
-///    `PoolOptions::max_leader_retries` nodes.
+/// One walk over candidate addresses: the cached leader (or primary) first,
+/// then untried seeds. A `NotLeader` hint jumps the walk to the hinted node
+/// and updates the cache; if the hinted node fails too, the walk resumes with
+/// the seeds instead of aborting. Hint hops and seed attempts share the
+/// `max_leader_retries` budget, and no address is tried twice, so a circular
+/// hint chain terminates.
+///
+/// `RequestTimeout` returns to the caller: the node may have applied the
+/// operation, so blindly retrying it elsewhere risks a duplicate write.
 macro_rules! leader_route {
     ($pool:expr, $try_addr:ident) => {{
         let pool: &CeleriantPool = $pool;
@@ -18,53 +22,54 @@ macro_rules! leader_route {
         }
 
         let first_addr = pool.current_or_primary_leader();
-        match $try_addr!(&first_addr) {
-            Ok(result) => return Ok(result),
-            Err(ClientError::NotLeader { leader_address: Some(ref new_addr), .. }) => {
-                let new_addr = new_addr.clone();
-                pool.update_leader(new_addr.clone());
-                return $try_addr!(&new_addr);
-            }
-            Err(ClientError::NotLeader { leader_address: None, .. }) => {}
-            Err(ClientError::ConnectionFailed(_)) => { pool.clear_leader(); }
-            Err(ClientError::ConnectionTimeout) => { pool.clear_leader(); }
-            // Pooled conn died mid-request: leader probably gone.
-            Err(ClientError::WireError(_)) => { pool.clear_leader(); }
-            Err(ClientError::ReadError(_)) => { pool.clear_leader(); }
-            Err(e @ ClientError::RequestTimeout) => { return Err(e); }
-            Err(ClientError::ServerBusy) => {}
-            Err(e) => return Err(e),
-        }
-
-        let max_retries = pool.options.max_leader_retries;
+        let mut tried: HashSet<String> = HashSet::new();
+        let mut next_hint: Option<String> = None;
+        let mut seeds = all_addrs.iter();
         let mut retries = 0usize;
-        for addr in &all_addrs {
-            if retries >= max_retries {
-                break;
-            }
-            if *addr == first_addr {
-                continue;
-            }
-            retries += 1;
-            match $try_addr!(addr.as_str()) {
+        let mut candidate = first_addr.clone();
+        loop {
+            tried.insert(candidate.clone());
+            match $try_addr!(&candidate) {
                 Ok(result) => {
-                    pool.update_leader(addr.clone());
+                    if candidate != first_addr {
+                        pool.update_leader(candidate);
+                    }
                     return Ok(result);
                 }
                 Err(ClientError::NotLeader { leader_address: Some(ref new_addr), .. }) => {
-                    let new_addr = new_addr.clone();
-                    pool.update_leader(new_addr.clone());
-                    return $try_addr!(&new_addr);
+                    if !tried.contains(new_addr) {
+                        next_hint = Some(new_addr.clone());
+                    }
                 }
-                Err(ClientError::NotLeader { leader_address: None, .. }) => continue,
-                Err(ClientError::ConnectionFailed(_)) => continue,
-                Err(ClientError::ConnectionTimeout) => continue,
-                Err(ClientError::WireError(_)) => continue,
-                Err(ClientError::ReadError(_)) => continue,
-                Err(ClientError::RequestTimeout) => continue,
-                Err(ClientError::ServerBusy) => continue,
+                Err(ClientError::NotLeader { leader_address: None, .. }) => {}
+                Err(e @ ClientError::WireError(WireError::MessageTooLarge { .. })) => {
+                    return Err(e)
+                }
+                // Pooled conn died mid-request: leader probably gone.
+                Err(ClientError::ConnectionFailed(_))
+                | Err(ClientError::ConnectionTimeout)
+                | Err(ClientError::WireError(_))
+                | Err(ClientError::ReadError(_)) => {
+                    pool.clear_leader();
+                }
+                Err(e @ ClientError::RequestTimeout) => return Err(e),
+                Err(ClientError::ServerBusy) => {}
                 Err(e) => return Err(e),
             }
+            if retries >= pool.options.max_leader_retries {
+                break;
+            }
+            retries += 1;
+            candidate = match next_hint.take() {
+                Some(hint) => {
+                    pool.update_leader(hint.clone());
+                    hint
+                }
+                None => match seeds.find(|a| !tried.contains(*a)) {
+                    Some(addr) => addr.clone(),
+                    None => break,
+                },
+            };
         }
 
         Err(ClientError::ConnectionFailed(std::io::Error::new(
@@ -112,6 +117,10 @@ macro_rules! read_route {
                             conn.mark_broken();
                             if pinned_leader { pool.clear_leader(); }
                             continue;
+                        }
+                        Err(e @ ClientError::WireError(WireError::MessageTooLarge { .. })) => {
+                            conn.mark_broken();
+                            return Err(e);
                         }
                         Err(ClientError::WireError(_)) => {
                             conn.mark_broken();
@@ -174,6 +183,7 @@ use celeriant_msg::response::responses::{
     AggregateDetailsResponse, DeleteResponse, ReadResponse, RegisterSchemaResponse, TrimStartResponse, WriteResponse,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
+use celeriant_wire::network::wire_error::WireError;
 use tokio::time::Duration;
 
 use crate::celeriant_client::{CeleriantClient, ClientIdentityConfig, ClientTlsConfig};
@@ -624,7 +634,8 @@ impl CeleriantPool {
     /// Convenience method: write events to a single aggregate without constructing a `WriteRequest`.
     ///
     /// `client_id` scopes client-seq idempotency — use a stable id per logical writer, never a
-    /// fresh random value per call.
+    /// fresh random value per call. Idempotency enforcement is opt-in: use `write_events_with`
+    /// with `enforce_client_idempotency: true` to enable it.
     pub async fn write_events(
         &self,
         aggregate_key: AggregateKey,
@@ -814,6 +825,9 @@ impl CeleriantPool {
     /// Borrow a connection to the current leader.
     pub async fn get_leader_connection(&self) -> Result<PooledConnection, ClientError> {
         let addr = self.current_or_primary_leader();
+        if addr.is_empty() {
+            return Err(err_no_addresses());
+        }
         let node = self.get_or_create_node(&addr);
         node.get().await
     }
@@ -977,12 +991,16 @@ impl CeleriantPool {
             .unwrap_or_else(|| self.primary_address())
     }
 
+    /// The cached leader, else the primary, else the first seed. Empty only
+    /// when no addresses are configured at all.
     fn current_or_primary_leader(&self) -> String {
-        self.leader_address
-            .read()
-            .unwrap()
-            .clone()
-            .unwrap_or_else(|| self.options.address.clone())
+        if let Some(leader) = self.leader_address.read().unwrap().clone() {
+            return leader;
+        }
+        if !self.options.address.is_empty() {
+            return self.options.address.clone();
+        }
+        self.options.seed_addresses.first().cloned().unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -1163,7 +1181,7 @@ impl PooledListOrgsIterator {
             shard_cursors,
             active_shards,
             max_shard: options.max_shard_hint,
-            next_shard_to_try: options.start_shard + 1,
+            next_shard_to_try: options.start_shard.saturating_add(1),
             seen: HashSet::new(),
             buffer: VecDeque::new(),
             exhausted: false,
@@ -1250,7 +1268,7 @@ impl PooledListOrgsIterator {
         if !self.shard_cursors.contains_key(&self.next_shard_to_try) {
             self.shard_cursors.insert(self.next_shard_to_try, None);
             self.active_shards.push_back(self.next_shard_to_try);
-            self.next_shard_to_try += 1;
+            self.next_shard_to_try = self.next_shard_to_try.saturating_add(1);
             return true;
         }
         false
@@ -1299,7 +1317,7 @@ impl PooledListAggregateTypesIterator {
             shard_cursors,
             active_shards,
             max_shard: options.max_shard_hint,
-            next_shard_to_try: options.start_shard + 1,
+            next_shard_to_try: options.start_shard.saturating_add(1),
             seen: HashSet::new(),
             buffer: VecDeque::new(),
             exhausted: false,
@@ -1388,7 +1406,7 @@ impl PooledListAggregateTypesIterator {
         if !self.shard_cursors.contains_key(&self.next_shard_to_try) {
             self.shard_cursors.insert(self.next_shard_to_try, None);
             self.active_shards.push_back(self.next_shard_to_try);
-            self.next_shard_to_try += 1;
+            self.next_shard_to_try = self.next_shard_to_try.saturating_add(1);
             return true;
         }
         false
@@ -1445,7 +1463,7 @@ impl PooledListAggregatesIterator {
             shard_cursors,
             active_shards,
             max_shard: options.max_shard_hint,
-            next_shard_to_try: options.start_shard + 1,
+            next_shard_to_try: options.start_shard.saturating_add(1),
             stats: HashMap::new(),
             deleted: HashSet::new(),
             order: Vec::new(),
@@ -1564,7 +1582,7 @@ impl PooledListAggregatesIterator {
         if !self.shard_cursors.contains_key(&self.next_shard_to_try) {
             self.shard_cursors.insert(self.next_shard_to_try, None);
             self.active_shards.push_back(self.next_shard_to_try);
-            self.next_shard_to_try += 1;
+            self.next_shard_to_try = self.next_shard_to_try.saturating_add(1);
             return true;
         }
         false
@@ -2501,6 +2519,515 @@ mod tests {
         assert!(
             seen.recv_timeout(RECV).expect("server saw the watch request").is_some(),
             "a Watch request must still carry a filled correlation id"
+        );
+    }
+
+    /// A server that acks the watch handshake with an empty `WatchResponse`,
+    /// then pushes a frame far larger than the pool's `max_response_size`.
+    async fn oversized_watch_server() -> std::net::SocketAddr {
+        use celeriant_msg::process_client_responses::ClientResponse;
+        use celeriant_msg::response::responses::WatchResponse;
+        use celeriant_msg::response::watch_event::WatchResponseEvent;
+        use celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES;
+        use celeriant_wire::codec::compression::DictCodec;
+        use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V2, WireHeader};
+        use tokio_util::compat::TokioAsyncReadCompatExt;
+
+        const MAX: u64 = 64 * 1024 * 1024;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                while let Ok((socket, _)) = listener.accept().await {
+                    tokio::task::spawn_local(async move {
+                        let mut stream = socket.compat();
+                        let codec = DictCodec::new(BUILTIN_DICT_BYTES, 3).unwrap();
+                        let Ok(header) = WireHeader::from_reader(&mut stream, MAX).await else {
+                            return;
+                        };
+                        let Ok(_request) =
+                            ClientRequest::read_from_header(header, &mut stream, &codec).await
+                        else {
+                            return;
+                        };
+                        let ack = ClientResponse::Watch(WatchResponse { events: Vec::new() });
+                        if ClientResponse::write_response(
+                            &mut stream, &ack, false, &codec, MAX, PROTOCOL_VERSION_V2,
+                        ).await.is_err() {
+                            return;
+                        }
+                        let big = ClientResponse::Watch(WatchResponse {
+                            events: (0..256u64).map(|i| WatchResponseEvent {
+                                org_id: i as u128,
+                                aggregate_type_id: 1,
+                                aggregate_id: i as u128,
+                                operation: 1,
+                                from_aggregate_version: Some(i),
+                                to_aggregate_version: Some(i + 1),
+                                keep_from_aggregate_version: None,
+                            }).collect(),
+                        });
+                        let _ = ClientResponse::write_response(
+                            &mut stream, &big, false, &codec, MAX, PROTOCOL_VERSION_V2,
+                        ).await;
+                    });
+                }
+            });
+        });
+        addr
+    }
+
+    /// A watch response past the pool's `max_response_size` must be rejected,
+    /// not delivered. The pool threads its size caps into the watch connection;
+    /// before the fix the watch used a hardcoded 10 MB cap and the pool's knob
+    /// was silently ignored.
+    #[tokio::test]
+    async fn a_watch_response_past_the_pools_max_response_size_is_rejected() {
+        use celeriant_msg::request::requests::WatchRequest;
+
+        let addr = oversized_watch_server().await;
+        let mut opts = PoolOptions::new(addr.to_string());
+        opts.max_response_size = 1024;
+        let pool = CeleriantPool::new(opts);
+
+        let request = WatchRequest {
+            correlation_id: None,
+            requested_latency_ms: None,
+            shard_id: None,
+            orgs: None,
+            aggregate_types: None,
+            aggregates: None,
+            operation_types: None,
+        };
+
+        let mut watch = pool
+            .watch(request, WatchOptions::default())
+            .await
+            .expect("the watch handshake completes on the empty ack");
+
+        match watch.next_timeout(Duration::from_secs(5)).await {
+            Ok(Some(_)) => panic!("an oversized watch response must be rejected, not delivered"),
+            Ok(None) => panic!("the oversized frame must arrive, not time out"),
+            Err(err) => assert!(
+                matches!(err, ClientError::ReadError(_)),
+                "expected ReadError from the oversized watch response, got {err:?}"
+            ),
+        }
+    }
+
+    /// Constructing a pooled iterator at the top of the shard range must not
+    /// overflow the shard cursor.
+    #[tokio::test]
+    async fn pooled_list_iterators_accept_max_start_shard_without_overflow() {
+        let addr = silent_server().await;
+        let pool = CeleriantPool::new(PoolOptions::new(addr.to_string()));
+        let node = pool.get_or_create_node(&addr.to_string());
+
+        let opts = crate::list_operations::ListOptions {
+            start_shard: u64::MAX,
+            ..Default::default()
+        };
+
+        let conn = node.get().await.unwrap();
+        let mut it = PooledListOrgsIterator::new(conn, opts.clone());
+        assert!(!it.try_add_next_shard(), "the cursor must saturate, not wrap");
+        let conn = node.get().await.unwrap();
+        let mut it = PooledListAggregateTypesIterator::new(conn, Some(1), opts.clone());
+        assert!(!it.try_add_next_shard(), "the cursor must saturate, not wrap");
+        let conn = node.get().await.unwrap();
+        let mut it = PooledListAggregatesIterator::new(conn, Some(1), Some(1), opts.clone());
+        assert!(!it.try_add_next_shard(), "the cursor must saturate, not wrap");
+    }
+
+    /// Accepts, reads the request so the client's write completes, then closes.
+    /// The client's response read hits EOF, surfacing a `ReadError` rather than
+    /// a clean `ConnectionFailed`.
+    async fn read_error_server() -> std::net::SocketAddr {
+        use celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES;
+        use celeriant_wire::codec::compression::DictCodec;
+        use celeriant_wire::network::wire_header::WireHeader;
+        use tokio_util::compat::TokioAsyncReadCompatExt;
+
+        const MAX: u64 = 64 * 1024 * 1024;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                while let Ok((socket, _)) = listener.accept().await {
+                    tokio::task::spawn_local(async move {
+                        let mut stream = socket.compat();
+                        let codec = DictCodec::new(BUILTIN_DICT_BYTES, 3).unwrap();
+                        let Ok(header) = WireHeader::from_reader(&mut stream, MAX).await else {
+                            return;
+                        };
+                        let Ok(_request) =
+                            ClientRequest::read_from_header(header, &mut stream, &codec).await
+                        else {
+                            return;
+                        };
+                        // Drop the socket: the client's read sees EOF.
+                    });
+                }
+            });
+        });
+        addr
+    }
+
+    /// A watch whose handshake dies with a `ReadError` on the pinned leader must
+    /// fail over to the next candidate, mirroring `read_route!`, instead of
+    /// surfacing the wire error immediately.
+    #[tokio::test]
+    async fn watch_fails_over_to_next_node_on_read_error() {
+        use celeriant_msg::request::requests::WatchRequest;
+
+        let bad = read_error_server().await;
+        let (good, _seen) = correlating_server(Answer::Watch).await;
+
+        let pool = CeleriantPool::new(
+            PoolOptions::new(bad.to_string()).with_seed_addresses(vec![good.to_string()]),
+        );
+
+        let request = WatchRequest {
+            correlation_id: None,
+            requested_latency_ms: None,
+            shard_id: None,
+            orgs: None,
+            aggregate_types: None,
+            aggregates: None,
+            operation_types: None,
+        };
+
+        let result = pool.watch(request, WatchOptions::default()).await;
+        assert!(result.is_ok(), "watch must fail over to the healthy node");
+        assert_eq!(result.unwrap().address(), good.to_string());
+    }
+
+    /// With no primary configured, leader routing must target the first seed,
+    /// never an empty address.
+    #[test]
+    fn oracle_seed_only_current_or_primary_leader_falls_back_to_seed() {
+        let pool = CeleriantPool::new(
+            PoolOptions::default().with_seed_addresses(vec!["b:1".into(), "c:1".into()]),
+        );
+        assert_eq!(pool.current_or_primary_leader(), "b:1");
+        assert_eq!(pool.read_addresses(), vec!["b:1".to_string(), "c:1".to_string()]);
+    }
+
+    /// A server that answers every request with a `Read` response whose body is
+    /// larger than the client's `max_response_size`, so the client's own
+    /// `WireHeader::from_reader` guard trips before any failover logic runs.
+    async fn oversized_read_server() -> std::net::SocketAddr {
+        use celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES;
+        use celeriant_wire::codec::compression::DictCodec;
+        use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V2, WireHeader};
+        use tokio_util::compat::TokioAsyncReadCompatExt;
+
+        const MAX: u64 = 64 * 1024 * 1024;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                while let Ok((socket, _)) = listener.accept().await {
+                    tokio::task::spawn_local(async move {
+                        let mut stream = socket.compat();
+                        let codec = DictCodec::new(BUILTIN_DICT_BYTES, 3).unwrap();
+                        loop {
+                            let Ok(header) = WireHeader::from_reader(&mut stream, MAX).await else {
+                                return;
+                            };
+                            let Ok(request) =
+                                ClientRequest::read_from_header(header, &mut stream, &codec).await
+                            else {
+                                return;
+                            };
+                            let asked = request.correlation_id();
+                            let resp = ClientResponse::Read(ReadResponse {
+                                correlation_id: asked,
+                                event_batches: vec![AggregateEventBatch {
+                                    aggregate_version: 1,
+                                    client_id: 1,
+                                    user_id: None,
+                                    server_timestamp: 0,
+                                    events: vec![DatablockAggregateEvent {
+                                        client_seq: 0,
+                                        event_seq: 0,
+                                        event_id: None,
+                                        event_timestamp: 0,
+                                        event_type_major: 1,
+                                        event_type_minor: 0,
+                                        event_value: Arc::new(vec![7u8; 8 * 1024]),
+                                        iv: None,
+                                    }],
+                                }],
+                                next_aggregate_version: None,
+                            });
+                            if ClientResponse::write_response(
+                                &mut stream, &resp, false, &codec, MAX, PROTOCOL_VERSION_V2,
+                            ).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        addr
+    }
+
+    /// A response exceeding `max_response_size` is a deterministic client-side
+    /// rejection, not a connection fault. `read_route!` must surface the
+    /// `MessageTooLarge` to the caller instead of failing every candidate and
+    /// reporting "all nodes unreachable".
+    #[tokio::test]
+    async fn an_oversized_read_response_surfaces_message_too_large_not_unreachable() {
+        let addr = oversized_read_server().await;
+        let mut opts = PoolOptions::new(addr.to_string());
+        opts.max_response_size = 1024;
+        let pool = CeleriantPool::new(opts);
+
+        let err = pool
+            .read(ReadRequest {
+                correlation_id: None,
+                aggregate_key: AggregateKey::new(1, 1, 1),
+                filters: ReadFilters::new(0),
+            })
+            .await
+            .expect_err("an oversized response must error");
+
+        assert!(
+            matches!(err, ClientError::WireError(WireError::MessageTooLarge { .. })),
+            "expected MessageTooLarge, got {err:?}"
+        );
+    }
+
+    /// How a mock write server answers each `Write` request it receives.
+    #[derive(Clone)]
+    enum WriteAnswer {
+        /// Redirect the client to `leader_address` via a `NotLeader` error.
+        NotLeader(String),
+        /// Commit the write and return a `WriteResponse`.
+        Ok,
+        /// Refuse a schema registration as a non-leader (error 2027) with a
+        /// leader hint, the way a follower answers `RegisterSchema`.
+        SchemaNotLeader(String),
+        /// Accept a schema registration.
+        SchemaOk,
+    }
+
+    /// A server that answers `Write` requests with a scripted response, echoing
+    /// the request's correlation id so the client's correlation check passes.
+    async fn write_server(answer: WriteAnswer) -> std::net::SocketAddr {
+        use celeriant_msg::process_client_responses::ClientResponse;
+        use celeriant_msg::response::responses::{ErrorResponse, WriteResponse};
+        use celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES;
+        use celeriant_wire::codec::compression::DictCodec;
+        use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V2, WireHeader};
+        use tokio_util::compat::TokioAsyncReadCompatExt;
+
+        const MAX: u64 = 64 * 1024 * 1024;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        // `DictCodec` holds a `RefCell`, so it is `!Sync`; own thread, own runtime.
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                while let Ok((socket, _)) = listener.accept().await {
+                    let answer = answer.clone();
+                    tokio::task::spawn_local(async move {
+                        let mut stream = socket.compat();
+                        let codec = DictCodec::new(BUILTIN_DICT_BYTES, 3).unwrap();
+                        loop {
+                            let Ok(header) = WireHeader::from_reader(&mut stream, MAX).await else {
+                                return;
+                            };
+                            let Ok(request) =
+                                ClientRequest::read_from_header(header, &mut stream, &codec).await
+                            else {
+                                return;
+                            };
+                            let asked = request.correlation_id();
+                            let resp = match &answer {
+                                WriteAnswer::NotLeader(leader) => {
+                                    ClientResponse::GenericError(ErrorResponse {
+                                        correlation_id: asked,
+                                        error_code: celeriant_msg::error_codes::WRITE_NOT_LEADER,
+                                        error_message: format!("{{\"leader_address\":\"{leader}\"}}"),
+                                    })
+                                }
+                                WriteAnswer::Ok => ClientResponse::Write(WriteResponse {
+                                    correlation_id: asked,
+                                    max_aggregate_version: Some(1),
+                                }),
+                                WriteAnswer::SchemaNotLeader(leader) => {
+                                    ClientResponse::GenericError(ErrorResponse {
+                                        correlation_id: asked,
+                                        error_code:
+                                            celeriant_msg::error_codes::REGISTER_SCHEMA_CANNOT_ACCEPT_WRITES,
+                                        error_message: format!("{{\"leader_address\":\"{leader}\"}}"),
+                                    })
+                                }
+                                WriteAnswer::SchemaOk => ClientResponse::RegisterSchema(
+                                    celeriant_msg::response::responses::RegisterSchemaResponse {
+                                        correlation_id: asked,
+                                    },
+                                ),
+                            };
+                            if ClientResponse::write_response(
+                                &mut stream, &resp, false, &codec, MAX, PROTOCOL_VERSION_V2,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        addr
+    }
+
+    fn empty_write_request() -> celeriant_msg::request::requests::WriteRequest {
+        celeriant_msg::request::requests::WriteRequest {
+            correlation_id: None,
+            client_id: 1,
+            user_id: None,
+            writes: HashMap::new(),
+        }
+    }
+
+    /// A stale `NotLeader{Some(addr)}` hint that points at a dead node must not
+    /// abort the write: the hinted retry fails, then the seed loop is walked and
+    /// the write lands on a reachable seed.
+    #[tokio::test]
+    async fn a_stale_leader_hint_falls_through_to_seed_failover() {
+        // A dead address: bind, capture, drop, so the hinted retry gets a reset.
+        let stale = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+
+        let primary = write_server(WriteAnswer::NotLeader(stale)).await;
+        let seed = write_server(WriteAnswer::Ok).await;
+
+        let pool = CeleriantPool::new(
+            PoolOptions::new(primary.to_string()).with_seed_addresses(vec![seed.to_string()]),
+        );
+
+        let result = pool.write(empty_write_request()).await;
+
+        assert!(
+            result.is_ok(),
+            "a stale leader hint must degrade to seed failover, got {result:?}"
+        );
+    }
+
+    /// A follower answers `RegisterSchema` with error 2027 plus a leader hint,
+    /// the same shape as the NotLeader errors. The pool must follow that hint
+    /// like any other leader redirect instead of surfacing a schema error.
+    #[tokio::test]
+    async fn schema_registration_on_a_follower_redirects_to_the_leader() {
+        use celeriant_wal::schema_key::SchemaKey;
+
+        let leader = write_server(WriteAnswer::SchemaOk).await;
+        let follower = write_server(WriteAnswer::SchemaNotLeader(leader.to_string())).await;
+
+        let pool = CeleriantPool::new(PoolOptions::new(follower.to_string()));
+
+        let result = pool
+            .register_schema(RegisterSchemaRequest {
+                correlation_id: None,
+                client_id: 1,
+                user_id: None,
+                schema_key: SchemaKey::new(1, 1, 1, 0),
+                schema_type: 0,
+                schema: "{}".to_string(),
+            })
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "schema registration must follow the 2027 leader hint, got {result:?}"
+        );
+        assert_eq!(
+            pool.leader_address.read().unwrap().clone(),
+            Some(leader.to_string()),
+            "the redirect must update the cached leader"
+        );
+    }
+
+    /// The write-path analog of the oversized-read case: a request past
+    /// `max_request_size` fails identically on every node, so `leader_route!`
+    /// must surface the `MessageTooLarge` instead of "no leader found".
+    #[tokio::test]
+    async fn an_oversized_write_request_surfaces_message_too_large_not_no_leader() {
+        use celeriant_msg::request::requests::SingleAggregateWrite;
+
+        let primary = write_server(WriteAnswer::Ok).await;
+        let mut opts = PoolOptions::new(primary.to_string());
+        opts.max_request_size = 1024;
+        let pool = CeleriantPool::new(opts);
+
+        let mut request = empty_write_request();
+        request.writes.insert(
+            AggregateKey::new(1, 1, 1),
+            SingleAggregateWrite {
+                events: vec![DatablockAggregateEvent {
+                    client_seq: 0,
+                    event_seq: 0,
+                    event_id: None,
+                    event_timestamp: 0,
+                    event_type_major: 1,
+                    event_type_minor: 0,
+                    event_value: Arc::new(vec![7u8; 8 * 1024]),
+                    iv: None,
+                }],
+                allow_create: true,
+                expected_version: None,
+                enforce_client_idempotency: false,
+            },
+        );
+
+        let err = pool.write(request).await.expect_err("an oversized request must error");
+        assert!(
+            matches!(err, ClientError::WireError(WireError::MessageTooLarge { .. })),
+            "expected MessageTooLarge, got {err:?}"
+        );
+    }
+
+    /// A redirect chain (primary hints at node2, node2 hints at node3, node3 is
+    /// the leader) is followed hop by hop instead of abandoning the second hint.
+    #[tokio::test]
+    async fn a_leader_hint_chain_is_followed_to_the_leader() {
+        let leader = write_server(WriteAnswer::Ok).await;
+        let middle = write_server(WriteAnswer::NotLeader(leader.to_string())).await;
+        let primary = write_server(WriteAnswer::NotLeader(middle.to_string())).await;
+
+        let pool = CeleriantPool::new(PoolOptions::new(primary.to_string()));
+
+        let result = pool.write(empty_write_request()).await;
+
+        assert!(result.is_ok(), "a two-hop leader hint chain must land, got {result:?}");
+        assert_eq!(
+            pool.leader_address.read().unwrap().clone(),
+            Some(leader.to_string()),
+            "the cache must hold the node that answered"
         );
     }
 }

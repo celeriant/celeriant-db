@@ -335,9 +335,9 @@ impl CeleriantClient {
         // with the same stateless dict helper once the body is in hand.
         let header = WireHeader::from_reader(&mut self.stream, self.max_response_size).await?;
         let response = if ClientResponse::is_fixed_size_variant(header.message_type) {
-            let response = ClientResponse::read_from_header(header, &mut self.stream).await?;
+            let raw = header.read_fixed_body_raw(&mut self.stream).await?;
             self.stream_dirty = false;
-            response
+            ClientResponse::deserialize_body(header.message_type, &raw, header.version)?
         } else {
             let raw = header.read_variable_body_raw(&mut self.stream).await?;
             self.stream_dirty = false;
@@ -408,6 +408,9 @@ impl CeleriantClient {
         known_dict_sha: Option<String>,
         dict_lookup: impl FnOnce(&str) -> Option<Arc<[u8]>>,
     ) -> Result<Option<u128>, ClientError> {
+        if self.stream_dirty {
+            return Err(ClientError::ProtocolError);
+        }
         let (public_key, nonce, signature) = match (&identity_config.public_key, &identity_config.private_key) {
             (Some(pub_key), Some(priv_key)) => {
                 let nonce = Crypto::generate_nonce()?;
@@ -651,6 +654,51 @@ mod tests {
         )
     }
 
+    /// A fixed-size response whose body fails to deserialise has still been fully
+    /// read off the socket, so the stream must stay clean and the connection kept.
+    #[tokio::test]
+    async fn a_fixed_size_deserialise_failure_leaves_the_stream_clean() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // Drain the request frame so the client's write completes.
+            let mut header = [0u8; 17];
+            socket.read_exact(&mut header).await.unwrap();
+            let body_len =
+                u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
+            let mut body = vec![0u8; body_len];
+            socket.read_exact(&mut body).await.unwrap();
+
+            // Correctly-framed fixed-size AggregateDetails response with a corrupt
+            // body: an invalid `Option` discriminant for `correlation_id`.
+            let mut resp = Vec::new();
+            resp.extend_from_slice(&2u32.to_le_bytes()); // version
+            resp.extend_from_slice(&1u32.to_le_bytes()); // message_type = AggregateDetails
+            resp.extend_from_slice(&1u32.to_le_bytes()); // compressed_length
+            resp.extend_from_slice(&1u32.to_le_bytes()); // uncompressed_length
+            resp.push(0); // compression_type = None
+            resp.push(2); // corrupt body
+            socket.write_all(&resp).await.unwrap();
+        });
+
+        let mut client = CeleriantClient::connect(&addr.to_string()).await.unwrap();
+        let err = client
+            .send_request(&details_request(1))
+            .await
+            .expect_err("corrupt fixed-size body must fail to deserialise");
+        assert!(
+            matches!(err, ClientError::ReadError(_)),
+            "expected ReadError, got {err:?}"
+        );
+        assert!(
+            !client.is_stream_dirty(),
+            "the body was fully consumed; the stream must stay clean"
+        );
+    }
+
     #[tokio::test]
     async fn a_fresh_client_has_a_clean_stream() {
         let addr = silent_server().await;
@@ -742,6 +790,24 @@ mod tests {
         assert!(
             client.is_stream_dirty(),
             "a partially written request frame leaves the stream desynchronised"
+        );
+    }
+
+    #[tokio::test]
+    async fn identify_refuses_a_dirty_stream() {
+        let addr = silent_server().await;
+        let mut client = CeleriantClient::connect(&addr.to_string()).await.unwrap();
+        client.stream_dirty = true;
+
+        let config = ClientIdentityConfig { public_key: None, private_key: None, api_key: None };
+        let result = timeout(
+            Duration::from_millis(200),
+            client.identify_with_known_sha(&config, None, |_| None),
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(Err(ClientError::ProtocolError))),
+            "identify must refuse a dirty stream, got {result:?}"
         );
     }
 

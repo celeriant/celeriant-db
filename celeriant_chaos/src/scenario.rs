@@ -1964,6 +1964,7 @@ pub async fn run_cas_storm_scenario(
         p999_ms: 0,
         min_ms: 0,
         max_ms: 0,
+        warmup_p50_ms: 0,
     };
     let mut scen_params = params;
     scen_params.tasks = WRITERS;
@@ -7319,6 +7320,7 @@ fn benchmark_from(
         p999_ms: at(999),
         min_ms: latencies.first().copied().unwrap_or(0),
         max_ms: latencies.last().copied().unwrap_or(0),
+        warmup_p50_ms: 0,
     }
 }
 
@@ -8762,4 +8764,210 @@ mod cardinality_pressure_tests {
         let b = benchmark_from(Vec::new(), 0, 0, 3, 60);
         assert_eq!((b.p50_ms, b.p99_ms, b.max_ms, b.throughput), (0, 0, 0, 0.0));
     }
+}
+
+
+
+/// Cluster-wide write rate at a scrape tick, summed across both nodes' per-shard
+/// wal_seq deltas is not what we want — use writes_total deltas between adjacent
+/// ticks on the leader. Returns (t_ms, writes_per_sec) pairs for the window.
+fn leader_write_rate_curve(samples: &[NodeSample], start_ms: u64, end_ms: u64) -> Vec<(u64, f64)> {
+    // Pick the host that is leader for most of the window.
+    let mut per_host: std::collections::BTreeMap<&str, Vec<&NodeSample>> = std::collections::BTreeMap::new();
+    for s in samples.iter().filter(|s| s.ok && s.t_ms >= start_ms && s.t_ms <= end_ms) {
+        per_host.entry(s.host.as_str()).or_default().push(s);
+    }
+    let leader = per_host
+        .iter()
+        .max_by_key(|(_, v)| v.iter().filter(|s| s.node_role >= 0.5).count())
+        .map(|(h, _)| *h);
+    let Some(leader) = leader else { return Vec::new() };
+    let ticks = &per_host[leader];
+    let mut curve = Vec::new();
+    for w in ticks.windows(2) {
+        let dt_ms = w[1].t_ms.saturating_sub(w[0].t_ms);
+        if dt_ms == 0 { continue; }
+        let dw = w[1].writes_total.saturating_sub(w[0].writes_total);
+        curve.push((w[1].t_ms, dw as f64 * 1000.0 / dt_ms as f64));
+    }
+    curve
+}
+
+/// EXPECTED RED (aspirational tier only), banked, `--scenario cold_connect_herd`
+/// only (excluded from `--full`). Codifies the 20k cold-connect envelope:
+/// MAX_CONCURRENT_CONNECTS=32 serialises the accept path and the default pool
+/// limits cap concurrency, so a thundering herd of cold connections sheds most of
+/// itself and takes tens of seconds to warm up. Both are catalogued and unfixed.
+///
+/// Two tiers:
+///   (a) REGRESSION (gating): sheds and survivor throughput within the measured
+///       envelope plus margin. Bound loosely so it is green today and on healthy
+///       variance — its job is to catch a REGRESSION off the known envelope, not
+///       to pass the aspirational bar.
+///   (b) ASPIRATIONAL SLA (non-fatal, emit-and-log): shed < 1% and warmup < 5s.
+///       This is the documented red half. The verdict is computed and printed
+///       into the report, but it is a `pass_with_detail` so it never fails the
+///       run — the harness has no expected-fail notion, and the aspirational
+///       breach must stay visible without turning the scenario red.
+///
+/// Registered `--scenario` only, like the other two red-banked scenarios: a 20k
+/// cold herd is too heavy to pay on every `--full` run, and the aspirational red
+/// must never break a routine full-suite pass. Run it with `--tasks 20000` to hit
+/// the catalogued envelope; the bounds scale with `--tasks`.
+pub async fn run_cold_connect_herd(
+    cfg: &ClusterConfig,
+    params: ScenarioParams,
+    run_dir: &PathBuf,
+) -> Result<ScenarioReport, String> {
+    const SCEN: &str = "cold_connect_herd";
+
+    let up = bring_up_cluster(cfg, SCEN, run_dir).await?;
+    // max_connections == tasks: the whole herd dials at once. No connect ramp.
+    let pool = build_bench_pool(cfg, &up, params).await?;
+
+    println!("[{SCEN}] smoke test");
+    smoke_test(&pool).await.map_err(|e| format!("smoke: {e}"))?;
+
+    let bench_window_start_ms = up.elapsed_ms();
+    println!(
+        "[{SCEN}] COLD herd: {} tasks dial at once (no ramp), {}s",
+        params.tasks, params.duration_secs
+    );
+    let bench_result = celeriant_bench::run_benchmark_ramped(&pool, params.tasks, params.duration_secs, None).await;
+    let bench_window_end_ms = up.elapsed_ms();
+
+    // Shed against the CONNECTION base, matching the campaign's "~14-15k sheds of
+    // 20k". The dominant cold-herd error is a connect that lost the accept
+    // serialization race ("no leader found") and retried behind backoff, so
+    // errors track roughly one-per-task at the herd edge; errors/tasks is the
+    // connection-shed rate. The attempt-share is reported too but is not the
+    // envelope figure — surviving tasks make many successful requests that dilute
+    // it toward zero.
+    let shed_conn_pct = bench_result.errors as f64 * 100.0 / (params.tasks.max(1)) as f64;
+    let attempts = bench_result.total_requests + bench_result.errors;
+    let shed_attempt_pct = if attempts > 0 {
+        bench_result.errors as f64 * 100.0 / attempts as f64
+    } else {
+        0.0
+    };
+
+    // Warmup is the per-connection first-successful-request median: on a cold herd
+    // that request carries the TCP connect that lost the serialization race, so it
+    // IS the cold-connect warmup cost the campaign measured (~29s at 20k). The
+    // scraper write-rate curve is kept as a secondary evidence artifact.
+    let warmup_secs = bench_result.warmup_p50_ms as f64 / 1000.0;
+    let samples = up.scraper.store().snapshot().await;
+    let curve = leader_write_rate_curve(&samples, bench_window_start_ms, bench_window_end_ms);
+    let peak_rate = curve.iter().map(|(_, r)| *r).fold(0.0_f64, f64::max);
+
+    println!(
+        "[{SCEN}] herd done: {} req, {} err | shed {:.1}% of {} connections ({:.2}% of {} attempts) | survivor {:.0} req/s, peak {:.0} req/s | warmup(p50 first-success) {:.1}s",
+        bench_result.total_requests, bench_result.errors, shed_conn_pct, params.tasks,
+        shed_attempt_pct, attempts, bench_result.throughput, peak_rate, warmup_secs,
+    );
+
+    // Persist the write-rate curve for the escalation write-up.
+    let curve_path = run_dir.join(format!("{SCEN}-write-rate.csv"));
+    let mut csv = String::from("t_ms,writes_per_sec\n");
+    for (t, r) in &curve {
+        csv.push_str(&format!("{t},{r:.1}\n"));
+    }
+    if let Err(e) = std::fs::write(&curve_path, csv) {
+        eprintln!("[{SCEN}] writing {}: {e}", curve_path.display());
+    }
+
+    // TIER (a): REGRESSION bound. Loose, from the catalogued envelope: ~14-15k
+    // connection-sheds of 20k (~70-78%), survivors 13-22k req/s, warmup median
+    // ~29s. Ceilings sit above the observed band so a healthy run and normal
+    // variance stay green; the job is catching a REGRESSION off the envelope, not
+    // passing the aspirational bar. Throughput floor scales with --tasks.
+    const SHED_CEILING_PCT: f64 = 92.0;
+    const WARMUP_CEILING_SECS: f64 = 60.0;
+    let throughput_floor_regression = (params.tasks as f64 * 0.25).max(2000.0);
+    let regression_check = if shed_conn_pct > SHED_CEILING_PCT {
+        CheckResult::fail(
+            "ColdConnectEnvelopeRegression",
+            format!(
+                "connection shed {shed_conn_pct:.1}% exceeds the {SHED_CEILING_PCT:.0}% envelope ceiling — worse \
+                 than the catalogued ~70-78% at 20k. The accept path regressed.",
+            ),
+        )
+    } else if bench_result.throughput < throughput_floor_regression {
+        CheckResult::fail(
+            "ColdConnectEnvelopeRegression",
+            format!(
+                "survivor throughput {:.0} req/s is below the {:.0} req/s regression floor for {} tasks — \
+                 the herd did not recover to the catalogued survivor band.",
+                bench_result.throughput, throughput_floor_regression, params.tasks,
+            ),
+        )
+    } else if warmup_secs > WARMUP_CEILING_SECS {
+        CheckResult::fail(
+            "ColdConnectEnvelopeRegression",
+            format!(
+                "warmup {warmup_secs:.1}s exceeds the {WARMUP_CEILING_SECS:.0}s ceiling — the accept serialization \
+                 got slower than the catalogued ~29s median.",
+            ),
+        )
+    } else {
+        CheckResult::pass_with_detail(
+            "ColdConnectEnvelopeRegression",
+            format!(
+                "within envelope: connection shed {shed_conn_pct:.1}% (ceiling {SHED_CEILING_PCT:.0}%), survivor \
+                 {:.0} req/s (floor {:.0}), warmup {warmup_secs:.1}s (ceiling {WARMUP_CEILING_SECS:.0}s)",
+                bench_result.throughput, throughput_floor_regression,
+            ),
+        )
+    };
+
+    // TIER (b): ASPIRATIONAL SLA. Non-fatal — pass_with_detail carries the verdict
+    // so the red target is visible in the report without failing the run.
+    const ASPIRATIONAL_SHED_PCT: f64 = 1.0;
+    const ASPIRATIONAL_WARMUP_SECS: f64 = 5.0;
+    let shed_met = shed_conn_pct < ASPIRATIONAL_SHED_PCT;
+    let warmup_met = warmup_secs < ASPIRATIONAL_WARMUP_SECS;
+    let verdict = if shed_met && warmup_met { "MET" } else { "BREACHED (documented red, non-fatal)" };
+    let aspirational_check = CheckResult::pass_with_detail(
+        "ColdConnectAspirationalSLA",
+        format!(
+            "ASPIRATIONAL SLA {verdict}: connection shed {shed_conn_pct:.1}% vs target <{ASPIRATIONAL_SHED_PCT:.0}% \
+             ({}), warmup {warmup_secs:.1}s vs target <{ASPIRATIONAL_WARMUP_SECS:.0}s ({}). This tier is the red \
+             half — the accept-serialization (MAX_CONCURRENT_CONNECTS=32) + pool-limit envelope is unfixed, so a \
+             breach here is expected until it is addressed.",
+            if shed_met { "met" } else { "BREACHED" },
+            if warmup_met { "met" } else { "BREACHED" },
+        ),
+    );
+
+    // The herd IS a connection storm; errors are expected. Nothing here gates on
+    // them (the regression tier owns that verdict), but the stability counters
+    // must stay clean — a cold herd should not trigger an election or a panic.
+    let expectations = ScenarioExpectations {
+        max_bench_errors: u64::MAX,
+        max_bench_error_ratio: None,
+        max_leader_elections: 1,
+        max_heartbeat_failures: 5,
+        max_s3_fallbacks: 50,
+        ..ScenarioExpectations::default()
+    };
+
+    // Throughput floor is asserted by the regression tier, not the generic floor.
+    let scen_params = ScenarioParams { throughput_floor: 0.0, ..params };
+
+    tear_down_and_evaluate_with_audit(
+        SCEN,
+        cfg,
+        up,
+        bench_result,
+        bench_window_start_ms,
+        bench_window_end_ms,
+        expectations,
+        scen_params,
+        vec![regression_check, aspirational_check],
+        None,
+        None,
+        None,
+        run_dir,
+    )
+    .await
 }

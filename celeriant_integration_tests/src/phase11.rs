@@ -16,7 +16,7 @@
 //!   troubleshooting.md + monitoring.md: when the follower cannot keep up the
 //!   leader sheds load; the client is told to back off (the tokio client maps
 //!   2012 to `ClientError::ServerBusy`), corroborated by the
-//!   `celeriant_replication_follower_pressured` metric.
+//!   `celeriant_writes_rejected_backpressure_total` metric.
 //! - concepts/retention-and-deletion.md: trim/delete are logical; the bytes are
 //!   reclaimed later by background compaction gated by
 //!   `--compaction-check-interval-secs` and a minimum reclaimable ratio.

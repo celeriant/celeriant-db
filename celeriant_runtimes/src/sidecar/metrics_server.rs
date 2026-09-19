@@ -37,7 +37,6 @@ pub async fn run_metrics_server(config: SidecarConfig, handle: PrometheusHandle)
         }));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.metrics_port));
-    tracing::info!("Metrics server listening on {}", addr);
 
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -46,11 +45,16 @@ pub async fn run_metrics_server(config: SidecarConfig, handle: PrometheusHandle)
             return;
         }
     };
+    tracing::info!("Metrics server listening on {}", addr);
 
     if let Err(e) = axum::serve(listener, app).await {
         tracing::error!("Metrics server error: {}", e);
     }
 }
+
+#[cfg(test)]
+#[path = "metrics_server_tests.rs"]
+mod metrics_server_tests;
 
 fn register_metric_descriptions() {
     use metrics::{describe_counter, describe_gauge, describe_histogram};
@@ -65,6 +69,13 @@ fn register_metric_descriptions() {
     describe_counter!("celeriant_write_events_total", "Total events written");
     describe_counter!("celeriant_write_bytes_total", "Total payload bytes written");
     describe_counter!("celeriant_read_bytes_total", "Total payload bytes read");
+    describe_counter!("celeriant_client_idempotency_inflight_total", "Duplicate writes rejected as in-flight (client_seq queued/fsynced but not yet read)");
+    describe_counter!("celeriant_client_idempotency_violations_total", "Duplicate writes rejected as already-applied (client_seq at or below the read cursor)");
+    describe_counter!("celeriant_client_seq_merge_on_apply_total", "Follower client_seq max merges on apply");
+    describe_counter!("celeriant_writes_rejected_backpressure_total", "Writes rejected by replication backpressure (labels: cause)");
+    describe_counter!("celeriant_deletes_rejected_backpressure_total", "Deletes rejected by replication backpressure (labels: cause)");
+    describe_counter!("celeriant_trims_rejected_backpressure_total", "Trims rejected by replication backpressure (labels: cause)");
+    describe_counter!("celeriant_writes_accepted_no_prior_client_seq_total", "Writes accepted with no prior client_seq cached");
 
     // Latency
     describe_histogram!("celeriant_write_duration_seconds", "Shard-internal write latency (excludes wire read, response write and mesh redirect)");
@@ -77,16 +88,12 @@ fn register_metric_descriptions() {
     describe_histogram!("celeriant_replication_batch_size", "Writers per replication batch");
     describe_gauge!("celeriant_replication_queue_bytes", "Replication queue bytes awaiting send");
     describe_gauge!("celeriant_replication_queue_high_water_bytes", "Replication queue threshold for S3 fallback");
-    describe_gauge!("celeriant_replication_follower_pressured", "1 when follower is falling behind (S3 fallback imminent)");
     describe_gauge!("celeriant_follower_read_lag", "Follower durable-but-unconfirmed entries (write.wal_seq - read.wal_seq); returns to 0 when a carrier confirms the tip");
     describe_gauge!("celeriant_parked_commit_queue_depth", "Follower deferred commits parked awaiting leader confirmation; a plateau above zero is a drain leak");
     describe_counter!("celeriant_parked_commit_overflow_total", "Parked commit queue exceeded the inflight cap (tripwire; nothing is dropped)");
     describe_gauge!("celeriant_last_self_acked_wal_seq", "Highest wal_seq this node acked to clients as leader (ack barrier); persists across demotion and restart");
     describe_gauge!("celeriant_node_status_code", "Per-shard node status: 0=BootCatchup 1=Follower 2=FollowerCatchingUp 3=Promoting 4=Leader 5=Fenced 6=Standalone");
     describe_counter!("celeriant_replication_s3_fallbacks_total", "Replication S3 fallbacks");
-    describe_counter!("celeriant_replication_rollback_retries_total", "Replication rollback retry attempts");
-    describe_counter!("celeriant_replication_rollback_io_error_total", "Replication rollback I/O failures");
-    describe_counter!("celeriant_replication_rollback_lock_timeout_total", "Replication rollback aborted: could not acquire lock");
     describe_counter!("celeriant_replication_intra_batch_chain_break_total", "Chain break detected within a single replication batch");
     describe_counter!("celeriant_replication_tip_hash_mismatch_kick_total", "Follower tip-hash mismatch; kicked into S3 catchup");
     describe_counter!("celeriant_replicate_stale_lease_total", "Replication rejected by follower: stale leader lease");
@@ -94,13 +101,28 @@ fn register_metric_descriptions() {
     describe_counter!("celeriant_s3_catchup_rounds_total", "S3 catchup rounds executed");
     describe_counter!("celeriant_replication_applied_events_total", "Events applied via replication or S3 catchup");
     describe_counter!("celeriant_replication_applied_bytes_total", "Payload bytes applied via replication or S3 catchup");
-    describe_counter!("celeriant_replication_snapshot_returned_to_queue_total", "Replication snapshot re-queued after BudgetExhausted (avoids rollback racing in-flight S3 PUT)");
     describe_counter!("celeriant_drain_role_change_total", "Pending-replication drain attempts on role change (labels: invariant_holds=true|false)");
     describe_counter!("celeriant_promotion_batch_budget_exceeded_total", "Promotion-batch upload skipped: scan exceeded max_promotion_batch_bytes");
 
     describe_counter!("celeriant_commit_notify_sent_total", "Post-burst commit-notify sends attempted (header-only empty batch carrying the confirmed index)");
     describe_counter!("celeriant_commit_notify_received_total", "Guard-passing empty-batch commit-notifies accepted by the follower");
     describe_counter!("celeriant_commit_notify_skipped_fenced_total", "Commit-notify trigger skipped: no lease budget available (fenced), distinct from exhaustion");
+    describe_gauge!("celeriant_commit_notify_obligation_seq", "Outstanding commit-notify obligations (pending_notify_seq - pushed_to_follower_seq); entries the leader confirmed but has not yet pushed to the follower");
+    describe_counter!("celeriant_replication_batch_rejected_total", "Replication batches rejected by the follower (labels: shard_id, reason)");
+    describe_counter!("celeriant_replication_capture_outcome_total", "Replication capture outcomes (labels: outcome, trigger)");
+    describe_counter!("celeriant_replication_spin_timeout_total", "Replication retry loop hard timeout");
+    describe_counter!("celeriant_replication_spin_fenced_total", "Replication retry aborted: leader fenced mid-retry");
+    describe_counter!("celeriant_replication_spin_terminal_total", "Replication retry hit a terminal error (snapshot returned to pending)");
+    describe_counter!("celeriant_replication_spin_retry_total", "Replication retry attempts");
+    describe_histogram!("celeriant_replication_confirm_loop_iterations", "Replication confirm loop iterations per commit");
+    describe_counter!("celeriant_commit_notify_gave_up_total", "Commit-notify timer gave up after repeated unproductive wakes (the probe becomes the carrier)");
+    describe_counter!("celeriant_cull_stale_client_seq_lru", "Stale client-seq LRU entries culled on demotion rewind");
+    describe_counter!("celeriant_cull_stale_agg_lru", "Stale aggregate LRU entries culled on demotion rewind");
+    describe_counter!("celeriant_take_pending_replication_dropped_batches", "Pending-replication batches dropped on take");
+    describe_counter!("celeriant_s3_fallback_lease_unconfirmed_total", "S3 fallback gated: lease not CAS-confirmed within the lease window (labels: shard_id)");
+    describe_histogram!("celeriant_barrier_sync_fsync_seconds", "Barrier-sync fsync duration");
+    describe_counter!("celeriant_barrier_sync_fsync_total", "Barrier-sync fsyncs executed");
+    describe_counter!("celeriant_barrier_sync_fsync_failed_total", "Barrier-sync fsync failures (barrier bump remains in-memory only)");
 
     // Probe (reachability / gap-fill)
     describe_counter!("celeriant_probe_total", "Replication probe attempts");
@@ -109,6 +131,7 @@ fn register_metric_descriptions() {
     describe_counter!("celeriant_probe_outcome_network_error_total", "Probe outcome: network error");
     describe_counter!("celeriant_probe_gap_send_success_total", "Probe gap-fill batch sent successfully");
     describe_counter!("celeriant_probe_gap_send_failed_total", "Probe gap-fill batch send failed");
+    describe_counter!("celeriant_probe_kick_total", "Probe kicked a follower to re-enter S3 catchup (labels: shard_id)");
     describe_histogram!("celeriant_probe_duration_seconds", "Probe round-trip duration");
     describe_histogram!("celeriant_probe_gap_size", "Detected probe gap size in WAL entries");
 
@@ -129,14 +152,26 @@ fn register_metric_descriptions() {
     describe_counter!("celeriant_cache_aggregate_snapshot_misses_total", "Aggregate snapshot LRU misses");
     describe_counter!("celeriant_cache_log_file_hits_total", "Log file LRU hits");
     describe_counter!("celeriant_cache_log_file_misses_total", "Log file LRU misses");
+    describe_counter!("celeriant_cache_aggregate_client_scan_found_total", "Aggregate client-scan found a cached result (write-path cache hit)");
+    describe_counter!("celeriant_cache_aggregate_client_scan_not_found_total", "Aggregate client-scan missed the cache (negative-lookup insert)");
+    describe_counter!("celeriant_cache_aggregate_client_tip_hint_total", "Aggregate client-scan served from the active-tip hint");
 
     // WAL and storage
     describe_gauge!("celeriant_wal_seq", "Current WAL sequence");
+    describe_gauge!("celeriant_read_wal_seq", "Shard-level committed read cursor; read <= write in every interleaving");
     describe_gauge!("celeriant_log_segments_total", "Active log segment count");
     describe_counter!("celeriant_log_rotations_total", "Log file rotations");
     describe_counter!("celeriant_log_segment_close_total", "Log segment file close events");
     describe_counter!("celeriant_rotation_out_of_space_total", "Rotations that hit ENOSPC. The shard stays alive but every write needing rotation fails, which otherwise reads as an unexplained throughput collapse");
     describe_counter!("celeriant_orphan_segment_recovered_total", "Orphaned log segments cleaned up on boot");
+    describe_counter!("celeriant_rotation_orphan_deleted_total", "Orphaned log segments deleted during rotation (leftover from a prior aborted rotation)");
+    describe_counter!("celeriant_truncate_divergence_advanced_total", "Divergent truncations that advanced the read cursor");
+    describe_counter!("celeriant_truncate_divergence_advanced_wal_seqs_total", "WAL seqs advanced by divergent truncations");
+    describe_counter!("celeriant_truncate_dropped_self_acked_events_total", "Truncate events that dropped self-acked wal_seqs (ack-barrier bypass signature)");
+    describe_counter!("celeriant_truncate_dropped_self_acked_wal_seqs_total", "Self-acked wal_seqs dropped by truncate");
+    describe_counter!("celeriant_truncate_refused_due_to_ack_barrier_total", "Truncates refused because the ack barrier covers the divergent wal_seq");
+    describe_counter!("celeriant_wal_divergent_truncations_total", "WAL truncated due to divergent entries");
+    describe_histogram!("celeriant_read_semaphore_wait_seconds", "Read semaphore wait duration");
     describe_gauge!("celeriant_segment_summary_last_bytes", "Serialized size of the most recently written segment summary sidecar");
     describe_gauge!("celeriant_segment_summary_last_aggregates", "Aggregate entry count of the most recently written segment summary sidecar");
     describe_counter!("celeriant_segment_summary_client_sets_dropped_total", "Per-aggregate client sets dropped to Unknown at seal — fires only when the 4 MiB payload cap overflows; a non-zero rate says the cap is wrong");
@@ -174,6 +209,18 @@ fn register_metric_descriptions() {
     describe_counter!("celeriant_intrashard_broadcast_dropped_total", "Shard-0 mesh broadcasts abandoned after retries, by kind and target shard. kind=\"status_update\" is a lease renewal a data shard never received, which fences it within heartbeat_lease_duration - max_clock_drift");
     describe_counter!("celeriant_s3_catchup_completion_dropped_total", "Catchup completions lost forwarding to shard 0 (receiver gone)");
     describe_counter!("celeriant_s3_catchup_task_started_total", "Spawned S3 catchup tasks that began running. Data shards only — shard 0 runs its catchup inline");
+    describe_counter!("celeriant_s3_catchup_self_uploads_seen_total", "S3 catchup fallback objects skipped as self-uploads (self-apply loop guard)");
+    describe_counter!("celeriant_s3_catchup_stall_bail_total", "S3 catchup bailed after zero progress across its stall budget (TCP/kick recovery proceeds)");
+    describe_counter!("celeriant_s3_catchup_via_s3_step_total", "S3 divergence search steps (labels: outcome=downloaded|skip|match)");
+    describe_counter!("celeriant_s3_catchup_via_s3_exhausted_total", "S3 divergence search exhausted with no usable candidate");
+    describe_counter!("celeriant_s3_catchup_reframed_at_read_total", "S3 divergence reframed at the read cursor (authority chains onto the read tip)");
+    describe_counter!("celeriant_s3_catchup_live_tail_yield_total", "S3 catchup yielded at the live tail");
+    describe_counter!("celeriant_s3_catchup_no_common_ancestor_total", "S3 chain mismatch with no common ancestor (retry catchup)");
+    describe_counter!("celeriant_s3_catchup_phantom_target_discarded_total", "Phantom catchup target discarded (taught by a dead lease epoch)");
+    describe_counter!("celeriant_s3_catchup_round_cap_total", "S3 catchup round cap reached (yielded Retry)");
+    describe_counter!("celeriant_s3_catchup_same_epoch_divergence_total", "Same-(lease_epoch,wal_seq) S3 batches with divergent content (content-immutability violated)");
+    describe_counter!("celeriant_s3_catchup_stalled_total", "S3 catchup stalled awaiting S3 data (retrying)");
+    describe_counter!("celeriant_catchup_drain_late_files_total", "Catchup drain caught a late-landing S3 file");
     describe_counter!("celeriant_s3_catchup_barrier_timeout_total", "Shards that missed the catchup completion barrier deadline");
     describe_gauge!("celeriant_watch_subscribers_active", "Active watch subscriptions");
 
@@ -202,6 +249,10 @@ fn register_metric_descriptions() {
     describe_histogram!("celeriant_s3_lease_cas_duration_seconds", "Latency of the run_election_to_acquire_s3_lease CAS round-trip (labels: reason)");
     describe_counter!("celeriant_s3_lease_superseded_total", "On-demand renewal concluded superseded / self-fence (labels: peer_present=true|false)");
     describe_counter!("celeriant_node_role_transitions_total", "Shard-0 leader<->follower role flips (labels: to=leader|follower)");
+    describe_counter!("celeriant_lease_orchestrator_unhandled_status_total", "Lease orchestrator received a status matching no handler arm (a stranded Promoting is the suspect)");
+    describe_counter!("celeriant_promotion_lease_renewed_total", "Promotion lease renewals");
+    describe_counter!("celeriant_promotion_superseded_during_catchup_total", "Promotions superseded during catchup (yielded)");
+    describe_counter!("celeriant_s3_lease_on_demand_renewal_total", "On-demand S3 lease renewals (labels: result=renewed|no_cas_write|superseded)");
 
     // Stability
     describe_counter!("celeriant_node_starts_total", "Node boot and restart cycles");

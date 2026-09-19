@@ -28,3 +28,29 @@ pub fn read_option_u128_le(
         byte => Err(InvalidOptionDiscriminant { offset, byte }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_discriminant_errors_instead_of_masking() {
+        let mut buf = [0u8; 17];
+        buf[0] = 0xFF;
+        buf[1..].copy_from_slice(&42u128.to_le_bytes());
+        assert_eq!(
+            read_option_u128_le(&buf, 0),
+            Err(InvalidOptionDiscriminant { offset: 0, byte: 0xFF }),
+            "invalid discriminant must surface as corruption, not decode as None"
+        );
+    }
+
+    #[test]
+    fn valid_discriminants_decode() {
+        let mut buf = [0u8; 17];
+        assert_eq!(read_option_u128_le(&buf, 0), Ok(None));
+        buf[0] = 1;
+        buf[1..].copy_from_slice(&42u128.to_le_bytes());
+        assert_eq!(read_option_u128_le(&buf, 0), Ok(Some(42)));
+    }
+}

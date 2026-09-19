@@ -111,6 +111,19 @@ mod tests {
     }
 
     #[test]
+    fn huge_length_prefix_errors_not_panics() {
+        // fixarray(3), id=0, then a str32 whose length prefix is u32::MAX.
+        let mut buf = vec![0x93u8, 0x00, 0xdb];
+        buf.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert!(deserialise::<TestMessage>(&buf).is_err());
+
+        // Same for an array32 element count of u32::MAX (after a valid empty string).
+        let mut buf = vec![0x93u8, 0x00, 0xa0, 0xdd];
+        buf.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert!(deserialise::<TestMessage>(&buf).is_err());
+    }
+
+    #[test]
     fn datablock_aggregate_event_with_iv() {
         use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
         use std::sync::Arc;

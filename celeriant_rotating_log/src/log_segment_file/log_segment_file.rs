@@ -130,7 +130,7 @@ impl LogSegmentFile {
                         new_log_id,
                         "Rotation target exists with zero dual-headers — deleting orphan from prior aborted rotation"
                     );
-                    metrics::counter!("celeriant_orphan_segment_recovered_total").increment(1);
+                    metrics::counter!("celeriant_rotation_orphan_deleted_total").increment(1);
                     std::fs::remove_file(&log_path).map_err(|e| OpenOrCreateError::RotationTargetUnsafe {
                         log_id: new_log_id,
                         path: log_path.to_string_lossy().into_owned(),
@@ -797,6 +797,66 @@ mod tests {
 
         let missing = dir.join("does_not_exist.wal");
         assert_eq!(is_zero_dual_header_orphan(&missing).unwrap(), false, "missing file is not orphan");
+    }
+
+    /// Captures every counter registration's name and labels so tests can assert
+    /// which Prometheus time series a code path emits.
+    #[derive(Default)]
+    struct CapturingRecorder {
+        counters: std::sync::Mutex<Vec<(String, Vec<(String, String)>)>>,
+    }
+
+    impl metrics::Recorder for CapturingRecorder {
+        fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+        fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+        fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+            let labels = key.labels().map(|l| (l.key().to_string(), l.value().to_string())).collect();
+            self.counters.lock().unwrap().push((key.name().to_string(), labels));
+            metrics::Counter::noop()
+        }
+
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+
+        fn register_histogram(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    #[test]
+    fn rotation_orphan_uses_distinct_metric_name() {
+        glommio_test!({
+            let recorder = CapturingRecorder::default();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+
+            let (_tmp, dir) = test_dir();
+            let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true)
+                .await
+                .unwrap();
+            make_zero_file(&dir.join("log_2.wal"), MIN_FILE_SIZE);
+
+            let rotated = file.rotate(&dir, MIN_FILE_SIZE).await.unwrap();
+            assert_eq!(rotated.metadata.borrow().log_id, 2);
+
+            let names: Vec<String> = {
+                let counters = recorder.counters.lock().unwrap();
+                counters.iter().map(|(n, _)| n.clone()).collect()
+            };
+            assert!(
+                names.iter().any(|n| n == "celeriant_rotation_orphan_deleted_total"),
+                "rotation orphan deletion must emit its own metric, got: {names:?}"
+            );
+            assert!(
+                !names.iter().any(|n| n == "celeriant_orphan_segment_recovered_total"),
+                "rotation must not reuse the boot-recovery metric, got: {names:?}"
+            );
+
+            file.close().await;
+            rotated.close().await;
+        });
     }
 
     #[test]

@@ -47,6 +47,7 @@ pub struct BenchmarkResult {
     pub p999_ms: u64,
     pub min_ms: u64,
     pub max_ms: u64,
+    pub warmup_p50_ms: u64,
 }
 
 pub fn expand_home(path: &str) -> PathBuf {
@@ -58,11 +59,27 @@ pub fn expand_home(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-pub async fn resolve_to_ip(host_port: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let addrs: Vec<_> = tokio::net::lookup_host(host_port).await?.collect();
-    let addr = addrs.first().ok_or_else(|| format!("DNS lookup failed for {host_port}"))?;
-    Ok(addr.to_string())
+/// Resolve a `host:port` to every address DNS returns. On a dual-stack host
+/// the first result is often IPv6; collapsing to it alone made the bench pool
+/// unreachable against an IPv4-only cluster, so the caller gets all of them.
+pub async fn resolve_to_ip(host_port: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    collect_resolved(tokio::net::lookup_host(host_port).await?, host_port)
 }
+
+fn collect_resolved(
+    addrs: impl Iterator<Item = std::net::SocketAddr>,
+    host_port: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let addrs: Vec<String> = addrs.map(|a| a.to_string()).collect();
+    if addrs.is_empty() {
+        return Err(format!("DNS lookup failed for {host_port}").into());
+    }
+    Ok(addrs)
+}
+
+
+
+
 
 pub fn build_tls_config(
     ca_cert: &str,
@@ -112,11 +129,18 @@ impl<'a> PoolBuilder<'a> {
         self,
         request_timeout: Duration,
     ) -> Result<Arc<CeleriantPool>, Box<dyn std::error::Error>> {
-        let resolved1 = resolve_to_ip(self.address1).await?;
+        let mut resolved1 = resolve_to_ip(self.address1).await?;
         let resolved2 = resolve_to_ip(self.address2).await?;
 
-        let mut opts = PoolOptions::new(&resolved1)
-            .with_seed_addresses(vec![resolved2])
+        // First resolution of address1 is the primary; every other resolution
+        // of either host is a seed, so the pool can fail over across address
+        // families as well as across nodes.
+        let primary = resolved1.remove(0);
+        let mut seeds = resolved1;
+        seeds.extend(resolved2);
+
+        let mut opts = PoolOptions::new(&primary)
+            .with_seed_addresses(seeds)
             .with_max_connections(self.max_connections)
             .with_connection_timeout(Duration::from_secs(30))
             .with_request_timeout(request_timeout);
@@ -501,10 +525,12 @@ async fn run_write_loop(
     // Exact before/after for the 1a cut, from the same run -- an A/B across binaries would carry
     // device drift (F-34) into a number whose whole purpose is to be comparable. `all_latencies`
     // is dead after the percentiles above, so the merge reuses it instead of copying.
+    let mut warmup_p50_ms = 0u64;
     if !warmup_latencies.is_empty() {
         warmup_latencies.sort_unstable();
         let held = warmup_latencies.len();
         let w_median = warmup_latencies[held / 2];
+        warmup_p50_ms = w_median;
         let w_max = warmup_latencies[held - 1];
         all_latencies.extend_from_slice(&warmup_latencies);
         all_latencies.sort_unstable();
@@ -528,6 +554,7 @@ async fn run_write_loop(
         p999_ms: p999,
         min_ms: min,
         max_ms: max,
+        warmup_p50_ms,
     }
 }
 
@@ -910,6 +937,7 @@ pub async fn run_benchmark_idempotent_opts(
             p999_ms: p999,
             min_ms: min,
             max_ms: max,
+            warmup_p50_ms: 0,
         },
         counters: IdempotentBenchCounters {
             ok_acks: ok_acks.load(Ordering::Relaxed),
@@ -1345,4 +1373,35 @@ pub async fn deep_audit_failing_aggregates(
     }
 
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collect_resolved, resolve_to_ip};
+
+    /// A dual-stack lookup keeps every address in resolver order — the IPv6
+    /// first result must not swallow the IPv4 one the cluster listens on.
+    #[test]
+    fn resolution_keeps_all_addresses_in_order() {
+        let dual: Vec<std::net::SocketAddr> =
+            vec!["[::1]:10000".parse().unwrap(), "127.0.0.1:10000".parse().unwrap()];
+        let addrs = collect_resolved(dual.into_iter(), "localhost:10000").unwrap();
+        assert_eq!(addrs, vec!["[::1]:10000".to_string(), "127.0.0.1:10000".to_string()]);
+    }
+
+    #[test]
+    fn an_empty_resolution_is_an_error_naming_the_host() {
+        let err = collect_resolved(std::iter::empty(), "ghost:1").unwrap_err();
+        assert!(err.to_string().contains("ghost:1"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn resolve_to_ip_returns_every_loopback_resolution() {
+        let addrs = resolve_to_ip("localhost:10000").await.unwrap();
+        assert!(!addrs.is_empty());
+        assert!(
+            addrs.iter().all(|a| a.ends_with(":10000")),
+            "every resolution keeps the port, got {addrs:?}"
+        );
+    }
 }

@@ -18,6 +18,7 @@ small-metablock = [
 
 [dev-dependencies]
 celeriant_rotating_log = { path = "../celeriant_rotating_log" }
+tracing-subscriber.workspace = true
 
 [dependencies]
 celeriant_crypto = { path = "../celeriant_crypto" }

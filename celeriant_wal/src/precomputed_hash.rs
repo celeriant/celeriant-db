@@ -185,4 +185,47 @@ mod tests {
         let build = PrecomputedBuildHasher::default();
         assert_ne!(build.hash_one(b"abc".as_slice()), build.hash_one(b"abcd".as_slice()));
     }
+
+    struct CaptureU64(u64);
+
+    impl std::hash::Hasher for CaptureU64 {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+        fn write(&mut self, _: &[u8]) {
+            unreachable!("key Hash impls write a single u64, not bytes")
+        }
+        fn write_u64(&mut self, n: u64) {
+            self.0 = n;
+        }
+    }
+
+    fn precomputed_hash_of<T: std::hash::Hash>(key: &T) -> u64 {
+        let mut capture = CaptureU64(0);
+        key.hash(&mut capture);
+        capture.finish()
+    }
+
+    #[test]
+    fn type_and_client_keys_precompute_with_default_hasher() {
+        use crate::aggregate_client_key::AggregateClientKey;
+        use crate::aggregate_key::AggregateKey;
+        use crate::aggregate_type_key::AggregateTypeKey;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hash;
+
+        let type_key = AggregateTypeKey::new(1, 2);
+        let mut expected = DefaultHasher::new();
+        1u128.hash(&mut expected);
+        2u128.hash(&mut expected);
+        assert_eq!(precomputed_hash_of(&type_key), expected.finish());
+
+        let client_key = AggregateClientKey::new(AggregateKey::new(1, 2, 3), 4);
+        let mut expected = DefaultHasher::new();
+        1u128.hash(&mut expected);
+        2u128.hash(&mut expected);
+        3u128.hash(&mut expected);
+        4u128.hash(&mut expected);
+        assert_eq!(precomputed_hash_of(&client_key), expected.finish());
+    }
 }

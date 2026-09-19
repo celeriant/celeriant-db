@@ -78,7 +78,8 @@ impl CeleriantClient {
     /// Convenience method: write events to a single aggregate without constructing a `WriteRequest`.
     ///
     /// `client_id` scopes client-seq idempotency — use a stable id per logical writer, never a
-    /// fresh random value per call.
+    /// fresh random value per call. Idempotency enforcement is opt-in: use `write_events_with`
+    /// with `enforce_client_idempotency: true` to enable it.
     pub async fn write_events(
         &mut self,
         aggregate_key: AggregateKey,
@@ -120,5 +121,25 @@ impl CeleriantClient {
             ClientResponse::RegisterSchema(r) => Ok(r),
             _ => Err(ClientError::ProtocolError),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_events_idempotency_is_off_by_default() {
+        assert!(!WriteEventsOptions::default().enforce_client_idempotency);
+    }
+
+    #[test]
+    fn write_events_doc_notes_opt_in_idempotency() {
+        let source = include_str!("client_operations.rs");
+        let needle = ["Idempotency enforcement is ", "opt-in"].concat();
+        assert!(
+            source.contains(&needle),
+            "write_events doc must state that idempotency enforcement is opt-in"
+        );
     }
 }

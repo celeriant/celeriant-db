@@ -1275,12 +1275,12 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
             if let Some(stats) = seen.get_mut(&key) {
                 if !stats.is_deleted {
-                    stats.event_batch_count += event_batch_count;
+                    stats.event_batch_count = stats.event_batch_count.saturating_add(event_batch_count);
                     stats.min_aggregate_version = stats.min_aggregate_version.min(min_aggregate_version);
                     stats.max_aggregate_version = stats.max_aggregate_version.max(last_aggregate_version);
                     stats.max_server_timestamp = stats.max_server_timestamp.max(last_server_timestamp);
-                    stats.compressed_size += compressed_size;
-                    stats.uncompressed_size += uncompressed_size;
+                    stats.compressed_size = stats.compressed_size.saturating_add(compressed_size);
+                    stats.uncompressed_size = stats.uncompressed_size.saturating_add(uncompressed_size);
                 }
             } else {
                 seen.insert(key.clone(), AccumulatedStats {
@@ -5096,6 +5096,33 @@ use celeriant_wal::segment_summary::segment_aggregate_entry::SegmentAggregateEnt
 
             let result = process(&shard, read_req(key(1, 1, 999))).await;
             assert!(matches!(result, Err(ShardError::Read(ShardReadError::AggregateNotExists))));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn read_beyond_tip_returns_empty_not_error() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            write_ok(&shard, write_req(agg.clone(), events(3))).await;
+
+            // from beyond the tip: Ok with zero events, exhausted signal, no error.
+            let read = unwrap_read(process(&shard, read_req_from(agg.clone(), 1000)).await);
+            assert!(read.event_batches.is_empty(), "from beyond tip must return no batches");
+            assert_eq!(read.next_aggregate_version, None, "from beyond tip must signal exhausted");
+
+            // to beyond the tip: Ok with the available events, no error.
+            let req = ClientRequest::Read(ReadRequest {
+                correlation_id: None,
+                aggregate_key: agg.clone(),
+                filters: ReadFilters::new(1).to_aggregate_version(1000),
+            });
+            let read = unwrap_read(process(&shard, req).await);
+            assert_eq!(read.event_batches.len(), 1, "to beyond tip must return the available batch");
 
             shard.close().await;
         });

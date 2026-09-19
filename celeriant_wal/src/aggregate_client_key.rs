@@ -118,3 +118,13 @@ impl Default for AggregateClientKey {
         Self::new(AggregateKey::default(), 0)
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Frozen check here as hash is persisted to disk
+    #[test]
+    fn client_id_bloom_hash_value_is_pinned() {
+        assert_eq!(client_id_bloom_hash(1), 2806482627441532945);
+    }
+}

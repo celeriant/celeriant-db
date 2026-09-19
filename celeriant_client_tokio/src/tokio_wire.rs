@@ -35,12 +35,7 @@ where
 }
 
 /// Like `read_from_header`, but fires `on_body_consumed` once the whole frame
-/// has been read off the socket — before decompression and deserialisation.
-///
-/// At that point the stream is back on a message boundary. If decompression or
-/// deserialisation fails afterwards, that's a bad frame, not a desynced stream,
-/// so a caller tracking stream position can mark the stream clean here and keep
-/// the connection.
+/// has been read off the socket (clean stream)
 pub(crate) async fn read_from_header_with<R>(
     header: WireHeader,
     reader: &mut R,
@@ -52,11 +47,12 @@ where
 {
     if ClientResponse::is_fixed_size_variant(header.message_type) {
         // Fixed-size frames are never compressed regardless of `dict_bytes`.
-        let response = ClientResponse::read_from_header(header, reader).await;
-        if response.is_ok() {
-            on_body_consumed();
-        }
-        return response;
+        let raw = header
+            .read_fixed_body_raw(reader)
+            .await
+            .map_err(ReadWireDataError::ReadBodyFailure)?;
+        on_body_consumed();
+        return ClientResponse::deserialize_body(header.message_type, &raw, header.version);
     }
 
     let raw = header
@@ -84,7 +80,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use celeriant_msg::process_client_responses::ClientResponse;
+    use celeriant_msg::process_client_responses::{ClientResponse, ClientResponseType};
     use celeriant_msg::response::responses::{AggregateDetailsResponse, WatchResponse};
     use celeriant_msg::response::watch_event::WatchResponseEvent;
     use celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES;
@@ -127,6 +123,35 @@ mod tests {
             })
             .collect();
         ClientResponse::Watch(WatchResponse { events })
+    }
+
+    fn malformed_frame(message_type: ClientResponseType) -> (WireHeader, Vec<u8>) {
+        let header = WireHeader {
+            version: PROTOCOL_VERSION_V2,
+            message_type: message_type as u32,
+            compressed_length: 1,
+            uncompressed_length: 1,
+            compression_type: CompressionType::None,
+        };
+        (header, vec![2u8])
+    }
+
+    /// Contract: `on_body_consumed` fires when a fixed-size frame's body is read, even
+    /// when the deserialisation then fails.
+    #[test]
+    fn on_body_consumed_fires_on_failed_fixed_size_deserialisation() {
+        block_on(async {
+            let (header, body) = malformed_frame(ClientResponseType::AggregateDetails);
+            let mut reader = Cursor::new(body);
+            let mut fired = false;
+            let result =
+                read_from_header_with(header, &mut reader, None, || fired = true).await;
+            assert!(result.is_err(), "fixed-size body must fail to deserialise");
+            assert!(
+                fired,
+                "contract: on_body_consumed must fire on failed fixed-size deserialisation"
+            );
+        });
     }
 
     /// Fixed-size responses are decoded the same regardless of `dict_bytes` — the codec
