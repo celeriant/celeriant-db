@@ -420,10 +420,10 @@ mod tests {
         glommio_test!({
             let (mut client, _) = SubscribedClient::new(None);
 
-            assert!(!client.should_wait_and_flush().await);
+            assert!(!client.should_wait_and_flush());
 
             client.accumulate_watch_event(write_event(1, 1, 1, 1));
-            assert!(client.should_wait_and_flush().await);
+            assert!(client.should_wait_and_flush());
         })
     }
 
@@ -433,10 +433,10 @@ mod tests {
             let (mut client, _) = SubscribedClient::new(Some(50));
 
             client.accumulate_watch_event(write_event(1, 1, 1, 1));
-            assert!(!client.should_wait_and_flush().await);
+            assert!(!client.should_wait_and_flush());
 
             glommio::timer::sleep(Duration::from_millis(55)).await;
-            assert!(client.should_wait_and_flush().await);
+            assert!(client.should_wait_and_flush());
         })
     }
 
@@ -452,7 +452,7 @@ mod tests {
             assert!(client.last_send_time.elapsed().as_millis() < 5);
 
             client.accumulate_watch_event(delete_event(2, 2, 2));
-            assert!(!client.should_wait_and_flush().await);
+            assert!(!client.should_wait_and_flush());
         })
     }
 
@@ -477,6 +477,37 @@ mod tests {
             latency_with_events.accumulate_watch_event(exists_event(1, 1, 1));
             let wait = latency_with_events.watch_wait_time().unwrap();
             assert!(wait.as_millis() > 90);
+        })
+    }
+
+    /// While `next()` is parked on the event channel it must not hold a borrow of the shared `SubscribedClient`
+    #[test]
+    fn watch_session_parked_next_leaves_the_client_borrowable() {
+        glommio_test!({
+            let watchers = Rc::new(AggregateWatchers::new());
+            let reader = Rc::new(MockAggregateReader {
+                watchers: watchers.clone(),
+            });
+
+            let (id, client) = watchers.add_subscriber(watch_request());
+            let probe = client.clone();
+            let mut session = WatchSession::new(id, client, reader);
+
+            let parked = glommio::spawn_local(async move {
+                let _ = session.next().await;
+            });
+
+            // Let next() reach the channel wait and park.
+            glommio::timer::sleep(Duration::from_millis(50)).await;
+
+            assert!(
+                probe.try_borrow_mut().is_ok(),
+                "next() parked on the event channel still holds a RefCell borrow of the SubscribedClient"
+            );
+
+            // Unpark the session so the task completes cleanly.
+            watchers.broadcast(write_event(1, 2, 3, 1));
+            parked.await;
         })
     }
 

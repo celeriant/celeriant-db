@@ -731,9 +731,10 @@ impl CeleriantPool {
     /// Dials the current leader by default; with `route_reads_to_followers`
     /// it dials a follower to keep subscription load off the leader, falling
     /// through to the remaining candidates (leader last) on connect failure.
-    /// The pool's TLS and identity configuration are applied to the watch
-    /// connection, overriding any values set on `options`. The pool's dict
-    /// cache is threaded in so the watch stream can decompress ZstdDict responses.
+    /// The pool's TLS, identity, and request/response size configuration are
+    /// applied to the watch connection, overriding any values set on `options`.
+    /// The pool's dict cache is threaded in so the watch stream can decompress
+    /// ZstdDict responses.
     pub async fn watch(
         &self,
         request: WatchRequest,
@@ -741,6 +742,8 @@ impl CeleriantPool {
     ) -> Result<WatchConnection, ClientError> {
         options.tls_config = self.options.tls_config.clone();
         options.identity_config = self.options.identity_config.clone();
+        options.max_request_size = self.options.max_request_size;
+        options.max_response_size = self.options.max_response_size;
         // Without a dial timeout a black-holed node stalls failover for the
         // OS TCP timeout; default to the pool's connection timeout.
         if options.timeout.is_none() {
@@ -764,7 +767,12 @@ impl CeleriantPool {
             ).await;
             match result {
                 Ok(conn) => return Ok(conn),
-                Err(ClientError::ConnectionFailed(_) | ClientError::ConnectionTimeout)
+                // Same failover classes as read_route!: a handshake dying with
+                // a wire/read error is a broken candidate, not a caller error.
+                Err(ClientError::ConnectionFailed(_)
+                | ClientError::ConnectionTimeout
+                | ClientError::WireError(_)
+                | ClientError::ReadError(_))
                     if i < addrs.len() - 1 =>
                 {
                     if !to_followers && i == 0 {

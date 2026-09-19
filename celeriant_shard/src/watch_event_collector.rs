@@ -54,10 +54,16 @@ impl WatchEventCollector {
         self.delete_events.entry(aggregate_key).or_insert(AggregateWatchEventOperation::Delete {});
     }
 
-    /// Records a trim event for an aggregate.
+    /// Records a trim event for an aggregate. Trim floors are monotonic, so two
+    /// trims coalesced into one fsync cycle merge to the highest floor.
     pub fn add_trim_event(&mut self, aggregate_key: AggregateKey, keep_from_aggregate_version: u64) {
         self.trim_events
             .entry(aggregate_key)
+            .and_modify(|event| {
+                if let AggregateWatchEventOperation::TrimStart { keep_from_aggregate_version: floor } = event {
+                    *floor = (*floor).max(keep_from_aggregate_version);
+                }
+            })
             .or_insert(AggregateWatchEventOperation::TrimStart { keep_from_aggregate_version });
     }
 
@@ -280,6 +286,29 @@ mod tests {
                 assert_eq!(*keep_from_aggregate_version, 5);
             }
             _ => panic!("Expected TrimStart event"),
+        }
+    }
+
+    #[test]
+    fn collector_add_trim_event_keeps_highest_floor() {
+        let mut collector = WatchEventCollector::new();
+        let key = make_aggregate_key(1, 2, 3);
+
+        for i in 0..2 {
+            if i == 0 {
+                collector.add_trim_event(key.clone(), 5);
+                collector.add_trim_event(key.clone(), 10);
+            } else {
+                collector.add_trim_event(key.clone(), 10);
+                collector.add_trim_event(key.clone(), 5);
+            }
+
+            match collector.trim_events.get(&key) {
+                Some(AggregateWatchEventOperation::TrimStart { keep_from_aggregate_version }) => {
+                    assert_eq!(*keep_from_aggregate_version, 10);
+                }
+                _ => panic!("Expected TrimStart event"),
+            }
         }
     }
 

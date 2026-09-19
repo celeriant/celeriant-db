@@ -13,7 +13,7 @@ pub struct SubscribedClient {
     pub last_send_time: std::time::Instant,
 
     /// Allows us to listen to aggregate changes in the Shard WAL
-    pub receiver: glommio::channels::local_channel::LocalReceiver<AggregateWatchEvent>,
+    pub receiver: std::rc::Rc<glommio::channels::local_channel::LocalReceiver<AggregateWatchEvent>>,
 
     /// Events accumulate here via hashmap merging, then flatten to vec on take
     pub accumulator: Option<WatchEventAccumulator>,
@@ -26,7 +26,7 @@ impl SubscribedClient {
 
         let client = Self {
             requested_latency: requested_latency_ms.map(Duration::from_millis),
-            receiver,
+            receiver: std::rc::Rc::new(receiver),
             last_send_time: Instant::now(),
             accumulator: None,
         };
@@ -37,7 +37,7 @@ impl SubscribedClient {
         self.accumulator.get_or_insert_default().accumulate(watch_event);
     }
 
-    pub async fn should_wait_and_flush(&self) -> bool {
+    pub fn should_wait_and_flush(&self) -> bool {
         if self.accumulator.is_none() {
             return false;
         }
@@ -126,7 +126,7 @@ mod test_subscribed_client {
 
                     assert!(!client.accumulator.as_ref().unwrap().is_empty());
                     assert!(client.last_send_time.elapsed().as_millis() <= 50);
-                    assert!(!client.should_wait_and_flush().await);
+                    assert!(!client.should_wait_and_flush());
 
                     client.accumulate_watch_event(AggregateWatchEvent {
                         aggregate_key: AggregateKey::new(1, 2, 4),
@@ -139,11 +139,11 @@ mod test_subscribed_client {
 
                     assert!(!client.accumulator.as_ref().unwrap().is_empty());
                     assert!(client.last_send_time.elapsed().as_millis() <= 50);
-                    assert!(!client.should_wait_and_flush().await);
+                    assert!(!client.should_wait_and_flush());
 
                     glommio::timer::sleep(client.additional_latency_wait_time()).await;
 
-                    assert!(client.should_wait_and_flush().await);
+                    assert!(client.should_wait_and_flush());
                     let elapsed_ms = client.last_send_time.elapsed().as_millis();
                     assert!(
                         elapsed_ms >= 10 && elapsed_ms <= 100,

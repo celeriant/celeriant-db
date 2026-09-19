@@ -17,6 +17,11 @@ pub mod phase8;
 pub mod phase9;
 pub mod phase10;
 pub mod phase11;
+pub mod invariant_list_termination;
+pub mod invariant_protocol_version;
+pub mod invariant_watch_dial_failover;
+pub mod invariant_watch_options_enforced;
+pub mod invariant_watch_trim_floor;
 
 pub mod api_key_test;
 pub mod batch;

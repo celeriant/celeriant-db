@@ -21,6 +21,8 @@ pub struct WatchOptions {
     pub max_shard_hint: Option<u64>,
     pub tls_config: Option<ClientTlsConfig>,
     pub identity_config: Option<ClientIdentityConfig>,
+    pub max_request_size: u64,
+    pub max_response_size: u64,
 }
 
 impl Default for WatchOptions {
@@ -31,6 +33,8 @@ impl Default for WatchOptions {
             max_shard_hint: None,
             tls_config: None,
             identity_config: None,
+            max_request_size: 10_000_000,
+            max_response_size: 64 * 1024 * 1024,
         }
     }
 }
@@ -57,14 +61,14 @@ impl<R: futures_util::io::AsyncRead + Unpin> futures_util::io::AsyncRead for Cou
 
 struct ShardStream {
     stream: crate::celeriant_client::ClientStream,
-    max_request_size: u64,
+    max_response_size: u64,
     current_dict: Option<CachedDict>,
     partial_frame_bytes: std::sync::atomic::AtomicUsize,
 }
 
 impl ShardStream {
     async fn read_next(&mut self) -> Result<WatchResponse, ClientError> {
-        let ShardStream { stream, max_request_size, current_dict, partial_frame_bytes } = self;
+        let ShardStream { stream, max_response_size, current_dict, partial_frame_bytes } = self;
         if partial_frame_bytes.load(std::sync::atomic::Ordering::Relaxed) > 0 {
             return Err(ClientError::ProtocolError);
         }
@@ -73,7 +77,7 @@ impl ShardStream {
             let mut counting = CountingRead { inner: stream, consumed: partial_frame_bytes };
             let header = celeriant_wire::network::wire_header::WireHeader::from_reader(
                 &mut counting,
-                *max_request_size,
+                *max_response_size,
             )
             .await
             .map_err(celeriant_msg::read_wire_data_error::ReadWireDataError::ReadHeaderFailure);
@@ -138,6 +142,7 @@ async fn identify_stream<F>(
     identity: &ClientIdentityConfig,
     known_sha: Option<String>,
     dict_lookup: F,
+    max_response_size: u64,
 ) -> Result<Option<CachedDict>, ClientError>
 where
     F: FnOnce(&str) -> Option<Arc<[u8]>>,
@@ -162,7 +167,7 @@ where
 
     write_identify_request(stream, &req, PROTOCOL_VERSION_V2).await?;
 
-    let header = WireHeader::from_reader(stream, 10_000_000).await?;
+    let header = WireHeader::from_reader(stream, max_response_size).await?;
     if header.message_type == IDENTIFY_RESPONSE_TYPE_ID {
         let resp = read_identify_response(header, stream).await?;
         let cached = match (resp.compression_dict_sha256, resp.compression_dict_bytes) {
@@ -183,6 +188,16 @@ where
     match response {
         ClientResponse::GenericError(err) => Err(ClientError::from_error_response(err)),
         _ => Err(ClientError::ProtocolError),
+    }
+}
+
+async fn bounded<T>(
+    budget: Option<Duration>,
+    phase: impl std::future::Future<Output = Result<T, ClientError>>,
+) -> Result<T, ClientError> {
+    match budget {
+        Some(duration) => timeout(duration, phase).await.map_err(|_| ClientError::ConnectionTimeout)?,
+        None => phase.await,
     }
 }
 
@@ -238,17 +253,14 @@ impl WatchConnection {
     where
         F: Fn(&str) -> Option<Arc<[u8]>> + Clone + Send + 'static,
     {
-        let max_request_size = 10_000_000;
-
         // If max_shard_hint is provided, skip probe and open N connections directly
         if let Some(max_shard) = options.max_shard_hint {
-            let num_shards = max_shard + 1;
+            let num_shards = max_shard.checked_add(1).ok_or(ClientError::ProtocolError)?;
             return Self::connect_multi_shard(
                 address,
                 &request,
                 &options,
                 num_shards,
-                max_request_size,
                 known_sha,
                 dict_lookup,
             )
@@ -263,28 +275,32 @@ impl WatchConnection {
         )
         .await?;
 
-        let current_dict = if let Some(ref identity) = options.identity_config {
-            identify_stream(&mut stream, identity, known_sha.clone(), dict_lookup.clone()).await?
-        } else {
-            None
-        };
+        let (current_dict, response) = bounded(options.timeout, async {
+            let current_dict = if let Some(ref identity) = options.identity_config {
+                identify_stream(&mut stream, identity, known_sha.clone(), dict_lookup.clone(), options.max_response_size).await?
+            } else {
+                None
+            };
 
-        // Send initial watch request without shard_id. Watch is fixed-size — never compressed.
-        ClientRequest::write_request(
-            &mut stream,
-            &ClientRequest::Watch(request.clone()),
-            max_request_size,
-            PROTOCOL_VERSION_V2,
-        )
+            // Send initial watch request without shard_id. Watch is fixed-size — never compressed.
+            ClientRequest::write_request(
+                &mut stream,
+                &ClientRequest::Watch(request.clone()),
+                options.max_request_size,
+                PROTOCOL_VERSION_V2,
+            )
+            .await?;
+
+            let response = crate::tokio_wire::read_response(&mut stream, options.max_response_size, current_dict.as_ref().map(|d| d.bytes.as_ref())).await?;
+            Ok((current_dict, response))
+        })
         .await?;
-
-        let response = crate::tokio_wire::read_response(&mut stream, max_request_size, current_dict.as_ref().map(|d| d.bytes.as_ref())).await?;
 
         match response {
             ClientResponse::Watch(_) => Ok(Self::new(
                 WatchMode::SingleShard(ShardStream {
                     stream,
-                    max_request_size,
+                    max_response_size: options.max_response_size,
                     current_dict,
                     partial_frame_bytes: std::sync::atomic::AtomicUsize::new(0),
                 }),
@@ -300,15 +316,19 @@ impl WatchConnection {
                 let mut shard0_request = request.clone();
                 shard0_request.shard_id = Some(0);
 
-                ClientRequest::write_request(
-                    &mut stream,
-                    &ClientRequest::Watch(shard0_request),
-                    max_request_size,
-                    PROTOCOL_VERSION_V2,
-                )
-                .await?;
+                let response = bounded(options.timeout, async {
+                    ClientRequest::write_request(
+                        &mut stream,
+                        &ClientRequest::Watch(shard0_request),
+                        options.max_request_size,
+                        PROTOCOL_VERSION_V2,
+                    )
+                    .await?;
 
-                let response = crate::tokio_wire::read_response(&mut stream, max_request_size, current_dict.as_ref().map(|d| d.bytes.as_ref())).await?;
+                    let response = crate::tokio_wire::read_response(&mut stream, options.max_response_size, current_dict.as_ref().map(|d| d.bytes.as_ref())).await?;
+                    Ok(response)
+                })
+                .await?;
                 match response {
                     ClientResponse::Watch(_) => {}
                     ClientResponse::GenericError(error) => {
@@ -319,7 +339,7 @@ impl WatchConnection {
 
                 let shard0_stream = ShardStream {
                     stream,
-                    max_request_size,
+                    max_response_size: options.max_response_size,
                     current_dict,
                     partial_frame_bytes: std::sync::atomic::AtomicUsize::new(0),
                 };
@@ -332,7 +352,6 @@ impl WatchConnection {
                         &request,
                         &options,
                         shard_id,
-                        max_request_size,
                         known_sha.clone(),
                         dict_lookup.clone(),
                     ));
@@ -387,6 +406,10 @@ impl WatchConnection {
         }
     }
 
+    pub fn is_multi_shard(&self) -> bool {
+        matches!(self.mode, WatchMode::MultiShard(_))
+    }
+
     /// True when a read was abandoned part-way through a frame, leaving the stream mid-message
     pub fn is_desynchronised(&self) -> bool {
         match &self.mode {
@@ -411,7 +434,6 @@ impl WatchConnection {
         request: &WatchRequest,
         options: &WatchOptions,
         shard_id: u64,
-        max_request_size: u64,
         known_sha: Option<String>,
         dict_lookup: F,
     ) -> Result<ShardStream, ClientError>
@@ -425,28 +447,32 @@ impl WatchConnection {
         )
         .await?;
 
-        let current_dict = if let Some(ref identity) = options.identity_config {
-            identify_stream(&mut stream, identity, known_sha, dict_lookup).await?
-        } else {
-            None
-        };
+        let (current_dict, response) = bounded(options.timeout, async {
+            let current_dict = if let Some(ref identity) = options.identity_config {
+                identify_stream(&mut stream, identity, known_sha, dict_lookup, options.max_response_size).await?
+            } else {
+                None
+            };
 
-        let mut shard_request = request.clone();
-        shard_request.shard_id = Some(shard_id);
+            let mut shard_request = request.clone();
+            shard_request.shard_id = Some(shard_id);
 
-        ClientRequest::write_request(
-            &mut stream,
-            &ClientRequest::Watch(shard_request),
-            max_request_size,
-            PROTOCOL_VERSION_V2,
-        )
+            ClientRequest::write_request(
+                &mut stream,
+                &ClientRequest::Watch(shard_request),
+                options.max_request_size,
+                PROTOCOL_VERSION_V2,
+            )
+            .await?;
+
+            let response = crate::tokio_wire::read_response(&mut stream, options.max_response_size, current_dict.as_ref().map(|d| d.bytes.as_ref())).await?;
+            Ok((current_dict, response))
+        })
         .await?;
-
-        let response = crate::tokio_wire::read_response(&mut stream, max_request_size, current_dict.as_ref().map(|d| d.bytes.as_ref())).await?;
         match response {
             ClientResponse::Watch(_) => Ok(ShardStream {
                 stream,
-                max_request_size,
+                max_response_size: options.max_response_size,
                 current_dict,
                 partial_frame_bytes: std::sync::atomic::AtomicUsize::new(0),
             }),
@@ -460,7 +486,6 @@ impl WatchConnection {
         request: &WatchRequest,
         options: &WatchOptions,
         num_shards: u64,
-        max_request_size: u64,
         known_sha: Option<String>,
         dict_lookup: F,
     ) -> Result<Self, ClientError>
@@ -474,7 +499,6 @@ impl WatchConnection {
                 request,
                 options,
                 shard_id,
-                max_request_size,
                 known_sha.clone(),
                 dict_lookup.clone(),
             ));
@@ -827,6 +851,51 @@ mod tests {
                 "a decode error consumed the whole frame, leaving the stream on a message \
                  boundary, yet the connection is permanently unusable: {other:?}"
             ),
+        }
+    }
+
+    /// A peer that accepts the socket and never acknowledges the watch request must not park `connect` forever
+    #[tokio::test]
+    async fn a_black_hole_peer_times_out_the_watch_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            // Hold the socket open without ever writing: the watch ack never arrives.
+            let _ = socket;
+            std::future::pending::<()>().await;
+        });
+
+        let options = WatchOptions {
+            timeout: Some(Duration::from_millis(200)),
+            ..WatchOptions::default()
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            WatchConnection::connect(&addr.to_string(), watch_request(), options),
+        )
+        .await;
+
+        match result {
+            Ok(Err(crate::client_error::ClientError::ConnectionTimeout)) => {}
+            Ok(Ok(_)) => panic!("a silent peer must not complete the watch handshake"),
+            Ok(Err(other)) => panic!("expected ConnectionTimeout from a silent peer, got {other:?}"),
+            Err(_) => panic!("connect did not return within the outer bound: the handshake is unbounded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_max_shard_hint_that_overflows_is_rejected_not_silently_empty() {
+        let options = WatchOptions {
+            max_shard_hint: Some(u64::MAX),
+            ..WatchOptions::default()
+        };
+        let result = WatchConnection::connect("127.0.0.1:1", watch_request(), options).await;
+        match result {
+            Err(crate::client_error::ClientError::ProtocolError) => {}
+            Ok(_) => panic!("a max_shard_hint of u64::MAX must not yield a silent empty watch"),
+            Err(other) => panic!("expected ProtocolError, got {other:?}"),
         }
     }
 

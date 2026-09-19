@@ -24,21 +24,21 @@ impl<R: AggregateReader> WatchSession<R> {
     }
 
     pub async fn next(&mut self) -> Result<WatchOutputType, WatchReadError> {
-        let timeout_duration = {
+        let (timeout_duration, receiver) = {
             let client = self.subscribed_client.borrow();
-            client.watch_wait_time().unwrap_or(Duration::from_secs(5))
+            (client.watch_wait_time().unwrap_or(Duration::from_secs(5)), client.receiver.clone())
         };
 
         match glommio::timer::timeout(timeout_duration, async {
-            self.subscribed_client.borrow().receiver.recv().await
+            receiver.recv().await
                 .ok_or(glommio::GlommioError::Closed(glommio::ResourceType::Channel(())))
         }).await {
             Ok(aggregate_watch_event) => {
                 let mut client = self.subscribed_client.borrow_mut();
-                
+
                 client.accumulate_watch_event(aggregate_watch_event);
 
-                if client.should_wait_and_flush().await {
+                if client.should_wait_and_flush() {
                     if let Some(response) = client.take_response() {
                         return Ok(WatchOutputType::Response(response));
                     }
@@ -50,7 +50,7 @@ impl<R: AggregateReader> WatchSession<R> {
             Err(_) => {
                 // Timeout
                 let mut client = self.subscribed_client.borrow_mut();
-                if client.should_wait_and_flush().await {
+                if client.should_wait_and_flush() {
                     if let Some(response) = client.take_response() {
                         return Ok(WatchOutputType::Response(response));
                     }
