@@ -104,12 +104,14 @@ Key pool options:
 
 ```rust
 use celeriant_client_tokio::ClientTlsConfig;
-use celeriant_crypto::pki::PkiManager;
+use std::path::Path;
 
-let ca = PkiManager::load_ca_bundle(Path::new("ca.crt"))?;
-let (certs, key) = PkiManager::load_identity(Path::new("client.crt"), Path::new("client.key"))?;
-let tls_config = PkiManager::build_client_config(&ca, certs, key)?;
-let tls = ClientTlsConfig::new(tls_config, "localhost".try_into()?);
+// mTLS: trust `ca.crt`, and present this client's own certificate.
+let tls = ClientTlsConfig::from_paths(
+    Path::new("ca.crt"),
+    Some((Path::new("client.crt"), Path::new("client.key"))),
+    "localhost",
+)?;
 
 // Direct connection
 let mut client = CeleriantClient::connect_tls("localhost:10000", tls.clone()).await?;
@@ -121,7 +123,22 @@ let pool = CeleriantPool::new(
 );
 ```
 
-For server-only TLS (no client cert), build the `rustls::ClientConfig` without a client identity.
+Pass `None` in place of the certificate pair for server-only TLS, where the client
+verifies the server but presents no identity of its own.
+
+The last argument is the TLS SNI and must match a SAN on the server's certificate.
+If all you have is the address, `sni_host` gives you the host part, including for
+IPv6 literals:
+
+```rust
+use celeriant_client_tokio::sni_host;
+
+let tls = ClientTlsConfig::from_paths(
+    Path::new("ca.crt"),
+    None,
+    sni_host("[fd00::5]:10000")?,   // "fd00::5"
+)?;
+```
 
 ## Client identity
 

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use celeriant_client_tokio::{ClientError, ServerError};
 
-pub const KEY_COUNT: usize = 28;
+pub const KEY_COUNT: usize = 29;
 
 /// The reported error classes. The discriminant is the index into
 /// `ErrorBreakdown`'s arrays, so `ALL` must stay in declaration order;
@@ -46,6 +46,8 @@ pub enum ErrorKey {
     ServerReplication,
     ServerShardRouting,
     ServerUnknown,
+    /// A `ClientError` variant added since this match was written.
+    Unclassified,
 }
 
 impl ErrorKey {
@@ -78,10 +80,11 @@ impl ErrorKey {
         ErrorKey::ServerReplication,
         ErrorKey::ServerShardRouting,
         ErrorKey::ServerUnknown,
+        ErrorKey::Unclassified,
     ];
 
-    /// Exhaustive by construction: a new `ClientError` variant is a compile
-    /// error here rather than a silent "other".
+    /// `ClientError` is `#[non_exhaustive]`, so the compiler no longer catches
+    /// a new variant here. It lands in `Unclassified`, named in the run JSON.
     pub fn of(e: &ClientError) -> Self {
         match e {
             ClientError::PoolTimeout { .. } => ErrorKey::PoolTimeout,
@@ -118,6 +121,7 @@ impl ErrorKey {
                 ServerError::ShardRouting { .. } => ErrorKey::ServerShardRouting,
                 ServerError::Unknown { .. } => ErrorKey::ServerUnknown,
             },
+            _ => ErrorKey::Unclassified,
         }
     }
 
@@ -151,6 +155,7 @@ impl ErrorKey {
             ErrorKey::ServerReplication => "Server(replication)",
             ErrorKey::ServerShardRouting => "Server(shard_routing)",
             ErrorKey::ServerUnknown => "Server(unknown)",
+            ErrorKey::Unclassified => "Unclassified",
         }
     }
 }
@@ -289,13 +294,14 @@ mod tests {
             (server(ServerError::Unknown { error_code: 4, error_message: String::new() }), "Server(unknown)"),
         ];
 
-        assert_eq!(cases.len(), KEY_COUNT, "the table must cover every key");
+        // Every key but `Unclassified`, which no variant that exists today reaches.
+        assert_eq!(cases.len(), KEY_COUNT - 1, "the table must cover every reachable key");
         let breakdown = ErrorBreakdown::default();
         for (err, expected) in &cases {
             assert_eq!(ErrorKey::of(err).name(), *expected);
             breakdown.record(err);
         }
-        assert_eq!(breakdown.snapshot().len(), KEY_COUNT, "every key must report once");
+        assert_eq!(breakdown.snapshot().len(), KEY_COUNT - 1, "every key must report once");
     }
 
     #[test]

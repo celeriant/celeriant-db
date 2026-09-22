@@ -393,6 +393,9 @@ pub fn classify_error(e: &ClientError) -> (OpOutcome, Option<String>) {
         ClientError::DictUnavailable { .. } => (OpOutcome::Fail, "DictUnavailable".to_string()),
         // Caller input, rejected before anything was built or sent.
         ClientError::InvalidShardRange { .. } => (OpOutcome::Fail, "InvalidShardRange".to_string()),
+        // `ClientError` is `#[non_exhaustive]`. An unrecognised variant has an
+        // unknown commit status, which is the definition of info.
+        _ => (OpOutcome::Info, format!("{e}")),
     };
     (outcome, Some(label))
 }

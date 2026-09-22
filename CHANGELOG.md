@@ -7,6 +7,66 @@ crates together.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-09-22
+
+Client API has three breaking changes.
+
+### Breaking
+
+- `ClientError` is `#[non_exhaustive]` and gains four variants:
+  `ConnectionLostAfterSend`, `PoolTimeout`, `InvalidShardRange`, and
+  `DictUnavailable`. The first two variants exist so a
+  caller can tell a request that was never sent from one whose outcome is
+  unknown.
+- `celeriant_client_wire::build_frame` takes a `max_size_bytes` cap. An
+  oversized body is now refused while it is still uncompressed.
+- `ListOperations::new` returns `Result<Self, ClientError>`. Shard range checks.
+
+### Added
+
+- `ClientTlsConfig::from_paths` builds a client config from PEM paths directly.
+  Pass an identity pair for mTLS, `None` for a client that verifies the server
+  and presents nothing. `ClientTlsConfig::new` is unchanged for callers that
+  already hold a `rustls::ClientConfig`.
+- `sni_host` takes the host out of a `host:port` address for use as the TLS
+  SNI, including bracketed IPv6 literals.
+- `CeleriantPool::stats()` snapshots pool counters: per-node connection stats,
+  leader redirects followed and skipped, walks exhausted, pool timeouts, and
+  post-send losses. Each counter costs one relaxed increment on the hot path.
+
+### Changed
+
+- The node ID derives from the private key at every start. The public key file
+  is no longer read or written. Derivation itself is unchanged,
+  `SHA-256(DER public key)[..16]`, so an existing node keeps its identity
+  across the upgrade as long as its `private_key` is intact. There is no longer
+  a second key file to corrupt, swap, or leave half written.
+- Key PEMs are created with mode 0600 instead of being chmod'ed after the
+  write. A key file that already existed is tightened on rewrite.
+- The server TLS accept path interleaves handshakes, and a slot semaphore
+  bounds how many run at once. Handshakes are CPU bound and still block, but a
+  burst of cold connections no longer swamps the accept loop.
+- Metric descriptions and the Grafana dashboard corrected.
+
+### Fixed
+
+- Waiting for a local pool slot reported `no leader found`. It is now
+  `PoolTimeout`, which says no node was contacted and the request is safe to
+  retry.
+- A timeout that reached the NIC surfaces to the caller instead of being
+  retried. The request may have been applied, so re-sending it anywhere is
+  wrong. Handshake steps still retry.
+- Pooled connections are polled before reuse, so a socket the server has
+  already closed is not handed to a caller.
+- The tokio client splits the header stream read from deserialisation. A
+  connection stays reusable when a body fails to deserialise.
+- Watch streams apply the configured max response size and timeout, neither of
+  which was wired up. The trim floor no longer moves backwards when events are
+  merged.
+- A shard cannot start a second S3 catchup while one is in flight, tracked per
+  shard by `s3_catchup_in_flight` rather than by node status.
+- The protocol version cannot change on an open connection.
+
 ## [0.1.2] - 2026-08-24
 
 ### Fixed

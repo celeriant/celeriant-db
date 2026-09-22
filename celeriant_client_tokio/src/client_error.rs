@@ -6,6 +6,7 @@ use celeriant_wire::network::wire_error::WireError;
 use crate::server_error::ServerError;
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ClientError {
     ConnectionFailed(std::io::Error),
     WireError(WireError),

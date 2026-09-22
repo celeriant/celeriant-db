@@ -25,4 +25,4 @@ serde_json.workspace = true
 
 [dev-dependencies]
 # Only so the error-classification table can name a `WireError` value.
-celeriant_wire = { path = "../celeriant_wire", version = "0.1.2" }
+celeriant_wire = { path = "../celeriant_wire", version = "0.2.0" }
