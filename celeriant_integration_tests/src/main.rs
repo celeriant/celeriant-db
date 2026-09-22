@@ -249,6 +249,7 @@ async fn dispatch_test(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         "invariant_watch_dial_survives_bad_candidates" => invariant_watch_dial_failover::survives_bad_candidates().await,
         "invariant_watch_options_enforced" => invariant_watch_options_enforced::options_are_enforced().await,
         "invariant_metrics_exported_families_described" => invariant_metrics_described::exported_families_are_described().await,
+        "invariant_connection_gauge_redirect" => invariant_connection_gauge_redirect::client_connection_gauge_follows_cross_shard_redirects().await,
         "invariant_rotation_orphan_own_counter" => invariant_rotation_orphan_metric::rotation_orphan_reports_on_its_own_counter().await,
         "debug_client_seq_dedup_across_promotion" => debug_client_seq_dedup_across_promotion::run().await,
         "debug_demotion_cull_acked_loss" => debug_demotion_cull_acked_loss::run().await,

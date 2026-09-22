@@ -2,9 +2,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use celeriant_bench::{
-    BenchmarkResult, DataIntegrityReport, DeepAuditReport, HistoryRecorder, IdempotentBenchCounters,
-    Pool, PoolBuilder, TaskAckSummary, WatchFloodParams, build_tls_config,
-    deep_audit_failing_aggregates, run_benchmark, run_benchmark_idempotent_opts,
+    BenchmarkResult, DataIntegrityReport, DeepAuditReport, ErrorBreakdown, ErrorKindCount,
+    HistoryRecorder, IdempotentBenchCounters, Pool, PoolBuilder, PoolStats, TaskAckSummary,
+    WatchFloodParams, build_tls_config, deep_audit_failing_aggregates, print_error_summary,
+    run_benchmark, run_benchmark_idempotent_opts,
     run_benchmark_idempotent_with_history, run_cas_storm, run_watch_flood, smoke_test,
     verify_no_seq_gaps, watch_dial_probe,
 };
@@ -23,10 +24,14 @@ pub struct ScenarioParams {
     pub duration_secs: u64,
     pub throughput_floor: f64,
     /// Spread bench task starts over this many seconds instead of releasing
-    /// one cold-connect herd. Only `baseline` consumes it (A/B for the
-    /// thundering-herd envelope); fault scenarios keep the herd — it is
-    /// part of their stress.
+    /// one cold-connect herd. `--connect-ramp` only; no scenario picks a ramp
+    /// for itself. Fault scenarios keep the herd: it is part of their stress.
     pub connect_ramp_secs: Option<u64>,
+    /// Bench pool size. `None` (default) means one connection per task: the
+    /// whole herd dials at once. `baseline` caps it so tasks multiplex over a
+    /// warm pool. Honoured by `build_bench_pool` only; the lane pools size
+    /// themselves per lane.
+    pub max_connections: Option<usize>,
     /// Run-varying seed (N3): drives `NemesisPrng`, the clock-scramble
     /// splitmix, and the epoch-oracle's aggregate sample. Printed at run
     /// start and persisted in `ScenarioReport` so a Heisenbug is
@@ -41,6 +46,7 @@ impl Default for ScenarioParams {
             duration_secs: 60,
             throughput_floor: 500.0,
             connect_ramp_secs: None,
+            max_connections: None,
             seed: 0xCE1E_51A7,
         }
     }
@@ -131,6 +137,15 @@ pub struct ScenarioReport {
     /// be re-derived from the run JSON instead of parsed out of prose.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cardinality: Option<crate::cardinality_deliverable::CardinalityDeliverable>,
+    /// `bench.errors` split by `ClientError` variant, heaviest first, with the
+    /// first message seen for each. Empty when the scenario's bench had no
+    /// failures or ran no write loop of its own.
+    pub bench_errors_by_kind: Vec<ErrorKindCount>,
+    /// The bench client pools' own counters: connects vs. pooled reuse, local
+    /// pool-gate timeouts, leader routing, and the connection-wait histogram.
+    /// Set only for scenarios whose bench ran a write loop of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bench_pool_stats: Option<PoolStats>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -138,6 +153,12 @@ pub struct ScenarioParamsJson {
     pub tasks: usize,
     pub duration_secs: u64,
     pub throughput_floor: f64,
+    /// The ramp the bench ran with; absent unless `--connect-ramp` was passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connect_ramp_secs: Option<u64>,
+    /// The bench pool size actually used, resolved from `tasks` when the
+    /// scenario did not cap it.
+    pub max_connections: usize,
     /// Seed for this run's fault schedule / clock skew / oracle sampling
     /// (N3), persisted so a failing run's fault plan is reproducible via
     /// `--seed`.
@@ -293,7 +314,7 @@ pub async fn build_bench_pool(
         client_cert: cfg.client_cert.to_str().unwrap(),
         client_key: cfg.client_key.to_str().unwrap(),
         plaintext: false,
-        max_connections: params.tasks,
+        max_connections: params.max_connections.unwrap_or(params.tasks),
     }
     .build()
     .await
@@ -805,6 +826,12 @@ pub async fn tear_down_and_evaluate_with_audit(
         bench_end_idx: end_idx,
         bench_actual_end_ms,
         bench_errors: bench_result.errors,
+        bench_pool_timeouts: bench_result
+            .errors_by_kind
+            .iter()
+            .find(|k| k.kind == celeriant_bench::ErrorKey::PoolTimeout.name())
+            .map_or(0, |k| k.count),
+        bench_tasks: params.tasks,
         bench_total_requests: bench_result.total_requests,
         bench_throughput: bench_result.throughput,
         throughput_floor: params.throughput_floor,
@@ -908,6 +935,8 @@ pub async fn tear_down_and_evaluate_with_audit(
             tasks: params.tasks,
             duration_secs: params.duration_secs,
             throughput_floor: params.throughput_floor,
+            connect_ramp_secs: params.connect_ramp_secs,
+            max_connections: params.max_connections.unwrap_or(params.tasks),
             seed: params.seed,
         },
         bench: BenchmarkSummary::from(&bench_result),
@@ -923,6 +952,8 @@ pub async fn tear_down_and_evaluate_with_audit(
         disk_truth: disk_truth_report,
         s3_lifecycle: s3_lifecycle_report,
         cardinality: None,
+        bench_errors_by_kind: bench_result.errors_by_kind,
+        bench_pool_stats: bench_result.pool_stats,
     })
 }
 
@@ -1202,15 +1233,28 @@ pub async fn delete_trim_checks(
     ]
 }
 
+/// Baseline's bench pool, capped so tasks multiplex over warm connections.
+const BASELINE_MAX_CONNECTIONS: usize = 2048;
+
 /// The single happy-path scenario. Drives a clean cluster bring-up, runs the
 /// bench against the actual leader with no chaos, then evaluates invariants
 /// with strict zero-tolerance expectations. Any non-zero counter delta or
 /// any role flip is a fail.
+///
+/// The pool is bounded (`BASELINE_MAX_CONNECTIONS`) rather than one connection
+/// per task, so the zero error budget means "no errors on a warm cluster": a
+/// herd of thousands of cold dials sheds on the leader's handshake rate (~107/s
+/// measured), which is `cold_connect_herd`'s subject, not this scenario's.
+/// `--connect-ramp` still applies for an A/B.
 pub async fn run_baseline(
     cfg: &ClusterConfig,
     params: ScenarioParams,
     run_dir: &PathBuf,
 ) -> Result<ScenarioReport, String> {
+    let params = ScenarioParams {
+        max_connections: Some(params.tasks.min(BASELINE_MAX_CONNECTIONS)),
+        ..params
+    };
     let up = bring_up_cluster(cfg, "baseline", run_dir).await?;
     let pool = build_bench_pool(cfg, &up, params).await?;
 
@@ -1218,7 +1262,13 @@ pub async fn run_baseline(
     smoke_test(&pool).await.map_err(|e| format!("smoke: {e}"))?;
 
     let bench_window_start_ms = up.elapsed_ms();
-    println!("[baseline] bench: {} tasks, {}s", params.tasks, params.duration_secs);
+    println!(
+        "[baseline] bench: {} tasks, {}s, {} pool connections, connect ramp {}s",
+        params.tasks,
+        params.duration_secs,
+        params.max_connections.unwrap_or(params.tasks),
+        params.connect_ramp_secs.unwrap_or(0),
+    );
     let dt_handle = spawn_delete_trim_sideload("baseline", &pool, params);
     let bench_result =
         celeriant_bench::run_benchmark_ramped(&pool, params.tasks, params.duration_secs, params.connect_ramp_secs).await;
@@ -1244,6 +1294,8 @@ pub async fn run_baseline(
     let expectations = ScenarioExpectations {
         assert_never_ahead: true,
         assert_read_converged_at_quiesce: true,
+        // A bounded, warm pool must never shed a request at the connect gate.
+        max_pool_timeout_ratio: Some(0.0),
         ..ScenarioExpectations::default()
     };
 
@@ -1965,6 +2017,8 @@ pub async fn run_cas_storm_scenario(
         min_ms: 0,
         max_ms: 0,
         warmup_p50_ms: 0,
+        errors_by_kind: storm.errors_by_kind,
+        pool_stats: Some(pool.stats()),
     };
     let mut scen_params = params;
     scen_params.tasks = WRITERS;
@@ -2310,9 +2364,11 @@ pub async fn run_clock_scrambler(
 
     let expectations = ScenarioExpectations {
         // Both nodes challenge during their fenced windows; every challenge
-        // bumps the elections counter (cf. clock_skew_follower's 30 for one
-        // node over one window — two nodes over four windows needs more).
-        max_leader_elections: 80,
+        // bumps the elections counter. Twelve recorded runs span 55..90 (the
+        // last four: 85, 68, 74, 83), so the old cap of 80 sat inside the
+        // scenario's own noise and failed runs that behaved correctly. 120
+        // clears the observed range with margin.
+        max_leader_elections: 120,
         max_s3_fallbacks: 1500,
         max_heartbeat_failures: 400,
         max_bench_errors: 500_000,
@@ -2637,8 +2693,12 @@ pub async fn run_follower_sigkill(
     let expectations = ScenarioExpectations {
         max_leader_elections: 30,
         max_s3_fallbacks: 300,
-        // Same downtime×cadence shape as follower_graceful_stop; measured 64-65.
+        // Floor only: the real bound is derived from the follower's measured
+        // outage. A SIGKILL restart drags a WAL cache warmup behind it (91s of
+        // shard-3 warmup in run 1789859811, 103s unreachable in total = 205
+        // failures at the 500ms cadence), and no absolute number survives that.
         max_heartbeat_failures: 90,
+        heartbeat_budget_from_downtime: true,
         // SIGKILL leaves no graceful close — bench errors run higher than
         // the graceful-stop case. Empirical run hit ~35k; 60k headroom.
         max_bench_errors: 60_000,
@@ -2653,6 +2713,10 @@ pub async fn run_follower_sigkill(
         max_split_brain_ticks: 4,
         require_leader_retained: false,
         assert_eventual_progress: true,
+        // Disk-truth tip-fork detection: the crash-restart reconciliation path
+        // is exactly where a same-wal_seq divergent tip can survive, and
+        // EventualConvergence's number comparison cannot see it.
+        assert_no_divergent_tips: true,
         ..ScenarioExpectations::default()
     };
 
@@ -5148,6 +5212,8 @@ pub async fn run_bench_load_sweep(
             tasks: last_tasks,
             duration_secs: base_params.duration_secs,
             throughput_floor: base_params.throughput_floor,
+            connect_ramp_secs: base_params.connect_ramp_secs,
+            max_connections: base_params.max_connections.unwrap_or(last_tasks),
             seed: base_params.seed,
         },
         bench: BenchmarkSummary::from(&last_result),
@@ -5163,6 +5229,8 @@ pub async fn run_bench_load_sweep(
         s3_lifecycle: None,
         disk_truth: None,
         cardinality: None,
+        bench_errors_by_kind: last_result.errors_by_kind,
+        bench_pool_stats: last_result.pool_stats,
     };
     Ok(report)
 }
@@ -6454,6 +6522,10 @@ pub async fn run_cardinality_pressure(
     let fill_start = Instant::now();
     let stop = Arc::new(AtomicBool::new(false));
     let counters = Arc::new(cw::FillCounters::default());
+    // One tally for the whole scenario: the fill, the contention phase and the
+    // failover phase all write through it, so the report's breakdown covers the
+    // same errors its `bench.errors` total does.
+    let bench_errors = Arc::new(ErrorBreakdown::default());
     let fill_curve = Arc::new(StdMutex::new(ReheatCostCurve::new(
         "Reheat cost by age — during the fill (phase 1)",
         params.seed,
@@ -6477,6 +6549,7 @@ pub async fn run_cardinality_pressure(
             stop.clone(),
             counters.clone(),
             fill_curve.clone(),
+            bench_errors.clone(),
             fill_start,
         )));
     }
@@ -6550,6 +6623,7 @@ pub async fn run_cardinality_pressure(
     // run 1787056102 ended with 478 of them, 447 to one node, still open 25
     // minutes later. Nothing here needs them again, and an fd nobody will ever
     // check out is a leak whatever else is true.
+    let lane_pool_stats = merged_pool_stats(&lane_pools);
     drop(lane_pools);
     // The run's cardinality figure. Exact, because every mint is a fresh id by
     // construction — unlike `AckLedger::ack_offers`, which double-counts a key
@@ -6627,6 +6701,7 @@ pub async fn run_cardinality_pressure(
                     },
                     p2_history.clone(),
                     None,
+                    bench_errors.clone(),
                 )));
             }
         }
@@ -6869,6 +6944,7 @@ run for reasons unrelated to memory or cardinality.");
                 },
                 p6_history.clone(),
                 Some(availability.clone()),
+                bench_errors.clone(),
             )));
         }
 
@@ -7077,8 +7153,8 @@ run for reasons unrelated to memory or cardinality.");
             format!("peak RSS {peak_rss_kb} kB, but MemTotal could not be read — no declared budget to compare against"),
         ),
     });
-    // goal.md asks for the OBSERVED density against the design point, not the
-    // sizing formula run forward on its own inputs. `achieved` is the model;
+    // Report the OBSERVED density against the design point, not the sizing
+    // formula run forward on its own inputs. `achieved` is the model;
     // quoting it as a measurement would make the run unfalsifiable, since it
     // cannot disagree with the request for any reason other than a clamp.
     let aps = &deliverable.aggs_per_segment;
@@ -7142,7 +7218,15 @@ run for reasons unrelated to memory or cardinality.");
     all_latencies.extend(p2_latencies);
     all_latencies.extend(p6_latencies);
     let window_secs = (bench_window_end_ms.saturating_sub(bench_window_start_ms) / 1000).max(1);
-    let bench_result = benchmark_from(all_latencies, total_ok, total_err, params.tasks, window_secs);
+    let bench_result = benchmark_from(
+        all_latencies,
+        total_ok,
+        total_err,
+        params.tasks,
+        window_secs,
+        &bench_errors,
+        lane_pool_stats,
+    );
 
     let expectations = ScenarioExpectations {
         // Phase 4 restarts both nodes and phase 6 kills one: three process
@@ -7295,6 +7379,15 @@ async fn run_read_plan(
     }
 }
 
+/// Merge every lane's client-pool counters. Taken while the pools are still
+/// alive: each of these scenarios retires its pools before the report is built.
+fn merged_pool_stats(pools: &[Arc<Pool>]) -> Option<PoolStats> {
+    pools.iter().map(|p| p.stats()).reduce(|mut acc, next| {
+        acc.merge(next);
+        acc
+    })
+}
+
 /// Aggregate the phases' latency reservoirs into the report's bench summary.
 /// Percentiles are exact over the retained union; each task's reservoir is
 /// uniform over its own stream and the tasks are symmetric.
@@ -7304,10 +7397,17 @@ fn benchmark_from(
     errors: u64,
     num_tasks: usize,
     elapsed_secs: u64,
+    breakdown: &ErrorBreakdown,
+    pool_stats: Option<PoolStats>,
 ) -> BenchmarkResult {
     latencies.sort_unstable();
     let n = latencies.len();
     let at = |q: usize| if n == 0 { 0 } else { latencies[(n * q / 1000).min(n - 1)] };
+    let errors_by_kind = breakdown.snapshot();
+    print_error_summary(&errors_by_kind);
+    if let Some(ref stats) = pool_stats {
+        println!("  {stats}");
+    }
     BenchmarkResult {
         num_tasks,
         total_requests: ok,
@@ -7321,6 +7421,8 @@ fn benchmark_from(
         min_ms: latencies.first().copied().unwrap_or(0),
         max_ms: latencies.last().copied().unwrap_or(0),
         warmup_p50_ms: 0,
+        errors_by_kind,
+        pool_stats,
     }
 }
 
@@ -7787,6 +7889,7 @@ fn start_defect_fill(
     card: &crate::cardinality_workload::CardinalityParams,
     seed: u64,
     budget: Duration,
+    errors: &Arc<ErrorBreakdown>,
 ) -> DefectFill {
     use crate::cardinality_workload as cw;
     use celeriant_bench::read_workload::ReheatCostCurve;
@@ -7822,6 +7925,7 @@ fn start_defect_fill(
                 stop.clone(),
                 counters.clone(),
                 curve.clone(),
+                errors.clone(),
                 start,
             ))
         })
@@ -8092,11 +8196,12 @@ pub async fn run_write_outage_selfheal(
 
     let mut extra_checks: Vec<CheckResult> = Vec::new();
     let bench_window_start_ms = up.elapsed_ms();
+    let bench_errors = Arc::new(ErrorBreakdown::default());
 
     // Pools live only for the load phase. Dropping them is what makes the
     // settle window honest: the field wedge persisted with every client
     // connection killed, so the scenario has to reach that same state.
-    let (totals, latencies, load_start_ms, load_end_ms, stop_reason) = {
+    let (totals, latencies, load_start_ms, load_end_ms, stop_reason, pool_stats) = {
         let pool = build_bench_pool(cfg, &up, load_params).await?;
         let lane_pools = build_lane_pools(cfg, &up, load_params).await?;
         println!("[{SCEN}] smoke test");
@@ -8105,12 +8210,14 @@ pub async fn run_write_outage_selfheal(
 
         let load_start_ms = up.elapsed_ms();
         println!("[{SCEN}] load on");
-        let fill = start_defect_fill(&lane_pools, defect, &card, params.seed, load_budget);
+        let fill =
+            start_defect_fill(&lane_pools, defect, &card, params.seed, load_budget, &bench_errors);
         let stop_reason =
             watch_defect_fill(SCEN, &fill, load_budget, &poll_store, card.disk_high_water_pct).await;
         let (totals, latencies) = fill.stop_and_join().await;
         let load_end_ms = up.elapsed_ms();
-        (totals, latencies, load_start_ms, load_end_ms, stop_reason)
+        let pool_stats = merged_pool_stats(&lane_pools);
+        (totals, latencies, load_start_ms, load_end_ms, stop_reason, pool_stats)
     };
 
     let load_stop = Instant::now();
@@ -8183,6 +8290,8 @@ pub async fn run_write_outage_selfheal(
         totals.write_errors + totals.reheat_errors,
         defect.tasks,
         window_secs,
+        &bench_errors,
+        pool_stats,
     );
     let scen_params = ScenarioParams {
         tasks: defect.tasks,
@@ -8335,7 +8444,8 @@ pub async fn run_promotion_failure_survival(
     let lane_pools = build_lane_pools(cfg, &up, load_params).await?;
 
     let bench_window_start_ms = up.elapsed_ms();
-    let fill = start_defect_fill(&lane_pools, defect, &card, params.seed, window);
+    let bench_errors = Arc::new(ErrorBreakdown::default());
+    let fill = start_defect_fill(&lane_pools, defect, &card, params.seed, window, &bench_errors);
     let disk_watchdog = fill.spawn_disk_watchdog(poll_store.clone(), card.disk_high_water_pct);
 
     // The availability probe: a small set of steady writers with their own
@@ -8370,6 +8480,7 @@ pub async fn run_promotion_failure_survival(
             },
             None,
             Some(availability.clone()),
+            bench_errors.clone(),
         )));
     }
 
@@ -8524,6 +8635,7 @@ pub async fn run_promotion_failure_survival(
         ready_ms.map(|v| format!("{v}ms")).unwrap_or_else(|| "not observed".into()),
     );
 
+    let lane_pool_stats = merged_pool_stats(&lane_pools);
     drop(probe_pool);
     drop(lane_pools);
     drop(pool);
@@ -8557,6 +8669,8 @@ pub async fn run_promotion_failure_survival(
         totals.write_errors + totals.reheat_errors + probe_stats.errors,
         defect.tasks,
         window_secs,
+        &bench_errors,
+        lane_pool_stats,
     );
     let scen_params = ScenarioParams {
         tasks: defect.tasks,
@@ -8717,7 +8831,7 @@ mod teardown_step_tests {
 
 #[cfg(test)]
 mod cardinality_pressure_tests {
-    use super::{benchmark_from, stride_sample};
+    use super::{ErrorBreakdown, benchmark_from, stride_sample};
     use celeriant_bench::{AggregateKey, TaskAckSummary};
 
     fn ack(n: u64) -> TaskAckSummary {
@@ -8746,7 +8860,7 @@ mod cardinality_pressure_tests {
     #[test]
     fn the_bench_summary_reports_percentiles_over_the_merged_reservoirs() {
         let lat: Vec<u64> = (1..=1000).collect();
-        let b = benchmark_from(lat, 5_000, 7, 300, 10);
+        let b = benchmark_from(lat, 5_000, 7, 300, 10, &ErrorBreakdown::default(), None);
         assert_eq!(b.total_requests, 5_000);
         assert_eq!(b.errors, 7);
         assert_eq!(b.throughput, 500.0);
@@ -8761,7 +8875,7 @@ mod cardinality_pressure_tests {
     fn an_empty_latency_set_reports_zeroes_rather_than_panicking() {
         // A phase that never acked must not index off the end of an empty
         // reservoir on the way to the report.
-        let b = benchmark_from(Vec::new(), 0, 0, 3, 60);
+        let b = benchmark_from(Vec::new(), 0, 0, 3, 60, &ErrorBreakdown::default(), None);
         assert_eq!((b.p50_ms, b.p99_ms, b.max_ms, b.throughput), (0, 0, 0, 0.0));
     }
 }
@@ -8794,10 +8908,14 @@ fn leader_write_rate_curve(samples: &[NodeSample], start_ms: u64, end_ms: u64) -
 }
 
 /// EXPECTED RED (aspirational tier only), banked, `--scenario cold_connect_herd`
-/// only (excluded from `--full`). Codifies the 20k cold-connect envelope:
-/// MAX_CONCURRENT_CONNECTS=32 serialises the accept path and the default pool
-/// limits cap concurrency, so a thundering herd of cold connections sheds most of
-/// itself and takes tens of seconds to warm up. Both are catalogued and unfixed.
+/// only (excluded from `--full`). Codifies the 20k cold-connect envelope: the
+/// bound is the leader's TLS handshake rate, which is CPU-bound on the shard
+/// executors and capped by `CELERIANT_HANDSHAKE_CONCURRENCY` (248 handshakes/s
+/// at the default 8, 313/s at 16, ~107/s with the old inline serialised
+/// handshake). A thundering herd of cold connections sheds most of itself
+/// waiting for a handshake slot and takes seconds to warm up. The sheds are
+/// `PoolTimeout`s: the request never left the client, so `BenchErrorsBounded`
+/// excludes them.
 ///
 /// Two tiers:
 ///   (a) REGRESSION (gating): sheds and survivor throughput within the measured
@@ -8837,8 +8955,8 @@ pub async fn run_cold_connect_herd(
     let bench_window_end_ms = up.elapsed_ms();
 
     // Shed against the CONNECTION base, matching the campaign's "~14-15k sheds of
-    // 20k". The dominant cold-herd error is a connect that lost the accept
-    // serialization race ("no leader found") and retried behind backoff, so
+    // 20k". The dominant cold-herd error is a `PoolTimeout`: the connect never
+    // won a handshake slot on the leader, so the request was never sent and
     // errors track roughly one-per-task at the herd edge; errors/tasks is the
     // connection-shed rate. The attempt-share is reported too but is not the
     // envelope figure — surviving tasks make many successful requests that dilute
@@ -8852,9 +8970,9 @@ pub async fn run_cold_connect_herd(
     };
 
     // Warmup is the per-connection first-successful-request median: on a cold herd
-    // that request carries the TCP connect that lost the serialization race, so it
-    // IS the cold-connect warmup cost the campaign measured (~29s at 20k). The
-    // scraper write-rate curve is kept as a secondary evidence artifact.
+    // that request carries the TCP connect that queued for a handshake slot, so it
+    // IS the cold-connect warmup cost measured (12.3s at 20k). The scraper
+    // write-rate curve is kept as a secondary evidence artifact.
     let warmup_secs = bench_result.warmup_p50_ms as f64 / 1000.0;
     let samples = up.scraper.store().snapshot().await;
     let curve = leader_write_rate_curve(&samples, bench_window_start_ms, bench_window_end_ms);
@@ -8876,11 +8994,12 @@ pub async fn run_cold_connect_herd(
         eprintln!("[{SCEN}] writing {}: {e}", curve_path.display());
     }
 
-    // TIER (a): REGRESSION bound. Loose, from the catalogued envelope: ~14-15k
-    // connection-sheds of 20k (~70-78%), survivors 13-22k req/s, warmup median
-    // ~29s. Ceilings sit above the observed band so a healthy run and normal
-    // variance stay green; the job is catching a REGRESSION off the envelope, not
-    // passing the aspirational bar. Throughput floor scales with --tasks.
+    // TIER (a): REGRESSION bound. Loose, from the envelope re-derived at 20k on
+    // 2026-09-20 (run 1789858788): 70.1% connection shed, survivor 21231 req/s,
+    // warmup median 12.3s, mean handshake 67.9ms with max 28 in flight. Ceilings
+    // sit above the observed band so a healthy run and normal variance stay
+    // green; the job is catching a REGRESSION off the envelope, not passing the
+    // aspirational bar. Throughput floor scales with --tasks.
     const SHED_CEILING_PCT: f64 = 92.0;
     const WARMUP_CEILING_SECS: f64 = 60.0;
     let throughput_floor_regression = (params.tasks as f64 * 0.25).max(2000.0);
@@ -8889,7 +9008,7 @@ pub async fn run_cold_connect_herd(
             "ColdConnectEnvelopeRegression",
             format!(
                 "connection shed {shed_conn_pct:.1}% exceeds the {SHED_CEILING_PCT:.0}% envelope ceiling — worse \
-                 than the catalogued ~70-78% at 20k. The accept path regressed.",
+                 than the measured 70.1% at 20k. The leader's handshake rate regressed.",
             ),
         )
     } else if bench_result.throughput < throughput_floor_regression {
@@ -8905,8 +9024,8 @@ pub async fn run_cold_connect_herd(
         CheckResult::fail(
             "ColdConnectEnvelopeRegression",
             format!(
-                "warmup {warmup_secs:.1}s exceeds the {WARMUP_CEILING_SECS:.0}s ceiling — the accept serialization \
-                 got slower than the catalogued ~29s median.",
+                "warmup {warmup_secs:.1}s exceeds the {WARMUP_CEILING_SECS:.0}s ceiling — the leader's TLS \
+                 handshake rate fell below the measured 12.3s median at 20k.",
             ),
         )
     } else {
@@ -8932,8 +9051,8 @@ pub async fn run_cold_connect_herd(
         format!(
             "ASPIRATIONAL SLA {verdict}: connection shed {shed_conn_pct:.1}% vs target <{ASPIRATIONAL_SHED_PCT:.0}% \
              ({}), warmup {warmup_secs:.1}s vs target <{ASPIRATIONAL_WARMUP_SECS:.0}s ({}). This tier is the red \
-             half — the accept-serialization (MAX_CONCURRENT_CONNECTS=32) + pool-limit envelope is unfixed, so a \
-             breach here is expected until it is addressed.",
+             half — the herd is bound by the leader's TLS handshake rate, CPU-bound on the shard executors and \
+             capped by CELERIANT_HANDSHAKE_CONCURRENCY, so a breach here is expected until that bound moves.",
             if shed_met { "met" } else { "BREACHED" },
             if warmup_met { "met" } else { "BREACHED" },
         ),

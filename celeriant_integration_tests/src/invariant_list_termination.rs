@@ -72,7 +72,7 @@ pub async fn terminate_at_shard_boundary() -> R {
 
     // Open-ended discovery from shard 0: complete sets, bounded time.
     let discover = ListOptions::default();
-    let orgs = timeout(DEADLINE, ListOrgsIterator::new(&mut client, discover.clone()).collect())
+    let orgs = timeout(DEADLINE, ListOrgsIterator::new(&mut client, discover.clone())?.collect())
         .await
         .map_err(|_| "list_orgs discovery did not terminate")??;
     if orgs.len() != 1 || orgs[0].org_id != ORG {
@@ -81,7 +81,7 @@ pub async fn terminate_at_shard_boundary() -> R {
 
     let types = timeout(
         DEADLINE,
-        ListAggregateTypesIterator::new(&mut client, Some(ORG), discover.clone()).collect(),
+        ListAggregateTypesIterator::new(&mut client, Some(ORG), discover.clone())?.collect(),
     )
     .await
     .map_err(|_| "list_aggregate_types discovery did not terminate")??;
@@ -93,7 +93,7 @@ pub async fn terminate_at_shard_boundary() -> R {
 
     let aggs = timeout(
         DEADLINE,
-        ListAggregatesIterator::new(&mut client, Some(ORG), None, discover).collect(),
+        ListAggregatesIterator::new(&mut client, Some(ORG), None, discover)?.collect(),
     )
     .await
     .map_err(|_| "list_aggregates discovery did not terminate")??;
@@ -109,18 +109,18 @@ pub async fn terminate_at_shard_boundary() -> R {
     // From the top of the range the cursor must saturate: terminate with an
     // empty result, not wrap around to shard 0 or spin.
     let top = ListOptions { start_shard: u64::MAX, ..Default::default() };
-    let orgs = timeout(DEADLINE, ListOrgsIterator::new(&mut client, top.clone()).collect())
+    let orgs = timeout(DEADLINE, ListOrgsIterator::new(&mut client, top.clone())?.collect())
         .await
         .map_err(|_| "list_orgs from u64::MAX did not terminate")??;
     let types = timeout(
         DEADLINE,
-        ListAggregateTypesIterator::new(&mut client, Some(ORG), top.clone()).collect(),
+        ListAggregateTypesIterator::new(&mut client, Some(ORG), top.clone())?.collect(),
     )
     .await
     .map_err(|_| "list_aggregate_types from u64::MAX did not terminate")??;
     let aggs = timeout(
         DEADLINE,
-        ListAggregatesIterator::new(&mut client, Some(ORG), None, top).collect(),
+        ListAggregatesIterator::new(&mut client, Some(ORG), None, top)?.collect(),
     )
     .await
     .map_err(|_| "list_aggregates from u64::MAX did not terminate")??;

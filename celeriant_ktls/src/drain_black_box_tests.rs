@@ -1,5 +1,5 @@
-// REVIEW-EVIDENCE — adversarial review of the post-handshake drain fix.
-// Everything here is evidence for a review claim; nothing under review is modified.
+// Black-box tests for the post-handshake drain, driven over real sockets. The
+// white-box set lives in `drain_contract_tests`.
 
 use futures_lite::AsyncReadExt;
 use std::io::Write;
@@ -69,7 +69,7 @@ fn spawn_accept(server_config: Arc<rustls::ServerConfig>) -> (SocketAddr, Receiv
 }
 
 /// Like `spawn_accept`, but after `ktls_accept` returns it keeps reading the
-/// stream — now decrypted by the kernel — until `want` total plaintext bytes
+/// stream, now decrypted by the kernel, until `want` total plaintext bytes
 /// have been seen or the peer goes quiet. Reports (trailing, kernel-read).
 fn spawn_accept_then_read(
     server_config: Arc<rustls::ServerConfig>,
@@ -171,8 +171,8 @@ impl HeldClient {
 }
 
 // ---------------------------------------------------------------------------
-// Claim: a maximum-size TLS record (16384 plaintext = 16406 on the wire) does
-// NOT deadlock against the 16KiB incoming buffer. read_into doubles the buffer
+// A maximum-size TLS record (16384 plaintext = 16406 on the wire) does not
+// deadlock against the 16KiB incoming buffer. read_into doubles the buffer
 // when it fills, so a record larger than the initial window still makes
 // progress. Split at the last byte forces the whole record to be resident.
 // ---------------------------------------------------------------------------
@@ -209,8 +209,8 @@ fn max_size_tls_record_split_reassembles_despite_16k_buffer() {
 }
 
 // ---------------------------------------------------------------------------
-// Claim: a header torn at EVERY interior offset reassembles. The white-box
-// tests cover 1 and 3; 2 and 4 complete the set (the record length is not yet
+// A header torn at EVERY interior offset reassembles. The white-box tests
+// cover 1 and 3; 2 and 4 complete the set (the record length is not yet
 // knowable at any of them).
 // ---------------------------------------------------------------------------
 #[test]
@@ -238,7 +238,7 @@ fn header_torn_at_offsets_two_and_four_reassembles() {
 }
 
 // ---------------------------------------------------------------------------
-// TOTALITY CONTRACT — the permanent guard against the drain over-reading.
+// TOTALITY CONTRACT: the permanent guard against the drain over-reading.
 //
 // A split record followed by three MORE complete records, all arriving in one
 // later write. The bounded drain reads no further than the split record's last
@@ -250,7 +250,7 @@ fn header_torn_at_offsets_two_and_four_reassembles() {
 // This fails in both directions: if the drain under-reads, the split record is
 // unrecoverable (userspace ate its head, the kernel cannot decrypt the rest)
 // and the totality breaks; if the drain over-reads, `trailing` grows without a
-// bound — the loop-1 defect.
+// bound, which is the defect this guards.
 // ---------------------------------------------------------------------------
 #[test]
 fn drain_and_kernel_together_yield_every_record_exactly_once() {
@@ -311,7 +311,7 @@ fn drain_and_kernel_together_yield_every_record_exactly_once() {
 }
 
 // ---------------------------------------------------------------------------
-// Claim: the CLIENT side of the shared drain reassembles a split record too.
+// The CLIENT side of the shared drain reassembles a split record too.
 // The server sends its flight plus a half-RTT app-data record fragment in one
 // write, so `ktls_connect` reaches its drain with a partial record resident.
 // ---------------------------------------------------------------------------
@@ -382,10 +382,11 @@ fn client_side_split_record_reassembles_byte_exact() {
 }
 
 // ---------------------------------------------------------------------------
-// Claim (loop 2 contract): `drain_discard` compacts in place and leaves the
-// read window — `buf.len()` — untouched; only `filled` moves.
+// `drain_discard` compacts in place and leaves the read window (`buf.len()`)
+// untouched; only `filled` moves.
 //
-// Loop 1 used `Vec::drain`, so every discard permanently shrank the window.
+// An earlier version used `Vec::drain`, so every discard permanently shrank the
+// window.
 // Since `read_into` only grows the buffer when `filled == buf.len()`, a
 // handshake read and consumed in small pieces shrank the window toward zero,
 // and at zero `buf[filled..]` is empty: the next read can only return 0, which
@@ -430,24 +431,21 @@ fn discards_keep_the_read_window_stable() {
 }
 
 // ---------------------------------------------------------------------------
-// DEFECT (this test is expected to FAIL): `trailing` has no cap.
+// `trailing` stays bounded against a peer that streams continuously after its
+// Finished.
 //
-// The drain exits only when the incoming buffer is EMPTY, and reads more
-// whenever the buffer ends mid-record. A peer that streams continuously after
-// its Finished leaves a partial record at the tail of nearly every read, so the
-// drain keeps reading — and every drained record is appended to `trailing`,
-// which is never bounded. The ceiling is DRAIN_DEADLINE x link rate, per
-// connection, allocated on the shard executor.
-//
-// The pre-fix macro could not do this: it never read more bytes, so `trailing`
-// was bounded by what was already resident. `read_more_bounded` is what turns a
-// bounded accumulation into an unbounded one.
+// The drain exits when the incoming buffer is empty, and `read_more_bounded`
+// tops up only as far as the pending record's last byte, so a faster peer
+// cannot make `trailing` grow. An earlier version read whenever the buffer
+// ended mid-record, which a continuous streamer keeps true from one read to the
+// next, so `trailing` grew to DRAIN_DEADLINE x link rate per connection,
+// allocated on the shard executor.
 // ---------------------------------------------------------------------------
 #[test]
-fn streaming_peer_grows_trailing_without_a_cap() {
+fn a_streaming_peer_cannot_grow_trailing_without_bound() {
     /// Generous: the drain only ever needs to finish the record it is stuck on.
     const SANE_TRAILING_CAP: usize = 1024 * 1024;
-    /// The peer stops here; the drain would keep going to DRAIN_DEADLINE.
+    /// The peer stops here; unbounded, the drain would run to DRAIN_DEADLINE.
     const PEER_CAP: usize = 64 * 1024 * 1024;
 
     let (server_config, client_config) = test_tls_configs();
@@ -463,7 +461,7 @@ fn streaming_peer_grows_trailing_without_a_cap() {
     client.send(&head);
     let mut pending = record[7..].to_vec();
 
-    // One max-size record at a time — rustls' plaintext buffer limit is 64KiB,
+    // One max-size record at a time: rustls' plaintext buffer limit is 64KiB,
     // so each record is framed and drained before the next is queued.
     let chunk = payload(0x9e, 16 * 1024);
     let mut sent = 0usize;
@@ -492,7 +490,7 @@ fn streaming_peer_grows_trailing_without_a_cap() {
         assert!(
             trailing.len() <= SANE_TRAILING_CAP,
             "drain buffered {} bytes of peer plaintext into `trailing` (peer streamed {sent} in \
-             {streamed_for:?}); nothing bounds it but DRAIN_DEADLINE x link rate",
+             {streamed_for:?}); it is reading past the record it is stuck on",
             trailing.len()
         );
     }

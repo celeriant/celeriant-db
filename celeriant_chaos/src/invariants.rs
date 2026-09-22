@@ -72,6 +72,12 @@ pub struct ScenarioExpectations {
     pub max_leader_elections: u64,
     pub max_s3_fallbacks: u64,
     pub max_heartbeat_failures: u64,
+    /// If true, `NoHeartbeatFailures` uses the larger of `max_heartbeat_failures`
+    /// and a budget derived from the follower's measured outage: one failure per
+    /// heartbeat interval for every tick the follower was unreachable or still
+    /// catching up, plus slack. A kill-restart whose WAL cache warmup runs for
+    /// a minute and a half makes any absolute number a guess about disk speed.
+    pub heartbeat_budget_from_downtime: bool,
     pub max_shard_panics: u64,
     pub max_node_starts: u64,
     pub max_bench_errors: u64,
@@ -81,6 +87,13 @@ pub struct ScenarioExpectations {
     /// windows grow with offered load); a ratio keeps the bound meaningful
     /// at any load while still catching total-outage regressions.
     pub max_bench_error_ratio: Option<f64>,
+    /// If `Some(r)`, run `PoolTimeoutsBounded`: `PoolTimeout` errors must be
+    /// `<= r * tasks`. A pool timeout is the client's own connect gate shedding
+    /// a request before a byte is sent, so it bounds client capacity, not the
+    /// server. `baseline` sets `Some(0.0)`: its pool is bounded and warm.
+    /// `None` (default) skips the bound: the herd-carrying scenarios' shed is
+    /// the subject of `cold_connect_herd`, not a per-scenario budget.
+    pub max_pool_timeout_ratio: Option<f64>,
 
     /// Maximum number of scrape ticks where `node_role` summed across both
     /// nodes is not exactly 1. Brief split-brain windows are tolerated by
@@ -164,10 +177,12 @@ impl Default for ScenarioExpectations {
             max_leader_elections: 0,
             max_s3_fallbacks: 0,
             max_heartbeat_failures: 0,
+            heartbeat_budget_from_downtime: false,
             max_shard_panics: 0,
             max_node_starts: 0,
             max_bench_errors: 0,
             max_bench_error_ratio: None,
+            max_pool_timeout_ratio: None,
             max_split_brain_ticks: 0,
             max_role_flips: 0,
             assert_eventual_progress: false,
@@ -202,6 +217,12 @@ pub struct RunData<'a> {
     /// so "0 writes" is meaningless, not a fault.
     pub bench_actual_end_ms: u64,
     pub bench_errors: u64,
+    /// The `PoolTimeout` share of `bench_errors`, from the bench's error
+    /// breakdown. The request was never sent, so `BenchErrorsBounded` excludes
+    /// it and `PoolTimeoutsBounded` bounds it on its own.
+    pub bench_pool_timeouts: u64,
+    /// Bench task count, the base `max_pool_timeout_ratio` is a fraction of.
+    pub bench_tasks: usize,
     pub bench_total_requests: u64,
     pub bench_throughput: f64,
     pub throughput_floor: f64,
@@ -242,10 +263,11 @@ pub fn run_all(data: &RunData, expect: &ScenarioExpectations) -> Vec<CheckResult
         check_leader_stable(data, expect),
         check_counter("NoUnexpectedElections", "celeriant_leader_elections_total", data, |s| s.leader_elections_total, expect.max_leader_elections),
         check_counter("NoS3Fallbacks", "celeriant_replication_s3_fallbacks_total", data, |s| s.s3_fallbacks_total, expect.max_s3_fallbacks),
-        check_counter("NoHeartbeatFailures", "celeriant_heartbeat_failures_total", data, |s| s.heartbeat_failures_total, expect.max_heartbeat_failures),
+        check_counter("NoHeartbeatFailures", "celeriant_heartbeat_failures_total", data, |s| s.heartbeat_failures_total, heartbeat_budget(data, expect)),
         check_counter("NoShardPanics", "celeriant_shard_panics_total", data, |s| s.shard_panics_total, expect.max_shard_panics),
         check_counter("NoNodeStarts", "celeriant_node_starts_total", data, |s| s.node_starts_total, expect.max_node_starts),
         check_bench_errors(data, expect),
+        check_pool_timeouts(data, expect),
         check_bench_throughput_floor(data),
         check_wal_seq_advanced(data),
         check_read_within_write(data),
@@ -444,25 +466,51 @@ fn check_counter(
     }
 }
 
+/// Errors the server was involved in: a `PoolTimeout` was shed by the client's
+/// own connect gate before a byte was sent, so counting it here would read a
+/// client capacity limit as a server defect. `PoolTimeoutsBounded` bounds it.
 fn check_bench_errors(data: &RunData, expect: &ScenarioExpectations) -> CheckResult {
     const NAME: &str = "BenchErrorsBounded";
+    let errors = data.bench_errors.saturating_sub(data.bench_pool_timeouts);
     // `bench_errors` counts retry ATTEMPTS while `total_requests` counts
     // completed ops, so errors can exceed requests during outage windows.
     // The ratio is therefore a share of all attempts (errors + completions):
     // bounded [0,1] and load-independent.
-    let attempts = data.bench_errors + data.bench_total_requests;
+    let attempts = errors + data.bench_total_requests;
     let ratio_allowance = expect
         .max_bench_error_ratio
         .map(|r| (r * attempts as f64) as u64)
         .unwrap_or(0);
     let allowed = expect.max_bench_errors.max(ratio_allowance);
-    if data.bench_errors <= allowed {
-        CheckResult::pass(NAME)
+    let detail = format!(
+        "{errors} server-involved errors ({} pool timeouts excluded), allowed {allowed}",
+        data.bench_pool_timeouts,
+    );
+    if errors <= allowed {
+        CheckResult::pass_with_detail(NAME, detail)
     } else {
-        CheckResult::fail(
+        CheckResult::fail(NAME, detail)
+    }
+}
+
+fn check_pool_timeouts(data: &RunData, expect: &ScenarioExpectations) -> CheckResult {
+    const NAME: &str = "PoolTimeoutsBounded";
+    let timeouts = data.bench_pool_timeouts;
+    let Some(ratio) = expect.max_pool_timeout_ratio else {
+        return CheckResult::pass_with_detail(
             NAME,
-            format!("bench reported {} errors (allowed {})", data.bench_errors, allowed),
-        )
+            format!("{timeouts} pool timeouts, not bounded here — the cold-connect shed is measured by cold_connect_herd"),
+        );
+    };
+    let allowed = (ratio * data.bench_tasks as f64) as u64;
+    let detail = format!(
+        "{timeouts} pool timeouts of {} tasks, allowed {allowed} (ratio {ratio})",
+        data.bench_tasks,
+    );
+    if timeouts <= allowed {
+        CheckResult::pass_with_detail(NAME, detail)
+    } else {
+        CheckResult::fail(NAME, detail)
     }
 }
 
@@ -510,6 +558,36 @@ fn check_leader_retained(data: &RunData) -> CheckResult {
     }
 }
 
+/// Allowed `heartbeat_failures_total` delta. With
+/// `heartbeat_budget_from_downtime`, the outage the run actually had sets the
+/// bound: the leader cannot heartbeat a follower whose scrape is failing or
+/// whose shards are still in boot-catchup, so one failure per heartbeat
+/// interval across that window is expected behaviour, not a defect.
+fn heartbeat_budget(data: &RunData, expect: &ScenarioExpectations) -> u64 {
+    /// `--heartbeat-interval-ms` default.
+    const HEARTBEAT_INTERVAL_MS: u64 = 500;
+    /// Covers the scrape-resolution edges and the reconnect round after the
+    /// follower is serving again.
+    const SLACK: u64 = 20;
+    /// `celeriant_node_status_effective_code` values where the follower is not
+    /// answering heartbeats: 0 = BootCatchup, 2 = FollowerCatchingUp.
+    const CATCHING_UP: [u64; 2] = [0, 2];
+
+    if !expect.heartbeat_budget_from_downtime {
+        return expect.max_heartbeat_failures;
+    }
+    let tick_ms = crate::sample::scrape_interval().as_millis() as u64;
+    let down_ticks = data.samples[data.bench_start_idx..=data.bench_end_idx]
+        .iter()
+        .filter(|s| s.host == data.follower_host)
+        .filter(|s| {
+            !s.ok || s.effective_status_by_shard.values().any(|v| CATCHING_UP.contains(v))
+        })
+        .count() as u64;
+    let derived = down_ticks * tick_ms / HEARTBEAT_INTERVAL_MS + SLACK;
+    expect.max_heartbeat_failures.max(derived)
+}
+
 /// PROGRESS check: at the end of the bench+settle window, every shard present
 /// on both hosts must either (a) have equal wal_seq on both sides, or (b) have
 /// the lower side strictly advancing in the final `PROGRESS_WINDOW_MS`.
@@ -518,8 +596,10 @@ fn check_leader_retained(data: &RunData) -> CheckResult {
 /// forked while other shards pushed both nodes' node-level max to the same
 /// value, masking the stuck shard in the old per-node-max comparison.
 ///
-/// The divergent-ahead case is handled symmetrically: the LOWER wal_seq side
-/// is "lagging" regardless of whether it's the leader or the follower.
+/// The follower-ahead case is NOT lag and is not judged by progress: the
+/// leader is the sole writer, so a follower past the leader's tip holds
+/// entries the leader never wrote. That is divergence, and it is reported as
+/// such; calling a quiescent leader "stuck" would be a false statement.
 fn check_eventual_convergence(data: &RunData) -> CheckResult {
     const NAME: &str = "EventualConvergence";
     /// Window over which we measure progress on the lagging node, in ms.
@@ -590,14 +670,22 @@ fn check_eventual_convergence(data: &RunData) -> CheckResult {
             continue;
         }
 
-        // The host with the lower wal_seq for this shard is lagging.
-        let (lagging_host, lagging_seq, leading_seq) = if l_seq < f_seq {
-            (data.leader_host, l_seq, f_seq)
-        } else {
-            (data.follower_host, f_seq, l_seq)
-        };
+        if f_seq > l_seq {
+            return CheckResult::fail(
+                NAME,
+                format!(
+                    "shard {shard_id}: follower {} is {} entries AHEAD of leader {} \
+                     (wal_seq {f_seq} vs {l_seq}): follower applied entries the leader never wrote",
+                    data.follower_host,
+                    f_seq - l_seq,
+                    data.leader_host,
+                ),
+            );
+        }
 
-        let lagging_last_t = if lagging_host == data.leader_host { l.t_ms } else { f.t_ms };
+        // Only the follower can be behind here; the ahead case returned above.
+        let (lagging_host, lagging_seq, leading_seq) = (data.follower_host, f_seq, l_seq);
+        let lagging_last_t = f.t_ms;
         let window_start_ms = lagging_last_t.saturating_sub(PROGRESS_WINDOW_MS);
 
         // Find the lagging host's first ok sample in the progress window for this shard.
@@ -1188,6 +1276,8 @@ mod tests {
             bench_end_idx: samples.len().saturating_sub(1),
             bench_actual_end_ms: u64::MAX,
             bench_errors: 0,
+            bench_pool_timeouts: 0,
+            bench_tasks: 0,
             bench_total_requests: 0,
             bench_throughput: 1000.0,
             throughput_floor: 0.0,
@@ -1324,6 +1414,104 @@ mod tests {
         let data = run_data(&samples);
         let result = check_eventual_convergence(&data);
         assert!(result.passed(), "expected PASS but got FAIL: {}", result.detail);
+    }
+
+    /// Both shard verdicts from one table: a follower past the leader's tip is
+    /// divergence (the leader is the sole writer, so progress cannot excuse it),
+    /// a follower behind it is judged on progress.
+    #[test]
+    fn shard_verdict_splits_divergence_from_lag() {
+        struct Case {
+            what: &'static str,
+            leader: u64,
+            follower: [u64; 3],
+            passes: bool,
+            detail: &'static str,
+        }
+        let cases = [
+            Case {
+                what: "follower ahead of a quiescent leader",
+                leader: 1000,
+                follower: [3071, 3071, 3071],
+                passes: false,
+                detail: "is 2071 entries AHEAD of leader",
+            },
+            Case {
+                what: "follower ahead and still climbing",
+                leader: 1000,
+                follower: [1100, 1200, 1300],
+                passes: false,
+                detail: "is 300 entries AHEAD of leader",
+            },
+            Case {
+                what: "follower behind and frozen",
+                leader: 1000,
+                follower: [900, 900, 900],
+                passes: false,
+                detail: "STUCK shard 3",
+            },
+            Case {
+                what: "follower behind but advancing",
+                leader: 1000,
+                follower: [800, 900, 950],
+                passes: true,
+                detail: "ok",
+            },
+            Case {
+                what: "converged",
+                leader: 1000,
+                follower: [1000, 1000, 1000],
+                passes: true,
+                detail: "ok",
+            },
+        ];
+        // t=7000 sits inside the 10s progress window ending at t=15000.
+        const TICKS: [u64; 3] = [0, 7_000, 15_000];
+        for c in cases {
+            let mut samples = Vec::new();
+            for (i, t) in TICKS.iter().enumerate() {
+                samples.push(sample(LEADER, *t, &[(3, c.leader)]));
+                samples.push(sample(FOLLOWER, *t, &[(3, c.follower[i])]));
+            }
+            let r = check_eventual_convergence(&run_data(&samples));
+            assert_eq!(r.passed(), c.passes, "{}: {}", c.what, r.detail);
+            assert!(r.detail.contains(c.detail), "{}: {}", c.what, r.detail);
+        }
+    }
+
+    /// The derived budget must track the outage the run measured, and never
+    /// drop below the scenario's own floor.
+    #[test]
+    fn heartbeat_budget_tracks_the_measured_outage() {
+        // Four impaired follower ticks at the 500ms scrape cadence: two
+        // unreachable, two answering but still in boot-catchup.
+        let mut samples = vec![sample(LEADER, 0, &[(1, 10)]), sample(FOLLOWER, 0, &[(1, 10)])];
+        for i in 1..=4u64 {
+            let mut f = sample(FOLLOWER, i * 500, &[(1, 10)]);
+            if i <= 2 {
+                f.ok = false;
+            } else {
+                f.effective_status_by_shard = [(1u32, 0u64)].into_iter().collect();
+            }
+            samples.push(sample(LEADER, i * 500, &[(1, 10)]));
+            samples.push(f);
+        }
+        let data = run_data(&samples);
+
+        let derived = ScenarioExpectations {
+            heartbeat_budget_from_downtime: true,
+            ..ScenarioExpectations::default()
+        };
+        assert_eq!(heartbeat_budget(&data, &derived), 4 + 20);
+
+        let with_floor = ScenarioExpectations { max_heartbeat_failures: 90, ..derived };
+        assert_eq!(heartbeat_budget(&data, &with_floor), 90);
+
+        let absolute = ScenarioExpectations {
+            max_heartbeat_failures: 90,
+            ..ScenarioExpectations::default()
+        };
+        assert_eq!(heartbeat_budget(&data, &absolute), 90);
     }
 
     #[test]
@@ -1829,6 +2017,51 @@ mod tests {
         assert!(!r.passed());
         assert!(r.detail.contains("freshness bound"), "{}", r.detail);
         assert!(r.detail.contains(FOLLOWER), "{}", r.detail);
+    }
+
+    #[test]
+    fn bench_errors_exclude_pool_timeouts() {
+        let samples = [sample(LEADER, 0, &[(1, 100)])];
+        // (bench_errors, pool_timeouts, max_bench_errors, expected pass)
+        let cases = [
+            (0, 0, 0, true),
+            (50, 50, 0, true),   // every failure was shed before a byte was sent
+            (51, 50, 0, false),  // one reached the server
+            (60, 50, 10, true),  // server-involved errors within the budget
+        ];
+        for (errors, timeouts, budget, pass) in cases {
+            let data = RunData {
+                bench_errors: errors,
+                bench_pool_timeouts: timeouts,
+                ..run_data(&samples)
+            };
+            let expect = ScenarioExpectations { max_bench_errors: budget, ..Default::default() };
+            let r = check_bench_errors(&data, &expect);
+            assert_eq!(r.passed(), pass, "errors={errors} timeouts={timeouts}: {}", r.detail);
+            assert!(r.detail.contains("pool timeouts excluded"), "{}", r.detail);
+        }
+    }
+
+    #[test]
+    fn pool_timeouts_bounded_as_a_fraction_of_tasks() {
+        let samples = [sample(LEADER, 0, &[(1, 100)])];
+        // 1000 tasks. (ratio, pool_timeouts, expected pass)
+        let cases = [
+            (None, 9_999, true), // unbounded: the herd's shed is cold_connect_herd's subject
+            (Some(0.0), 0, true),
+            (Some(0.0), 1, false),
+            (Some(0.01), 10, true),
+            (Some(0.01), 11, false),
+        ];
+        for (ratio, timeouts, pass) in cases {
+            let data =
+                RunData { bench_pool_timeouts: timeouts, bench_tasks: 1000, ..run_data(&samples) };
+            let expect =
+                ScenarioExpectations { max_pool_timeout_ratio: ratio, ..Default::default() };
+            let r = check_pool_timeouts(&data, &expect);
+            assert_eq!(r.passed(), pass, "ratio={ratio:?} timeouts={timeouts}: {}", r.detail);
+            assert!(r.detail.contains("pool timeouts"), "{}", r.detail);
+        }
     }
 }
 

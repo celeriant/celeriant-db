@@ -1,12 +1,12 @@
 use std::{cell::Cell, collections::HashSet, fs, path::{Path, PathBuf}, sync::Arc};
 
 use celeriant_client_tokio::{
-    CeleriantPool, PoolOptions, WriteEventsOptions,
-    celeriant_client::{ClientIdentityConfig, ClientTlsConfig},
+    CeleriantPool, ClientTlsConfig, PoolOptions, WriteEventsOptions, sni_host,
+    celeriant_client::ClientIdentityConfig,
     list_operations::ListOptions,
     watch_connection::WatchOptions,
 };
-use celeriant_crypto::{pki::PkiManager, Crypto};
+use celeriant_crypto::Crypto;
 use celeriant_msg::request::{
     read_filters::ReadFilters,
     requests::*,
@@ -17,12 +17,11 @@ use celeriant_wal::{
     schema_key::SchemaKey,
 };
 use directories::ProjectDirs;
-use rustls::pki_types::ServerName;
 use tokio::time::Duration;
 
 use crate::cli::Cli;
 use crate::tui::settings::{IdentityMode, Settings};
-use crate::utils::{extract_host, format_timestamp, format_u128_uuid, parse_u128};
+use crate::utils::{format_timestamp, format_u128_uuid, parse_u128};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Screen {
@@ -649,32 +648,21 @@ impl App {
             return Err("TLS is enabled but ca_cert is not configured".to_string());
         }
 
-        let ca_bundle = PkiManager::load_ca_bundle(Path::new(&s.ca_cert))
-            .map_err(|e| format!("Failed to load CA certificate '{}': {}", s.ca_cert, e))?;
-
-        let client_config = if !s.client_cert.is_empty() && !s.client_key.is_empty() {
-            let (chain, key) = PkiManager::load_identity(
-                Path::new(&s.client_cert),
-                Path::new(&s.client_key),
-            )
-            .map_err(|e| format!("Failed to load client identity '{}': {}", s.client_cert, e))?;
-            PkiManager::build_client_config(&ca_bundle, chain, key)
-                .map_err(|e| format!("Failed to build TLS client config: {}", e))?
+        // Both halves must be filled in; a half-configured identity stays anonymous.
+        let identity = if !s.client_cert.is_empty() && !s.client_key.is_empty() {
+            Some((Path::new(&s.client_cert), Path::new(&s.client_key)))
         } else {
-            PkiManager::build_client_config_no_auth(&ca_bundle)
-                .map_err(|e| format!("Failed to build TLS client config: {}", e))?
+            None
         };
 
         let host = if !s.server_name.is_empty() {
-            &s.server_name
+            s.server_name.as_str()
         } else {
-            extract_host(&self.server_address)
+            sni_host(&self.server_address).map_err(|e| e.to_string())?
         };
 
-        let server_name = ServerName::try_from(host.to_owned())
-            .map_err(|_| format!("Invalid TLS server name: {host}"))?;
-
-        Ok(ClientTlsConfig::new(client_config, server_name))
+        ClientTlsConfig::from_paths(Path::new(&s.ca_cert), identity, host)
+            .map_err(|e| format!("Failed to build TLS config from CA '{}': {}", s.ca_cert, e))
     }
 
     fn build_identity_config(&self) -> Result<Option<ClientIdentityConfig>, String> {

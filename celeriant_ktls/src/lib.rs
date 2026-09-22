@@ -170,7 +170,7 @@ pub fn verify_ktls_support() -> Result<(), KtlsError> {
 mod drain_contract_tests;
 
 #[cfg(test)]
-mod review_evidence_tests;
+mod drain_black_box_tests;
 
 #[cfg(test)]
 mod accept_bounded_completion;

@@ -21,6 +21,7 @@ pub mod invariant_list_termination;
 pub mod invariant_metrics_described;
 pub mod invariant_pool_seed_only_routing;
 pub mod invariant_protocol_version;
+pub mod invariant_connection_gauge_redirect;
 pub mod invariant_rotation_orphan_metric;
 pub mod invariant_schema_redirect;
 pub mod invariant_size_caps;
@@ -178,7 +179,6 @@ use std::path::PathBuf;
 use celeriant_client_tokio::ClientTlsConfig;
 use celeriant_crypto::pki::PkiManager;
 pub use celeriant_lib::server_config::{ConfigClientAuth, ConfigTlsMode};
-use rustls_pki_types::ServerName;
 use tempfile::TempDir;
 use tokio::net::TcpStream;
 use tokio::time::sleep;
@@ -1633,12 +1633,20 @@ impl TestPki {
         client_key_path: &std::path::Path,
         server_name: &str,
     ) -> Result<ClientTlsConfig, Box<dyn std::error::Error>> {
-        let ca_bundle = PkiManager::load_ca_bundle(&self.ca_cert_path())?;
-        let (cert_chain, key) = PkiManager::load_identity(client_cert_path, client_key_path)?;
-        let client_config = PkiManager::build_client_config(&ca_bundle, cert_chain, key)?;
-        let sni = ServerName::try_from(server_name.to_string())
-            .map_err(|e| format!("Invalid server name '{}': {e}", server_name))?;
-        Ok(ClientTlsConfig::new(client_config, sni))
+        Ok(ClientTlsConfig::from_paths(
+            &self.ca_cert_path(),
+            Some((client_cert_path, client_key_path)),
+            server_name,
+        )?)
+    }
+
+    /// A client trusting this CA but presenting no client certificate.
+    /// The anonymous case `build_client_tls_config` cannot express.
+    pub fn build_anonymous_tls_config(
+        &self,
+        server_name: &str,
+    ) -> Result<ClientTlsConfig, Box<dyn std::error::Error>> {
+        Ok(ClientTlsConfig::from_paths(&self.ca_cert_path(), None, server_name)?)
     }
 }
 

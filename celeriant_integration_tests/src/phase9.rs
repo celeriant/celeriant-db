@@ -15,6 +15,7 @@
 
 use std::time::Duration;
 
+use celeriant_client_tokio::ClientTlsConfig;
 use celeriant_client_tokio::celeriant_client::{CeleriantClient, ClientIdentityConfig};
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_client_tokio::client_operations::WriteEventsOptions;
@@ -126,7 +127,7 @@ pub async fn mtls_require_no_cert_refused() -> R {
         .map_err(|e| format!("positive control failed — a valid mTLS client could not connect: {e}"))?;
 
     // No client cert at all (anonymous) must be refused under `require`.
-    let anon = build_anonymous_tls(&pki, "localhost")?;
+    let anon = pki.build_anonymous_tls_config("localhost")?;
     match connect_and_probe(server.address(), anon).await {
         Err(_) => Ok(()),
         Ok(()) => Err("require server accepted a client presenting NO certificate".into()),
@@ -147,7 +148,7 @@ pub async fn tls_strict_refuses_plaintext() -> R {
     let server = TestServer::start_with_config_labeled(port, cfg, "tls-strict".into()).await?;
 
     // Positive control: a TLS client (anonymous, trusts the CA) connects + writes.
-    let tls = build_anonymous_tls(&pki, "localhost")?;
+    let tls = pki.build_anonymous_tls_config("localhost")?;
     connect_and_probe(server.address(), tls)
         .await
         .map_err(|e| format!("positive control failed — a TLS client could not reach the strict server: {e}"))?;
@@ -180,7 +181,7 @@ pub async fn tls_client_auth_none_allows_anonymous() -> R {
 
     // Client trusts the CA but presents NO client cert (anonymous). With
     // client-auth=none the server does not request one, so the write succeeds.
-    let tls = build_anonymous_tls(&pki, "localhost")?;
+    let tls = pki.build_anonymous_tls_config("localhost")?;
     let mut c = CeleriantClient::connect_tls(server.address(), tls).await?;
     let key = AggregateKey::new(900, 4, 1);
     c.write_events_with(
@@ -346,7 +347,7 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 /// reject surfaces here).
 async fn connect_and_probe(
     address: &str,
-    tls: celeriant_client_tokio::celeriant_client::ClientTlsConfig,
+    tls: ClientTlsConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut c = tokio::time::timeout(Duration::from_secs(10), CeleriantClient::connect_tls(address, tls))
         .await
@@ -358,29 +359,4 @@ async fn connect_and_probe(
     )
     .await?;
     Ok(())
-}
-
-/// A client TLS config that trusts the test CA but presents NO client identity
-/// certificate (anonymous client). Built directly from rustls so we can omit the
-/// client auth cert that `TestPki::build_client_tls_config` always attaches.
-fn build_anonymous_tls(
-    pki: &TestPki,
-    server_name: &str,
-) -> Result<celeriant_client_tokio::celeriant_client::ClientTlsConfig, Box<dyn std::error::Error>> {
-    use rustls_pki_types::ServerName;
-    use std::sync::Arc;
-
-    let ca_pem = std::fs::read(pki.ca_cert_path())?;
-    let mut roots = rustls::RootCertStore::empty();
-    let mut reader = std::io::BufReader::new(&ca_pem[..]);
-    for cert in rustls_pemfile::certs(&mut reader) {
-        roots.add(cert?)?;
-    }
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let client_config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let sni = ServerName::try_from(server_name.to_string())?;
-    Ok(celeriant_client_tokio::celeriant_client::ClientTlsConfig::new(Arc::new(client_config), sni))
 }

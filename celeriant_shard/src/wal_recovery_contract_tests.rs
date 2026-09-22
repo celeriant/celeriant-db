@@ -22,8 +22,8 @@
 //!     => boot recovers to the PRIOR header cursor, serves exactly what that
 //!        header covers, invents no tail, and stays writable.
 //!
-//! The crash window is simulated on disk (goal.md "Falsification depth": the
-//! window itself is not exercised, the resulting states are). A shard writes
+//! The crash window is simulated on disk: the window itself is not exercised,
+//! the resulting states are. A shard writes
 //! batch A, is closed, and its two durable header blocks are captured. It then
 //! writes batch B — whose datablocks, metablocks AND header land — and is
 //! dropped SIGKILL-style. Restoring A's header blocks over B's, leaving every

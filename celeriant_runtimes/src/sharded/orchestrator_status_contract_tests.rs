@@ -393,6 +393,7 @@ fn shard_config(dir: &std::path::Path) -> ShardConfig {
         list_page_size: 100,
         list_max_concurrent: 16,
         read_max_concurrent: 64,
+        handshake_concurrency: 8,
         schema_cache_bytes: 1024 * 1024,
         max_schema_size_bytes: 16384,
         max_clock_drift_ms: DRIFT_MS,

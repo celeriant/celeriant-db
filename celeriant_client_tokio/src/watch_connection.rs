@@ -10,7 +10,8 @@ use celeriant_msg::response::responses::WatchResponse;
 use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V2, WireHeader};
 use tokio::time::{timeout, Duration};
 
-use crate::celeriant_client::{CachedDict, ClientIdentityConfig, ClientStream, ClientTlsConfig};
+use crate::ClientTlsConfig;
+use crate::celeriant_client::{CachedDict, ClientIdentityConfig, ClientStream};
 use crate::client_error::ClientError;
 
 /// Options for configuring a watch connection
@@ -174,12 +175,10 @@ where
             (Some(sha), Some(bytes)) => {
                 Some(CachedDict { sha, bytes: Arc::from(bytes.into_boxed_slice()) })
             }
-            (Some(sha), None) => {
-                match dict_lookup(&sha) {
-                    Some(bytes) => Some(CachedDict { sha, bytes }),
-                    None => None
-                }
-            }
+            (Some(sha), None) => match dict_lookup(&sha) {
+                Some(bytes) => Some(CachedDict { sha, bytes }),
+                None => return Err(ClientError::DictUnavailable { sha }),
+            },
             (None, _) => None,
         };
         return Ok(cached);
@@ -255,7 +254,10 @@ impl WatchConnection {
     {
         // If max_shard_hint is provided, skip probe and open N connections directly
         if let Some(max_shard) = options.max_shard_hint {
-            let num_shards = max_shard.checked_add(1).ok_or(ClientError::ProtocolError)?;
+            let num_shards = max_shard.checked_add(1).ok_or(ClientError::InvalidShardRange {
+                start_shard: options.start_shard,
+                max_shard_hint: max_shard,
+            })?;
             return Self::connect_multi_shard(
                 address,
                 &request,
@@ -885,6 +887,72 @@ mod tests {
         }
     }
 
+    /// The watch handshake carries the same dict negotiation as a request
+    /// connection, so an unresolvable confirmed sha must fail the dial rather
+    /// than hand back a watch that dies on its first compressed frame.
+    #[tokio::test]
+    async fn a_watch_identify_confirming_an_uncached_dict_sha_fails_the_dial() {
+        use celeriant_msg::process_identify::{read_identify_request, write_identify_response};
+        use celeriant_msg::response::responses::IdentifyResponse;
+        use celeriant_wire::network::wire_header::WireHeader;
+        use crate::celeriant_client::ClientIdentityConfig;
+        use crate::client_error::ClientError;
+        use futures_lite::AsyncWriteExt;
+        use tokio_util::compat::TokioAsyncReadCompatExt;
+
+        const UNCACHED_SHA: &str = "a-sha-no-cache-can-resolve";
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (watched, mut saw_watch) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = socket.compat();
+            let header = WireHeader::from_reader(&mut stream, WATCH_MAX).await.unwrap();
+            read_identify_request(header, &mut stream).await.unwrap();
+            let resp = IdentifyResponse {
+                correlation_id: None,
+                client_id: Some(7),
+                access_level: None,
+                compression_dict_sha256: Some(UNCACHED_SHA.to_string()),
+                compression_dict_bytes: None,
+            };
+            write_identify_response(&mut stream, &resp, PROTOCOL_VERSION_V2).await.unwrap();
+            stream.flush().await.unwrap();
+            if WireHeader::from_reader(&mut stream, WATCH_MAX).await.is_ok() {
+                let _ = watched.send(()).await;
+            }
+        });
+
+        let options = WatchOptions {
+            identity_config: Some(ClientIdentityConfig {
+                public_key: None,
+                private_key: None,
+                api_key: None,
+            }),
+            timeout: Some(Duration::from_secs(5)),
+            ..WatchOptions::default()
+        };
+        let dialled = WatchConnection::connect_with_dict(
+            &addr.to_string(),
+            watch_request(),
+            options,
+            Some(UNCACHED_SHA.to_string()),
+            |_| None,
+        )
+        .await;
+
+        match dialled {
+            Err(ClientError::DictUnavailable { ref sha }) => assert_eq!(sha, UNCACHED_SHA),
+            Err(other) => panic!("expected DictUnavailable, got {other:?}"),
+            Ok(_) => panic!("a confirmed sha the client cannot resolve must fail the dial"),
+        }
+        assert!(
+            saw_watch.try_recv().is_err(),
+            "the watch request must not follow a failed handshake"
+        );
+    }
+
     #[tokio::test]
     async fn a_max_shard_hint_that_overflows_is_rejected_not_silently_empty() {
         let options = WatchOptions {
@@ -893,9 +961,11 @@ mod tests {
         };
         let result = WatchConnection::connect("127.0.0.1:1", watch_request(), options).await;
         match result {
-            Err(crate::client_error::ClientError::ProtocolError) => {}
+            Err(crate::client_error::ClientError::InvalidShardRange { max_shard_hint, .. }) => {
+                assert_eq!(max_shard_hint, u64::MAX)
+            }
             Ok(_) => panic!("a max_shard_hint of u64::MAX must not yield a silent empty watch"),
-            Err(other) => panic!("expected ProtocolError, got {other:?}"),
+            Err(other) => panic!("expected InvalidShardRange, got {other:?}"),
         }
     }
 

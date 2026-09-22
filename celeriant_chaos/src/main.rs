@@ -5,7 +5,7 @@ use clap::Parser;
 
 use celeriant_chaos::actions::find_project_root;
 use celeriant_chaos::config::ClusterConfig;
-use celeriant_chaos::report::{RunDir, write_run_report, write_scenario};
+use celeriant_chaos::report::{RunDir, git, tracked_changes, write_run_report, write_scenario};
 use celeriant_chaos::scenario::{
     DefectParams, run_promotion_failure_survival, run_write_outage_selfheal,
     ScenarioParams, ScenarioReport, run_baseline, run_bridge, run_cas_storm_scenario,
@@ -32,6 +32,12 @@ struct Args {
     #[arg(long)]
     full: bool,
 
+    /// Allow `--full` to run with tracked modifications in the working tree.
+    /// A full suite takes hours and its run directory is the record of a
+    /// build; an uncommitted tree makes that record unreproducible.
+    #[arg(long)]
+    allow_dirty: bool,
+
     /// Run one scenario by name. See README for the list; a few sit outside
     /// --full, including the defect reproductions `write_outage_selfheal` and
     /// `promotion_failure_survival`.
@@ -43,7 +49,8 @@ struct Args {
     tasks: usize,
 
     /// Spread bench task starts over this many seconds (baseline scenario
-    /// only). Default: off — the cold-connect herd is part of the test.
+    /// only; fault scenarios keep the cold-connect herd). Off by default:
+    /// baseline bounds its pool instead of ramping.
     #[arg(long)]
     connect_ramp: Option<u64>,
 
@@ -169,6 +176,30 @@ struct Args {
     defect_settle_secs: Option<u64>,
 }
 
+/// A `--full` run is a multi-hour record of one build. Refuse to start one
+/// against a tree whose TRACKED files differ from HEAD. Untracked scratch
+/// (session notes, workspaces) does not count.
+fn refuse_full_on_dirty_tree(project_root: &PathBuf) -> Result<(), String> {
+    let porcelain = git(project_root, &["status", "--porcelain"])?;
+    let changes = tracked_changes(&porcelain);
+    if changes.is_empty() {
+        return Ok(());
+    }
+    // Printed rather than returned: `main`'s Err is Debug-formatted, which
+    // renders a multi-line list as one escaped blob.
+    eprintln!(
+        "--full refused: {} tracked file(s) differ from HEAD, so this run could not be \
+         reproduced from any commit. Untracked files (session scratch) are ignored; \
+         only these count:",
+        changes.len(),
+    );
+    for change in &changes {
+        eprintln!("  {change}");
+    }
+    eprintln!("Commit them, stash them, or pass --allow-dirty.");
+    Err("--full refused: dirty working tree".into())
+}
+
 /// Entropy source for the default seed: no `rand` crate dependency here, so
 /// mix wall-clock nanos with `RandomState`'s per-process random keys (both
 /// vary run-to-run without needing a PRNG library).
@@ -194,6 +225,10 @@ async fn main() -> Result<(), String> {
     };
     let cfg = ClusterConfig::load(deploy_dir)?;
 
+    if args.full && !args.allow_dirty {
+        refuse_full_on_dirty_tree(&project_root)?;
+    }
+
     let seed = args.seed.unwrap_or_else(entropy_seed);
 
     println!("=== celeriant-chaos ===");
@@ -211,6 +246,7 @@ async fn main() -> Result<(), String> {
         duration_secs: args.duration,
         throughput_floor: args.throughput_floor,
         connect_ramp_secs: args.connect_ramp,
+        max_connections: None,
         seed,
     };
 

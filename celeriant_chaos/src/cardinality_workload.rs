@@ -28,7 +28,8 @@ use celeriant_bench::account_workload::{
 use celeriant_bench::population::{AgeBucket, Member, Population, PopulationConfig};
 use celeriant_bench::read_workload::{ReadErrorKind, ReheatCostCurve};
 use celeriant_bench::{
-    ClientError, HistoryRecorder, Pool, ReadFilters, ServerError, WriteError, WriteEventsOptions,
+    ClientError, ErrorBreakdown, HistoryRecorder, Pool, ReadFilters, ServerError, WriteError,
+    WriteEventsOptions,
 };
 
 /// Data shards on the cluster: 4 cores with `RESERVE_COORDINATOR_SHARD=true`,
@@ -48,10 +49,9 @@ pub const BLOOM_DESIGN_POINT_AGGS_PER_SEGMENT: u64 = 200_000;
 // Parameters
 // ---------------------------------------------------------------------------
 
-/// Fill budget presets. The third column of goal.md's table is the point: the
-/// oldest measurable dormancy age is bounded by how long the fill ran, so five
-/// hours is not a longer version of one hour — it reaches a part of the reheat
-/// curve one hour cannot.
+/// Fill budget presets. The oldest measurable dormancy age is bounded by how
+/// long the fill ran, so five hours is not a longer version of one hour: it
+/// reaches a part of the reheat curve one hour cannot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Preset {
     /// 10 min. No useful age spread; proves the harness assembles. Inconclusive
@@ -831,6 +831,10 @@ pub async fn run_fill_task(
     stop: Arc<AtomicBool>,
     counters: Arc<FillCounters>,
     curve: Arc<std::sync::Mutex<ReheatCostCurve>>,
+    // Scenario-wide tally by `ClientError` variant. `FillErrorTally` is the
+    // write-shaped view for the markdown; this is the uniform one every
+    // scenario's JSON carries.
+    errors: Arc<ErrorBreakdown>,
     start: Instant,
 ) -> FillOutcome {
     let mut population = Population::new(population_config(cfg.task_id, cfg.tasks, cfg.budget, cfg.seed));
@@ -931,6 +935,7 @@ pub async fn run_fill_task(
                             totals.reheat_errors += 1;
                             totals.errors_by_kind.record(FillWriteError::of(&e));
                             counters.record_error(FillWriteError::of(&e));
+                            errors.record(&e);
                             if let Ok(mut c) = curve.lock() {
                                 c.record_error(bucket, ReadErrorKind::of(&e));
                             }
@@ -1026,12 +1031,14 @@ pub async fn run_fill_task(
                     totals.write_errors += 1;
                     totals.errors_by_kind.record(FillWriteError::Idempotency);
                     counters.record_error(FillWriteError::Idempotency);
+                    errors.record(&e);
                     active.swap_remove(i);
                 }
                 FillRetry::Backoff => {
                     totals.write_errors += 1;
                     totals.errors_by_kind.record(FillWriteError::of(&e));
                     counters.record_error(FillWriteError::of(&e));
+                    errors.record(&e);
                     active[i].defer(now_ms);
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
@@ -1309,6 +1316,7 @@ pub async fn run_hot_writer(
     cfg: HotWriterConfig,
     history: Option<Arc<HistoryRecorder>>,
     availability: Option<Arc<AvailabilityClock>>,
+    errors: Arc<ErrorBreakdown>,
 ) -> (HotWriterStats, Vec<u64>) {
     let client_id = cfg.member.client_id ^ ((cfg.replica as u128 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
     let key = account_key(cfg.member.aggregate_id);
@@ -1370,6 +1378,7 @@ pub async fn run_hot_writer(
                     continue;
                 }
                 stats.errors += 1;
+                errors.record(&e);
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
@@ -1731,8 +1740,8 @@ mod tests {
 
     #[test]
     fn the_payload_mix_is_derived_and_the_achieved_density_is_reported() {
-        // goal.md's own sizing table: 256MB wants ~4% large events to hit the
-        // 200k design point, 1GB wants ~53%.
+        // The sizing table: 256MB wants ~4% large events to hit the 200k
+        // design point, 1GB wants ~53%.
         let small = CardinalityParams { segment_bytes: 256 * 1024 * 1024, ..Default::default() };
         let big = CardinalityParams { segment_bytes: 1024 * 1024 * 1024, ..Default::default() };
         assert!((small.large_event_fraction() - 0.039).abs() < 0.005, "{}", small.large_event_fraction());

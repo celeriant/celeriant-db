@@ -36,14 +36,20 @@ pub struct OutFrame {
 
 /// Compress an already-serialized body with the cluster `dict` when `compress` is set and a dict is
 /// present, else pass it through uncompressed (e.g. a client that has not yet negotiated a dict).
-/// Synchronous: the `&[u8]` dict borrow ends here.
 pub fn build_frame(
     type_id: u32,
     uncompressed: Vec<u8>,
     dict: Option<&[u8]>,
     compress: bool,
+    max_size_bytes: u64,
 ) -> Result<OutFrame, WireError> {
     let uncompressed_size = checked_u32_len(uncompressed.len())?;
+    if uncompressed_size as u64 > max_size_bytes {
+        return Err(WireError::MessageTooLarge {
+            message_length: uncompressed_size as u64,
+            max_size_bytes,
+        });
+    }
     let (compression, body) = match (compress, dict) {
         (true, Some(dict)) => (
             CompressionType::ZstdDict,
@@ -151,7 +157,7 @@ mod tests {
 
     impl Conn {
         async fn round_trip(&mut self, type_id: u32, body: Vec<u8>, compress: bool) -> Result<Vec<u8>, WireError> {
-            let frame = build_frame(type_id, body, Some(&self.dict), compress)?;
+            let frame = build_frame(type_id, body, Some(&self.dict), compress, MAX)?;
             let mut wire = Vec::new();
             write_frame(&mut wire, &frame, MAX, PROTOCOL_VERSION_V2).await?;
             let mut reader = Cursor::new(wire);
@@ -171,6 +177,24 @@ mod tests {
         let fut = conn.round_trip(3, payload.clone(), true);
         assert_send(&fut);
         assert_eq!(block_on(fut).unwrap(), payload);
+    }
+
+    /// A body the cap already forbids must be refused where it is still
+    /// uncompressed, so an oversized request never pays for compression it
+    /// cannot use. The write-side guard still catches a body that compression
+    /// grew across the cap.
+    #[test]
+    fn an_oversized_body_is_refused_before_it_is_compressed() {
+        const TINY_MAX: u64 = 4096;
+        let body = vec![0u8; 1_048_576];
+        match build_frame(3, body, Some(&dict()), true, TINY_MAX) {
+            Ok(_) => panic!("a body over the cap must not reach the compressor"),
+            Err(WireError::MessageTooLarge { message_length, max_size_bytes }) => {
+                assert_eq!(message_length, 1_048_576, "the uncompressed length is what was judged");
+                assert_eq!(max_size_bytes, TINY_MAX);
+            }
+            Err(other) => panic!("expected MessageTooLarge, got {other:?}"),
+        }
     }
 
     /// Uncompressed frames round-trip too (the zero-copy `decompress` borrow path).

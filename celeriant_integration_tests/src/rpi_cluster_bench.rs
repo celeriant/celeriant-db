@@ -23,12 +23,10 @@ use std::time::Duration;
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_client_tokio::ClientTlsConfig;
-use celeriant_crypto::pki::PkiManager;
 use celeriant_msg::process_client_requests::ClientRequest;
 use celeriant_msg::request::requests::{SingleAggregateWrite, WriteRequest};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
-use rustls_pki_types::ServerName;
 use tokio::sync::Barrier;
 use tokio::time::Instant;
 
@@ -53,16 +51,11 @@ fn build_tls_config(
     client_key: &str,
     server_name: &str,
 ) -> Result<ClientTlsConfig, Box<dyn std::error::Error>> {
-    let ca_path = expand_home(ca_cert);
-    let cert_path = expand_home(client_cert);
-    let key_path = expand_home(client_key);
-
-    let ca_bundle = PkiManager::load_ca_bundle(&ca_path)?;
-    let (cert_chain, key) = PkiManager::load_identity(&cert_path, &key_path)?;
-    let client_config = PkiManager::build_client_config(&ca_bundle, cert_chain, key)?;
-    let sni = ServerName::try_from(server_name.to_string())
-        .map_err(|e| format!("Invalid server name '{}': {e}", server_name))?;
-    Ok(ClientTlsConfig::new(client_config, sni))
+    Ok(ClientTlsConfig::from_paths(
+        &expand_home(ca_cert),
+        Some((&expand_home(client_cert), &expand_home(client_key))),
+        server_name,
+    )?)
 }
 
 struct TaskStats {

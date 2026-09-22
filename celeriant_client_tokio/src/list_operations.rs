@@ -28,6 +28,20 @@ fn is_shard_routing_error(error: &ClientError) -> bool {
     matches!(error, ClientError::Server(crate::server_error::ServerError::ShardRouting { .. }))
 }
 
+/// A `max_shard_hint` below `start_shard` names a range no shard can satisfy.
+/// Discovery reports it as a clean empty stream, indistinguishable from an empty
+/// database, so reject it where the caller can still see it. That is the
+/// contract `WatchConnection` already holds for its own impossible ranges.
+pub(crate) fn check_shard_range(options: &ListOptions) -> Result<(), ClientError> {
+    match options.max_shard_hint {
+        Some(max) if max < options.start_shard => Err(ClientError::InvalidShardRange {
+            start_shard: options.start_shard,
+            max_shard_hint: max,
+        }),
+        _ => Ok(()),
+    }
+}
+
 impl Default for ListOptions {
     fn default() -> Self {
         Self {
@@ -54,14 +68,15 @@ pub struct ListOrgsIterator<'a> {
 }
 
 impl<'a> ListOrgsIterator<'a> {
-    pub fn new(client: &'a mut CeleriantClient, options: ListOptions) -> Self {
+    pub fn new(client: &'a mut CeleriantClient, options: ListOptions) -> Result<Self, ClientError> {
+        check_shard_range(&options)?;
         let mut active_shards = VecDeque::new();
         let mut shard_cursors = HashMap::new();
 
         active_shards.push_back(options.start_shard);
         shard_cursors.insert(options.start_shard, None);
 
-        Self {
+        Ok(Self {
             client,
             shard_cursors,
             active_shards,
@@ -70,7 +85,7 @@ impl<'a> ListOrgsIterator<'a> {
             seen: HashSet::new(),
             buffer: VecDeque::new(),
             exhausted: false,
-        }
+        })
     }
 
     /// Get the next organization, or None if exhausted
@@ -192,13 +207,14 @@ impl<'a> ListAggregateTypesIterator<'a> {
         client: &'a mut CeleriantClient,
         org_id: Option<u128>,
         options: ListOptions,
-    ) -> Self {
+    ) -> Result<Self, ClientError> {
+        check_shard_range(&options)?;
         let mut active_shards = VecDeque::new();
         let mut shard_cursors = HashMap::new();
         active_shards.push_back(options.start_shard);
         shard_cursors.insert(options.start_shard, None);
 
-        Self {
+        Ok(Self {
             client,
             org_id,
             shard_cursors,
@@ -208,7 +224,7 @@ impl<'a> ListAggregateTypesIterator<'a> {
             seen: HashSet::new(),
             buffer: VecDeque::new(),
             exhausted: false,
-        }
+        })
     }
 
     pub async fn next(&mut self) -> Option<Result<AggregateTypeListItem, ClientError>> {
@@ -414,13 +430,14 @@ impl<'a> ListAggregatesIterator<'a> {
         org_id: Option<u128>,
         aggregate_type_id: Option<u128>,
         options: ListOptions,
-    ) -> Self {
+    ) -> Result<Self, ClientError> {
+        check_shard_range(&options)?;
         let mut active_shards = VecDeque::new();
         let mut shard_cursors = HashMap::new();
         active_shards.push_back(options.start_shard);
         shard_cursors.insert(options.start_shard, None);
 
-        Self {
+        Ok(Self {
             client,
             org_id,
             aggregate_type_id,
@@ -435,7 +452,7 @@ impl<'a> ListAggregatesIterator<'a> {
             order_pos: 0,
             buffer: VecDeque::new(),
             exhausted: false,
-        }
+        })
     }
 
     /// Get the next aggregate with accumulated stats, or None if exhausted
@@ -599,6 +616,46 @@ mod tests {
         assert_eq!(stats.uncompressed_size, u64::MAX);
     }
 
+    /// A range that can never hold a shard is a caller mistake, not an empty
+    /// database: reject it where the watch path rejects its own impossible
+    /// range, before a byte reaches the node.
+    #[tokio::test]
+    async fn an_impossible_shard_range_is_rejected_before_any_request() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sent, mut saw_request) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut byte = [0u8; 1];
+            if matches!(socket.read(&mut byte).await, Ok(1)) {
+                let _ = sent.send(()).await;
+            }
+        });
+        let mut client = crate::celeriant_client::CeleriantClient::connect(&addr.to_string())
+            .await
+            .unwrap();
+
+        let opts = ListOptions { start_shard: 4, max_shard_hint: Some(3), ..Default::default() };
+        for outcome in [
+            ListOrgsIterator::new(&mut client, opts.clone()).map(|_| ()),
+            ListAggregateTypesIterator::new(&mut client, Some(1), opts.clone()).map(|_| ()),
+            ListAggregatesIterator::new(&mut client, Some(1), Some(1), opts.clone()).map(|_| ()),
+        ] {
+            match outcome {
+                Err(ClientError::InvalidShardRange { start_shard: 4, max_shard_hint: 3 }) => {}
+                Err(other) => panic!("expected InvalidShardRange, got {other:?}"),
+                Ok(()) => panic!("max_shard_hint below start_shard must not yield a silent empty stream"),
+            }
+        }
+
+        assert!(
+            saw_request.try_recv().is_err(),
+            "a rejected range must not put a request on the wire"
+        );
+    }
+
     /// Constructing an iterator at the top of the shard range must not
     /// overflow the shard cursor (start_shard + 1 panicked in debug builds).
     #[tokio::test]
@@ -617,21 +674,21 @@ mod tests {
         for (start_shard, adds_before_stop) in [(u64::MAX - 1, 1), (u64::MAX, 0)] {
             let opts = ListOptions { start_shard, ..Default::default() };
             {
-                let mut it = ListOrgsIterator::new(&mut client, opts.clone());
+                let mut it = ListOrgsIterator::new(&mut client, opts.clone()).unwrap();
                 for _ in 0..adds_before_stop {
                     assert!(it.try_add_next_shard());
                 }
                 assert!(!it.try_add_next_shard(), "the cursor must saturate, not wrap");
             }
             {
-                let mut it = ListAggregateTypesIterator::new(&mut client, Some(1), opts.clone());
+                let mut it = ListAggregateTypesIterator::new(&mut client, Some(1), opts.clone()).unwrap();
                 for _ in 0..adds_before_stop {
                     assert!(it.try_add_next_shard());
                 }
                 assert!(!it.try_add_next_shard(), "the cursor must saturate, not wrap");
             }
             {
-                let mut it = ListAggregatesIterator::new(&mut client, Some(1), Some(1), opts.clone());
+                let mut it = ListAggregatesIterator::new(&mut client, Some(1), Some(1), opts.clone()).unwrap();
                 for _ in 0..adds_before_stop {
                     assert!(it.try_add_next_shard());
                 }

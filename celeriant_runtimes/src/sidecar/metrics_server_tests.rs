@@ -74,6 +74,8 @@ fn recorded_metrics_have_descriptions() {
         "celeriant_barrier_sync_fsync_failed_total",
         "celeriant_probe_kick_total",
         "celeriant_s3_catchup_stall_bail_total",
+        "celeriant_s3_catchup_task_skipped_in_flight_total",
+        "celeriant_s3_catchup_task_timeout_total",
         "celeriant_s3_catchup_via_s3_step_total",
         "celeriant_s3_catchup_via_s3_exhausted_total",
         "celeriant_s3_catchup_reframed_at_read_total",
@@ -106,6 +108,10 @@ fn recorded_metrics_have_descriptions() {
         "celeriant_writes_accepted_no_prior_client_seq_total",
         "celeriant_writes_rejected_backpressure_total",
         "celeriant_rotation_orphan_deleted_total",
+        "celeriant_client_accepts_total",
+        "celeriant_tls_handshake_seconds",
+        "celeriant_tls_handshake_failures_total",
+        "celeriant_tls_handshakes_in_flight",
     ];
 
     for name in recorded {

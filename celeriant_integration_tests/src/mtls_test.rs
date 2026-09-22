@@ -13,8 +13,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_client_tokio::ClientTlsConfig;
-use celeriant_crypto::pki::PkiManager;
 use crate::{ServerConfig, TestPki, TestServer};
 use celeriant_lib::server_config::{ConfigClientAuth, ConfigTlsMode};
 use celeriant_msg::{
@@ -26,7 +24,6 @@ use celeriant_wal::{
     aggregate_key::AggregateKey,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
-use rustls_pki_types::ServerName;
 use tokio::time::Duration;
 
 const CLIENT_ID: u128 = 54321;
@@ -255,12 +252,7 @@ async fn test_untrusted_cert_rejected() -> Result<(), Box<dyn std::error::Error>
     )
     .await?;
 
-    let ca_bundle = PkiManager::load_ca_bundle(&cluster_pki.ca_cert_path())?;
-    let (cert_chain, key) = PkiManager::load_identity(&rogue_client_cert, &rogue_client_key)?;
-    let client_config = PkiManager::build_client_config(&ca_bundle, cert_chain, key)?;
-    let sni = ServerName::try_from("localhost".to_string())
-        .map_err(|e| format!("Invalid server name: {e}"))?;
-    let tls = ClientTlsConfig::new(client_config, sni);
+    let tls = cluster_pki.build_client_tls_config(&rogue_client_cert, &rogue_client_key, "localhost")?;
 
     match CeleriantClient::connect_with_timeout(
         server.address(),
@@ -385,11 +377,7 @@ async fn test_trust_domain_isolation() -> Result<(), Box<dyn std::error::Error>>
     let mut client_port_ok = false;
     for attempt in 0..KTLS_RETRIES {
         // Client trusts intracluster CA to verify the server's node cert.
-        let ca_bundle = PkiManager::load_ca_bundle(&intracluster_pki.ca_cert_path())?;
-        let (cert_chain, key) = PkiManager::load_identity(&client_cert, &client_key)?;
-        let client_config = PkiManager::build_client_config(&ca_bundle, cert_chain, key)?;
-        let sni = ServerName::try_from("localhost".to_string())?;
-        let tls = ClientTlsConfig::new(client_config, sni);
+        let tls = intracluster_pki.build_client_tls_config(&client_cert, &client_key, "localhost")?;
 
         match CeleriantClient::connect_with_timeout(
             server.address(),
@@ -426,11 +414,7 @@ async fn test_trust_domain_isolation() -> Result<(), Box<dyn std::error::Error>>
 
     // 2. Same client cert should be rejected on the replication port.
     let repl_addr = format!("127.0.0.1:{}", port + 1);
-    let ca_bundle = PkiManager::load_ca_bundle(&intracluster_pki.ca_cert_path())?;
-    let (cert_chain, key) = PkiManager::load_identity(&client_cert, &client_key)?;
-    let client_config = PkiManager::build_client_config(&ca_bundle, cert_chain, key)?;
-    let sni = ServerName::try_from("localhost".to_string())?;
-    let tls = ClientTlsConfig::new(client_config, sni);
+    let tls = intracluster_pki.build_client_tls_config(&client_cert, &client_key, "localhost")?;
 
     match CeleriantClient::connect_with_timeout(
         &repl_addr,

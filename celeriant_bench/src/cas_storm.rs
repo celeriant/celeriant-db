@@ -12,6 +12,7 @@
 //! counters are corroborating colour. Rounds advance lock-step: losers learn
 //! the new version from the conflict error's `current_aggregate_version`.
 
+use crate::error_breakdown::{print_error_summary, ErrorBreakdown, ErrorKindCount};
 use crate::history::HistoryRecorder;
 use celeriant_client_tokio::pool::CeleriantPool;
 use celeriant_client_tokio::{ClientError, ServerError, WriteEventsOptions, WriteError};
@@ -41,6 +42,9 @@ pub struct CasStormOutcome {
     /// Definitive non-OCC rejections (not-leader, busy, validation).
     pub other_failures: u64,
     pub elapsed_secs: f64,
+    /// `ambiguous + other_failures` split by `ClientError` variant. OCC
+    /// conflicts are correct behaviour here, so they are deliberately absent.
+    pub errors_by_kind: Vec<ErrorKindCount>,
 }
 
 pub async fn run_cas_storm(
@@ -75,6 +79,7 @@ pub async fn run_cas_storm(
     let ambiguous = Arc::new(AtomicU64::new(0));
     let other_failures = Arc::new(AtomicU64::new(0));
     let rounds = Arc::new(AtomicU64::new(0));
+    let breakdown = Arc::new(ErrorBreakdown::default());
 
     let start = Instant::now();
     let deadline = start + Duration::from_secs(duration_secs);
@@ -91,6 +96,7 @@ pub async fn run_cas_storm(
         let ambiguous = ambiguous.clone();
         let other_failures = other_failures.clone();
         let rounds = rounds.clone();
+        let breakdown = Arc::clone(&breakdown);
         let history = history.clone();
         let client_id: u128 = 9_001 + w as u128;
 
@@ -142,14 +148,17 @@ pub async fn run_cas_storm(
                             version.fetch_max(*cv, Ordering::Relaxed);
                         }
                     }
-                    Err(e) => match crate::history::classify_error(e).0 {
-                        crate::history::OpOutcome::Fail => {
-                            other_failures.fetch_add(1, Ordering::Relaxed);
+                    Err(e) => {
+                        breakdown.record(e);
+                        match crate::history::classify_error(e).0 {
+                            crate::history::OpOutcome::Fail => {
+                                other_failures.fetch_add(1, Ordering::Relaxed);
+                            }
+                            _ => {
+                                ambiguous.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
-                        _ => {
-                            ambiguous.fetch_add(1, Ordering::Relaxed);
-                        }
-                    },
+                    }
                 }
 
                 let end = barrier.wait().await;
@@ -180,6 +189,9 @@ pub async fn run_cas_storm(
         ));
     }
 
+    let errors_by_kind = breakdown.snapshot();
+    print_error_summary(&errors_by_kind);
+
     Ok(CasStormOutcome {
         rounds: rounds.load(Ordering::Relaxed),
         ok_writes: ok_writes.load(Ordering::Relaxed),
@@ -187,6 +199,7 @@ pub async fn run_cas_storm(
         ambiguous: ambiguous.load(Ordering::Relaxed),
         other_failures: other_failures.load(Ordering::Relaxed),
         elapsed_secs: start.elapsed().as_secs_f64(),
+        errors_by_kind,
     })
 }
 

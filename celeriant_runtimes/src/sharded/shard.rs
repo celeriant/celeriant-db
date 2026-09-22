@@ -2,7 +2,7 @@ use std::{
     cell::{Cell, RefCell},
     rc::Rc,
     sync::{Arc, atomic::{AtomicBool, Ordering}},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use celeriant_distributed::{lease_store::LeaseStore, node_status::NodeStatus, node_status_logic::{compute_new_ttl, decide_post_catchup_action, PostCatchupAction}, s3_lease_manager::{ElectionOutcome, S3LeaseManager}, validated_node_status::{self, ValidatedNodeStatus, set_node_status_and_metric}};
@@ -17,6 +17,7 @@ use glommio::{
         shared_channel::ConnectedReceiver,
     },
     net::TcpListener,
+    sync::Semaphore,
 };
 use tracing::{debug, error, info, warn};
 
@@ -24,7 +25,7 @@ use crate::sharded::{
     api_key_reloader::ApiKeyReloader,
     catchup_barrier,
     connection_handler::{
-        CatchupCompletionMsg, ConnectionContext, PortType, handle_enter_s3_catchup, handle_new_connection, handle_redirected_client_connection, handle_redirected_cluster_connection,
+        CatchupCompletionMsg, ConnectionContext, ConnectionGauges, GaugeGuard, PortType, handle_enter_s3_catchup, handle_new_connection, handle_redirected_client_connection, handle_redirected_cluster_connection,
     },
     intrashard_messages::{ExtensionMesh, IntrashardMessages, RedirectedConnection},
     shard_config::ShardConfig,
@@ -98,6 +99,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
             lease_manager: lease_manager.map(Rc::new),
             dict_codec,
             extension_redirect_sink: Some(Rc::new(extension_redirect_tx)),
+            connection_gauges: Rc::new(ConnectionGauges::new(current_shard_id)),
         };
 
         // Wire the out-of-band lease-renewal hook: lets the replication path nudge shard 0
@@ -202,24 +204,45 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
         let client_shard_failed = self.shard_failed.clone();
         let client_tls = tls_cell.clone();
         glommio::spawn_local(async move {
+            let accept_metrics = Rc::new(AcceptMetrics::new(client_ctx.current_shard_id, PortType::Client));
+            // 8 is calibrated on the 4-shard rpi cluster (handshake ~27ms idle, ~65ms
+            // under a herd); 16 bought 26% more rate for double the herd p99. Re-measure per host.
+            let handshake_slots = Rc::new(Semaphore::new(client_ctx.config.handshake_concurrency.max(1)));
             loop {
-                if client_ctx.shutdown_requested.get() || client_shard_failed.load(Ordering::Relaxed) {
-                    break;
-                }
+                // Take the slot before accepting, so surplus connections wait in
+                // the kernel backlog rather than as in-flight handshake state.
+                let permit = match acquire_handshake_slot(&handshake_slots, &client_ctx.shutdown_requested, &client_shard_failed).await {
+                    Some(permit) => permit,
+                    None => break,
+                };
                 // Read current TLS config each iteration so hot-reloads take effect
                 // for new connections without requiring a restart.
                 let tls_snapshot = client_tls.borrow().as_ref()
                     .map(|t| (t.tls_mode, t.client_server_config.clone()));
                 match glommio::timer::timeout(Duration::from_secs(1), client_listener.shared_accept()).await {
                     Ok(stream) => {
+                        let accepted_at = Instant::now();
+                        accept_metrics.accepts.increment(1);
                         let tcp_stream = stream.bind_to_executor();
                         if let Err(e) = tcp_stream.set_nodelay(true) {
                             warn!("set_nodelay failed on client connection: {e}");
                         }
-                        match maybe_ktls_accept(tcp_stream, &tls_snapshot).await {
-                            Ok((tcp_stream, trailing)) => handle_new_connection(tcp_stream, trailing, client_ctx.clone(), PortType::Client),
-                            Err(e) => warn!("TLS handshake failed on client port: {:?}", e),
-                        }
+                        let peer = tcp_stream.peer_addr().ok();
+                        let task_ctx = client_ctx.clone();
+                        let task_metrics = accept_metrics.clone();
+                        glommio::spawn_local(async move {
+                            // The slot belongs to this task, not to the accept loop's binding.
+                            let _permit = permit;
+                            let handshake = measured_ktls_accept(tcp_stream, &tls_snapshot, accepted_at, &task_metrics).await;
+                            // Free the slot the moment the handshake is done; serving the
+                            // connection is not what the semaphore bounds.
+                            drop(_permit);
+                            match handshake {
+                                Ok((tcp_stream, trailing)) => handle_new_connection(tcp_stream, trailing, task_ctx, PortType::Client),
+                                Err(e) => warn!(peer = ?peer, "TLS handshake failed on client port: {:?}", e),
+                            }
+                        })
+                        .detach();
                     }
                     Err(_) => {}
                 }
@@ -232,23 +255,42 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
         let repl_shard_failed = self.shard_failed.clone();
         let repl_tls = tls_cell.clone();
         glommio::spawn_local(async move {
+            let accept_metrics = Rc::new(AcceptMetrics::new(repl_ctx.current_shard_id, PortType::Replication));
+            // Its own semaphore: a client-connection herd must not starve the
+            // replication handshakes that heartbeats and catch-up depend on.
+            let handshake_slots = Rc::new(Semaphore::new(repl_ctx.config.handshake_concurrency.max(1)));
             loop {
-                if repl_ctx.shutdown_requested.get() || repl_shard_failed.load(Ordering::Relaxed) {
-                    break;
-                }
+                let permit = match acquire_handshake_slot(&handshake_slots, &repl_ctx.shutdown_requested, &repl_shard_failed).await {
+                    Some(permit) => permit,
+                    None => break,
+                };
                 let tls_snapshot = repl_tls.borrow().as_ref()
                     .map(|t| (t.tls_mode, t.replication_server_config.clone()));
                 match glommio::timer::timeout(Duration::from_secs(1), repl_listener.shared_accept()).await {
                     Ok(stream) => {
+                        let accepted_at = Instant::now();
+                        accept_metrics.accepts.increment(1);
                         let tcp_stream = stream.bind_to_executor();
                         if let Err(e) = tcp_stream.set_nodelay(true) {
                             warn!("set_nodelay failed on replication connection: {e}");
                         }
                         set_tcp_keepalive(&tcp_stream);
-                        match maybe_ktls_accept(tcp_stream, &tls_snapshot).await {
-                            Ok((tcp_stream, trailing)) => handle_new_connection(tcp_stream, trailing, repl_ctx.clone(), PortType::Replication),
-                            Err(e) => warn!("TLS handshake failed on replication port: {:?}", e),
-                        }
+                        let peer = tcp_stream.peer_addr().ok();
+                        let task_ctx = repl_ctx.clone();
+                        let task_metrics = accept_metrics.clone();
+                        glommio::spawn_local(async move {
+                            // The slot belongs to this task, not to the accept loop's binding.
+                            let _permit = permit;
+                            let handshake = measured_ktls_accept(tcp_stream, &tls_snapshot, accepted_at, &task_metrics).await;
+                            // Free the slot the moment the handshake is done; serving the
+                            // connection is not what the semaphore bounds.
+                            drop(_permit);
+                            match handshake {
+                                Ok((tcp_stream, trailing)) => handle_new_connection(tcp_stream, trailing, task_ctx, PortType::Replication),
+                                Err(e) => warn!(peer = ?peer, "TLS handshake failed on replication port: {:?}", e),
+                            }
+                        })
+                        .detach();
                     }
                     Err(_) => {}
                 }
@@ -437,7 +479,7 @@ enum CatchupRunOutcome {
 static CATCHUP_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 // Total budget for one attempt's completion barrier. a liveness backstop for an unresponsive shard
-const COMPLETION_BARRIER_TIMEOUT: Duration = Duration::from_secs(90);
+pub(crate) const COMPLETION_BARRIER_TIMEOUT: Duration = Duration::from_secs(90);
 
 async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     ctx: &ConnectionContext<R, D, S>,
@@ -555,7 +597,7 @@ async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'stati
         // draining promotion outruns the uploader instead of handing it 5s
         // head starts. Any shard waiting on the view (zero progress or error)
         // keeps the sleep; its bail bound is paced in attempts-with-sleeps.
-        if catchup_attempts::attempt_racing_live_feed(&results) {
+        if catchup_attempts::attempt_racing_live_feed(&results, &timed_out) {
             warn!(attempt, "S3 catchup: all shards racing a live feed, re-attempting immediately");
         } else {
             warn!(attempt, "S3 catchup waiting on the S3 view or retriable errors, retrying in 5s");
@@ -1708,6 +1750,70 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
     }
 }
 
+/// Take a handshake slot, re-checking shutdown every second so an accept loop
+/// whose slots are all busy still stops promptly. `None` means stop looping.
+async fn acquire_handshake_slot(
+    slots: &Rc<Semaphore>,
+    shutdown_requested: &Cell<bool>,
+    shard_failed: &AtomicBool,
+) -> Option<glommio::sync::StaticPermit> {
+    loop {
+        if shutdown_requested.get() || shard_failed.load(Ordering::Relaxed) {
+            return None;
+        }
+        match glommio::timer::timeout(Duration::from_secs(1), slots.acquire_static_permit(1)).await {
+            Ok(permit) => return Some(permit),
+            Err(glommio::GlommioError::TimedOut(_)) => {}
+            Err(e) => {
+                error!("Handshake semaphore unusable, stopping accept loop: {e}");
+                return None;
+            }
+        }
+    }
+}
+
+/// Accept-path metric handles for one shard and port, resolved once per accept
+/// loop. Resolving them per connection would allocate a `Vec<Label>` and clone
+/// both label values on every call.
+struct AcceptMetrics {
+    accepts: metrics::Counter,
+    handshakes_in_flight: metrics::Gauge,
+    handshake_seconds: metrics::Histogram,
+    handshake_failures: metrics::Counter,
+}
+
+impl AcceptMetrics {
+    fn new(shard_id: usize, port_type: PortType) -> Self {
+        let labels = [("shard_id", shard_id.to_string()), ("port_type", port_type.label().to_string())];
+        Self {
+            accepts: metrics::counter!("celeriant_client_accepts_total", &labels),
+            handshakes_in_flight: metrics::gauge!("celeriant_tls_handshakes_in_flight", &labels),
+            handshake_seconds: metrics::histogram!("celeriant_tls_handshake_seconds", &labels),
+            handshake_failures: metrics::counter!("celeriant_tls_handshake_failures_total", &labels),
+        }
+    }
+}
+
+/// `maybe_ktls_accept` with the accept-to-handshake-complete measurements the
+/// cold-connect herd needs. `accepted_at` is taken in the accept loop, so this
+/// includes time the connection waited for a handshake slot.
+async fn measured_ktls_accept(
+    stream: glommio::net::TcpStream,
+    tls_config: &Option<(TlsMode, Arc<rustls::ServerConfig>)>,
+    accepted_at: Instant,
+    metrics: &AcceptMetrics,
+) -> Result<(glommio::net::TcpStream, Vec<u8>), celeriant_ktls::KtlsError> {
+    // Guarded, not paired calls: this task can be dropped mid-handshake when the
+    // executor tears down, which would otherwise leak the gauge.
+    let _in_flight = GaugeGuard::enter(&metrics.handshakes_in_flight);
+    let result = maybe_ktls_accept(stream, tls_config).await;
+    metrics.handshake_seconds.record(accepted_at.elapsed().as_secs_f64());
+    if result.is_err() {
+        metrics.handshake_failures.increment(1);
+    }
+    result
+}
+
 /// Apply kTLS upgrade to a freshly accepted stream based on `tls_config`.
 ///
 /// Returns the stream unchanged when no TLS config is present (disabled mode).
@@ -1885,6 +1991,71 @@ fn should_fire_reachability_probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `handshake_concurrency` is clamped to >= 1 only in the CLI
+    /// (`celeriant/src/server_config.rs:845`). A `ShardConfig` built anywhere
+    /// else with 0 hands the accept loop a zero-unit semaphore, and
+    /// `acquire_handshake_slot` then never returns a permit: the shard binds
+    /// the port, never accepts, and logs nothing.
+    #[test]
+    fn zero_handshake_concurrency_stalls_the_accept_loop() {
+        glommio::LocalExecutorBuilder::default()
+            .spawn(|| async {
+                let slots = Rc::new(Semaphore::new(0));
+                let shutdown = Cell::new(false);
+                let failed = AtomicBool::new(false);
+                let outcome = glommio::timer::timeout(Duration::from_millis(1500), async {
+                    Ok::<_, glommio::GlommioError<()>>(acquire_handshake_slot(&slots, &shutdown, &failed).await)
+                })
+                .await;
+                assert!(outcome.is_err(), "zero units must never yield a handshake slot");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The semaphore bound only holds if a handshake task that is dropped
+    /// mid-flight returns its slot (executor teardown, or the 10s TLS timeout
+    /// dropping the inner future). Nothing else in the suite touches the accept
+    /// loop, so this pins the property.
+    #[test]
+    fn handshake_slot_returns_when_the_task_is_cancelled() {
+        glommio::LocalExecutorBuilder::default()
+            .spawn(|| async {
+                let slots = Rc::new(Semaphore::new(1));
+                let shutdown = Cell::new(false);
+                let failed = AtomicBool::new(false);
+                let permit = acquire_handshake_slot(&slots, &shutdown, &failed).await.expect("first slot");
+                let task = glommio::spawn_local(async move {
+                    let _permit = permit;
+                    std::future::pending::<()>().await;
+                });
+                glommio::executor().yield_now().await;
+                assert_eq!(slots.available(), 0, "the in-flight handshake holds the only slot");
+                task.cancel().await;
+                assert_eq!(slots.available(), 1, "a cancelled handshake task must return its slot");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// Shutdown must win over a fully-booked semaphore, or a shard whose slots
+    /// are all held by 10s handshakes would sit in the accept loop for 10s.
+    #[test]
+    fn acquire_handshake_slot_gives_up_on_shutdown_with_no_slots_free() {
+        glommio::LocalExecutorBuilder::default()
+            .spawn(|| async {
+                let slots = Rc::new(Semaphore::new(0));
+                let shutdown = Cell::new(true);
+                let failed = AtomicBool::new(false);
+                assert!(acquire_handshake_slot(&slots, &shutdown, &failed).await.is_none());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     #[test]
     fn should_fire_reachability_probe_truth_table() {

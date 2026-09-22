@@ -186,9 +186,9 @@ impl LeaseStore for GatedLeaseStore {
 
 // ── Shard-side fakes: the WAL needs a client and a downloader, neither is exercised ──
 
-struct IdleReplicationClient {
-    reachable: Cell<bool>,
-    heartbeat_in_flight: Cell<Option<u64>>,
+pub(crate) struct IdleReplicationClient {
+    pub(crate) reachable: Cell<bool>,
+    pub(crate) heartbeat_in_flight: Cell<Option<u64>>,
 }
 
 impl ReplicationClient for IdleReplicationClient {
@@ -221,7 +221,7 @@ impl S3Downloader for EmptyDownloader {
 
 // ── Harness ───────────────────────────────────────────────────────────────────
 
-fn scratch_dir(tag: &str) -> PathBuf {
+pub(crate) fn scratch_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "celeriant_lease_singleflight_{tag}_{}_{}",
         std::process::id(),
@@ -231,7 +231,7 @@ fn scratch_dir(tag: &str) -> PathBuf {
     dir
 }
 
-fn internal_config(dir: &std::path::Path) -> InternalShardConfig {
+pub(crate) fn internal_config(dir: &std::path::Path) -> InternalShardConfig {
     InternalShardConfig {
         wal_join_data_meta_writes: true,
         node_id: NODE_ID,
@@ -283,7 +283,7 @@ fn lease_config() -> S3LeaseConfig {
     }
 }
 
-fn shard_config(dir: &std::path::Path) -> ShardConfig {
+pub(crate) fn shard_config(dir: &std::path::Path) -> ShardConfig {
     ShardConfig {
         wal_join_data_meta_writes: true,
         node_id: NODE_ID,
@@ -329,6 +329,7 @@ fn shard_config(dir: &std::path::Path) -> ShardConfig {
         list_page_size: 100,
         list_max_concurrent: 16,
         read_max_concurrent: 64,
+        handshake_concurrency: 8,
         schema_cache_bytes: 1024 * 1024,
         max_schema_size_bytes: 16384,
         max_clock_drift_ms: DRIFT_MS,
@@ -403,6 +404,7 @@ async fn leader_shard_zero(dir: &std::path::Path) -> (TestContext, Rc<StoreProbe
             DictCodec::new(celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES, 3).expect("builtin dict"),
         ),
         extension_redirect_sink: None,
+        connection_gauges: Rc::new(crate::sharded::connection_handler::ConnectionGauges::new(0)),
     };
     (ctx, probe)
 }

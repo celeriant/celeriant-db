@@ -88,6 +88,24 @@ pub struct NodeSample {
     /// Used to distinguish "listener never saw a TCP connection" from
     /// "listener saw it and rejected it" during post-promotion debugging.
     pub client_connections_active: u64,
+    /// Sockets the server's accept loops returned (`celeriant_client_accepts_total`),
+    /// client port only, summed across shards. Against bench task count this
+    /// says whether the herd's connects ever reached the listener.
+    #[serde(default)]
+    pub client_accepts_total: u64,
+    /// `celeriant_tls_handshake_seconds` sum and count, client port only. The
+    /// handshake runs inline on the shard executor, so sum/count is the mean
+    /// time an accept loop spent not accepting.
+    #[serde(default)]
+    pub tls_handshake_seconds_sum: f64,
+    #[serde(default)]
+    pub tls_handshake_count: u64,
+    #[serde(default)]
+    pub tls_handshake_failures_total: u64,
+    /// Sum of `celeriant_tls_handshakes_in_flight` across shards, client port.
+    /// Pinned at one per shard means the handshake is the accept bottleneck.
+    #[serde(default)]
+    pub tls_handshakes_in_flight: u64,
     /// Sum of `celeriant_watch_subscribers_active` across all shards. The watch
     /// chaos scenario watches this drain to ~0 after the flood — a leaked watch
     /// session (the CLOSE-WAIT bug) shows up as a gauge that stays elevated.
@@ -243,6 +261,11 @@ pub struct NodeSample {
     /// "never started" from "started and never finished".
     #[serde(default)]
     pub s3_catchup_task_started_total: u64,
+    /// Catchup re-attempts refused because that shard's previous catchup was
+    /// still running. Non-zero means the barrier is timing out on a real
+    /// overrun, not that catchup is duplicating work.
+    #[serde(default)]
+    pub s3_catchup_task_skipped_in_flight_total: u64,
     /// StatusUpdate broadcasts dropped because the mesh channel was full — a
     /// shard that never learns a peer's status is one of the wedge causes.
     #[serde(default)]
@@ -313,6 +336,11 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
     let mut mesh_dequeued: BTreeMap<String, u64> = BTreeMap::new();
     let mut client_connections_active: u64 = 0;
     let mut watch_subscribers_active: u64 = 0;
+    let mut client_accepts_total: u64 = 0;
+    let mut tls_handshake_seconds_sum = 0.0_f64;
+    let mut tls_handshake_count: u64 = 0;
+    let mut tls_handshake_failures_total: u64 = 0;
+    let mut tls_handshakes_in_flight: u64 = 0;
 
     const COUNTERS: &[&str] = &[
         "celeriant_writes_total",
@@ -387,6 +415,7 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         "celeriant_s3_catchup_barrier_timeout_total",
         "celeriant_s3_catchup_stall_bail_total",
         "celeriant_s3_catchup_task_started_total",
+        "celeriant_s3_catchup_task_skipped_in_flight_total",
         "celeriant_intrashard_status_broadcast_dropped_total",
         "celeriant_intrashard_broadcast_dropped_total",
         "celeriant_s3_catchup_completion_dropped_total",
@@ -400,6 +429,20 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         // metric_name{labels} value [timestamp]   OR   metric_name value
         let Some((name_part, value_str)) = split_metric_line(line) else { continue };
         let name = strip_labels(name_part);
+
+        // The one histogram the harness reads: sum/count (not the buckets) are
+        // enough for a mean handshake time, and they have to be caught before
+        // the blanket suffix skip below.
+        if name == "celeriant_tls_handshake_seconds_sum" || name == "celeriant_tls_handshake_seconds_count" {
+            if is_client_port(name_part) && let Ok(v) = value_str.parse::<f64>() {
+                if name.ends_with("_sum") {
+                    tls_handshake_seconds_sum += v;
+                } else {
+                    tls_handshake_count = tls_handshake_count.saturating_add(v as u64);
+                }
+            }
+            continue;
+        }
 
         // Histograms expand to _bucket / _sum / _count — we want neither.
         if name.ends_with("_bucket") || name.ends_with("_sum") || name.ends_with("_count") {
@@ -514,8 +557,26 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
             continue;
         }
         if name == "celeriant_client_connections_active" {
-            if let Ok(v) = value_str.parse::<f64>() {
+            if is_client_port(name_part) && let Ok(v) = value_str.parse::<f64>() {
                 client_connections_active = client_connections_active.saturating_add(v as u64);
+            }
+            continue;
+        }
+        if name == "celeriant_client_accepts_total" {
+            if is_client_port(name_part) && let Ok(v) = value_str.parse::<f64>() {
+                client_accepts_total = client_accepts_total.saturating_add(v as u64);
+            }
+            continue;
+        }
+        if name == "celeriant_tls_handshake_failures_total" {
+            if is_client_port(name_part) && let Ok(v) = value_str.parse::<f64>() {
+                tls_handshake_failures_total = tls_handshake_failures_total.saturating_add(v as u64);
+            }
+            continue;
+        }
+        if name == "celeriant_tls_handshakes_in_flight" {
+            if is_client_port(name_part) && let Ok(v) = value_str.parse::<f64>() {
+                tls_handshakes_in_flight = tls_handshakes_in_flight.saturating_add(v as u64);
             }
             continue;
         }
@@ -565,6 +626,11 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         node_starts_total: get("celeriant_node_starts_total"),
         client_connections_active,
         watch_subscribers_active,
+        client_accepts_total,
+        tls_handshake_seconds_sum,
+        tls_handshake_count,
+        tls_handshake_failures_total,
+        tls_handshakes_in_flight,
         capture_dropped_items_total: get("celeriant_replication_capture_dropped_items_total"),
         capture_dropped_bytes_total: get("celeriant_replication_capture_dropped_bytes_total"),
         writes_accepted_no_prior_client_seq_total: get("celeriant_writes_accepted_no_prior_client_seq_total"),
@@ -626,6 +692,7 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         s3_catchup_barrier_timeout_total: get("celeriant_s3_catchup_barrier_timeout_total"),
         s3_catchup_stall_bail_total: get("celeriant_s3_catchup_stall_bail_total"),
         s3_catchup_task_started_total: get("celeriant_s3_catchup_task_started_total"),
+        s3_catchup_task_skipped_in_flight_total: get("celeriant_s3_catchup_task_skipped_in_flight_total"),
         intrashard_status_broadcast_dropped_total: get("celeriant_intrashard_status_broadcast_dropped_total"),
         intrashard_broadcast_dropped_total: get("celeriant_intrashard_broadcast_dropped_total"),
         s3_catchup_completion_dropped_total: get("celeriant_s3_catchup_completion_dropped_total"),
@@ -633,6 +700,13 @@ pub fn parse_metrics(host: String, t_ms: u64, body: &str) -> NodeSample {
         barrier_sync_fsync_failed_total: get("celeriant_barrier_sync_fsync_failed_total"),
         metric_keys_present,
     }
+}
+
+/// The accept-path series carry a `port_type` label; only the client port is
+/// comparable with the bench's connection count. Series without the label
+/// (older builds) are kept.
+fn is_client_port(name_part: &str) -> bool {
+    extract_label(name_part, "port_type").is_none_or(|p| p == "client")
 }
 
 /// Extract the value of `key` from a Prometheus label set, e.g.
@@ -772,6 +846,32 @@ mod tests {
         assert_eq!(s.write_errors_by_code.get("occ_conflict"), Some(&12));
         assert_eq!(s.write_errors_total, 450_043);
         assert!(s.metric_keys_present.contains("celeriant_write_errors_total"));
+    }
+
+    #[test]
+    fn accept_path_metrics_sum_over_shards_and_ignore_the_replication_port() {
+        let s = sample(
+            "# TYPE celeriant_tls_handshake_seconds histogram\n\
+             celeriant_tls_handshake_seconds_bucket{shard_id=\"0\",port_type=\"client\",le=\"0.1\"} 3\n\
+             celeriant_tls_handshake_seconds_sum{shard_id=\"0\",port_type=\"client\"} 1.5\n\
+             celeriant_tls_handshake_seconds_count{shard_id=\"0\",port_type=\"client\"} 10\n\
+             celeriant_tls_handshake_seconds_sum{shard_id=\"1\",port_type=\"client\"} 0.5\n\
+             celeriant_tls_handshake_seconds_count{shard_id=\"1\",port_type=\"client\"} 4\n\
+             celeriant_tls_handshake_seconds_sum{shard_id=\"1\",port_type=\"replication\"} 99\n\
+             celeriant_tls_handshake_seconds_count{shard_id=\"1\",port_type=\"replication\"} 99\n\
+             celeriant_client_accepts_total{shard_id=\"0\",port_type=\"client\"} 12\n\
+             celeriant_client_accepts_total{shard_id=\"1\",port_type=\"client\"} 30\n\
+             celeriant_client_accepts_total{shard_id=\"1\",port_type=\"replication\"} 7\n\
+             celeriant_tls_handshake_failures_total{shard_id=\"0\",port_type=\"client\"} 2\n\
+             celeriant_tls_handshake_failures_total{shard_id=\"0\",port_type=\"replication\"} 5\n\
+             celeriant_tls_handshakes_in_flight{shard_id=\"0\",port_type=\"client\"} 1\n\
+             celeriant_tls_handshakes_in_flight{shard_id=\"1\",port_type=\"client\"} 1\n",
+        );
+        assert_eq!(s.client_accepts_total, 42);
+        assert_eq!(s.tls_handshake_seconds_sum, 2.0);
+        assert_eq!(s.tls_handshake_count, 14);
+        assert_eq!(s.tls_handshake_failures_total, 2);
+        assert_eq!(s.tls_handshakes_in_flight, 2);
     }
 
     type Field = fn(&NodeSample) -> u64;

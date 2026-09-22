@@ -24,7 +24,7 @@
 //!
 //! RPi cluster, twice, ~31s of client-visible write unavailability against a
 //! suite that asserts 1600ms failover; the node then hung until systemd
-//! SIGKILLed it (`session-v2/goal.md`, DEFECT 2):
+//! SIGKILLed it:
 //!
 //! ```text
 //! 10:24:01  Heartbeat TTL expired — auto-fenced
@@ -62,11 +62,8 @@
 //! at the process boundary (S3 lease store, S3 downloader, peer link) — is
 //! copied from `adversarial_promotion_window_tests.rs`.
 //!
-//! Acceptance set: this test plus
-//! `review_evidence_tests::d2fix::stepdown_must_not_block_the_retry_until_the_won_lease_expires`,
-//! which drives the same harness without the rival takeover and so covers the
-//! step-down branch this one never reaches (here the status is `Follower` at the
-//! error). Both must be green for the Defect-2 fix.
+//! This test never reaches the step-down branch: the status is `Follower` at the
+//! error, because the rival takeover resolves first.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
@@ -408,6 +405,7 @@ fn shard_config(dir: &std::path::Path) -> ShardConfig {
         list_page_size: 100,
         list_max_concurrent: 16,
         read_max_concurrent: 64,
+        handshake_concurrency: 8,
         schema_cache_bytes: 1024 * 1024,
         max_schema_size_bytes: 16384,
         max_clock_drift_ms: DRIFT_MS,

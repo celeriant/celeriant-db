@@ -293,6 +293,12 @@ pub struct ShardWal<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
     /// It's thread per core, but tasks still interleave at a await boundaries.
     pub s3_elections_in_flight: Rc<Cell<u32>>,
 
+    /// At most ONE `enter_s3_catchup` may be in flight per shard at any instant.
+    /// `catchup_from_s3` takes no lock: it snapshots the WAL tip on entry and carries
+    /// `next_wal_seq` across every await, so a second concurrent run truncates to its
+    /// own divergence point and re-applies batches the first already appended.
+    pub s3_catchup_in_flight: Rc<Cell<bool>>,
+
     /// Out-of-band hook for the replication path to nudge shard 0 to definitively
     /// renew the S3 lease (CAS `lease.json`) when an S3 fallback would otherwise be
     /// gated by a stale CAS confirmation. The heartbeat loop can stall in the kernel
@@ -728,6 +734,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             commit_notify_obligation_gauge,
             s3_cas_confirmed_at_ms: Rc::new(Cell::new(0)),
             s3_elections_in_flight: Rc::new(Cell::new(0)),
+            s3_catchup_in_flight: Rc::new(Cell::new(false)),
             lease_renewal_requester: OnceCell::new(),
             ack_barrier_rewind_armed: Cell::new(true),
             pending_notify_seq: Rc::new(Cell::new(0)),
@@ -3357,6 +3364,11 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             }
         };
 
+        // If this shard is in catchup (might diverge from global node_status)
+        if self.s3_catchup_in_flight.get() {
+            return Ok(response(ReplicationResult::Rejected(FollowerRejection::NotAFollower)));
+        }
+
         let leader_lease_epoch = match self.node_status.get().effective_node_status() {
             NodeStatus::Follower { leader_lease_epoch } => leader_lease_epoch,
             _ => return Ok(response(ReplicationResult::Rejected(FollowerRejection::NotAFollower))),
@@ -4514,22 +4526,32 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     /// (never re-derived from this shard's own status: the Promoting
     /// StatusUpdate broadcast can lag or drop, and a promotion catchup run as
     /// Following would fast-exit without consuming the peer's acked data).
+    /// Re-assert the catching-up status that closes this shard's TCP replication
+    /// gate. Separate from `enter_s3_catchup` because a re-attempt refused by the
+    /// single-flight guard must still close the gate: the orchestrator may have
+    /// bailed the previous run and flipped this shard back to Follower.
+    ///
+    /// Promoting stays put: it carries the won lease's real TTL and the promotion
+    /// upload gate needs to see it afterwards; the rewrite below (expiry 0) would
+    /// decay it to Fenced instantly.
+    pub fn mark_catching_up(&self) {
+        if self.node_status.get().raw().is_promoting() {
+            return;
+        }
+        let catchup_status = match self.node_status.get().raw() {
+            NodeStatus::Follower { leader_lease_epoch }
+            | NodeStatus::FollowerCatchingUp { leader_lease_epoch } => {
+                NodeStatus::FollowerCatchingUp { leader_lease_epoch }
+            }
+            NodeStatus::BootCatchup => NodeStatus::BootCatchup,
+            _ => NodeStatus::BootCatchup,
+        };
+        set_node_status_and_metric(&self.node_status, ValidatedNodeStatus::create_custom_status(catchup_status, 0, 0), self.config.shard_id);
+    }
+
     pub async fn enter_s3_catchup(&self, role: shard_wal_s3_catchup::CatchupRole) -> Result<S3CatchupResult, S3CatchupError> {
 
-        // Promoting stays put through catchup: it carries the won lease's real
-        // TTL and the promotion upload gate needs to see it afterwards; the
-        // rewrite below (expiry 0) would decay it to Fenced instantly.
-        if !self.node_status.get().raw().is_promoting() {
-            let catchup_status = match self.node_status.get().raw() {
-                NodeStatus::Follower { leader_lease_epoch }
-                | NodeStatus::FollowerCatchingUp { leader_lease_epoch } => {
-                    NodeStatus::FollowerCatchingUp { leader_lease_epoch }
-                }
-                NodeStatus::BootCatchup => NodeStatus::BootCatchup,
-                _ => NodeStatus::BootCatchup,
-            };
-            set_node_status_and_metric(&self.node_status, ValidatedNodeStatus::create_custom_status(catchup_status, 0, 0), self.config.shard_id);
-        }
+        self.mark_catching_up();
 
         // A target taught by a dead lease epoch is a phantom: its tail may
         // have been culled cluster-wide, and chasing it burns the full
@@ -8649,6 +8671,46 @@ use celeriant_wal::segment_summary::segment_aggregate_entry::SegmentAggregateEnt
                 shard.handle_replication_batch(replication_batch_req(vec![replication_item(1, GENESIS_HASH)])).await,
             );
             assert!(matches!(resp.result, ReplicationResult::Rejected(FollowerRejection::NotAFollower)));
+
+            shard.close().await;
+        });
+    }
+
+    /// INVARIANT: TCP replication stays shut while a catchup task still owns this
+    /// WAL's tail, even at status Follower.
+    ///
+    /// Single-flight alone does not cover this: for Following/Promoting a barrier
+    /// timeout is StallBail, so `run_s3_catchup` returns StalledView and the
+    /// orchestrator resumes Follower for TCP-driven recovery, while the
+    /// overrunning task still holds its own `next_wal_seq` and can still
+    /// truncate. FAIL means the leader's batches land underneath it and the
+    /// follower's tail diverges exactly as two concurrent catchups would.
+    #[test]
+    fn replication_rejected_while_a_catchup_task_still_owns_the_wal() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_follower_shard(&dir).await;
+
+            shard.s3_catchup_in_flight.set(true);
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(replication_batch_req(vec![replication_item(1, GENESIS_HASH)])).await,
+            );
+            assert!(
+                matches!(resp.result, ReplicationResult::Rejected(FollowerRejection::NotAFollower)),
+                "a batch arriving under a draining catchup must be rejected, got {:?}",
+                resp.result,
+            );
+
+            // The same batch, once the catchup task has released the WAL.
+            shard.s3_catchup_in_flight.set(false);
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(replication_batch_req(vec![replication_item(1, GENESIS_HASH)])).await,
+            );
+            assert!(
+                matches!(resp.result, ReplicationResult::Success { .. }),
+                "the gate must reopen when the catchup ends, got {:?}",
+                resp.result,
+            );
 
             shard.close().await;
         });

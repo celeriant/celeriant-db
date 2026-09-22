@@ -24,9 +24,22 @@ pub enum ClientError {
     /// The client should retry after a brief backoff.
     ServerBusy,
     ConnectionTimeout,
+    /// The request was fully written and the node never answered. It may or may
+    /// not have been applied, so it must never be re-sent anywhere.
+    ConnectionLostAfterSend(std::io::Error),
+    /// Gave up waiting for a pool slot to `address`. No node was contacted and
+    /// no byte was sent, so retrying cannot duplicate the request.
+    PoolTimeout { address: String },
     RequestTimeout,
     /// Identity verification error (nonce generation, signing, or verification failure)
     IdentityError(CryptoError),
+    /// The caller named a shard range no shard can satisfy, so no request was
+    /// built or sent.
+    InvalidShardRange { start_shard: u64, max_shard_hint: u64 },
+    /// Identify confirmed a compression dictionary by sha without resending its
+    /// bytes, and nothing on this client can resolve that sha. Every later
+    /// ZstdDict frame would fail, so the handshake fails instead.
+    DictUnavailable { sha: String },
 }
 
 impl ClientError {
@@ -63,7 +76,22 @@ impl std::fmt::Display for ClientError {
             ClientError::ServerBusy => write!(f, "Server busy — retry after backoff"),
             ClientError::RequestTimeout => write!(f, "Request timeout"),
             ClientError::ConnectionTimeout => write!(f, "Connection timeout"),
+            ClientError::ConnectionLostAfterSend(e) => {
+                write!(f, "Connection lost after the request was sent; outcome unknown: {e}")
+            }
+            ClientError::PoolTimeout { address } => write!(
+                f,
+                "Pool timeout: waited for a connection to {address}; request not sent"
+            ),
             ClientError::IdentityError(e) => write!(f, "Identity verification error: {}", e),
+            ClientError::InvalidShardRange { start_shard, max_shard_hint } => write!(
+                f,
+                "Impossible shard range: max_shard_hint {max_shard_hint} is below start_shard {start_shard}"
+            ),
+            ClientError::DictUnavailable { sha } => write!(
+                f,
+                "Server confirmed compression dictionary {sha} without sending it, and it is not cached"
+            ),
         }
     }
 }

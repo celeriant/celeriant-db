@@ -11,10 +11,8 @@ use celeriant_client_wire::{build_frame, decompress_body, write_frame};
 use celeriant_wal::compression_type::CompressionType;
 use celeriant_wire::network::wire_error::WireError;
 use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V2, WireHeader};
-use rustls_pki_types::ServerName;
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
-use tokio_rustls::TlsConnector;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
 /// A compression dict received from the server during Identify.
@@ -25,29 +23,8 @@ pub struct CachedDict {
 }
 
 use crate::client_error::ClientError;
+use crate::client_tls_config::ClientTlsConfig;
 
-#[derive(Clone)]
-pub struct ClientTlsConfig {
-    pub connector: TlsConnector,
-    pub server_name: ServerName<'static>,
-}
-
-impl std::fmt::Debug for ClientTlsConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClientTlsConfig")
-            .field("server_name", &self.server_name)
-            .finish_non_exhaustive()
-    }
-}
-
-impl ClientTlsConfig {
-    pub fn new(client_config: Arc<rustls::ClientConfig>, server_name: ServerName<'static>) -> Self {
-        Self {
-            connector: TlsConnector::from(client_config),
-            server_name,
-        }
-    }
-}
 
 pub(crate) enum ClientStream {
     Plain(Compat<TcpStream>),
@@ -102,6 +79,29 @@ impl futures_util::io::AsyncWrite for ClientStream {
 
 impl Unpin for ClientStream {}
 
+impl ClientStream {
+    /// The socket underneath, TLS or not, for a liveness peek.
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            ClientStream::Plain(s) => s.get_ref(),
+            ClientStream::Tls(s) => s.get_ref().get_ref().0,
+        }
+    }
+}
+
+/// Reclassify a response-read failure that happened after the request frame was
+/// flushed. Only a network error means the answer never arrived; an answer that
+/// arrived and could not be read keeps its own typed variant, and its stream is
+/// still clean.
+fn lost_after_send(e: ClientError) -> ClientError {
+    match e {
+        ClientError::WireError(WireError::NetworkError(io)) => {
+            ClientError::ConnectionLostAfterSend(io)
+        }
+        other => other,
+    }
+}
+
 /// Establish a TCP/TLS connection, returning a raw ClientStream.
 /// Shared by CeleriantClient and WatchConnection.
 pub(crate) async fn connect_stream(
@@ -127,7 +127,7 @@ pub(crate) async fn connect_stream(
     match tls_config {
         None => Ok(ClientStream::Plain(tcp.compat())),
         Some(cfg) => {
-            let handshake = cfg.connector.connect(cfg.server_name.clone(), tcp);
+            let handshake = cfg.handshake(tcp);
             let tls = if let Some(duration) = connection_timeout {
                 timeout(duration, handshake)
                     .await
@@ -239,6 +239,22 @@ impl CeleriantClient {
         self.stream_dirty
     }
 
+    /// Whether the peer still holds this connection open, as one non-blocking
+    /// peek. A pooled socket the server closed while idle still takes a write
+    /// into the send buffer; the read then sees EOF, which is an unknown
+    /// outcome and is never retried. `Pending` is the healthy answer: the
+    /// socket is open with nothing pending. Bytes waiting on an idle
+    /// request/response connection mean it is out of step, so it goes too.
+    pub(crate) async fn is_peer_live(&self) -> bool {
+        let tcp = self.stream.tcp();
+        std::future::poll_fn(|cx| {
+            let mut byte = [0u8; 1];
+            let mut buf = tokio::io::ReadBuf::new(&mut byte);
+            std::task::Poll::Ready(matches!(tcp.poll_peek(cx, &mut buf), std::task::Poll::Pending))
+        })
+        .await
+    }
+
     /// Set request timeout (default: none)
     pub fn with_timeout(mut self, duration: Duration) -> Self {
         self.timeout = Some(duration);
@@ -311,7 +327,7 @@ impl CeleriantClient {
             let type_id = request.request_type() as u32;
             let compress = self.choose_compression(request) == CompressionType::ZstdDict;
             let dict = self.current_dict.as_ref().map(|d| d.bytes.as_ref());
-            Some(build_frame(type_id, body, dict, compress)?)
+            Some(build_frame(type_id, body, dict, compress, self.max_request_size)?)
         } else {
             None
         };
@@ -328,23 +344,16 @@ impl CeleriantClient {
         };
         if let Err(e) = written {
             self.stream_dirty = matches!(e, WireError::NetworkError(_));
-            return Err(e.into());
+            // The frame never reached the node, so a dead socket here is a
+            // pre-send connection failure that another node can still serve.
+            return Err(match e {
+                WireError::NetworkError(io) => ClientError::ConnectionFailed(io),
+                other => other.into(),
+            });
         }
 
-        // Fixed-size responses read straight from the header; variable-size bodies are decompressed
-        // with the same stateless dict helper once the body is in hand.
-        let header = WireHeader::from_reader(&mut self.stream, self.max_response_size).await?;
-        let response = if ClientResponse::is_fixed_size_variant(header.message_type) {
-            let raw = header.read_fixed_body_raw(&mut self.stream).await?;
-            self.stream_dirty = false;
-            ClientResponse::deserialize_body(header.message_type, &raw, header.version)?
-        } else {
-            let raw = header.read_variable_body_raw(&mut self.stream).await?;
-            self.stream_dirty = false;
-            let dict = self.current_dict.as_ref().map(|d| d.bytes.as_ref());
-            let plain = decompress_body(header.compression_type, header.uncompressed_length, &raw, dict)?;
-            ClientResponse::deserialize_body(header.message_type, &plain, header.version)?
-        };
+        // The frame is fully on the wire from here on
+        let response = self.read_response().await.map_err(lost_after_send)?;
 
         let sent = request.correlation_id();
         if response.carries_correlation_id() && response.correlation_id() != sent {
@@ -368,6 +377,26 @@ impl CeleriantClient {
             ClientResponse::ProtocolError(_) => Err(ClientError::ProtocolError),
             ClientResponse::GenericError(error) => Err(ClientError::from_error_response(error)),
             _ => Ok(response),
+        }
+    }
+
+    /// Read one response frame off the stream. Wire level only: a server error
+    /// response is a successful read.
+    ///
+    /// Fixed-size responses read straight from the header; variable-size bodies are
+    /// decompressed with the stateless dict helper once the body is in hand.
+    async fn read_response(&mut self) -> Result<ClientResponse, ClientError> {
+        let header = WireHeader::from_reader(&mut self.stream, self.max_response_size).await?;
+        if ClientResponse::is_fixed_size_variant(header.message_type) {
+            let raw = header.read_fixed_body_raw(&mut self.stream).await?;
+            self.stream_dirty = false;
+            Ok(ClientResponse::deserialize_body(header.message_type, &raw, header.version)?)
+        } else {
+            let raw = header.read_variable_body_raw(&mut self.stream).await?;
+            self.stream_dirty = false;
+            let dict = self.current_dict.as_ref().map(|d| d.bytes.as_ref());
+            let plain = decompress_body(header.compression_type, header.uncompressed_length, &raw, dict)?;
+            Ok(ClientResponse::deserialize_body(header.message_type, &plain, header.version)?)
         }
     }
 
@@ -466,10 +495,16 @@ impl CeleriantClient {
             (Some(sha), Some(bytes)) => {
                 Some(CachedDict { sha, bytes: Arc::from(bytes.into_boxed_slice()) })
             }
-            (Some(sha), None) => {
+            (Some(sha), None) => match dict_lookup(&sha) {
                 // Server confirmed sha match; retrieve bytes from pool cache.
-                dict_lookup(&sha).map(|bytes| CachedDict { sha, bytes })
-            }
+                Some(bytes) => Some(CachedDict { sha, bytes }),
+                // The frame boundary is clean but the negotiated state is not:
+                // retire the connection so the pool discards rather than reuses it.
+                None => {
+                    self.stream_dirty = true;
+                    return Err(ClientError::DictUnavailable { sha });
+                }
+            },
             (None, _) => None,
         };
 
@@ -507,60 +542,8 @@ mod tests {
         let addr = silent_server().await;
         let address = addr.to_string();
 
-        let ring_provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
-
-        #[derive(Debug)]
-        struct AcceptAny(Vec<rustls::SignatureScheme>);
-        impl rustls::client::danger::ServerCertVerifier for AcceptAny {
-            fn verify_server_cert(
-                &self,
-                _end_entity: &rustls_pki_types::CertificateDer<'_>,
-                _intermediates: &[rustls_pki_types::CertificateDer<'_>],
-                _server_name: &rustls_pki_types::ServerName<'_>,
-                _ocsp_response: &[u8],
-                _now: rustls_pki_types::UnixTime,
-            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-                Ok(rustls::client::danger::ServerCertVerified::assertion())
-            }
-
-            fn verify_tls12_signature(
-                &self,
-                _message: &[u8],
-                _cert: &rustls_pki_types::CertificateDer<'_>,
-                _dss: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-
-            fn verify_tls13_signature(
-                &self,
-                _message: &[u8],
-                _cert: &rustls_pki_types::CertificateDer<'_>,
-                _dss: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-
-            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-                self.0.clone()
-            }
-        }
-
-        let schemes = ring_provider
-            .signature_verification_algorithms
-            .supported_schemes();
-
-        let client_config = rustls::ClientConfig::builder_with_provider(ring_provider)
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAny(schemes)))
-            .with_no_client_auth();
-
-        let tls_config = ClientTlsConfig::new(
-            std::sync::Arc::new(client_config),
-            rustls_pki_types::ServerName::try_from("localhost").unwrap().to_owned(),
-        );
+        let tls_config = ClientTlsConfig::dangerous_accept_any("localhost")
+            .expect("dangerous_accept_any failed");
 
         let start = std::time::Instant::now();
         let result = connect_stream(
@@ -577,6 +560,61 @@ mod tests {
             result.map(|_| ())
         );
         assert!(elapsed < Duration::from_millis(1500), "timed out too slowly: {elapsed:?}");
+    }
+
+    /// Answers one Identify with a sha the client is expected to already hold,
+    /// and no bytes: the server's "you already have this dict" confirmation.
+    async fn dict_sha_only_server() -> std::net::SocketAddr {
+        use celeriant_msg::process_identify::{read_identify_request, write_identify_response};
+        use celeriant_msg::response::responses::IdentifyResponse;
+        use futures_lite::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = socket.compat();
+            let header = WireHeader::from_reader(&mut stream, 64 * 1024 * 1024).await.unwrap();
+            read_identify_request(header, &mut stream).await.unwrap();
+            let resp = IdentifyResponse {
+                correlation_id: None,
+                client_id: Some(7),
+                access_level: None,
+                compression_dict_sha256: Some(UNCACHED_SHA.to_string()),
+                compression_dict_bytes: None,
+            };
+            write_identify_response(&mut stream, &resp, PROTOCOL_VERSION_V2).await.unwrap();
+            stream.flush().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        addr
+    }
+
+    const UNCACHED_SHA: &str = "a-sha-no-cache-can-resolve";
+
+    /// A confirmed dict the client cannot resolve leaves the connection unable
+    /// to read any ZstdDict frame. Fail the handshake there, and retire the
+    /// connection so the pool never hands it out.
+    #[tokio::test]
+    async fn an_identify_confirming_an_uncached_dict_sha_fails_the_handshake() {
+        let addr = dict_sha_only_server().await;
+        let mut client = CeleriantClient::connect(&addr.to_string()).await.unwrap();
+        let identity = ClientIdentityConfig { public_key: None, private_key: None, api_key: None };
+
+        let err = client
+            .identify_with_known_sha(&identity, Some(UNCACHED_SHA.to_string()), |_| None)
+            .await
+            .expect_err("a confirmed sha the client cannot resolve must fail Identify");
+
+        match err {
+            ClientError::DictUnavailable { ref sha } => assert_eq!(sha, UNCACHED_SHA),
+            other => panic!("expected DictUnavailable, got {other:?}"),
+        }
+        assert!(client.current_dict.is_none(), "no dict was resolved");
+        assert!(
+            client.is_stream_dirty(),
+            "the connection must be discarded, not returned to the pool"
+        );
     }
 
     #[test]

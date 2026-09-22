@@ -59,9 +59,11 @@ pub(crate) enum AttemptDecision {
 /// case (racing an uploader). Any zero-progress Retry or any Err means some
 /// shard is waiting on the view, not racing it — that shard's bail bound is
 /// paced in attempts-with-sleeps, and an unpaced re-attempt would compress it
-/// below its commented guarantee.
-pub(crate) fn attempt_racing_live_feed(results: &[CatchupCompletionMsg]) -> bool {
-    results.iter().all(|msg| match &msg.result {
+/// below its commented guarantee. A shard that missed the barrier is absent
+/// from `results` entirely, so it is checked separately: it is still draining,
+/// which is the opposite of proof that it is racing.
+pub(crate) fn attempt_racing_live_feed(results: &[CatchupCompletionMsg], timed_out: &[usize]) -> bool {
+    timed_out.is_empty() && results.iter().all(|msg| match &msg.result {
         Ok(r) => r.batches_applied > 0 || r.completion == CatchupCompletion::Caught,
         Err(_) => false,
     })
@@ -249,19 +251,23 @@ mod tests {
         let msg = |shard_id: usize, result: Result<S3CatchupResult, S3CatchupError>| CatchupCompletionMsg { shard_id, attempt: 1, result };
 
         // all shards applying → racing
-        assert!(attempt_racing_live_feed(&[msg(0, res(Retry, 2, false)), msg(1, res(Retry, 1, false))]));
+        assert!(attempt_racing_live_feed(&[msg(0, res(Retry, 2, false)), msg(1, res(Retry, 1, false))], &[]));
         // progress + an already-caught shard (applied 0) → racing
-        assert!(attempt_racing_live_feed(&[msg(0, res(Retry, 2, false)), msg(1, res(Caught, 0, false))]));
+        assert!(attempt_racing_live_feed(&[msg(0, res(Retry, 2, false)), msg(1, res(Caught, 0, false))], &[]));
         // progress + a zero-progress Retry (stalled or churn) → not racing
-        assert!(!attempt_racing_live_feed(&[msg(0, res(Retry, 2, false)), msg(1, res(Retry, 0, true))]));
-        assert!(!attempt_racing_live_feed(&[msg(0, res(Retry, 2, false)), msg(1, res(Retry, 0, false))]));
+        assert!(!attempt_racing_live_feed(&[msg(0, res(Retry, 2, false)), msg(1, res(Retry, 0, true))], &[]));
+        assert!(!attempt_racing_live_feed(&[msg(0, res(Retry, 2, false)), msg(1, res(Retry, 0, false))], &[]));
         // progress + any Err → not racing
         assert!(!attempt_racing_live_feed(&[
             msg(0, res(Retry, 2, false)),
             msg(1, Err(S3CatchupError::SidecarUnavailable)),
-        ]));
+        ], &[]));
         // all zero-progress → not racing
-        assert!(!attempt_racing_live_feed(&[msg(0, res(Retry, 0, true))]));
+        assert!(!attempt_racing_live_feed(&[msg(0, res(Retry, 0, true))], &[]));
+        // every REPORTING shard progressing but one missed the barrier → not racing.
+        // That shard is absent from `results`, so ignoring `timed_out` reads the
+        // attempt as a clean sweep and re-broadcasts with its task still draining.
+        assert!(!attempt_racing_live_feed(&[msg(0, res(Retry, 2, false)), msg(1, res(Caught, 0, false))], &[2]));
     }
 
     /// A shard that misses the completion barrier is inconclusive, not clean.

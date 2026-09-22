@@ -32,11 +32,53 @@ use super::{
     shard_error_response::{shard_error_to_client_response, shard_error_to_cluster_response, shard_routing_error_to_code, watch_read_error_to_client_response, watch_session_error_to_client_response},
 };
 
-struct ConnectionGuard<'a>(&'a [(&'static str, String); 1]);
+/// Holds a gauge up for the life of the guard. Drop restores it, so a task
+/// cancelled mid-await cannot leak the count. Holds a resolved handle, not
+/// labels: re-resolving would allocate a `Vec<Label>` on every call.
+pub struct GaugeGuard(metrics::Gauge);
 
-impl Drop for ConnectionGuard<'_> {
+impl GaugeGuard {
+    pub fn enter(gauge: &metrics::Gauge) -> Self {
+        gauge.increment(1.0);
+        Self(gauge.clone())
+    }
+}
+
+impl Drop for GaugeGuard {
     fn drop(&mut self) {
-        metrics::gauge!("celeriant_client_connections_active", self.0).decrement(1.0);
+        self.0.decrement(1.0);
+    }
+}
+
+/// `celeriant_client_connections_active` handles for one shard, resolved once
+/// so an accepted connection costs no label allocation.
+///
+/// A connection holds its port's gauge for as long as the stream lives on this
+/// shard. A cross-shard redirect drops the sending shard's guard and the
+/// receiving shard takes its own, so the total is unchanged and the `shard_id`
+/// label follows the stream.
+pub struct ConnectionGauges {
+    client: metrics::Gauge,
+    replication: metrics::Gauge,
+}
+
+impl ConnectionGauges {
+    pub fn new(shard_id: usize) -> Self {
+        let gauge = |port_type: PortType| {
+            metrics::gauge!(
+                "celeriant_client_connections_active",
+                "shard_id" => shard_id.to_string(),
+                "port_type" => port_type.label(),
+            )
+        };
+        Self { client: gauge(PortType::Client), replication: gauge(PortType::Replication) }
+    }
+
+    fn enter(&self, port_type: PortType) -> GaugeGuard {
+        GaugeGuard::enter(match port_type {
+            PortType::Client => &self.client,
+            PortType::Replication => &self.replication,
+        })
     }
 }
 
@@ -44,6 +86,16 @@ impl Drop for ConnectionGuard<'_> {
 pub enum PortType {
     Client,
     Replication,
+}
+
+impl PortType {
+    /// Metric label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            PortType::Client => "client",
+            PortType::Replication => "replication",
+        }
+    }
 }
 
 pub struct CatchupCompletionMsg {
@@ -67,6 +119,7 @@ pub struct ConnectionContext<R: ReplicationClient + 'static, D: S3Downloader + '
     pub lease_manager: Option<Rc<S3LeaseManager<S>>>,
     pub dict_codec: Rc<DictCodec>,
     pub extension_redirect_sink: Option<Rc<LocalSender<RedirectedConnection>>>,
+    pub connection_gauges: Rc<ConnectionGauges>,
 }
 
 /// Connection-level state for identity verification and access control
@@ -89,6 +142,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
             lease_manager: self.lease_manager.clone(),
             dict_codec: self.dict_codec.clone(),
             extension_redirect_sink: self.extension_redirect_sink.clone(),
+            connection_gauges: self.connection_gauges.clone(),
         }
     }
 }
@@ -134,9 +188,7 @@ pub fn handle_new_connection<R: ReplicationClient + 'static, D: S3Downloader + '
 
         debug!(shard_id = ctx.current_shard_id, peer = %peer_addr, ?port_type, trailing_bytes = trailing.len(), "Connection accepted");
 
-        let shard_label = [("shard_id", ctx.current_shard_id.to_string())];
-        metrics::gauge!("celeriant_client_connections_active", &shard_label).increment(1.0);
-        let _guard = ConnectionGuard(&shard_label);
+        let _guard = ctx.connection_gauges.enter(port_type);
 
         match port_type {
             PortType::Client => {
@@ -253,6 +305,7 @@ pub fn handle_redirected_client_connection<R: ReplicationClient + 'static, D: S3
     );
 
     glommio::spawn_local(async move {
+        let _guard = ctx.connection_gauges.enter(PortType::Client);
         let conn_state = ConnectionState { verified_client_id, access_level, client_has_dict: false };
         handle_client_pipelining(tcp_stream, Some(request), max_response_size, message_version, ctx, conn_state).await;
     })
@@ -269,9 +322,37 @@ pub fn handle_redirected_cluster_connection<R: ReplicationClient + 'static, D: S
     let _ = tcp_stream.set_nodelay(true);
 
     glommio::spawn_local(async move {
+        let _guard = ctx.connection_gauges.enter(PortType::Replication);
         handle_cluster_pipelining(tcp_stream, Some(request), max_response_size, message_version, ctx).await;
     })
     .detach();
+}
+
+/// Upper bound on one catchup task. Matched to shard 0's completion barrier:
+/// a task still running past it has already missed the generation it was
+/// started for.
+const CATCHUP_TASK_TIMEOUT: Duration = super::shard::COMPLETION_BARRIER_TIMEOUT;
+
+/// INVARIANT: at most one S3 catchup task per shard at any instant. A catchup
+/// that truncates the WAL and re-applies from its own `next_wal_seq` is only
+/// correct when nothing else is doing the same to the same WAL.
+struct CatchupInFlight {
+    flag: Rc<Cell<bool>>,
+}
+
+impl CatchupInFlight {
+    fn try_enter(flag: &Rc<Cell<bool>>) -> Option<Self> {
+        if flag.replace(true) {
+            return None;
+        }
+        Some(CatchupInFlight { flag: flag.clone() })
+    }
+}
+
+impl Drop for CatchupInFlight {
+    fn drop(&mut self) {
+        self.flag.set(false);
+    }
 }
 
 pub fn handle_enter_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
@@ -280,9 +361,41 @@ pub fn handle_enter_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader +
     attempt: u64,
 ) {
     glommio::spawn_local(async move {
+        // Before the guard, so a re-attempt refused below still closes the TCP
+        // replication gate. A shard bailed back to Follower and then re-kicked
+        // would otherwise skip and keep accepting batches under a draining task.
+        ctx.shard_wal.mark_catching_up();
+
+        // A re-attempt for a shard whose previous attempt is still draining (it
+        // overran shard 0's completion barrier) reports nothing for this
+        // generation: the barrier then names it unreported, which is the honest
+        // reading (its data state is still unknown) and never reads as Caught.
+        let Some(_in_flight) = CatchupInFlight::try_enter(&ctx.shard_wal.s3_catchup_in_flight) else {
+            metrics::counter!("celeriant_s3_catchup_task_skipped_in_flight_total",
+                &[("shard_id", ctx.current_shard_id.to_string())]).increment(1);
+            warn!(shard_id = ctx.current_shard_id, attempt, "S3 catchup still in flight for this shard; skipping the re-attempt");
+            return;
+        };
         metrics::counter!("celeriant_s3_catchup_task_started_total",
             &[("shard_id", ctx.current_shard_id.to_string())]).increment(1);
-        let result = ctx.shard_wal.enter_s3_catchup(role).await;
+
+        // The guard is only safe if it is guaranteed to be released. The sidecar
+        // round-trip inside catchup has no timeout of its own, so a hung sidecar
+        // would latch the flag for the process lifetime and skip every later
+        // attempt for this shard. Bounded by the completion barrier: past it the
+        // orchestrator has already given up on this generation anyway, and the
+        // only await that lasts that long is an S3 call, not a WAL write.
+        let result = match glommio::timer::timeout(CATCHUP_TASK_TIMEOUT, async {
+            Ok::<_, glommio::GlommioError<()>>(ctx.shard_wal.enter_s3_catchup(role).await)
+        }).await {
+            Ok(result) => result,
+            Err(_) => {
+                metrics::counter!("celeriant_s3_catchup_task_timeout_total",
+                    &[("shard_id", ctx.current_shard_id.to_string())]).increment(1);
+                warn!(shard_id = ctx.current_shard_id, attempt, timeout_ms = CATCHUP_TASK_TIMEOUT.as_millis() as u64, "S3 catchup exceeded its task budget; abandoning the attempt so the next one can run");
+                return;
+            }
+        };
 
         if let Err(e) = try_send_with_retry(
             ctx.intrashard_sender.as_ref(), 0,
@@ -1603,6 +1716,110 @@ mod tests {
     use celeriant_wal::aggregate_key::AggregateKey;
     use std::collections::HashMap;
 
+    /// The single-flight guard is a liveness hazard as much as a safety one: a
+    /// flag that stays true skips EVERY later catchup for that shard, and the
+    /// shard then never reports for any generation: Boot loops on the 90s
+    /// barrier forever, Following StallBails on every attempt.
+    ///
+    /// PASS: the flag tracks the guard's lifetime, so the attempt after a
+    /// completed catchup enters. FAIL: catchup is permanently disabled for the
+    /// shard with only a warn line to show for it.
+    #[test]
+    fn catchup_guard_releases_on_drop_so_the_next_attempt_enters() {
+        let flag = Rc::new(Cell::new(false));
+
+        let first = CatchupInFlight::try_enter(&flag).expect("an idle shard must enter");
+        assert!(CatchupInFlight::try_enter(&flag).is_none(), "a second task must be refused while the first runs");
+
+        drop(first);
+        assert!(!flag.get(), "the flag must not latch after the holder ends");
+        assert!(CatchupInFlight::try_enter(&flag).is_some(), "the attempt after a completed catchup must run");
+    }
+
+    /// The guard is held across every await of `enter_s3_catchup`, so the exits
+    /// that matter are the ones that never reach the end of the task: shutdown
+    /// dropping the task, or executor teardown. Drop is what returns the flag
+    /// on those paths.
+    #[test]
+    fn catchup_guard_releases_when_the_holding_task_is_cancelled() {
+        glommio::LocalExecutorBuilder::default()
+            .spawn(|| async {
+                let flag = Rc::new(Cell::new(false));
+                let guard = CatchupInFlight::try_enter(&flag).expect("enter");
+                let task = glommio::spawn_local(async move {
+                    let _guard = guard;
+                    std::future::pending::<()>().await;
+                });
+                glommio::executor().yield_now().await;
+                assert!(flag.get(), "the in-flight catchup holds the flag");
+                task.cancel().await;
+                assert!(!flag.get(), "a cancelled catchup task must return the flag");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// Value of `celeriant_client_connections_active` for one shard/port, or 0
+    /// when the series is absent. Label order in the exposition is not
+    /// guaranteed, so match on the labels rather than the whole line.
+    fn connections_active(rendered: &str, shard_id: &str, port_type: &str) -> f64 {
+        rendered
+            .lines()
+            .find(|line| {
+                line.starts_with("celeriant_client_connections_active{")
+                    && line.contains(&format!("shard_id=\"{shard_id}\""))
+                    && line.contains(&format!("port_type=\"{port_type}\""))
+            })
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0.0)
+    }
+
+    /// The gauge follows the stream. A cross-shard redirect used to drop the
+    /// sending shard's guard with nothing taking its place, so the count fell
+    /// to near zero while thousands of sockets were open.
+    #[test]
+    fn connection_gauge_hands_over_on_a_cross_shard_redirect() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let accepting_shard = ConnectionGauges::new(0);
+            let receiving_shard = ConnectionGauges::new(3);
+
+            let accepted = accepting_shard.enter(PortType::Client);
+            assert_eq!(connections_active(&handle.render(), "0", "client"), 1.0);
+
+            // The receiving shard takes its own guard, then the sending shard's
+            // task ends and drops its own. Net count unchanged either way.
+            let redirected = receiving_shard.enter(PortType::Client);
+            drop(accepted);
+
+            let rendered = handle.render();
+            assert_eq!(connections_active(&rendered, "0", "client"), 0.0, "{rendered}");
+            assert_eq!(connections_active(&rendered, "3", "client"), 1.0, "{rendered}");
+
+            drop(redirected);
+            assert_eq!(connections_active(&handle.render(), "3", "client"), 0.0);
+        });
+    }
+
+    /// Replication connections carry their own `port_type`, so they no longer
+    /// inflate the client count the chaos scraper reads.
+    #[test]
+    fn replication_connections_do_not_land_on_the_client_series() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let gauges = ConnectionGauges::new(1);
+            let _peer = gauges.enter(PortType::Replication);
+
+            let rendered = handle.render();
+            assert_eq!(connections_active(&rendered, "1", "replication"), 1.0, "{rendered}");
+            assert_eq!(connections_active(&rendered, "1", "client"), 0.0, "{rendered}");
+        });
+    }
+
     /// A promoting node refuses heartbeat adoption at epoch <= its own (zombie
     /// leader must not re-open the replication gate mid-window) and steps down
     /// only for a genuinely newer election win.
@@ -1727,6 +1944,7 @@ mod tests {
             list_page_size: 100,
             list_max_concurrent: 16,
             read_max_concurrent: 64,
+            handshake_concurrency: 8,
             schema_cache_bytes: 4_194_304, // 4MB
             max_schema_size_bytes: 16384,
             replication_delay: Duration::from_millis(20),

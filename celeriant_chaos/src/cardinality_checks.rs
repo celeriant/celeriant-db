@@ -286,9 +286,9 @@ pub fn read_latency_uncensored(
 
 /// Nothing — read or write — came back carrying another request's correlation id.
 ///
-/// goal.md's complaint about the previous chaos harness was that the error
-/// variants proving stream desync were "recorded and never read", naming both
-/// the read and the write side. This is the assertion that reads them.
+/// The previous chaos harness recorded the error variants that prove stream
+/// desync and never read them, on either the read or the write side. This is
+/// the assertion that reads them.
 ///
 /// Unlike every other check here it has no threshold and no tolerance: load,
 /// partitions, restarts and S3 outages are all modelled faults that cannot
@@ -708,7 +708,7 @@ mod tests {
             "one misbound read must fail the run"
         );
 
-        // The write side counts too — goal.md names both.
+        // The write side counts too.
         assert_eq!(
             no_correlation_mismatches(&[("p", &clean)], Some((10, 1))).outcome,
             CheckOutcome::Fail,

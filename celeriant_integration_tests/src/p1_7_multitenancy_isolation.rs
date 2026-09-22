@@ -77,7 +77,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 2: List aggregates filtering by org_id = 2 (should be empty)
     println!("\n=== Phase 2: List aggregates for org_id = 2 (expect empty) ===");
     let options = ListOptions::default();
-    let aggs_iter = ListAggregatesIterator::new(&mut client, Some(2), None, options);
+    let aggs_iter = ListAggregatesIterator::new(&mut client, Some(2), None, options)?;
     let org2_aggregates = aggs_iter.collect().await?;
     println!("Found {} aggregates for org_id = 2", org2_aggregates.len());
     assert!(
@@ -90,7 +90,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 3: List aggregates for org_id = 1 (sanity check)
     println!("\n=== Phase 3: List aggregates for org_id = 1 (sanity check) ===");
     let options = ListOptions::default();
-    let aggs_iter = ListAggregatesIterator::new(&mut client, Some(1), None, options);
+    let aggs_iter = ListAggregatesIterator::new(&mut client, Some(1), None, options)?;
     let org1_aggregates = aggs_iter.collect().await?;
     println!("Found {} aggregates for org_id = 1", org1_aggregates.len());
     assert!(

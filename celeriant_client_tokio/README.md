@@ -81,15 +81,18 @@ The pool also supports `delete`, `trim_start`, `aggregate_details`, `register_sc
 
 ```rust
 use celeriant_client_tokio::ClientTlsConfig;
-use celeriant_crypto::pki::PkiManager;
+use std::path::Path;
 
-let ca = PkiManager::load_ca_bundle(Path::new("ca.crt"))?;
-let (certs, key) = PkiManager::load_identity(Path::new("client.crt"), Path::new("client.key"))?;
-let tls_config = PkiManager::build_client_config(&ca, certs, key)?;
-let tls = ClientTlsConfig::new(tls_config, "localhost".try_into()?);
+let tls = ClientTlsConfig::from_paths(
+    Path::new("ca.crt"),
+    Some((Path::new("client.crt"), Path::new("client.key"))),
+    "localhost",
+)?;
 
 let mut client = CeleriantClient::connect_tls("localhost:10010", tls).await?;
 ```
+
+Pass `None` in place of the certificate pair for server-only TLS.
 
 ## Examples
 

@@ -18,8 +18,11 @@ celeriant_client_tokio = { path = "../celeriant_client_tokio" }
 celeriant_crypto = { path = "../celeriant_crypto" }
 celeriant_wal = { path = "../celeriant_wal" }
 celeriant_msg = { path = "../celeriant_msg" }
-rustls-pki-types.workspace = true
 tokio.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# Only so the error-classification table can name a `WireError` value.
+celeriant_wire = { path = "../celeriant_wire", version = "0.1.2" }

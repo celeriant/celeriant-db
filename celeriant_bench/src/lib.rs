@@ -11,26 +11,28 @@ use celeriant_client_tokio::pool::{CeleriantPool, PoolOptions};
 /// `PoolBuilder::build` — likewise the protocol types its schema oracle
 /// drives through the pool.
 pub use celeriant_client_tokio::pool::CeleriantPool as Pool;
-pub use celeriant_client_tokio::{ClientError, SchemaError, ServerError, WriteError, WriteEventsOptions};
+pub use celeriant_client_tokio::{
+    ClientError, PoolStats, SchemaError, ServerError, WriteError, WriteEventsOptions,
+};
 pub use celeriant_msg::request::read_filters::ReadFilters;
 pub use celeriant_msg::request::requests::RegisterSchemaRequest;
 pub use celeriant_wal::aggregate_key::AggregateKey;
 pub use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 pub use celeriant_wal::schema_key::SchemaKey;
-use celeriant_crypto::pki::PkiManager;
-use rustls_pki_types::ServerName;
 use tokio::sync::Barrier;
 use tokio::time::Instant;
 
 pub mod account_workload;
 pub mod cas_storm;
 pub mod delete_trim;
+pub mod error_breakdown;
 pub mod history;
 pub mod population;
 pub mod read_workload;
 pub mod watch_flood;
 pub use cas_storm::{cas_storm_aggregate, run_cas_storm, CasStormOutcome};
 pub use delete_trim::{audit_delete_trim, audit_delete_trim_pinned, run_delete_trim_workload, DeleteTrimAuditReport, DeleteTrimCounters, DeleteTrimOutcome};
+pub use error_breakdown::{print_error_summary, ErrorBreakdown, ErrorKey, ErrorKindCount};
 pub use history::{HistoryRecorder, HistorySummary};
 pub use watch_flood::{run_watch_flood, run_watch_flood_with_history, watch_dial_probe, WatchFloodParams, WatchFloodResult};
 
@@ -48,6 +50,14 @@ pub struct BenchmarkResult {
     pub min_ms: u64,
     pub max_ms: u64,
     pub warmup_p50_ms: u64,
+    /// Every failed request of the run, classified by `ClientError` variant.
+    /// Empty for the runs that have no request loop of their own.
+    pub errors_by_kind: Vec<ErrorKindCount>,
+    /// The client pools' own counters at the end of the loop: connects, reuse,
+    /// pool-gate timeouts, leader routing, and the `get()` wait histogram.
+    /// Multi-pool runs are merged into one snapshot. `None` for the runs that
+    /// have no request loop of their own.
+    pub pool_stats: Option<PoolStats>,
 }
 
 pub fn expand_home(path: &str) -> PathBuf {
@@ -87,12 +97,11 @@ pub fn build_tls_config(
     client_key: &str,
     server_name: &str,
 ) -> Result<ClientTlsConfig, Box<dyn std::error::Error>> {
-    let ca_bundle = PkiManager::load_ca_bundle(&expand_home(ca_cert))?;
-    let (cert_chain, key) = PkiManager::load_identity(&expand_home(client_cert), &expand_home(client_key))?;
-    let client_config = PkiManager::build_client_config(&ca_bundle, cert_chain, key)?;
-    let sni = ServerName::try_from(server_name.to_string())
-        .map_err(|e| format!("Invalid server name '{server_name}': {e}"))?;
-    Ok(ClientTlsConfig::new(client_config, sni))
+    Ok(ClientTlsConfig::from_paths(
+        &expand_home(ca_cert),
+        Some((&expand_home(client_cert), &expand_home(client_key))),
+        server_name,
+    )?)
 }
 
 pub struct PoolBuilder<'a> {
@@ -182,8 +191,8 @@ pub async fn run_benchmark(
 }
 
 /// The primary workload, as one knob per safety layer so a run can price them
-/// one at a time (`session/session-2/goal.md` Phase 3). `None` throughout means the
-/// original opaque-payload fire-and-forget append, unchanged.
+/// one at a time. `None` throughout means the original opaque-payload
+/// fire-and-forget append, unchanged.
 ///
 /// Deliberately absent: client-side batching and client idempotency. One event per
 /// request is a property of the workload being modelled, not a limitation here.
@@ -337,6 +346,10 @@ pub async fn run_benchmark_ramped_fanout(
     run_write_loop(pools, num_tasks, duration_secs, connect_ramp_secs, None).await
 }
 
+/// Failures still worth a line each, so an outright misconfiguration is visible
+/// without waiting for the run to end. Everything past this is only tallied.
+const FIRST_ERRORS_LOGGED: u64 = 20;
+
 async fn run_write_loop(
     pools: &[Arc<CeleriantPool>],
     num_tasks: usize,
@@ -347,6 +360,7 @@ async fn run_write_loop(
     let barrier = Arc::new(Barrier::new(num_tasks));
     let total_ok = Arc::new(AtomicU64::new(0));
     let total_err = Arc::new(AtomicU64::new(0));
+    let breakdown = Arc::new(ErrorBreakdown::default());
 
     let mut tasks = Vec::with_capacity(num_tasks);
     let start = Instant::now();
@@ -356,6 +370,7 @@ async fn run_write_loop(
         let barrier = barrier.clone();
         let ok_counter = total_ok.clone();
         let err_counter = total_err.clone();
+        let breakdown = Arc::clone(&breakdown);
 
         tasks.push(tokio::spawn(async move {
             // The pool dials lazily, so a task's FIRST successful request carries a TCP connect
@@ -453,8 +468,14 @@ async fn run_write_loop(
                         continue;
                     }
                     Err(e) => {
-                        err_counter.fetch_add(1, Ordering::Relaxed);
-                        eprintln!("Task {id} error: {e}");
+                        // A line per failure buried 10k+ lines in a chaos log and left
+                        // nothing structured behind. The tally is the record now; the
+                        // increment it reads is the one the error path already paid.
+                        let seen = err_counter.fetch_add(1, Ordering::Relaxed);
+                        breakdown.record(&e);
+                        if seen < FIRST_ERRORS_LOGGED {
+                            eprintln!("Task {id} error: {e}");
+                        }
                         let next = if backoff_ms == 0 {
                             BACKOFF_INITIAL_MS
                         } else {
@@ -542,6 +563,18 @@ async fn run_write_loop(
         );
     }
 
+    let errors_by_kind = breakdown.snapshot();
+    print_error_summary(&errors_by_kind);
+
+    // Several pools means several destinations, so the rows merge by address.
+    let pool_stats = pools.iter().map(|p| p.stats()).reduce(|mut acc, next| {
+        acc.merge(next);
+        acc
+    });
+    if let Some(ref stats) = pool_stats {
+        println!("  {stats}");
+    }
+
     BenchmarkResult {
         num_tasks,
         total_requests: ok,
@@ -555,6 +588,8 @@ async fn run_write_loop(
         min_ms: min,
         max_ms: max,
         warmup_p50_ms,
+        errors_by_kind,
+        pool_stats,
     }
 }
 
@@ -938,6 +973,9 @@ pub async fn run_benchmark_idempotent_opts(
             min_ms: min,
             max_ms: max,
             warmup_p50_ms: 0,
+            // The idempotent bench keeps its own typed tally in `IdempotentBenchCounters`.
+            errors_by_kind: Vec::new(),
+            pool_stats: None,
         },
         counters: IdempotentBenchCounters {
             ok_acks: ok_acks.load(Ordering::Relaxed),

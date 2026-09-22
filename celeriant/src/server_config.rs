@@ -218,6 +218,14 @@ pub struct ServerConfig {
 
     #[arg(
         long,
+        default_value_t = 8,
+        env = "CELERIANT_HANDSHAKE_CONCURRENCY",
+        help = "Maximum TLS handshakes in flight per shard on each of the client and replication ports; 1 handshakes serially in the accept loop (8)"
+    )]
+    pub handshake_concurrency: u64,
+
+    #[arg(
+        long,
         default_value_t = 2 * 1024 * 1024,
         env = "CELERIANT_NEGATIVE_LOOKUP_CACHE_BYTES",
         help = "Per-shard byte budget for the in-memory per-aggregate negative-lookup client blooms (idempotency scan short-circuit). Entries are demand-built and evicted whole; eviction only costs a rebuild scan, never correctness (2 MiB)"
@@ -834,6 +842,7 @@ impl ServerConfig {
             list_page_size: self.list_page_size as usize,
             list_max_concurrent: self.list_max_concurrent,
             read_max_concurrent: self.read_max_concurrent,
+            handshake_concurrency: self.handshake_concurrency.max(1),
             schema_cache_bytes: memory_budget.schema_cache_bytes,
             max_schema_size_bytes: self.max_schema_size_bytes,
             max_clock_drift_ms: self.max_clock_drift_ms,
@@ -934,6 +943,7 @@ impl ServerConfig {
         check_field!(list_page_size);
         check_field!(list_max_concurrent);
         check_field!(read_max_concurrent);
+        check_field!(handshake_concurrency);
         check_field!(negative_lookup_cache_bytes);
         check_field!(max_schema_size_bytes);
         check_field!(client_connection_timeout_ms);
@@ -1049,6 +1059,7 @@ impl Default for ServerConfig {
             list_page_size: 2000,
             list_max_concurrent: 16,
             read_max_concurrent: 64,
+            handshake_concurrency: 8,
             negative_lookup_cache_bytes: 2 * 1024 * 1024,
             max_schema_size_bytes: 16384,
             s3_endpoint_override: None,

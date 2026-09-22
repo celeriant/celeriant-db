@@ -347,6 +347,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             distributed: false,
         },
         TestEntry {
+            name: "invariant_connection_gauge_redirect",
+            description: "Metrics invariant: celeriant_client_connections_active follows a stream across a cross-shard redirect instead of decaying to zero",
+            estimated_secs: 20,
+            categories: &[Invariant],
+            distributed: false,
+        },
+        TestEntry {
             name: "invariant_rotation_orphan_own_counter",
             description: "Metrics invariant: orphan deletion during runtime log rotation reports on celeriant_rotation_orphan_deleted_total, not the boot-recovery series",
             estimated_secs: 20,

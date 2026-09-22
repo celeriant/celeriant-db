@@ -16,7 +16,14 @@ use crate::common::{R, event, port_for, read_all, unique_key};
 /// Families from the once-undescribed set that a standalone server exports
 /// after a write and a read. If none of these render, the premise is unmet and
 /// the test fails rather than passing vacuously.
-const PREMISE_FAMILIES: &[&str] = &["celeriant_read_wal_seq"];
+const PREMISE_FAMILIES: &[&str] = &[
+    "celeriant_read_wal_seq",
+    // Accept path: every connected client walks it, so these render on any
+    // server that answered a request.
+    "celeriant_client_accepts_total",
+    "celeriant_tls_handshake_seconds",
+    "celeriant_tls_handshakes_in_flight",
+];
 
 pub async fn exported_families_are_described() -> R {
     let server = TestServer::start_with_port(port_for("invariant_metrics_described")).await?;

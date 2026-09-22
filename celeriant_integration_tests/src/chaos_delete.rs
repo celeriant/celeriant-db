@@ -332,7 +332,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Verify orgs
     println!("\nVerifying organizations...");
     let list_options = ListOptions::default();
-    let org_iter = ListOrgsIterator::new(&mut verify_client, list_options);
+    let org_iter = ListOrgsIterator::new(&mut verify_client, list_options)?;
     let listed_orgs: Vec<_> = org_iter.collect().await?;
     let listed_org_ids: HashSet<u128> = listed_orgs.iter().map(|o| o.org_id).collect();
 
@@ -357,7 +357,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Verify aggregate types
     println!("\nVerifying aggregate types...");
     let list_options = ListOptions::default();
-    let type_iter = ListAggregateTypesIterator::new(&mut verify_client, None, list_options);
+    let type_iter = ListAggregateTypesIterator::new(&mut verify_client, None, list_options)?;
     let listed_types: Vec<_> = type_iter.collect().await?;
     let listed_type_keys: HashSet<(u128, u128)> = listed_types
         .iter()
@@ -391,7 +391,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         include_deleted: true,
         ..Default::default()
     };
-    let agg_iter = ListAggregatesIterator::new(&mut verify_client, None, None, list_options);
+    let agg_iter = ListAggregatesIterator::new(&mut verify_client, None, None, list_options)?;
     let listed_aggregates: Vec<_> = agg_iter.collect().await?;
 
     // Control listing. `max_shard_hint` suppresses the iterator's shard-discovery probe,
@@ -408,7 +408,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             max_shard_hint: Some(max_shard),
             ..Default::default()
         },
-    );
+    )?;
     let hinted_aggregates: Vec<_> = hinted_iter.collect().await?;
     println!(
         "  Listed {} aggregates via shard discovery, {} with max_shard_hint={}",

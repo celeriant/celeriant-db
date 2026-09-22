@@ -261,7 +261,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("(Reading from FOLLOWER)");
     }
     let options = ListOptions::default();
-    let orgs_iter = ListOrgsIterator::new(&mut read_client, options);
+    let orgs_iter = ListOrgsIterator::new(&mut read_client, options)?;
     let orgs = orgs_iter.collect().await?;
     println!("Found {} organizations:", orgs.len());
     for org in &orgs {
@@ -276,7 +276,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n=== Listing Aggregate Types ===");
     let options = ListOptions::default();
-    let types_iter = ListAggregateTypesIterator::new(&mut read_client, Some(1), options);
+    let types_iter = ListAggregateTypesIterator::new(&mut read_client, Some(1), options)?;
     let agg_types = types_iter.collect().await?;
     println!("Found {} aggregate types for org 1:", agg_types.len());
     for agg_type in &agg_types {
@@ -299,7 +299,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n=== Listing Aggregates (before delete) ===");
     let options = ListOptions::default();
-    let aggs_iter = ListAggregatesIterator::new(&mut read_client, Some(1), None, options);
+    let aggs_iter = ListAggregatesIterator::new(&mut read_client, Some(1), None, options)?;
     let aggregates = aggs_iter.collect().await?;
     println!("Found {} aggregates for org 1:", aggregates.len());
     for agg in &aggregates {
@@ -354,7 +354,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // === List Aggregates again to verify delete ===
     println!("\n=== Listing Aggregates (after delete, excluding deleted) ===");
     let options = ListOptions::default();
-    let aggs_iter = ListAggregatesIterator::new(&mut read_client, Some(1), None, options);
+    let aggs_iter = ListAggregatesIterator::new(&mut read_client, Some(1), None, options)?;
     let aggregates = aggs_iter.collect().await?;
     println!("Found {} non-deleted aggregates for org 1:", aggregates.len());
     for agg in &aggregates {
@@ -381,7 +381,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         include_deleted: true,
         ..Default::default()
     };
-    let aggs_iter = ListAggregatesIterator::new(&mut read_client, Some(1), None, options);
+    let aggs_iter = ListAggregatesIterator::new(&mut read_client, Some(1), None, options)?;
     let aggregates = aggs_iter.collect().await?;
     println!(
         "Found {} total aggregates for org 1 (including deleted):",

@@ -94,6 +94,7 @@ pub struct ShardConfig {
     pub list_page_size: usize,
     pub list_max_concurrent: u64,
     pub read_max_concurrent: u64,
+    pub handshake_concurrency: u64,
     pub schema_cache_bytes: u64,
     pub max_schema_size_bytes: u64,
     pub max_clock_drift_ms: u64,

@@ -28,3 +28,6 @@ futures-lite.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

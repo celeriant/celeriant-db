@@ -1,8 +1,7 @@
 use anyhow::{Context, Result, bail};
 use base64::Engine;
-use celeriant_client_tokio::{CeleriantClient, ClientIdentityConfig, ClientTlsConfig};
+use celeriant_client_tokio::{sni_host, CeleriantClient, ClientIdentityConfig, ClientTlsConfig};
 use celeriant_client_tokio::list_operations::*;
-use celeriant_crypto::pki::PkiManager;
 use humansize::{format_size, BINARY};
 use celeriant_msg::{
     process_client_requests::ClientRequest,
@@ -17,11 +16,10 @@ use celeriant_wal::{
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
     schema_key::SchemaKey,
 };
-use rustls::pki_types::ServerName;
 use std::{collections::HashMap, fs};
 
 use crate::cli::*;
-use crate::utils::{extract_host, format_response, format_timestamp, format_u128_uuid};
+use crate::utils::{format_response, format_timestamp, format_u128_uuid};
 
 fn build_tls_config(cli: &Cli) -> Result<Option<ClientTlsConfig>> {
     if !cli.tls {
@@ -33,23 +31,22 @@ fn build_tls_config(cli: &Cli) -> Result<Option<ClientTlsConfig>> {
 
     let ca_path = cli.ca_cert.as_ref()
         .ok_or_else(|| anyhow::anyhow!("--ca-cert is required when --tls is enabled"))?;
-    let ca_bundle = PkiManager::load_ca_bundle(ca_path)
-        .with_context(|| format!("Failed to load CA certificate: {}", ca_path.display()))?;
 
-    let client_config = if let Some(cert_path) = &cli.client_cert {
-        let key_path = cli.client_key.as_ref().unwrap(); // clap `requires` guarantees this
-        let (chain, key) = PkiManager::load_identity(cert_path, key_path)
-            .with_context(|| format!("Failed to load client identity: {}", cert_path.display()))?;
-        PkiManager::build_client_config(&ca_bundle, chain, key)?
-    } else {
-        PkiManager::build_client_config_no_auth(&ca_bundle)?
+    let identity = match (&cli.client_cert, &cli.client_key) {
+        (Some(cert), Some(key)) => Some((cert.as_path(), key.as_path())),
+        (None, None) => None,
+        _ => bail!("--client-cert and --client-key must be given together"),
     };
 
-    let host = cli.server_name.as_deref().unwrap_or_else(|| extract_host(&cli.server));
-    let server_name = ServerName::try_from(host.to_owned())
-        .map_err(|_| anyhow::anyhow!("Invalid server name for TLS SNI: {host}"))?;
+    let host = match cli.server_name.as_deref() {
+        Some(name) => name,
+        None => sni_host(&cli.server)?,
+    };
 
-    Ok(Some(ClientTlsConfig::new(client_config, server_name)))
+    let tls = ClientTlsConfig::from_paths(ca_path, identity, host)
+        .with_context(|| format!("Failed to build TLS config from CA {}", ca_path.display()))?;
+
+    Ok(Some(tls))
 }
 
 async fn identify_client(cli: &Cli, client: &mut CeleriantClient) -> Result<Option<u128>> {
@@ -390,7 +387,7 @@ async fn list_orgs(client: &mut CeleriantClient, args: ListOrgsArgs) -> Result<(
         start_shard: args.shard,
         ..Default::default()
     };
-    let items = ListOrgsIterator::new(client, options).collect().await?;
+    let items = ListOrgsIterator::new(client, options)?.collect().await?;
 
     match args.format {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(
@@ -417,7 +414,7 @@ async fn list_types(client: &mut CeleriantClient, args: ListTypesArgs) -> Result
         start_shard: args.shard,
         ..Default::default()
     };
-    let items = ListAggregateTypesIterator::new(client, args.org, options).collect().await?;
+    let items = ListAggregateTypesIterator::new(client, args.org, options)?.collect().await?;
 
     match args.format {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(
@@ -512,7 +509,7 @@ async fn list_aggregates(client: &mut CeleriantClient, args: ListAggregatesArgs)
         include_deleted: args.include_deleted,
         ..Default::default()
     };
-    let items = ListAggregatesIterator::new(client, args.org, args.aggregate_type, options)
+    let items = ListAggregatesIterator::new(client, args.org, args.aggregate_type, options)?
         .collect().await?;
 
     match args.format {

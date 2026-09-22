@@ -382,8 +382,17 @@ pub fn classify_error(e: &ClientError) -> (OpOutcome, Option<String>) {
             (OpOutcome::Info, "CorrelationMismatch".to_string())
         }
         ClientError::ConnectionTimeout => (OpOutcome::Info, "ConnectionTimeout".to_string()),
+        ClientError::PoolTimeout { .. } => (OpOutcome::Info, "PoolTimeout".to_string()),
+        // Flushed, never answered: the write may have committed.
+        ClientError::ConnectionLostAfterSend(_) => {
+            (OpOutcome::Info, "ConnectionLostAfterSend".to_string())
+        }
         ClientError::RequestTimeout => (OpOutcome::Info, "RequestTimeout".to_string()),
         ClientError::IdentityError(_) => (OpOutcome::Info, "IdentityError".to_string()),
+        // The handshake failed before the request was serialised.
+        ClientError::DictUnavailable { .. } => (OpOutcome::Fail, "DictUnavailable".to_string()),
+        // Caller input, rejected before anything was built or sent.
+        ClientError::InvalidShardRange { .. } => (OpOutcome::Fail, "InvalidShardRange".to_string()),
     };
     (outcome, Some(label))
 }

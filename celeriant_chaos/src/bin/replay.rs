@@ -68,6 +68,8 @@ fn replay(path: &str) -> Result<bool, String> {
         bench_end_idx: end_idx,
         bench_actual_end_ms: run.bench_actual_end_ms,
         bench_errors: 0,
+        bench_pool_timeouts: 0,
+        bench_tasks: 0,
         bench_total_requests: 0,
         bench_throughput: 0.0,
         throughput_floor: 0.0,

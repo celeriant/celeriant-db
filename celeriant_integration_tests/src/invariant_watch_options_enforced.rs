@@ -128,7 +128,7 @@ pub async fn options_are_enforced() -> R {
     )
     .await
     {
-        Err(ClientError::ProtocolError) => {}
+        Err(ClientError::InvalidShardRange { max_shard_hint, .. }) if max_shard_hint == u64::MAX => {}
         Ok(_) => {
             return Err(
                 "a max_shard_hint of u64::MAX connected; wrapped to zero shards this is a \
@@ -137,7 +137,9 @@ pub async fn options_are_enforced() -> R {
             );
         }
         Err(other) => {
-            return Err(format!("expected ProtocolError for the overflowing hint, got {other:?}").into());
+            return Err(
+                format!("expected InvalidShardRange for the overflowing hint, got {other:?}").into()
+            );
         }
     }
 

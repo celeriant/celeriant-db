@@ -9,14 +9,17 @@ pub mod read_all_iterator;
 pub mod server_error;
 mod tokio_wire;
 pub mod watch_connection;
+pub mod client_tls_config;
 
-pub use celeriant_client::{CachedDict, CeleriantClient, ClientIdentityConfig, ClientTlsConfig};
+pub use celeriant_client::{CachedDict, CeleriantClient, ClientIdentityConfig};
+pub use client_tls_config::{sni_host, ClientTlsConfig};
 pub use client_operations::WriteEventsOptions;
 pub use event_helpers::{from_json, json_event};
 pub use client_error::ClientError;
 pub use pool::{
-    CeleriantPool, PoolOptions, PooledConnection, PooledListAggregateTypesIterator,
-    PooledListAggregatesIterator, PooledListOrgsIterator, PooledReadAllIterator,
+    CeleriantPool, ConnectionStats, NodeStats, PoolOptions, PoolStats, PooledConnection,
+    PooledListAggregateTypesIterator, PooledListAggregatesIterator, PooledListOrgsIterator,
+    PooledReadAllIterator,
 };
 pub use pool_trait::CeleriantPoolApi;
 pub use read_all_iterator::ReadAllIterator;

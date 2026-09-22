@@ -153,7 +153,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Listing consistency check: if list_aggregates shows key2, its stats must match
     // what count_events returns (i.e. listing must not show more than the read path).
     let list_opts = ListOptions { max_shard_hint: Some(0), ..Default::default() };
-    let aggs = ListAggregatesIterator::new(&mut leader_client, Some(1), Some(0), list_opts)
+    let aggs = ListAggregatesIterator::new(&mut leader_client, Some(1), Some(0), list_opts)?
         .collect()
         .await?;
     let listed_ids: Vec<u128> = aggs.iter().map(|a| a.aggregate_id).collect();

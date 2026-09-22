@@ -260,6 +260,19 @@ Reference numbers from a 2-node RPi 5 cluster (Samsung 9100 PRO 1TB NVMe, Pimoro
 
 The throughput phase saturates the connection pool to find the ceiling. The latency phase uses fewer connections to show what tail latency looks like under moderate load. Your numbers will vary with NVMe model and network setup.
 
+## Chaos runs
+
+Run the harness through `chaos.sh`, which tees its stdout and stderr (including the bench's
+per-task error lines) into `harness.log` inside the run directory the harness creates:
+
+```sh
+deploy/rpi-cluster/chaos.sh --scenario baseline --tasks 15000
+```
+
+Each run directory also gets a `build.txt` with the git HEAD, `git status --porcelain` and the
+harness version. `--full` refuses to start when tracked files differ from HEAD (untracked
+scratch is ignored); pass `--allow-dirty` to override.
+
 ## Monitoring
 
 Once the infra stack is running:
@@ -339,6 +352,7 @@ curl http://$INFRA_HOST:9000/minio/health/live
 | `setup-ktls.sh` | Kernel rebuild with `CONFIG_TLS=m` (runs ON the Pi) |
 | `setup-infra.sh` | Docker install, compose deploy on infra node (via SSH) or locally |
 | `gen-certs.sh` | Generates dual-CA TLS certs and distributes to data nodes |
+| `chaos.sh` | Runs `celeriant_chaos` and tees its stdout+stderr into the run directory's `harness.log` |
 | `docker-compose.yml` | Infra stack: MinIO, Prometheus, Loki, Grafana |
 | `docker-compose.local-override.yml` | Compose override for local mode (remaps prometheus bind mount to generated config) |
 | `prometheus.yml` | Scrape config template for both Celeriant nodes |

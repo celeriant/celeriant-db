@@ -77,7 +77,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     write_event(&mut client, &post_rotation_key, 1, true).await?;
 
     // Verify list_orgs
-    let orgs = ListOrgsIterator::new(&mut client, options.clone()).collect().await?;
+    let orgs = ListOrgsIterator::new(&mut client, options.clone())?.collect().await?;
     let org_ids: Vec<u128> = orgs.iter().map(|o| o.org_id).collect();
     println!("Orgs found: {:?}", org_ids);
     assert!(org_ids.contains(&1), "Expected org 1");
@@ -85,7 +85,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     assert!(org_ids.contains(&3), "Expected org 3");
 
     // Verify list_aggregate_types for org 1
-    let types = ListAggregateTypesIterator::new(&mut client, Some(1), options.clone())
+    let types = ListAggregateTypesIterator::new(&mut client, Some(1), options.clone())?
         .collect()
         .await?;
     let type_ids: Vec<u128> = types.iter().map(|t| t.aggregate_type_id).collect();
@@ -94,7 +94,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     assert!(type_ids.contains(&20), "Expected type 20 for org 1");
 
     // Verify list_aggregate_types for org 2
-    let types = ListAggregateTypesIterator::new(&mut client, Some(2), options.clone())
+    let types = ListAggregateTypesIterator::new(&mut client, Some(2), options.clone())?
         .collect()
         .await?;
     let type_ids: Vec<u128> = types.iter().map(|t| t.aggregate_type_id).collect();
@@ -103,7 +103,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     assert!(type_ids.contains(&30), "Expected type 30 for org 2");
 
     // Verify list_aggregates for (org=1, type=10)
-    let aggs = ListAggregatesIterator::new(&mut client, Some(1), Some(10), options.clone())
+    let aggs = ListAggregatesIterator::new(&mut client, Some(1), Some(10), options.clone())?
         .collect()
         .await?;
     let agg_ids: Vec<u128> = aggs.iter().map(|a| a.aggregate_id).collect();
@@ -140,7 +140,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // Verify aggregate 200 is excluded from default listing
-    let aggs = ListAggregatesIterator::new(&mut client, Some(2), None, options.clone())
+    let aggs = ListAggregatesIterator::new(&mut client, Some(2), None, options.clone())?
         .collect()
         .await?;
     let agg_ids: Vec<u128> = aggs.iter().map(|a| a.aggregate_id).collect();
@@ -153,7 +153,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         max_shard_hint: Some(0),
         ..Default::default()
     };
-    let aggs = ListAggregatesIterator::new(&mut client, Some(2), None, deleted_options)
+    let aggs = ListAggregatesIterator::new(&mut client, Some(2), None, deleted_options)?
         .collect()
         .await?;
     let agg_200 = aggs.iter().find(|a| a.aggregate_id == 200);
@@ -164,7 +164,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Verify org 2 still listed (agg 201 exists)
-    let orgs = ListOrgsIterator::new(&mut client, options.clone()).collect().await?;
+    let orgs = ListOrgsIterator::new(&mut client, options.clone())?.collect().await?;
     let org_ids: Vec<u128> = orgs.iter().map(|o| o.org_id).collect();
     println!("Orgs after delete: {:?}", org_ids);
     assert!(org_ids.contains(&2), "Org 2 should still exist (agg 201 is alive)");
@@ -184,7 +184,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     write_event(&mut client, &trim_key, 5, false).await?;
 
     // Check min_aggregate_version before trim
-    let aggs = ListAggregatesIterator::new(&mut client, Some(1), Some(10), options.clone())
+    let aggs = ListAggregatesIterator::new(&mut client, Some(1), Some(10), options.clone())?
         .collect()
         .await?;
     let before = aggs.iter().find(|a| a.aggregate_id == 888).unwrap();
@@ -206,7 +206,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .send_request(&ClientRequest::TrimStart(req))
         .await?;
 
-    let aggs = ListAggregatesIterator::new(&mut client, Some(1), Some(10), options.clone())
+    let aggs = ListAggregatesIterator::new(&mut client, Some(1), Some(10), options.clone())?
         .collect()
         .await?;
     let after = aggs.iter().find(|a| a.aggregate_id == 888).unwrap();
@@ -256,7 +256,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Recreate
     write_event(&mut client, &recreate_key, 4, true).await?;
 
-    let aggs = ListAggregatesIterator::new(&mut client, Some(3), Some(10), options.clone())
+    let aggs = ListAggregatesIterator::new(&mut client, Some(3), Some(10), options.clone())?
         .collect()
         .await?;
     let recreated = aggs.iter().find(|a| a.aggregate_id == 400);

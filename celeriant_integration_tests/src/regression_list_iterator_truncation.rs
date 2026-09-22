@@ -89,7 +89,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The listing under test: shard range discovered by probing, which is the path that could
     // truncate.
     let discovery: HashSet<u128> =
-        ListAggregatesIterator::new(&mut client, Some(ORG_ID), Some(AGG_TYPE_ID), ListOptions::default())
+        ListAggregatesIterator::new(&mut client, Some(ORG_ID), Some(AGG_TYPE_ID), ListOptions::default())?
             .collect()
             .await?
             .into_iter()
@@ -100,7 +100,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let max_shard = (NUM_SHARDS - 1) as u64;
     let hinted_options = ListOptions { max_shard_hint: Some(max_shard), ..Default::default() };
     let hinted: HashSet<u128> =
-        ListAggregatesIterator::new(&mut client, Some(ORG_ID), Some(AGG_TYPE_ID), hinted_options)
+        ListAggregatesIterator::new(&mut client, Some(ORG_ID), Some(AGG_TYPE_ID), hinted_options)?
             .collect()
             .await?
             .into_iter()

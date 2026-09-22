@@ -12,16 +12,77 @@ impl RunDir {
         let ts = current_timestamp();
         let root = deploy_dir.join("runs").join(&ts);
         fs::create_dir_all(&root).map_err(|e| format!("create {}: {e}", root.display()))?;
-        Ok(Self { root })
+        let dir = Self { root };
+        dir.write_build_stamp(deploy_dir, &ts)?;
+        Ok(dir)
+    }
+
+    /// Which build produced this run. Without it a run directory is a pile of
+    /// numbers with no way back to the code that made them.
+    fn write_build_stamp(&self, repo_dir: &Path, ts: &str) -> Result<(), String> {
+        let head = git(repo_dir, &["rev-parse", "HEAD"]).unwrap_or_else(|e| format!("(unavailable: {e})"));
+        let status = git(repo_dir, &["status", "--porcelain"]).unwrap_or_else(|e| format!("(unavailable: {e})"));
+        let body = format!(
+            "timestamp_unix: {ts}\nceleriant_chaos: {}\ngit_head: {head}\ngit_status_porcelain:\n{}\n",
+            env!("CARGO_PKG_VERSION"),
+            if status.is_empty() { "(clean)" } else { &status },
+        );
+        let path = self.root.join("build.txt");
+        fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))
     }
 }
 
+/// Run `git` in `repo_dir` and return trimmed stdout.
+pub fn git(repo_dir: &Path, args: &[&str]) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(args)
+        .output()
+        .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+    if !out.status.success() {
+        return Err(format!("git {} exited {}", args.join(" "), out.status));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+}
+
+/// Porcelain lines for TRACKED changes only. Untracked (`??`) entries are
+/// ignored: a working session keeps scratch directories around, and treating
+/// those as a dirty tree would refuse every run.
+pub fn tracked_changes(porcelain: &str) -> Vec<&str> {
+    porcelain.lines().filter(|l| !l.starts_with("??") && !l.trim().is_empty()).collect()
+}
+
 pub fn write_scenario(dir: &RunDir, report: &ScenarioReport) -> Result<(), String> {
+    print_accept_summary(report);
     let path = dir.root.join(format!("{}.json", report.name));
     let body = serde_json::to_string_pretty(report)
         .map_err(|e| format!("serialize: {e}"))?;
     fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(())
+}
+
+/// Server accept path, from the last good sample of each host. One line per
+/// scenario: connections the listener actually took, and what the inline
+/// handshake cost the shard executor that took them.
+fn print_accept_summary(report: &ScenarioReport) {
+    for host in report.samples.iter().map(|s| s.host.as_str()).collect::<std::collections::BTreeSet<_>>() {
+        let Some(last) = report.samples.iter().rev().find(|s| s.ok && s.host == host) else { continue };
+        let mean_ms = if last.tls_handshake_count == 0 {
+            0.0
+        } else {
+            last.tls_handshake_seconds_sum / last.tls_handshake_count as f64 * 1000.0
+        };
+        println!(
+            "[{}] {host} accept: {} accepted, {} conns active, handshakes {} (mean {mean_ms:.1}ms, {} failed, {} in flight)",
+            report.name,
+            last.client_accepts_total,
+            last.client_connections_active,
+            last.tls_handshake_count,
+            last.tls_handshake_failures_total,
+            last.tls_handshakes_in_flight,
+        );
+    }
 }
 
 pub fn write_run_report(dir: &RunDir, scenarios: &[ScenarioReport]) -> Result<(), String> {
@@ -114,4 +175,30 @@ fn current_timestamp() -> String {
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     // Plain unix seconds — no chrono dep, sortable lexicographically.
     format!("{secs}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn untracked_entries_do_not_make_the_tree_dirty() {
+        let porcelain = "?? session/\n M celeriant_chaos/src/main.rs\nA  new.rs\n";
+        assert_eq!(
+            tracked_changes(porcelain),
+            vec![" M celeriant_chaos/src/main.rs", "A  new.rs"]
+        );
+        assert!(tracked_changes("?? session/\n?? debate-workspace/\n").is_empty());
+    }
+
+    #[test]
+    fn a_run_directory_stamps_the_build_it_came_from() {
+        let tmp = std::env::temp_dir().join(format!("celeriant-chaos-rundir-{}", std::process::id()));
+        let dir = RunDir::create(&tmp).unwrap();
+        let stamp = fs::read_to_string(dir.root.join("build.txt")).unwrap();
+        assert!(stamp.contains("git_head: "), "{stamp}");
+        assert!(stamp.contains("git_status_porcelain:"), "{stamp}");
+        assert!(stamp.contains(concat!("celeriant_chaos: ", env!("CARGO_PKG_VERSION"))), "{stamp}");
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }

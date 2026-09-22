@@ -197,7 +197,11 @@ fn register_metric_descriptions() {
     describe_counter!("celeriant_schema_scan_segments_skipped_total", "Segments a schema-absence scan skipped outright via the per-segment schema set");
 
     // Connections
-    describe_gauge!("celeriant_client_connections_active", "Open client TCP connections");
+    describe_gauge!("celeriant_client_connections_active", "Open TCP connections (labels: shard_id, port_type=client|replication). A cross-shard redirect moves the stream's count to the receiving shard's label");
+    describe_counter!("celeriant_client_accepts_total", "Sockets returned by shared_accept(), counted before the handshake (labels: shard_id, port_type=client|replication)");
+    describe_histogram!("celeriant_tls_handshake_seconds", "Accept to handshake-complete latency (labels: shard_id, port_type). Measured from the accept, so it includes time the connection waited for a handshake slot as well as the handshake itself");
+    describe_counter!("celeriant_tls_handshake_failures_total", "Accepted sockets whose handshake failed or timed out (labels: shard_id, port_type)");
+    describe_gauge!("celeriant_tls_handshakes_in_flight", "Handshakes in progress (labels: shard_id, port_type). Each runs in its own task, bounded per shard and port by CELERIANT_HANDSHAKE_CONCURRENCY");
     describe_counter!("celeriant_connection_redirects_total", "Cross-shard connection redirects");
     describe_counter!("celeriant_extension_redirects_total", "Cross-shard connection redirects by a PerShardExtension (e.g. the queue)");
     describe_counter!("celeriant_extension_redirect_dropped_total", "Extension redirects dropped because the target shard's inbound channel was full or closed");
@@ -209,6 +213,8 @@ fn register_metric_descriptions() {
     describe_counter!("celeriant_intrashard_broadcast_dropped_total", "Shard-0 mesh broadcasts abandoned after retries, by kind and target shard. kind=\"status_update\" is a lease renewal a data shard never received, which fences it within heartbeat_lease_duration - max_clock_drift");
     describe_counter!("celeriant_s3_catchup_completion_dropped_total", "Catchup completions lost forwarding to shard 0 (receiver gone)");
     describe_counter!("celeriant_s3_catchup_task_started_total", "Spawned S3 catchup tasks that began running. Data shards only — shard 0 runs its catchup inline");
+    describe_counter!("celeriant_s3_catchup_task_skipped_in_flight_total", "Catchup re-attempts dropped because that shard's previous catchup was still running. The shard reports nothing for that generation, so the completion barrier names it unreported");
+    describe_counter!("celeriant_s3_catchup_task_timeout_total", "Catchup tasks abandoned after exceeding the completion-barrier budget. Bounds the single-flight guard: a hung sidecar would otherwise skip every later catchup for that shard");
     describe_counter!("celeriant_s3_catchup_self_uploads_seen_total", "S3 catchup fallback objects skipped as self-uploads (self-apply loop guard)");
     describe_counter!("celeriant_s3_catchup_stall_bail_total", "S3 catchup bailed after zero progress across its stall budget (TCP/kick recovery proceeds)");
     describe_counter!("celeriant_s3_catchup_via_s3_step_total", "S3 divergence search steps (labels: outcome=downloaded|skip|match)");

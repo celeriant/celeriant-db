@@ -14,7 +14,7 @@ const _: () = {
     use celeriant_client_tokio::server_error::*;
     use celeriant_client_tokio::{
         CeleriantClient, CeleriantPool, ClientError, ClientIdentityConfig, ClientTlsConfig,
-        PoolOptions, WatchOptions, WriteEventsOptions, from_json, json_event,
+        PoolOptions, WatchOptions, WriteEventsOptions, from_json, json_event, sni_host,
     };
     use celeriant_crypto::Crypto;
     use celeriant_crypto::pki::PkiManager;
@@ -70,16 +70,23 @@ const _: () = {
     async fn tls() -> Result<(), Box<dyn std::error::Error>> {
         use std::path::Path;
 
-        let ca = PkiManager::load_ca_bundle(Path::new("ca.crt"))?;
-        let (certs, key) =
-            PkiManager::load_identity(Path::new("client.crt"), Path::new("client.key"))?;
-        let tls_config = PkiManager::build_client_config(&ca, certs, key)?;
-        let tls = ClientTlsConfig::new(tls_config, "localhost".try_into()?);
+        let tls = ClientTlsConfig::from_paths(
+            Path::new("ca.crt"),
+            Some((Path::new("client.crt"), Path::new("client.key"))),
+            "localhost",
+        )?;
 
         let mut client =
             CeleriantClient::connect_tls("localhost:10000", tls.clone()).await?;
 
         let pool = CeleriantPool::new(PoolOptions::new("localhost:10000").with_tls(tls));
+
+        // Server-only TLS, and SNI derived from an address.
+        let anon = ClientTlsConfig::from_paths(
+            Path::new("ca.crt"),
+            None,
+            sni_host("[fd00::5]:10000")?,
+        )?;
         Ok(())
     }
 

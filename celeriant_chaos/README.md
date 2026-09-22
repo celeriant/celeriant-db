@@ -41,7 +41,7 @@ The crate ships a second binary, `replay`, for pushing stored run JSONs back thr
 Other flags:
 
 - `--seed <u64>` fixes the seed behind nemesis fault schedules, clock-skew jitter, and oracle sample selection. Defaults to wall-clock entropy and is printed at startup, so a Heisenbug run can be replayed exactly.
-- `--connect-ramp <secs>` spreads bench task starts over a window (baseline only). Off by default: the cold-connect herd is part of the test.
+- `--connect-ramp <secs>` spreads bench task starts over a window (baseline only; fault scenarios keep the cold-connect herd). Off by default: baseline instead builds a bounded pool of `min(tasks, 512)` connections, so tasks multiplex over warm connections and its zero error budget means "no errors on a warm cluster". Every other scenario keeps one connection per task; the herd sheds on the leader's handshake rate (~107/s measured) and its envelope is `cold_connect_herd`'s subject.
 
 Each invocation creates a new run directory under `<deploy_dir>/runs/<timestamp>/` containing one `<scenario>.json` per scenario plus a top-level `report.md` summary. On any scenario failure, `journalctl` from both nodes covering the run window is fetched into that directory.
 
@@ -105,7 +105,9 @@ Two scenarios exist but sit outside `--full`, so they need `--scenario`:
 
 ## Invariants
 
-Each scenario supplies a `ScenarioExpectations` (see `src/invariants.rs`) declaring the maximum tolerated counter deltas across the bench window plus optional checks like `EventualConvergence`, `LeaderRetained`, `FinalLeaderWroteDuringBench`, and `DistinctLeaderHosts`. `baseline` uses `Default` (zero everywhere). Chaos scenarios bump only the fields they expect to perturb — exceeding the bound fails just like a strict-zero violation.
+Each scenario supplies a `ScenarioExpectations` (see `src/invariants.rs`) declaring the maximum tolerated counter deltas across the bench window plus optional checks like `EventualConvergence`, `LeaderRetained`, `FinalLeaderWroteDuringBench`, and `DistinctLeaderHosts`. `baseline` uses `Default` (zero everywhere) plus `max_pool_timeout_ratio: Some(0.0)`. Chaos scenarios bump only the fields they expect to perturb; exceeding the bound fails just like a strict-zero violation.
+
+`BenchErrorsBounded` counts only errors the server was involved in: a `PoolTimeout` is the client's own connect gate shedding a request before a byte is sent, so it is subtracted out and bounded on its own by `PoolTimeoutsBounded` (`max_pool_timeout_ratio`, a fraction of `--tasks`). `None`, the default, leaves the shed unbounded, because measuring it is `cold_connect_herd`'s job.
 
 Metrics alone can miss a fork that both nodes agree about, so the heavier scenarios stack oracles on top:
 

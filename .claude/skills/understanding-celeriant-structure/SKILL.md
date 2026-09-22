@@ -47,7 +47,7 @@ S3/HTTP runs in a separate tokio sidecar runtime. io_uring and tokio are incompa
 
 ```
 log_N.wal (preallocated, up to 1GB)
-[Header 512KB] [Metablocks 1024B each, growing down ->] [Free space] [<- Datablocks variable, growing up] [Header 512KB]
+[Header 4096KB] [Metablocks 1024B each, growing down ->] [Free space] [<- Datablocks variable, growing up] [Header 4096KB]
 ```
 
 Rotates when metablocks and datablocks meet. Dual headers for crash recovery. File does not grow. Can shrink via compaction.

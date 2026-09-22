@@ -7,10 +7,15 @@
 /// One walk over candidate addresses: the cached leader (or primary) first,
 /// then untried seeds. A `NotLeader` hint jumps the walk to the hinted node
 /// and updates the cache; if the hinted node fails too, the walk resumes with
-/// the seeds instead of aborting. Hint hops and seed attempts share the
-/// `max_leader_retries` budget, and no address is tried twice, so a circular
-/// hint chain terminates.
+/// the seeds instead of aborting. Only a definitive `NotLeader` answer retires
+/// an address, so a node whose connection failed can still be reached by a
+/// later hint. Hint hops and seed attempts share the `max_leader_retries`
+/// budget, so a circular hint chain terminates.
 ///
+/// `PoolTimeout` returns to the caller: the wait was on this client's own
+/// semaphores, no node was contacted, and no follower can serve a write.
+/// Any post-send failure returns to the caller: the request was flushed, so
+/// re-sending it anywhere could duplicate the operation.
 /// `RequestTimeout` returns to the caller: the node may have applied the
 /// operation, so blindly retrying it elsewhere risks a duplicate write.
 macro_rules! leader_route {
@@ -22,60 +27,77 @@ macro_rules! leader_route {
         }
 
         let first_addr = pool.current_or_primary_leader();
-        let mut tried: HashSet<String> = HashSet::new();
+        // Bookkeeping stays empty (and unallocated) until a node answers.
+        let mut answered: Vec<String> = Vec::new();
         let mut next_hint: Option<String> = None;
         let mut seeds = all_addrs.iter();
         let mut retries = 0usize;
         let mut candidate = first_addr.clone();
         loop {
-            tried.insert(candidate.clone());
-            match $try_addr!(&candidate) {
+            let last_err = match $try_addr!(&candidate) {
                 Ok(result) => {
                     if candidate != first_addr {
                         pool.update_leader(candidate);
                     }
                     return Ok(result);
                 }
-                Err(ClientError::NotLeader { leader_address: Some(ref new_addr), .. }) => {
-                    if !tried.contains(new_addr) {
-                        next_hint = Some(new_addr.clone());
-                    }
+                Err(e @ ClientError::PoolTimeout { .. }) => return Err(e),
+                // Post-send: the frame is on the wire and either no answer came
+                // back (`ConnectionLostAfterSend`) or one came that this client
+                // could not read. The node may have applied it, so it is never
+                // re-sent. A `MessageTooLarge` request is pre-send but fails the
+                // same way on every node, so it returns here too.
+                Err(e @ ClientError::ConnectionLostAfterSend(_)) => {
+                    pool.routing.post_send_losses.fetch_add(1, Ordering::Relaxed);
+                    return Err(e);
                 }
-                Err(ClientError::NotLeader { leader_address: None, .. }) => {}
-                Err(e @ ClientError::WireError(WireError::MessageTooLarge { .. })) => {
-                    return Err(e)
-                }
-                // Pooled conn died mid-request: leader probably gone.
-                Err(ClientError::ConnectionFailed(_))
-                | Err(ClientError::ConnectionTimeout)
-                | Err(ClientError::WireError(_))
-                | Err(ClientError::ReadError(_)) => {
-                    pool.clear_leader();
+                Err(e @ ClientError::WireError(_)) | Err(e @ ClientError::ReadError(_)) => {
+                    return Err(e);
                 }
                 Err(e @ ClientError::RequestTimeout) => return Err(e),
-                Err(ClientError::ServerBusy) => {}
+                Err(e @ ClientError::NotLeader { .. }) => {
+                    // A definitive answer retires this address first, so a node
+                    // that hints at itself is not dialled twice.
+                    answered.push(candidate.clone());
+                    if let ClientError::NotLeader { leader_address: Some(hint), .. } = &e {
+                        // A hint into an open circuit breaker is skipped without
+                        // spending a retry: it would fast-fail and starve an
+                        // untried seed of the budget.
+                        if !answered.iter().any(|a| a == hint) && !pool.is_known_node_down(hint) {
+                            next_hint = Some(hint.clone());
+                        } else {
+                            pool.routing.hints_skipped.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    e
+                }
+                // Pre-send: the node was never reached, so the walk goes on.
+                Err(e @ ClientError::ConnectionFailed(_))
+                | Err(e @ ClientError::ConnectionTimeout) => {
+                    pool.clear_leader();
+                    e
+                }
+                Err(e @ ClientError::ServerBusy) => e,
                 Err(e) => return Err(e),
-            }
+            };
             if retries >= pool.options.max_leader_retries {
-                break;
+                return Err(pool.err_walk_exhausted(&candidate, &last_err));
             }
             retries += 1;
             candidate = match next_hint.take() {
                 Some(hint) => {
+                    pool.routing.redirects_followed.fetch_add(1, Ordering::Relaxed);
                     pool.update_leader(hint.clone());
                     hint
                 }
-                None => match seeds.find(|a| !tried.contains(*a)) {
-                    Some(addr) => addr.clone(),
-                    None => break,
-                },
+                None => {
+                    match seeds.find(|a| **a != first_addr && !answered.iter().any(|x| x == *a)) {
+                        Some(addr) => addr.clone(),
+                        None => return Err(pool.err_walk_exhausted(&candidate, &last_err)),
+                    }
+                }
             };
         }
-
-        Err(ClientError::ConnectionFailed(std::io::Error::new(
-            std::io::ErrorKind::NotConnected,
-            "no leader found across known nodes",
-        )))
     }};
 }
 
@@ -127,7 +149,10 @@ macro_rules! read_route {
                             if pinned_leader { pool.clear_leader(); }
                             continue;
                         }
-                        Err(ClientError::ReadError(_)) => {
+                        Err(ClientError::ReadError(_))
+                        // A read is safe to retry, so a lost response is just
+                        // another broken candidate.
+                        | Err(ClientError::ConnectionLostAfterSend(_)) => {
                             conn.mark_broken();
                             if pinned_leader { pool.clear_leader(); }
                             continue;
@@ -153,6 +178,11 @@ macro_rules! read_route {
                 Err(ClientError::ConnectionTimeout) => {
                     if pinned_leader { pool.clear_leader(); }
                     continue;
+                }
+                // A local pool wait doesnt clear cleader
+                Err(e @ ClientError::PoolTimeout { .. }) => {
+                    if i + 1 < addrs.len() { continue; }
+                    return Err(e);
                 }
                 Err(e) => return Err(e),
             }
@@ -186,7 +216,8 @@ use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::network::wire_error::WireError;
 use tokio::time::Duration;
 
-use crate::celeriant_client::{CeleriantClient, ClientIdentityConfig, ClientTlsConfig};
+use crate::ClientTlsConfig;
+use crate::celeriant_client::{CeleriantClient, ClientIdentityConfig};
 use crate::client_error::ClientError;
 use crate::client_operations::WriteEventsOptions;
 use crate::watch_connection::{WatchConnection, WatchOptions};
@@ -334,6 +365,200 @@ fn err_all_unreachable() -> ClientError {
 }
 
 // ---------------------------------------------------------------------------
+// Stats
+// ---------------------------------------------------------------------------
+
+/// Exclusive upper bounds, in milliseconds, of the `NodePool::get()` wait
+/// histogram. Anything at or above the last bound lands in the final bucket.
+const WAIT_BUCKET_BOUNDS_MS: [u128; 5] = [1, 10, 100, 1_000, 10_000];
+
+pub const WAIT_BUCKETS: usize = WAIT_BUCKET_BOUNDS_MS.len() + 1;
+
+const WAIT_BUCKET_LABELS: [&str; WAIT_BUCKETS] =
+    ["<1ms", "<10ms", "<100ms", "<1s", "<10s", ">=10s"];
+
+fn wait_bucket(waited: Duration) -> usize {
+    let ms = waited.as_millis();
+    WAIT_BUCKET_BOUNDS_MS.iter().position(|bound| ms < *bound).unwrap_or(WAIT_BUCKETS - 1)
+}
+
+/// Per-node connection counters, live. Every write is a relaxed increment: a
+/// snapshot is an operational read, never a synchronisation point.
+#[derive(Default)]
+struct NodeCounters {
+    attempted: AtomicU64,
+    succeeded: AtomicU64,
+    failed: AtomicU64,
+    timed_out: AtomicU64,
+    pool_timeouts_permit: AtomicU64,
+    pool_timeouts_connect: AtomicU64,
+    circuit_breaker_rejections: AtomicU64,
+    pooled_reuse: AtomicU64,
+    preflight_retired: AtomicU64,
+    wait_buckets: [AtomicU64; WAIT_BUCKETS],
+}
+
+impl NodeCounters {
+    fn record_wait(&self, waited: Duration) {
+        self.wait_buckets[wait_bucket(waited)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> ConnectionStats {
+        ConnectionStats {
+            attempted: self.attempted.load(Ordering::Relaxed),
+            succeeded: self.succeeded.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+            timed_out: self.timed_out.load(Ordering::Relaxed),
+            pool_timeouts_permit: self.pool_timeouts_permit.load(Ordering::Relaxed),
+            pool_timeouts_connect: self.pool_timeouts_connect.load(Ordering::Relaxed),
+            circuit_breaker_rejections: self.circuit_breaker_rejections.load(Ordering::Relaxed),
+            pooled_reuse: self.pooled_reuse.load(Ordering::Relaxed),
+            preflight_retired: self.preflight_retired.load(Ordering::Relaxed),
+            wait_buckets: std::array::from_fn(|i| self.wait_buckets[i].load(Ordering::Relaxed)),
+        }
+    }
+}
+
+/// Pool-level leader-routing counters, live.
+#[derive(Default)]
+struct RoutingCounters {
+    redirects_followed: AtomicU64,
+    hints_skipped: AtomicU64,
+    cache_clears: AtomicU64,
+    pinned_to_seed: AtomicU64,
+    walks_exhausted: AtomicU64,
+    post_send_losses: AtomicU64,
+}
+
+/// Connection counters for one node, or summed over every node of a pool.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ConnectionStats {
+    /// New connections dialled. A `get()` served from the idle list is not an attempt.
+    pub attempted: u64,
+    pub succeeded: u64,
+    /// Pre-send remote failure of the dial or the handshake.
+    pub failed: u64,
+    /// The subset of pre-send remote failures that were `ConnectionTimeout`.
+    pub timed_out: u64,
+    /// `PoolTimeout` waiting on this client's own per-node permit gate.
+    pub pool_timeouts_permit: u64,
+    /// `PoolTimeout` waiting on this client's own 32-wide connect gate.
+    pub pool_timeouts_connect: u64,
+    pub circuit_breaker_rejections: u64,
+    /// `get()` calls served from the idle list.
+    pub pooled_reuse: u64,
+    /// Idle connections dropped at checkout because the peer had closed them.
+    pub preflight_retired: u64,
+    /// `get()` entry to return, whatever the outcome, bucketed by `WAIT_BUCKET_LABELS`.
+    pub wait_buckets: [u64; WAIT_BUCKETS],
+}
+
+impl ConnectionStats {
+    pub fn pool_timeouts(&self) -> u64 {
+        self.pool_timeouts_permit + self.pool_timeouts_connect
+    }
+
+    fn add(&mut self, other: &ConnectionStats) {
+        self.attempted += other.attempted;
+        self.succeeded += other.succeeded;
+        self.failed += other.failed;
+        self.timed_out += other.timed_out;
+        self.pool_timeouts_permit += other.pool_timeouts_permit;
+        self.pool_timeouts_connect += other.pool_timeouts_connect;
+        self.circuit_breaker_rejections += other.circuit_breaker_rejections;
+        self.pooled_reuse += other.pooled_reuse;
+        self.preflight_retired += other.preflight_retired;
+        for (slot, n) in self.wait_buckets.iter_mut().zip(other.wait_buckets) {
+            *slot += n;
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NodeStats {
+    pub address: String,
+    pub stats: ConnectionStats,
+}
+
+/// A point-in-time read of a pool's counters. Snapshotting allocates; the
+/// counters it reads cost one relaxed increment each on the hot path.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PoolStats {
+    /// Summed over every node this pool has dialled.
+    pub connections: ConnectionStats,
+    /// `NotLeader` hints the walk hopped to.
+    pub leader_redirects_followed: u64,
+    /// `NotLeader` hints refused: already answered in this walk, or breaker open.
+    pub leader_hints_skipped: u64,
+    pub leader_cache_clears: u64,
+    /// Failures that found no cached leader and pinned `seed_addresses[0]`
+    /// instead: a follower, whenever the primary is the leader.
+    pub leader_pinned_to_seed: u64,
+    /// Leader walks that ran out of candidates.
+    pub walks_exhausted: u64,
+    /// `ConnectionLostAfterSend` returned to a write caller.
+    pub post_send_losses: u64,
+    /// Per-address breakdown, sorted by address.
+    pub nodes: Vec<NodeStats>,
+}
+
+impl PoolStats {
+    /// Fold another pool's snapshot in. Rows for the same address are summed.
+    /// For bench runs that spread tasks over several pools.
+    pub fn merge(&mut self, other: PoolStats) {
+        self.connections.add(&other.connections);
+        self.leader_redirects_followed += other.leader_redirects_followed;
+        self.leader_hints_skipped += other.leader_hints_skipped;
+        self.leader_cache_clears += other.leader_cache_clears;
+        self.leader_pinned_to_seed += other.leader_pinned_to_seed;
+        self.walks_exhausted += other.walks_exhausted;
+        self.post_send_losses += other.post_send_losses;
+        for node in other.nodes {
+            match self.nodes.iter_mut().find(|n| n.address == node.address) {
+                Some(existing) => existing.stats.add(&node.stats),
+                None => self.nodes.push(node),
+            }
+        }
+        self.nodes.sort_unstable_by(|a, b| a.address.cmp(&b.address));
+    }
+}
+
+impl std::fmt::Display for PoolStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let c = &self.connections;
+        write!(
+            f,
+            "Pool stats: connects {}/{} ok, {} failed, {} timed out | reuse {} | \
+             pool timeouts {} (permit {}, connect {}) | breaker rejects {} | \
+             preflight retired {} | \
+             redirects {}, hints skipped {}, cache clears {}, pinned to seed {}, \
+             walks exhausted {}, \
+             post-send losses {} | wait",
+            c.succeeded,
+            c.attempted,
+            c.failed,
+            c.timed_out,
+            c.pooled_reuse,
+            c.pool_timeouts(),
+            c.pool_timeouts_permit,
+            c.pool_timeouts_connect,
+            c.circuit_breaker_rejections,
+            c.preflight_retired,
+            self.leader_redirects_followed,
+            self.leader_hints_skipped,
+            self.leader_cache_clears,
+            self.leader_pinned_to_seed,
+            self.walks_exhausted,
+            self.post_send_losses,
+        )?;
+        for (label, count) in WAIT_BUCKET_LABELS.iter().zip(&c.wait_buckets) {
+            write!(f, " {label}={count}")?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // NodePool (internal)
 // ---------------------------------------------------------------------------
 
@@ -372,6 +597,7 @@ struct NodePool {
     /// Shared pool-level dict cache. Allows `create_client` to supply a known sha
     /// and store received bytes without a back-reference to `CeleriantPool`.
     dict_cache: Arc<Mutex<PoolDictCache>>,
+    counters: NodeCounters,
 }
 
 impl NodePool {
@@ -385,7 +611,35 @@ impl NodePool {
             connect_semaphore: tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTS),
             last_connect_failure: Mutex::new(None),
             dict_cache,
+            counters: NodeCounters::default(),
         }
+    }
+
+    /// A wait on one of this pool's own semaphores expired. Nothing was dialled
+    /// and nothing was sent, so this says nothing about the node's health.
+    /// `gate` is the counter for the semaphore that expired.
+    fn err_pool_timeout(&self, gate: &AtomicU64) -> ClientError {
+        gate.fetch_add(1, Ordering::Relaxed);
+        ClientError::PoolTimeout { address: self.address.clone() }
+    }
+
+    /// The breaker exists to stop hammering a node that will not take a
+    /// connection, so only a handshake that died on the wire arms it. Anything
+    /// the node *answered* with (`DictUnavailable`, `IdentityRequired`, a
+    /// server error) proves it is up and reachable, and a local
+    /// `IdentityError` is our own key material: none of those say the dial
+    /// would fail, and fabricating `ConnectionFailed` for them would hide the
+    /// real cause behind "circuit breaker open". A variant added later is not a
+    /// dial failure until someone says so here.
+    fn is_dial_failure(e: &ClientError) -> bool {
+        matches!(
+            e,
+            ClientError::ConnectionFailed(_)
+                | ClientError::ConnectionTimeout
+                | ClientError::ConnectionLostAfterSend(_)
+                | ClientError::WireError(_)
+                | ClientError::ReadError(_)
+        )
     }
 
     fn is_circuit_open(&self) -> bool {
@@ -393,27 +647,38 @@ impl NodePool {
         matches!(*guard, Some(failed_at) if failed_at.elapsed() < CIRCUIT_BREAKER_COOLDOWN)
     }
 
+    /// Times the whole wait, entry to a connection in hand or to the error that
+    /// ended it, for the price of one `Instant::now()`.
     async fn get(self: &Arc<Self>) -> Result<PooledConnection, ClientError> {
+        let entered = Instant::now();
+        let result = self.checkout().await;
+        self.counters.record_wait(entered.elapsed());
+        result
+    }
+
+    async fn checkout(self: &Arc<Self>) -> Result<PooledConnection, ClientError> {
         if self.is_circuit_open() {
+            self.counters.circuit_breaker_rejections.fetch_add(1, Ordering::Relaxed);
             return Err(ClientError::ConnectionFailed(std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
                 format!("circuit breaker open for {}", self.address),
             )));
         }
 
-        // Acquire a permit — enforces max_connections_per_node as a hard cap.
+        // Acquire a permit: enforces max_connections_per_node as a hard cap.
         let permit = tokio::time::timeout(
             self.options.connection_timeout,
             Arc::clone(&self.semaphore).acquire_owned(),
         )
         .await
-        .map_err(|_| ClientError::ConnectionTimeout)?
+        .map_err(|_| self.err_pool_timeout(&self.counters.pool_timeouts_permit))?
         .expect("semaphore closed unexpectedly");
 
-        // Evict stale connections and pop the first fresh one.
-        let reuse = self.pop_fresh();
+        // Evict stale connections and pop the first live one.
+        let reuse = self.pop_live().await;
 
         if let Some(client) = reuse {
+            self.counters.pooled_reuse.fetch_add(1, Ordering::Relaxed);
             return Ok(PooledConnection {
                 client: Some(client),
                 broken: false,
@@ -429,18 +694,20 @@ impl NodePool {
             self.connect_semaphore.acquire(),
         )
         .await
-        .map_err(|_| ClientError::ConnectionTimeout)?
+        .map_err(|_| self.err_pool_timeout(&self.counters.pool_timeouts_connect))?
         .expect("connect semaphore closed unexpectedly");
 
-        // Re-check circuit breaker — may have tripped while we waited.
+        // Re-check circuit breaker: may have tripped while we waited.
         if self.is_circuit_open() {
+            self.counters.circuit_breaker_rejections.fetch_add(1, Ordering::Relaxed);
             return Err(ClientError::ConnectionFailed(std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
                 format!("circuit breaker open for {}", self.address),
             )));
         }
 
-        if let Some(client) = self.pop_fresh() {
+        if let Some(client) = self.pop_live().await {
+            self.counters.pooled_reuse.fetch_add(1, Ordering::Relaxed);
             return Ok(PooledConnection {
                 client: Some(client),
                 broken: false,
@@ -449,8 +716,10 @@ impl NodePool {
             });
         }
 
+        self.counters.attempted.fetch_add(1, Ordering::Relaxed);
         match Self::create_client(&self.address, &self.options, &self.dict_cache).await {
             Ok(client) => {
+                self.counters.succeeded.fetch_add(1, Ordering::Relaxed);
                 *self.last_connect_failure.lock().unwrap() = None;
                 Ok(PooledConnection {
                     client: Some(client),
@@ -460,10 +729,29 @@ impl NodePool {
                 })
             }
             Err(e) => {
-                *self.last_connect_failure.lock().unwrap() = Some(Instant::now());
+                self.counters.failed.fetch_add(1, Ordering::Relaxed);
+                if matches!(e, ClientError::ConnectionTimeout) {
+                    self.counters.timed_out.fetch_add(1, Ordering::Relaxed);
+                }
+                if Self::is_dial_failure(&e) {
+                    *self.last_connect_failure.lock().unwrap() = Some(Instant::now());
+                }
                 Err(e)
             }
         }
+    }
+
+    /// The next idle connection the peer has not closed behind our back. The
+    /// peek costs one non-blocking syscall per pooled checkout and none on a
+    /// freshly dialled socket.
+    async fn pop_live(&self) -> Option<CeleriantClient> {
+        while let Some(client) = self.pop_fresh() {
+            if client.is_peer_live().await {
+                return Some(client);
+            }
+            self.counters.preflight_retired.fetch_add(1, Ordering::Relaxed);
+        }
+        None
     }
 
     /// Drop every entry idle for at least `idle_timeout` and take the next
@@ -502,7 +790,12 @@ impl NodePool {
             let dict_cache_ref = Arc::clone(dict_cache);
             client.identify_with_known_sha(identity, known_sha, move |sha| {
                 dict_cache_ref.lock().unwrap().cache.get(sha).cloned()
-            }).await?;
+            }).await.map_err(|e| match e {
+                // The handshake stalled, not the caller's request: nothing of
+                // theirs was serialised, so this is a pre-send connect failure.
+                ClientError::RequestTimeout => ClientError::ConnectionTimeout,
+                other => other,
+            })?;
 
             // If the client received new dict bytes, store them in the pool cache.
             if let Some(ref d) = client.current_dict {
@@ -538,7 +831,7 @@ impl PooledConnection {
         self.client.as_mut().expect("client consumed before drop")
     }
 
-    /// Mark this connection as broken — it will be dropped instead of returned to the pool.
+    /// Mark this connection as broken: it is dropped instead of returned to the pool.
     pub fn mark_broken(&mut self) {
         self.broken = true;
     }
@@ -583,7 +876,7 @@ impl PoolDictCache {
 /// transparent failover, and manages connection lifecycle (idle eviction,
 /// broken connection discard).
 ///
-/// Wrap in `Arc` if shared across tasks — the pool itself is not `Clone`.
+/// Wrap in `Arc` if shared across tasks; the pool itself is not `Clone`.
 pub struct CeleriantPool {
     options: Arc<PoolOptions>,
     nodes: RwLock<HashMap<String, Arc<NodePool>>>,
@@ -591,6 +884,7 @@ pub struct CeleriantPool {
     read_counter: AtomicU64,
     /// Pool-level dict cache shared between all node pools in this pool.
     dict_cache: Arc<Mutex<PoolDictCache>>,
+    routing: RoutingCounters,
 }
 
 impl CeleriantPool {
@@ -602,11 +896,53 @@ impl CeleriantPool {
             leader_address: RwLock::new(None),
             read_counter: AtomicU64::new(0),
             dict_cache: Arc::new(Mutex::new(PoolDictCache::new())),
+            routing: RoutingCounters::default(),
         }
     }
 
     pub fn options(&self) -> &PoolOptions {
         &self.options
+    }
+
+    /// Read this pool's counters. Allocates one row per node dialled so far,
+    /// so call it out of band: at the end of a run, or on a metrics tick.
+    pub fn stats(&self) -> PoolStats {
+        let mut nodes: Vec<NodeStats> = self
+            .nodes
+            .read()
+            .unwrap()
+            .values()
+            .map(|node| NodeStats { address: node.address.clone(), stats: node.counters.snapshot() })
+            .collect();
+        nodes.sort_unstable_by(|a, b| a.address.cmp(&b.address));
+
+        let mut connections = ConnectionStats::default();
+        for node in &nodes {
+            connections.add(&node.stats);
+        }
+
+        PoolStats {
+            connections,
+            leader_redirects_followed: self.routing.redirects_followed.load(Ordering::Relaxed),
+            leader_hints_skipped: self.routing.hints_skipped.load(Ordering::Relaxed),
+            leader_cache_clears: self.routing.cache_clears.load(Ordering::Relaxed),
+            leader_pinned_to_seed: self.routing.pinned_to_seed.load(Ordering::Relaxed),
+            walks_exhausted: self.routing.walks_exhausted.load(Ordering::Relaxed),
+            post_send_losses: self.routing.post_send_losses.load(Ordering::Relaxed),
+            nodes,
+        }
+    }
+
+    /// The leader walk ran out of candidates. Name the node it gave up on and
+    /// what that node produced: "no leader found" alone hid every concrete
+    /// failure.
+    #[cold]
+    fn err_walk_exhausted(&self, address: &str, last: &ClientError) -> ClientError {
+        self.routing.walks_exhausted.fetch_add(1, Ordering::Relaxed);
+        ClientError::ConnectionFailed(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            format!("no leader found; last attempt to {address} failed: {last}"),
+        ))
     }
 
     /// Returns the cached dict bytes for `sha`, or `None` if not yet cached.
@@ -633,7 +969,7 @@ impl CeleriantPool {
 
     /// Convenience method: write events to a single aggregate without constructing a `WriteRequest`.
     ///
-    /// `client_id` scopes client-seq idempotency — use a stable id per logical writer, never a
+    /// `client_id` scopes client-seq idempotency, so use a stable id per logical writer, never a
     /// fresh random value per call. Idempotency enforcement is opt-in: use `write_events_with`
     /// with `enforce_client_idempotency: true` to enable it.
     pub async fn write_events(
@@ -708,6 +1044,7 @@ impl CeleriantPool {
         &self,
         options: crate::list_operations::ListOptions,
     ) -> Result<PooledListOrgsIterator, ClientError> {
+        crate::list_operations::check_shard_range(&options)?;
         let conn = self.get_connection().await?;
         Ok(PooledListOrgsIterator::new(conn, options))
     }
@@ -719,6 +1056,7 @@ impl CeleriantPool {
         org_id: Option<u128>,
         options: crate::list_operations::ListOptions,
     ) -> Result<PooledListAggregateTypesIterator, ClientError> {
+        crate::list_operations::check_shard_range(&options)?;
         let conn = self.get_connection().await?;
         Ok(PooledListAggregateTypesIterator::new(conn, org_id, options))
     }
@@ -731,6 +1069,7 @@ impl CeleriantPool {
         aggregate_type_id: Option<u128>,
         options: crate::list_operations::ListOptions,
     ) -> Result<PooledListAggregatesIterator, ClientError> {
+        crate::list_operations::check_shard_range(&options)?;
         let conn = self.get_connection().await?;
         Ok(PooledListAggregatesIterator::new(conn, org_id, aggregate_type_id, options))
     }
@@ -849,11 +1188,13 @@ impl CeleriantPool {
                         Err(ClientError::ConnectionTimeout) => { conn.mark_broken(); Err(ClientError::ConnectionTimeout) }
                         Err(ClientError::WireError(e)) => { conn.mark_broken(); Err(ClientError::WireError(e)) }
                         Err(ClientError::ReadError(e)) => { conn.mark_broken(); Err(ClientError::ReadError(e)) }
+                        Err(ClientError::ConnectionLostAfterSend(e)) => { conn.mark_broken(); Err(ClientError::ConnectionLostAfterSend(e)) }
                         Err(e @ ClientError::RequestTimeout) => { conn.mark_broken(); return Err(e); }
                         other => other,
                     },
                     Err(e @ ClientError::ConnectionFailed(_))
                     | Err(e @ ClientError::ConnectionTimeout)
+                    | Err(e @ ClientError::PoolTimeout { .. })
                     | Err(e @ ClientError::RequestTimeout)
                     | Err(e @ ClientError::ServerBusy) => Err(e),
                     Err(e) => return Err(e),
@@ -873,11 +1214,13 @@ impl CeleriantPool {
                         Err(ClientError::ConnectionTimeout) => { conn.mark_broken(); Err(ClientError::ConnectionTimeout) }
                         Err(ClientError::WireError(e)) => { conn.mark_broken(); Err(ClientError::WireError(e)) }
                         Err(ClientError::ReadError(e)) => { conn.mark_broken(); Err(ClientError::ReadError(e)) }
+                        Err(ClientError::ConnectionLostAfterSend(e)) => { conn.mark_broken(); Err(ClientError::ConnectionLostAfterSend(e)) }
                         Err(e @ ClientError::RequestTimeout) => { conn.mark_broken(); return Err(e); }
                         other => other,
                     },
                     Err(e @ ClientError::ConnectionFailed(_))
                     | Err(e @ ClientError::ConnectionTimeout)
+                    | Err(e @ ClientError::PoolTimeout { .. })
                     | Err(e @ ClientError::RequestTimeout)
                     | Err(e @ ClientError::ServerBusy) => Err(e),
                     Err(e) => return Err(e),
@@ -897,11 +1240,13 @@ impl CeleriantPool {
                         Err(ClientError::ConnectionTimeout) => { conn.mark_broken(); Err(ClientError::ConnectionTimeout) }
                         Err(ClientError::WireError(e)) => { conn.mark_broken(); Err(ClientError::WireError(e)) }
                         Err(ClientError::ReadError(e)) => { conn.mark_broken(); Err(ClientError::ReadError(e)) }
+                        Err(ClientError::ConnectionLostAfterSend(e)) => { conn.mark_broken(); Err(ClientError::ConnectionLostAfterSend(e)) }
                         Err(e @ ClientError::RequestTimeout) => { conn.mark_broken(); return Err(e); }
                         other => other,
                     },
                     Err(e @ ClientError::ConnectionFailed(_))
                     | Err(e @ ClientError::ConnectionTimeout)
+                    | Err(e @ ClientError::PoolTimeout { .. })
                     | Err(e @ ClientError::RequestTimeout)
                     | Err(e @ ClientError::ServerBusy) => Err(e),
                     Err(e) => return Err(e),
@@ -924,11 +1269,13 @@ impl CeleriantPool {
                         Err(ClientError::ConnectionTimeout) => { conn.mark_broken(); Err(ClientError::ConnectionTimeout) }
                         Err(ClientError::WireError(e)) => { conn.mark_broken(); Err(ClientError::WireError(e)) }
                         Err(ClientError::ReadError(e)) => { conn.mark_broken(); Err(ClientError::ReadError(e)) }
+                        Err(ClientError::ConnectionLostAfterSend(e)) => { conn.mark_broken(); Err(ClientError::ConnectionLostAfterSend(e)) }
                         Err(e @ ClientError::RequestTimeout) => { conn.mark_broken(); return Err(e); }
                         other => other,
                     },
                     Err(e @ ClientError::ConnectionFailed(_))
                     | Err(e @ ClientError::ConnectionTimeout)
+                    | Err(e @ ClientError::PoolTimeout { .. })
                     | Err(e @ ClientError::RequestTimeout)
                     | Err(e @ ClientError::ServerBusy) => Err(e),
                     Err(e) => return Err(e),
@@ -980,7 +1327,7 @@ impl CeleriantPool {
         candidates
     }
 
-    /// Test hook: the address a watch subscription dials first — the leader by
+    /// Test hook: the address a watch subscription dials first. The leader by
     /// default, a rotating follower on opt-in. `watch()` itself iterates the
     /// full candidate list, so this exists only to pin the routing contract.
     #[cfg(test)]
@@ -1019,10 +1366,21 @@ impl CeleriantPool {
     fn clear_leader(&self) {
         let mut guard = self.leader_address.write().unwrap();
         if guard.is_some() {
+            self.routing.cache_clears.fetch_add(1, Ordering::Relaxed);
             *guard = None;
         } else if let Some(seed) = self.options.seed_addresses.first() {
+            // Not a clear: this pins the first seed, which is a follower
+            // whenever the primary is the leader. Counted apart so the two
+            // are never read as one number.
+            self.routing.pinned_to_seed.fetch_add(1, Ordering::Relaxed);
             *guard = Some(seed.clone());
         }
+    }
+
+    /// Whether a node we have already dialled is inside its breaker cooldown.
+    /// Never inserts: a hint we skip must not grow the node map.
+    fn is_known_node_down(&self, address: &str) -> bool {
+        self.nodes.read().unwrap().get(address).is_some_and(|n| n.is_circuit_open())
     }
 
     fn get_or_create_node(&self, address: &str) -> Arc<NodePool> {
@@ -1146,9 +1504,9 @@ fn leaves_connection_dirty(error: &ClientError) -> bool {
         error,
         ClientError::ConnectionFailed(_)
             | ClientError::ConnectionTimeout
+            | ClientError::ConnectionLostAfterSend(_)
             | ClientError::RequestTimeout
             | ClientError::WireError(_)
-            | ClientError::ReadError(_)
             | ClientError::ProtocolError
             | ClientError::CorrelationMismatch { .. }
     )
@@ -1599,6 +1957,8 @@ impl PooledListAggregatesIterator {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
 
     /// Accepts and never answers, so a request future parked on the response
@@ -1634,7 +1994,7 @@ mod tests {
                 aggregate_key: AggregateKey::new(1, 1, 1),
             });
             // One poll: the request reaches the socket, the response read parks.
-            // Then the guard is dropped without any error path ever running —
+            // Then the guard is dropped without any error path ever running, so
             // nothing calls mark_broken, which is the whole bug.
             let polled = conn.client().send_request(&req).now_or_never();
             assert!(polled.is_none(), "one poll must park on the response read");
@@ -1668,7 +2028,7 @@ mod tests {
     enum Answer {
         /// What a real server does: the request's own id, echoed back.
         Echo,
-        /// Someone else's id, made deterministic — the production desync.
+        /// Someone else's id, made deterministic: the production desync.
         WrongId,
         /// A server *error* frame carrying someone else's id: the stale
         /// rejection that walked through as a real answer in production.
@@ -1793,7 +2153,7 @@ mod tests {
     }
 
     /// Pins the *clear* site. Without it every request retires its connection and
-    /// the pool silently degrades to connect-per-request — which no behavioural
+    /// the pool silently degrades to connect-per-request, which no behavioural
     /// test notices, because the answers stay correct.
     #[tokio::test]
     async fn a_completed_request_leaves_the_connection_poolable() {
@@ -1937,8 +2297,8 @@ mod tests {
     }
 
 
-    /// The response-type check's only new behaviour is retiring the connection —
-    /// the `ProtocolError` value itself is already produced by the `_ =>` arms in
+    /// The response-type check's only new behaviour is retiring the connection.
+    /// The `ProtocolError` value itself is already produced by the `_ =>` arms in
     /// `client_operations`. So the retire half is the half worth pinning.
     #[tokio::test]
     async fn a_wrong_variant_response_retires_the_stream() {
@@ -1990,7 +2350,7 @@ mod tests {
 
     /// `send_request` short-circuits its fill when an id is already present, so
     /// only the typed helpers actually exercise `set_correlation_id_if_absent`
-    /// against a supplied value — which is the path `celeriant_cli
+    /// against a supplied value, which is the path `celeriant_cli
     /// --correlation-id` depends on.
     #[tokio::test]
     async fn a_typed_helper_never_rewrites_a_caller_supplied_correlation_id() {
@@ -2055,7 +2415,7 @@ mod tests {
         assert!(Arc::ptr_eq(&found, &bytes));
     }
 
-    // Blind-oracle routing tests (session/goal.md contract, authored unseen).
+    // Leader-routing contract tests.
     #[test]
     fn oracle_default_no_leader_primary_first_all_known_once() {
         let pool = CeleriantPool::new(
@@ -2326,6 +2686,7 @@ mod tests {
         for e in [
             ClientError::RequestTimeout,
             ClientError::ConnectionTimeout,
+            ClientError::ConnectionLostAfterSend(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
             ClientError::ProtocolError,
             ClientError::ConnectionFailed(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
         ] {
@@ -2334,6 +2695,11 @@ mod tests {
 
         // A server error response was read off the wire in full. Retiring the
         // connection for it would churn the pool on ordinary rejections.
+        // The body was read in full; only deserialising it failed, so the
+        // stream is still in sync and the connection can be reused.
+        assert!(!leaves_connection_dirty(&ClientError::ReadError(
+            celeriant_msg::read_wire_data_error::ReadWireDataError::UnknownMessageType(9)
+        )));
         assert!(!leaves_connection_dirty(&ClientError::ServerBusy));
         assert!(!leaves_connection_dirty(&ClientError::IdentityRequired));
         assert!(!leaves_connection_dirty(&ClientError::NotLeader {
@@ -2348,8 +2714,8 @@ mod tests {
         let aged = |secs: u64| Instant::now() - Duration::from_secs(secs);
 
         // Named by what each row proves, so a failure says which rule broke.
-        // The second `pop_front` in `NodePool::get` — the one taken after
-        // queueing on the connect semaphore — used to skip the age check
+        // The second `pop_front` in `NodePool::get`, the one taken after queueing
+        // on the connect semaphore, used to skip the age check
         // entirely, which is row "all stale".
         let cases: [(&str, Vec<(u32, Instant)>, Option<u32>); 5] = [
             ("empty", vec![], None),
@@ -2381,8 +2747,8 @@ mod tests {
     const RECV: Duration = Duration::from_secs(5);
 
     /// Both halves of the fill rule. `None` must be filled, because otherwise
-    /// nothing binds the response. A supplied id is an application tag —
-    /// `celeriant_cli --correlation-id` prints it back — so it must survive
+    /// nothing binds the response. A supplied id is an application tag that
+    /// `celeriant_cli --correlation-id` prints back, so it must survive
     /// the transport byte for byte.
     #[tokio::test]
     async fn the_transport_fills_a_missing_correlation_id_and_never_rewrites_a_supplied_one() {
@@ -2492,7 +2858,7 @@ mod tests {
     }
 
     /// `WatchResponse` carries no correlation id and never will, so the check
-    /// must let it through — while the request itself still carries one.
+    /// must let it through, while the request itself still carries one.
     #[tokio::test]
     async fn a_watch_request_works_though_its_response_carries_no_correlation_id() {
         use celeriant_msg::process_client_responses::ClientResponse;
@@ -2641,6 +3007,38 @@ mod tests {
         let conn = node.get().await.unwrap();
         let mut it = PooledListAggregatesIterator::new(conn, Some(1), Some(1), opts.clone());
         assert!(!it.try_add_next_shard(), "the cursor must saturate, not wrap");
+    }
+
+    /// The pooled list path must refuse an impossible shard range where the
+    /// direct path does, before it costs a connection.
+    #[tokio::test]
+    async fn a_pooled_impossible_shard_range_never_reaches_a_connection() {
+        let primary = write_server(WriteAnswer::Ok).await;
+        let pool = CeleriantPool::new(PoolOptions::new(primary.to_string()));
+        let opts = crate::list_operations::ListOptions {
+            start_shard: 4,
+            max_shard_hint: Some(3),
+            ..Default::default()
+        };
+
+        for outcome in [
+            pool.list_orgs(opts.clone()).await.map(|_| ()),
+            pool.list_aggregate_types(Some(1), opts.clone()).await.map(|_| ()),
+            pool.list_aggregates(Some(1), Some(1), opts.clone()).await.map(|_| ()),
+        ] {
+            match outcome {
+                Err(ClientError::InvalidShardRange { start_shard: 4, max_shard_hint: 3 }) => {}
+                Err(other) => panic!("expected InvalidShardRange, got {other:?}"),
+                Ok(()) => panic!("an impossible range must not yield a silent empty stream"),
+            }
+        }
+
+        let c = pool.stats().connections;
+        assert_eq!(
+            (c.attempted, c.pooled_reuse),
+            (0, 0),
+            "a rejected range must not cost a connection"
+        );
     }
 
     /// Accepts, reads the request so the client's write completes, then closes.
@@ -2819,6 +3217,17 @@ mod tests {
         NotLeader(String),
         /// Commit the write and return a `WriteResponse`.
         Ok,
+        /// Read the request in full, then close without answering: the write
+        /// may or may not have been applied.
+        ReadThenClose,
+        /// Answer with a correctly framed fixed-size Write response whose body
+        /// is corrupt: the answer arrives, the client cannot read it.
+        CorruptBody,
+        /// Answer a `Read` request. Lets one fake stand in for a read node.
+        ReadOk,
+        /// Answer the first request on a session, then read the second and
+        /// close without answering it.
+        OkThenCloseOnSecond,
         /// Refuse a schema registration as a non-leader (error 2027) with a
         /// leader hint, the way a follower answers `RegisterSchema`.
         SchemaNotLeader(String),
@@ -2829,6 +3238,58 @@ mod tests {
     /// A server that answers `Write` requests with a scripted response, echoing
     /// the request's correlation id so the client's correlation check passes.
     async fn write_server(answer: WriteAnswer) -> std::net::SocketAddr {
+        write_server_at("127.0.0.1:0", answer, Arc::new(AtomicUsize::new(0))).await
+    }
+
+    /// A `write_server` whose accepted sockets a test can close, the way a
+    /// server restart closes the connections a client still holds pooled.
+    struct ClosableServer {
+        addr: std::net::SocketAddr,
+        requests: Arc<AtomicUsize>,
+        close: tokio::sync::watch::Sender<bool>,
+        closed: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl ClosableServer {
+        /// Close every idle session and return once the FIN is on its way.
+        fn close_sessions(&self) {
+            self.close.send(true).unwrap();
+            self.closed.recv().unwrap();
+        }
+    }
+
+    async fn closable_write_server(answer: WriteAnswer) -> ClosableServer {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (close, close_rx) = tokio::sync::watch::channel(false);
+        let (closed_tx, closed) = std::sync::mpsc::channel();
+        let addr = write_server_inner(
+            "127.0.0.1:0",
+            answer,
+            Arc::clone(&requests),
+            Some((close_rx, closed_tx)),
+        )
+        .await;
+        ClosableServer { addr, requests, close, closed }
+    }
+
+    /// `write_server` bound to a chosen address, counting the requests it
+    /// served so a test can prove a node was, or was not, asked.
+    async fn write_server_at(
+        bind: &str,
+        answer: WriteAnswer,
+        requests: Arc<AtomicUsize>,
+    ) -> std::net::SocketAddr {
+        write_server_inner(bind, answer, requests, None).await
+    }
+
+    type CloseSignal = (tokio::sync::watch::Receiver<bool>, std::sync::mpsc::Sender<()>);
+
+    async fn write_server_inner(
+        bind: &str,
+        answer: WriteAnswer,
+        requests: Arc<AtomicUsize>,
+        close: Option<CloseSignal>,
+    ) -> std::net::SocketAddr {
         use celeriant_msg::process_client_responses::ClientResponse;
         use celeriant_msg::response::responses::{ErrorResponse, WriteResponse};
         use celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES;
@@ -2837,7 +3298,7 @@ mod tests {
         use tokio_util::compat::TokioAsyncReadCompatExt;
 
         const MAX: u64 = 64 * 1024 * 1024;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = std::net::TcpListener::bind(bind).unwrap();
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
         // `DictCodec` holds a `RefCell`, so it is `!Sync`; own thread, own runtime.
@@ -2848,11 +3309,25 @@ mod tests {
                 let listener = tokio::net::TcpListener::from_std(listener).unwrap();
                 while let Ok((socket, _)) = listener.accept().await {
                     let answer = answer.clone();
+                    let requests = Arc::clone(&requests);
+                    let mut close = close.clone();
+                    // Only a close signalled from now on is ours to obey.
+                    if let Some((closing, _)) = close.as_mut() {
+                        closing.mark_unchanged();
+                    }
                     tokio::task::spawn_local(async move {
                         let mut stream = socket.compat();
                         let codec = DictCodec::new(BUILTIN_DICT_BYTES, 3).unwrap();
-                        loop {
-                            let Ok(header) = WireHeader::from_reader(&mut stream, MAX).await else {
+                        let mut served = 0usize;
+                        'session: loop {
+                            let header = match close.as_mut() {
+                                Some((closing, _)) => tokio::select! {
+                                    h = WireHeader::from_reader(&mut stream, MAX) => h,
+                                    _ = closing.changed() => break 'session,
+                                },
+                                None => WireHeader::from_reader(&mut stream, MAX).await,
+                            };
+                            let Ok(header) = header else {
                                 return;
                             };
                             let Ok(request) =
@@ -2861,6 +3336,27 @@ mod tests {
                                 return;
                             };
                             let asked = request.correlation_id();
+                            requests.fetch_add(1, Ordering::SeqCst);
+                            served += 1;
+                            if matches!(answer, WriteAnswer::ReadThenClose)
+                                || (matches!(answer, WriteAnswer::OkThenCloseOnSecond) && served > 1)
+                            {
+                                return;
+                            }
+                            if matches!(answer, WriteAnswer::CorruptBody) {
+                                use futures_util::AsyncWriteExt as _;
+                                // 17-byte header: version, message type (Write),
+                                // compressed len, uncompressed len, compression.
+                                let mut frame = Vec::with_capacity(18);
+                                frame.extend_from_slice(&PROTOCOL_VERSION_V2.to_le_bytes());
+                                frame.extend_from_slice(&3u32.to_le_bytes());
+                                frame.extend_from_slice(&1u32.to_le_bytes());
+                                frame.extend_from_slice(&1u32.to_le_bytes());
+                                frame.push(0);
+                                frame.push(2); // invalid `Option` discriminant
+                                let _ = stream.write_all(&frame).await;
+                                continue;
+                            }
                             let resp = match &answer {
                                 WriteAnswer::NotLeader(leader) => {
                                     ClientResponse::GenericError(ErrorResponse {
@@ -2869,7 +3365,17 @@ mod tests {
                                         error_message: format!("{{\"leader_address\":\"{leader}\"}}"),
                                     })
                                 }
-                                WriteAnswer::Ok => ClientResponse::Write(WriteResponse {
+                                WriteAnswer::ReadOk => ClientResponse::Read(
+                                    celeriant_msg::response::responses::ReadResponse {
+                                        correlation_id: asked,
+                                        event_batches: Vec::new(),
+                                        next_aggregate_version: None,
+                                    },
+                                ),
+                                WriteAnswer::Ok
+                                | WriteAnswer::ReadThenClose
+                                | WriteAnswer::OkThenCloseOnSecond
+                                | WriteAnswer::CorruptBody => ClientResponse::Write(WriteResponse {
                                     correlation_id: asked,
                                     max_aggregate_version: Some(1),
                                 }),
@@ -2896,11 +3402,25 @@ mod tests {
                                 return;
                             }
                         }
+                        // Asked to close: drop the socket, then report, so the
+                        // caller knows the FIN is out before it acts.
+                        drop(stream);
+                        if let Some((_, closed)) = close {
+                            let _ = closed.send(());
+                        }
                     });
                 }
             });
         });
         addr
+    }
+
+    fn empty_read_request() -> ReadRequest {
+        ReadRequest {
+            correlation_id: None,
+            aggregate_key: AggregateKey::new(1, 1, 1),
+            filters: ReadFilters::new(0),
+        }
     }
 
     fn empty_write_request() -> celeriant_msg::request::requests::WriteRequest {
@@ -3030,4 +3550,425 @@ mod tests {
             "the cache must hold the node that answered"
         );
     }
+
+    fn counter() -> Arc<AtomicUsize> {
+        Arc::new(AtomicUsize::new(0))
+    }
+
+    fn count(c: &Arc<AtomicUsize>) -> usize {
+        c.load(Ordering::SeqCst)
+    }
+
+    /// A port nothing listens on: a dial is refused, so the node fails
+    /// pre-send. The address can be handed to `write_server_at` later.
+    fn reserved_address() -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().to_string()
+    }
+
+    /// The leader took the request and died before answering: it may
+    /// have applied it. Re-sending it to the seed could duplicate the write, so
+    /// the caller is told the outcome is unknown and nothing else is dialled.
+    #[tokio::test]
+    async fn a_request_lost_after_it_was_sent_is_never_re_sent_elsewhere() {
+        let (leader_hits, seed_hits) = (counter(), counter());
+        let leader =
+            write_server_at("127.0.0.1:0", WriteAnswer::ReadThenClose, leader_hits.clone()).await;
+        let seed = write_server_at(
+            "127.0.0.1:0",
+            WriteAnswer::NotLeader(leader.to_string()),
+            seed_hits.clone(),
+        )
+        .await;
+
+        let pool = CeleriantPool::new(
+            PoolOptions::new(leader.to_string()).with_seed_addresses(vec![seed.to_string()]),
+        );
+
+        let err = pool
+            .write(empty_write_request())
+            .await
+            .expect_err("a lost response is not a success");
+
+        assert!(
+            matches!(err, ClientError::ConnectionLostAfterSend(_)),
+            "expected ConnectionLostAfterSend, got {err:?}"
+        );
+        assert_eq!(count(&leader_hits), 1, "the leader must be asked exactly once");
+        assert_eq!(count(&seed_hits), 0, "a request that may have landed is never re-sent");
+    }
+
+    /// A server that closed a pooled connection while it sat idle must not
+    /// cost the caller a write: writing to that socket still succeeds locally
+    /// and only the read sees EOF, which is unknown-outcome and never retried.
+    /// The checkout preflights the socket and dials a fresh one instead.
+    #[tokio::test]
+    async fn a_connection_closed_while_idle_is_retired_at_checkout() {
+        let leader = closable_write_server(WriteAnswer::Ok).await;
+        let pool = CeleriantPool::new(PoolOptions::new(leader.addr.to_string()));
+
+        pool.write(empty_write_request()).await.expect("the first write must land");
+        leader.close_sessions();
+
+        let second = pool.write(empty_write_request()).await;
+
+        assert!(second.is_ok(), "a closed idle connection must not fail a write, got {second:?}");
+        assert_eq!(
+            leader.requests.load(Ordering::SeqCst),
+            2,
+            "the leader must have served both writes, each exactly once"
+        );
+        assert_eq!(
+            pool.stats().connections.preflight_retired,
+            1,
+            "the dead connection must be counted as retired at checkout"
+        );
+    }
+
+    /// The honest residual: a connection that passes the preflight and is closed
+    /// while the request is in flight is still an unknown outcome.
+    #[tokio::test]
+    async fn a_connection_closed_after_the_request_is_read_stays_unknown() {
+        let leader = write_server(WriteAnswer::OkThenCloseOnSecond).await;
+        let pool = CeleriantPool::new(PoolOptions::new(leader.to_string()));
+
+        pool.write(empty_write_request()).await.expect("the first write must land");
+
+        let err = pool
+            .write(empty_write_request())
+            .await
+            .expect_err("the second answer never comes");
+
+        assert!(
+            matches!(err, ClientError::ConnectionLostAfterSend(_)),
+            "expected ConnectionLostAfterSend, got {err:?}"
+        );
+    }
+
+    /// A hint naming a node whose breaker is open is skipped for free. When
+    /// each follower hints back at the dead primary, charging a retry for every
+    /// re-entry burns the budget before the live leader is ever reached.
+    #[tokio::test]
+    async fn a_stale_hint_must_not_starve_an_untried_seed() {
+        let primary = reserved_address();
+        let live = counter();
+        let s1 = write_server(WriteAnswer::NotLeader(primary.clone())).await;
+        let s2 = write_server(WriteAnswer::NotLeader(primary.clone())).await;
+        let s3 = write_server_at("127.0.0.1:0", WriteAnswer::Ok, live.clone()).await;
+
+        let pool = CeleriantPool::new(PoolOptions::new(primary).with_seed_addresses(vec![
+            s1.to_string(),
+            s2.to_string(),
+            s3.to_string(),
+        ]));
+
+        let result = pool.write(empty_write_request()).await;
+
+        assert_eq!(count(&live), 1, "the live leader must be reached");
+        assert!(result.is_ok(), "a live leader in the seed list must serve the write, got {result:?}");
+    }
+
+    /// An address is never re-entered, even when the hint names the answering
+    /// node itself, which is what a follower with a stale election view reports.
+    #[tokio::test]
+    async fn a_node_that_hints_at_itself_must_not_be_re_entered() {
+        let hits = counter();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        write_server_at(&addr, WriteAnswer::NotLeader(addr.clone()), hits.clone()).await;
+
+        let pool = CeleriantPool::new(PoolOptions::new(addr));
+
+        pool.write(empty_write_request())
+            .await
+            .expect_err("a node that redirects to itself cannot serve the write");
+
+        assert_eq!(count(&hits), 1, "a definitive NotLeader must retire the address");
+    }
+
+    /// A stalled identify handshake is this node failing before the
+    /// caller's write was ever serialised. Reporting it as `RequestTimeout`
+    /// would tell the caller an untouched write may have been applied.
+    #[tokio::test]
+    async fn a_stalled_handshake_is_not_an_ambiguous_request_timeout() {
+        let deaf = silent_server().await;
+
+        let pool = CeleriantPool::new(
+            PoolOptions::new(deaf.to_string())
+                .with_identity(ClientIdentityConfig::from_api_key("k"))
+                .with_request_timeout(Duration::from_millis(300)),
+        );
+
+        let err = pool
+            .write(empty_write_request())
+            .await
+            .expect_err("the handshake never completes");
+
+        assert!(!matches!(err, ClientError::RequestTimeout), "got {err:?}");
+        assert!(
+            err.to_string().contains("Connection timeout"),
+            "a pre-send handshake stall is a connect failure: {err}"
+        );
+    }
+
+    /// The answer arrived but could not be read, so the node may have
+    /// applied the write. The error keeps its type and nothing is re-sent.
+    #[tokio::test]
+    async fn an_answer_that_cannot_be_decoded_is_never_re_sent() {
+        let (leader_hits, seed_hits) = (counter(), counter());
+        let leader =
+            write_server_at("127.0.0.1:0", WriteAnswer::CorruptBody, leader_hits.clone()).await;
+        let seed = write_server_at(
+            "127.0.0.1:0",
+            WriteAnswer::NotLeader(leader.to_string()),
+            seed_hits.clone(),
+        )
+        .await;
+
+        let pool = CeleriantPool::new(
+            PoolOptions::new(leader.to_string()).with_seed_addresses(vec![seed.to_string()]),
+        );
+
+        let err = pool
+            .write(empty_write_request())
+            .await
+            .expect_err("an unreadable answer is not a success");
+
+        assert!(matches!(err, ClientError::ReadError(_)), "expected a typed ReadError, got {err:?}");
+        assert_eq!(count(&leader_hits), 1, "the leader must be asked exactly once");
+        assert_eq!(count(&seed_hits), 0, "a write that may have landed is never re-sent");
+    }
+
+    /// A read is not the leader's to refuse: when the pinned leader's pool
+    /// is saturated the read moves on, and the leader stays cached.
+    #[tokio::test]
+    async fn a_saturated_leader_pool_falls_through_to_the_next_read_candidate() {
+        let leader = write_server(WriteAnswer::ReadOk).await;
+        let follower = write_server(WriteAnswer::ReadOk).await;
+
+        let mut opts = PoolOptions::new(leader.to_string())
+            .with_seed_addresses(vec![follower.to_string()]);
+        opts.max_connections_per_node = 1;
+        opts.connection_timeout = Duration::from_millis(50);
+        let pool = CeleriantPool::new(opts);
+
+        let _held = pool.get_leader_connection().await.expect("the leader must accept");
+
+        let result = pool.read(empty_read_request()).await;
+
+        assert!(result.is_ok(), "a follower must serve the read, got {result:?}");
+        assert!(pool.leader_address.read().unwrap().is_none(), "the cache must be untouched");
+    }
+
+    /// A read whose answer is lost is safe to retry, so the next
+    /// candidate serves it instead of failing the caller.
+    #[tokio::test]
+    async fn a_read_whose_answer_is_lost_fails_over_to_the_next_candidate() {
+        let leader = write_server(WriteAnswer::ReadThenClose).await;
+        let follower = write_server(WriteAnswer::ReadOk).await;
+
+        let pool = CeleriantPool::new(
+            PoolOptions::new(leader.to_string()).with_seed_addresses(vec![follower.to_string()]),
+        );
+
+        let result = pool.read(empty_read_request()).await;
+
+        assert!(result.is_ok(), "a lost read answer must fail over, got {result:?}");
+    }
+
+    /// A pre-send refusal still walks, but the seed's hint back to the refusing
+    /// leader is skipped while its breaker is open, so the walk ends naming the
+    /// last address it tried and the answer it gave.
+    #[tokio::test]
+    async fn a_hint_into_an_open_breaker_is_skipped_and_the_walk_reports_its_last_try() {
+        let seed_hits = counter();
+        let leader = reserved_address();
+        let seed =
+            write_server_at("127.0.0.1:0", WriteAnswer::NotLeader(leader.clone()), seed_hits.clone())
+                .await;
+
+        let pool = CeleriantPool::new(
+            PoolOptions::new(leader.clone()).with_seed_addresses(vec![seed.to_string()]),
+        );
+
+        let err = pool.write(empty_write_request()).await.expect_err("the leader is down");
+        let text = err.to_string();
+
+        assert!(text.contains(&seed.to_string()), "the error must name the last node tried: {text}");
+        assert!(text.contains(&leader), "the error must carry the answer it got: {text}");
+        assert_eq!(count(&seed_hits), 1, "the seed answers once; it cannot serve the write");
+    }
+
+    /// The breaker is a cooldown, not a verdict: once it lapses the
+    /// next write reaches the leader through the same walk.
+    #[tokio::test]
+    async fn the_walk_reaches_the_leader_again_once_the_breaker_lapses() {
+        let leader_addr = reserved_address();
+        let seed = write_server(WriteAnswer::NotLeader(leader_addr.clone())).await;
+        let pool = CeleriantPool::new(
+            PoolOptions::new(leader_addr.clone()).with_seed_addresses(vec![seed.to_string()]),
+        );
+
+        pool.write(empty_write_request()).await.expect_err("the leader is down");
+
+        let leader_hits = counter();
+        write_server_at(&leader_addr, WriteAnswer::Ok, leader_hits.clone()).await;
+        tokio::time::sleep(CIRCUIT_BREAKER_COOLDOWN + Duration::from_millis(200)).await;
+
+        pool.write(empty_write_request()).await.expect("the leader is back");
+        assert_eq!(count(&leader_hits), 1, "the recovered leader must serve the write");
+        // The cache only names a node that differs from the primary, so what
+        // must hold is that routing points back at the leader.
+        assert_eq!(pool.current_or_primary_leader(), leader_addr, "routing must have recovered");
+    }
+
+    /// A local pool wait is not a node fault: no byte was sent, so the write
+    /// returns at once with the address it waited on, the leader cache is
+    /// untouched, and no seed is dialled (a follower cannot serve a write).
+    #[tokio::test]
+    async fn a_local_pool_wait_returns_pool_timeout_without_walking_the_seeds() {
+        let primary = write_server(WriteAnswer::Ok).await;
+        // Bound but never accepted: a dial would still be completed by the
+        // kernel backlog, so a pending accept proves the seed was contacted.
+        let seed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        seed.set_nonblocking(true).unwrap();
+
+        let mut opts = PoolOptions::new(primary.to_string())
+            .with_seed_addresses(vec![seed.local_addr().unwrap().to_string()]);
+        opts.max_connections_per_node = 1;
+        opts.connection_timeout = Duration::from_millis(50);
+        let pool = CeleriantPool::new(opts);
+
+        // Hold the node's only permit for the duration of the write.
+        let _held = pool.get_leader_connection().await.expect("primary must accept");
+
+        let err = pool
+            .write(empty_write_request())
+            .await
+            .expect_err("a saturated node pool must not block forever");
+
+        match err {
+            ClientError::PoolTimeout { ref address, .. } => {
+                assert_eq!(address, &primary.to_string())
+            }
+            other => panic!("expected PoolTimeout, got {other:?}"),
+        }
+        assert!(pool.leader_address.read().unwrap().is_none(), "the cache must be untouched");
+        assert!(
+            matches!(seed.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "the seed must never be dialled"
+        );
+    }
+
+    /// The two numbers the stats exist to separate: a cold connect and a
+    /// pooled reuse. The second write must dial nothing.
+    #[tokio::test]
+    async fn stats_separate_a_cold_connect_from_a_pooled_reuse() {
+        let primary = write_server(WriteAnswer::Ok).await;
+        let pool = CeleriantPool::new(PoolOptions::new(primary.to_string()));
+
+        pool.write(empty_write_request()).await.expect("the leader answers");
+        let c = pool.stats().connections;
+        assert_eq!((c.attempted, c.succeeded, c.pooled_reuse), (1, 1, 0), "first write must dial");
+
+        pool.write(empty_write_request()).await.expect("the leader answers");
+        let c = pool.stats().connections;
+        assert_eq!((c.attempted, c.pooled_reuse), (1, 1), "second write must reuse the connection");
+    }
+
+    /// A followed hint is the hop that the old code refused to make.
+    #[tokio::test]
+    async fn stats_count_a_followed_leader_redirect() {
+        let leader = write_server(WriteAnswer::Ok).await;
+        let primary = write_server(WriteAnswer::NotLeader(leader.to_string())).await;
+        let pool = CeleriantPool::new(PoolOptions::new(primary.to_string()));
+
+        pool.write(empty_write_request()).await.expect("the hint leads to the leader");
+
+        assert_eq!(pool.stats().leader_redirects_followed, 1);
+    }
+
+    /// A local pool wait is counted on the permit gate, and the histogram
+    /// bucket it lands in is the one the `connection_timeout` predicts.
+    #[tokio::test]
+    async fn stats_count_a_pool_timeout_and_its_wait_bucket() {
+        let primary = write_server(WriteAnswer::Ok).await;
+        let mut opts = PoolOptions::new(primary.to_string());
+        opts.max_connections_per_node = 1;
+        opts.connection_timeout = Duration::from_millis(50);
+        let pool = CeleriantPool::new(opts);
+
+        let _held = pool.get_leader_connection().await.expect("primary must accept");
+        // That checkout timed its own wait. On a loaded machine it can land in
+        // the same bucket, so only the delta across the write is the evidence.
+        let before = pool.stats().connections.wait_buckets;
+
+        pool.write(empty_write_request()).await.expect_err("the only permit is held");
+
+        let c = pool.stats().connections;
+        assert_eq!((c.pool_timeouts(), c.pool_timeouts_permit), (1, 1));
+        let bucket = wait_bucket(Duration::from_millis(50));
+        assert_eq!(
+            c.wait_buckets[bucket] - before[bucket], 1,
+            "the 50ms wait must land in its own bucket: {before:?} -> {:?}", c.wait_buckets
+        );
+    }
+
+    /// With no cached leader, `clear_leader` pins `seed_addresses[0]`, which is
+    /// follower-pinning, not a cache clear.
+    #[tokio::test]
+    async fn stats_separate_a_cache_clear_from_a_pin_to_the_first_seed() {
+        let pool = CeleriantPool::new(
+            PoolOptions::new("p:1").with_seed_addresses(vec!["b:1".into()]),
+        );
+
+        pool.clear_leader();
+        pool.clear_leader();
+
+        let stats = pool.stats();
+        assert_eq!((stats.leader_pinned_to_seed, stats.leader_cache_clears), (1, 1));
+    }
+
+    /// A hint naming a node inside its breaker cooldown is refused, and the
+    /// refusal is the number that explains a walk ending early.
+    #[tokio::test]
+    async fn stats_count_a_hint_refused_by_an_open_breaker() {
+        let leader = reserved_address();
+        let seed = write_server(WriteAnswer::NotLeader(leader.clone())).await;
+        let pool = CeleriantPool::new(
+            PoolOptions::new(leader).with_seed_addresses(vec![seed.to_string()]),
+        );
+
+        pool.write(empty_write_request()).await.expect_err("the leader is down");
+
+        let stats = pool.stats();
+        assert_eq!(stats.leader_hints_skipped, 1);
+        assert_eq!(stats.leader_redirects_followed, 0, "a refused hint is not a hop");
+        assert_eq!(stats.walks_exhausted, 1);
+    }
+
+    /// An exhausted walk reports where it gave up. "no leader found across
+    /// known nodes" on its own hid the concrete failure of every attempt.
+    #[tokio::test]
+    async fn an_exhausted_walk_names_the_last_address_and_its_error() {
+        let dead = || {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+        let (primary, seed) = (dead(), dead());
+
+        let pool = CeleriantPool::new(
+            PoolOptions::new(primary).with_seed_addresses(vec![seed.clone()]),
+        );
+
+        let err = pool.write(empty_write_request()).await.expect_err("both nodes are dead");
+        let text = err.to_string();
+        assert!(text.contains(&seed), "the last address tried must be named: {text}");
+        assert!(
+            !text.ends_with("no leader found across known nodes"),
+            "the concrete error must survive: {text}"
+        );
+    }
 }
+
